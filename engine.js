@@ -200,7 +200,7 @@
           throw new Error("Linked audio and video must stay aligned.");
     }
   };
-  const sameLaneOverlap = (left, right) => left.type === right.type && left.track === right.track &&
+  const sameLaneOverlap = (left, right) => (left.type === 'audio') === (right.type === 'audio') && left.track === right.track &&
     left.start < right.start + right.duration - .001 && right.start < left.start + left.duration - .001;
   const assertNoNewOverlaps = (before, after) => {
     const original = new Map(before.clips.map(clip => [clip.id, clip]));
@@ -808,6 +808,13 @@
     }
   }
   const Editor = {
+    formatTimecode(seconds, fps = 30) {
+      const frames = Math.max(0, Math.round((seconds || 0) * fps));
+      const nominal = Math.round(fps);
+      const whole = Math.floor(frames / nominal);
+      return [Math.floor(whole/3600),Math.floor(whole/60)%60,whole%60,frames%nominal]
+        .map(value=>String(value).padStart(2,'0')).join(':');
+    },
     get: () => ({
       project,
       revision,
@@ -1109,8 +1116,18 @@
       if (!clip || !source) return;
       ensureLinkedEditable(clip);
       const members=[clip,...linkedClips(clip)];
-      const lower=Math.max(...members.map(member=>-member.in));
-      const upper=Math.min(...members.map(member=>(mediaOf(member)?.duration||0)-member.in-member.duration*(Number(member.speed)||1)));
+      const bounds=members.map(member=>{
+        const following=followingTransition(member);
+        const before=transitionBefore(member);
+        const after=following ? Math.min(transitionLength(following)-transitionBefore(following),following.duration) : 0;
+        const speed=Number(member.speed)||1;
+        const sourceHead=(member.reverse?after:before)*speed;
+        const sourceTail=(member.duration+(member.reverse?before:after))*speed;
+        return [sourceHead-member.in,(mediaOf(member)?.duration||0)-member.in-sourceTail];
+      });
+      const lower=Math.max(...bounds.map(([start])=>start));
+      const upper=Math.min(...bounds.map(([,end])=>end));
+      if (lower>upper) throw new Error('Not enough source footage to slip the clip and keep its transitions.');
       const shift=clamp(snap(delta),lower,upper);
       if (!shift) return;
       Editor.editProject(next=>{for(const member of next.clips.filter(c=>members.some(m=>m.id===c.id)))member.in=Math.max(0,member.in+shift);});
@@ -1162,7 +1179,6 @@
     },
     addTitle() {
       if (trackLocked("title", 4)) throw new Error("Unlock the title track before editing.");
-      snapshot();
       const clip = {
         id: uid(),
         mediaId: null,
@@ -1176,9 +1192,8 @@
         volume: 100,
         transition: "none",
       };
-      project.clips.push(clip);
+      Editor.editProject(next=>next.clips.push(clip));
       selectedId = clip.id;
-      project.duration = duration();
       notify();
     },
     addTransition() {

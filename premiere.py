@@ -22,6 +22,7 @@ TRANSITIONS = {
     'wipe': ('ADBE Wipe', 'Wipe'),
 }
 TRANSITION_BY_MATCH = {match:style for style,(match,_) in TRANSITIONS.items()}
+AUDIO_CROSSFADE = 'Constant Gain'
 
 STILL_IMAGES = frozenset({".png", ".bmp", ".jpg", ".jpeg"})
 ROOT = Path(__file__).resolve().parent
@@ -217,7 +218,10 @@ def _read_transition(track, item, clip_data):
                      if abs(transition.cut_point.seconds - item.start.seconds) < .05), None)
     if matching is None:
         return
-    clip_data['transition'] = TRANSITION_BY_MATCH.get(matching.match_name, 'native')
+    if clip_data['type'] == 'audio':
+        clip_data['transition'] = 'dissolve' if matching.match_name == AUDIO_CROSSFADE else 'native'
+    else:
+        clip_data['transition'] = TRANSITION_BY_MATCH.get(matching.match_name, 'native')
     clip_data['transitionBefore'] = matching.cut_point_offset.seconds
     clip_data['transitionDuration'] = matching.duration.seconds
     clip_data['transitionMatchName'] = matching.match_name
@@ -720,7 +724,11 @@ def save_project(data):
                 raise ValueError('Unsupported audio track')
             audio_regions[track].append((region['start'], region['start'] + region['duration']))
     pending_transitions = []
-    for item in sorted(data.get('clips', []), key=lambda clip: 'premiereIndex' not in clip):
+    camera_audio = {}
+    items = data.get('clips', [])
+    video_ends = {(item['track'], round((item['start'] + item['duration']) * requested_fps)): item
+                  for item in items if item.get('type') == 'video'}
+    for item in sorted(items, key=lambda clip: ('premiereIndex' not in clip, clip['start'])):
         companion = None
         source = available.get(item.get('mediaId'))
         is_audio = item.get('type') == 'audio'
@@ -751,15 +759,12 @@ def save_project(data):
             if clip is None:
                 raise ValueError('Original Premiere clip is unavailable')
             if index != original_track:
-                if is_audio:
-                    clip.track.move_clip(clip, tracks[index])
-                else:
-                    for transition in list(clip.track.transitions):
-                        if abs(transition.cut_point.seconds - clip.start.seconds) < .05 or abs(transition.cut_point.seconds - clip.end.seconds) < .05:
-                            clip.track.remove_transition(transition)
-                    clip.track.move_clip(clip, tracks[index])
+                for transition in list(clip.track.transitions):
+                    if abs(transition.cut_point.seconds - clip.start.seconds) < .05 or abs(transition.cut_point.seconds - clip.end.seconds) < .05:
+                        clip.track.remove_transition(transition)
+                clip.track.move_clip(clip, tracks[index])
             original_start = clip.start.seconds
-            if not is_audio and (item.get('transition') == 'none' or abs(float(item.get('start', 0)) - original_start) > 0.001):
+            if item.get('transition') == 'none' or abs(float(item.get('start', 0)) - original_start) > 0.001:
                 for transition in list(tracks[index].transitions):
                     if abs(transition.cut_point.seconds - original_start) < 0.05:
                         tracks[index].remove_transition(transition)
@@ -792,12 +797,19 @@ def save_project(data):
                 has_audio = any(element.tag == 'AudioClip' for element in source._clip_elements)
                 if not is_audio and has_audio and item.get('embeddedAudio', True):
                     begin, end = item['start'], item['start'] + item['duration']
-                    free = next((i for i, regions in enumerate(audio_regions)
-                                 if all(a >= end or b <= begin for a, b in regions)), None)
+                    previous = video_ends.get((ui_track, round(begin * requested_fps)))
+                    paired = camera_audio.get(id(previous)) if item.get('transition') in ('dissolve', 'wipe') else None
+                    candidates = [paired[1]] if paired else range(len(audio_regions))
+                    free = next((i for i in candidates if all(a >= end or b <= begin for a, b in audio_regions[i])), None)
                     if free is None:
+                        if paired:
+                            raise ValueError('Linked camera sound needs one free audio track across the crossfade')
                         raise ValueError('No free audio track for linked camera sound')
                     clip, companion = sequence.add_linked_clip(source, placement, index, free)
                     audio_regions[free].append((begin, end))
+                    camera_audio[id(item)] = (companion, free)
+                    if paired or (previous is None and item.get('transition') in ('dissolve','wipe','fade')):
+                        pending_transitions.append((companion, item, AUDIO_CROSSFADE, AUDIO_CROSSFADE))
                 else:
                     clip = tracks[index].add_clip(source, placement)
         speed = float(item.get('speed', clip.speed))
@@ -830,10 +842,18 @@ def save_project(data):
             companion.out_point = clip.out_point
             companion.end = clip.end
             premiere_effects.apply(companion, {}, float(item.get('volume', 100)))
+            audio_item = {key: item[key] for key in ('volume','fadeIn','fadeOut','pan') if key in item}
+            if (item.get('keyframes') or {}).get('volume'):
+                audio_item['keyframes'] = {'volume': item['keyframes']['volume']}
+            premiere_effects.apply_extended(companion, audio_item)
+            item = {**item, 'fadeIn': 0, 'fadeOut': 0, 'pan': 0,
+                    'keyframes': {key: points for key, points in (item.get('keyframes') or {}).items() if key != 'volume'}}
         premiere_effects.apply(clip, item.get('color') or {}, float(item.get('volume', 100)))
         premiere_effects.apply_extended(clip, item)
         if item.get('transition') in TRANSITIONS and not is_audio:
-            pending_transitions.append((clip, item))
+            pending_transitions.append((clip, item, *TRANSITIONS[item['transition']]))
+        elif is_audio and item.get('transition') == 'dissolve':
+            pending_transitions.append((clip, item, AUDIO_CROSSFADE, AUDIO_CROSSFADE))
     if original:
         retained = {(('video' if c.get('type') == 'title' else c.get('type')), c.get('premiereTrack'), c.get('premiereIndex')) for c in data.get('clips', []) if 'premiereIndex' in c}
         for key, clip in original_clips.items():
@@ -842,8 +862,7 @@ def save_project(data):
                     if abs(transition.cut_point.seconds - clip.start.seconds) < 0.05 or abs(transition.cut_point.seconds - clip.end.seconds) < 0.05:
                         clip.track.remove_transition(transition)
                 clip.track.remove_clip(clip)
-    for clip, item in pending_transitions:
-        match, label = TRANSITIONS[item['transition']]
+    for clip, item, match, label in pending_transitions:
         length = py_premiere.Time.from_seconds(float(item.get('transitionDuration', .5)))
         before = py_premiere.Time.from_seconds(float(item.get('transitionBefore', 0)))
         existing = next((t for t in clip.track.transitions if abs(t.cut_point.seconds-clip.start.seconds)<.5/requested_fps), None)

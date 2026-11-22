@@ -375,8 +375,9 @@ def apply_extended(clip, item):
     opacity = float(item.get('opacity',100))
     if not math.isfinite(opacity) or not 0 <= opacity <= 100:
         raise ValueError('Invalid clip opacity')
-    if automation.get('opacity') or opacity != 100:
-        component = _component(clip,'AE.ADBE Opacity') or _attach(clip,'opacity')
+    component = _component(clip,'AE.ADBE Opacity')
+    if automation.get('opacity') or opacity != 100 or (component and 'opacity' in item):
+        component = component or _attach(clip,'opacity')
         param = _parameter(component,'Opacity')
         if automation.get('opacity'):
             if not param.is_time_varying and abs(float(param.value or 0)-opacity)>.0001:

@@ -6,7 +6,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "vendor"))
 import py_premiere
 import premiere_effects
-from premiere import save_project
+from premiere import open_project, save_project
 
 
 class ExtendedEffectsRoundTrip(unittest.TestCase):
@@ -75,6 +75,19 @@ if __name__ == '__main__':
 
 
 class NativeMotionAndFade(unittest.TestCase):
+    def test_resetting_native_static_opacity_to_full(self):
+        project = {
+            'name': 'Reset opacity', 'fps': 25,
+            'media': [{'id': 'ridge', 'name': 'ridge.mp4', 'src': '/assets/ridge.mp4'}],
+            'clips': [{'id': 'v', 'type': 'video', 'track': 1, 'mediaId': 'ridge',
+                       'start': 0, 'duration': 2, 'in': 0, 'opacity': 40}],
+        }
+        native = open_project(save_project(project))
+        self.assertEqual(native['clips'][0]['opacity'],40)
+        native['clips'][0]['opacity'] = 100
+        reopened = open_project(save_project(native))
+        self.assertEqual(reopened['clips'][0]['opacity'],100)
+
     def test_lumetri_white_balance_roundtrip(self):
         app = py_premiere.new()
         sequence = app.project.add_sequence('Balance', '1080p25')

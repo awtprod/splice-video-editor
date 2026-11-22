@@ -417,7 +417,7 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
                 before=_number(clip.get('transitionBefore',0),'transition lead',0,2)
                 render_source=(source_in if clip.get('reverse') else source_in-before*speed)-source_offsets.get(item['id'],0)
                 render_length=length+before
-                delay=round((start-before)*1000)
+                delay=round((start-before)*48000)
                 volume_keys=(clip.get('keyframes') or {}).get('volume')
                 gain = (100 if volume_keys else _number(clip.get('volume',100),'volume',0,200)) * _number(mix.get('gain',100),'track gain',0,200) / 10000
                 pan = max(-1,min(1,(_number(clip.get('pan', 0), 'pan', -100, 100) + _number(mix.get('pan',0),'track pan',-100,100))/100))
@@ -426,25 +426,29 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
                 fade_out = min(length,_number(clip.get('fadeOut',0),'fade out',0,7200))
                 chain = f'[{index}:a]atrim=start={render_source:.6f}:duration={render_length*speed:.6f}'
                 if clip.get('reverse'): chain += ',areverse'
-                chain += ',asetpts=PTS-STARTPTS'
+                tempo = ''
                 remaining=speed
                 while remaining>2:
-                    chain += ',atempo=2';remaining/=2
+                    tempo += ',atempo=2';remaining/=2
                 while remaining<.5:
-                    chain += ',atempo=0.5';remaining*=2
-                chain += f',atempo={remaining:.6f},volume={gain:.4f},{panner}'
+                    tempo += ',atempo=0.5';remaining*=2
+                if abs(remaining-1)>1e-6:
+                    tempo += f',atempo={remaining:.6f}'
+                processing=f',asetpts=PTS-STARTPTS{tempo},aresample=48000,volume={gain:.4f},{panner}'
+                chain += processing
                 envelope=[]
                 if volume_keys:
                     volume_expr=_keyframe_expr(clip,'volume',float(clip.get('volume',100)),0,200,f'(t-{before:.6f})')
                     envelope.append(f'({volume_expr})/100')
                 if clip.get('transition') in ('dissolve','wipe','fade'):
-                    chain += f',afade=t=in:st=0:d={min(float(clip.get("transitionDuration",.5)),render_length):.6f}'
+                    incoming=min(_number(clip.get('transitionDuration',.5),'transition duration',1/float(fps),2),render_length)
+                    envelope.append(f'min(1,t/{incoming:.9f})')
                 next_clip=next((candidate for candidate in clips if candidate is not clip and candidate.get('type')==clip['type'] and candidate.get('track')==clip.get('track') and candidate.get('transition') in ('dissolve','wipe') and abs(float(candidate['start'])-(start+length))<.05),None)
                 if next_clip:
                     next_before=_number(next_clip.get('transitionBefore',0),'transition lead',0,2)
                     next_duration=_number(next_clip.get('transitionDuration',.5),'transition duration',1/float(fps),2)
                     fade_start=before+length-next_before
-                    chain += f",volume='if(lt(t,{fade_start:.6f}),1,max(0,1-(t-{fade_start:.6f})/{next_duration:.6f}))':eval=frame"
+                    envelope.append(f'max(0,min(1,1-(t-{fade_start:.9f})/{next_duration:.9f}))')
                 if fade_in or fade_out:
                     head = f'max(0,(t-{before:.9f})/{fade_in:.9f})' if fade_in else '1'
                     tail = f'max(0,({render_length:.9f}-t)/{fade_out:.9f})' if fade_out else '1'
@@ -452,9 +456,9 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
                 if envelope:
                     gain_expr='*'.join(envelope)
                     chain += f",aeval=exprs='val(ch)*{gain_expr}':channel_layout=stereo"
-                filters.append(chain + f',adelay={delay}|{delay}[audio{number}]')
+                filters.append(chain + f',adelay={delay}S:all=1[audio{number}]')
                 audio_labels.append(f'[audio{number}]')
-                if next_clip:
+                if next_clip and not fade_out:
                     after=max(0,next_duration-next_before)
                     if after>=1/float(fps):
                         available=(source_in/speed if clip.get('reverse') else (item['_actualDuration']-source_in-length*speed)/speed)
@@ -463,15 +467,13 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
                         tail_source-=source_offsets.get(item['id'],0)
                         tail_chain=f'[{index}:a]atrim=start={tail_source:.6f}:duration={after*speed:.6f}'
                         if clip.get('reverse'): tail_chain+=',areverse'
-                        tail_chain+=',asetpts=PTS-STARTPTS'
-                        remaining=speed
-                        while remaining>2: tail_chain+=',atempo=2';remaining/=2
-                        while remaining<.5: tail_chain+=',atempo=0.5';remaining*=2
-                        tail_chain+=f",atempo={remaining:.6f},volume={gain:.4f},{panner}"
+                        tail_chain+=processing
                         if volume_keys:
                             terminal=sorted(volume_keys,key=lambda point:point['time'])[-1]['value']
                             tail_chain+=f",volume={_number(terminal,'volume keyframe',0,200)/100:.6f}"
-                        tail_chain+=f",volume='max(0,1-({next_before:.6f}+t)/{next_duration:.6f})':eval=frame,adelay={round((start+length)*1000)}|{round((start+length)*1000)}[tailaudio{number}]"
+                        tail_gain=f'max(0,1-({next_before:.9f}+t)/{next_duration:.9f})'
+                        tail_delay=round((start+length)*48000)
+                        tail_chain+=f",aeval=exprs='val(ch)*{tail_gain}':channel_layout=stereo,adelay={tail_delay}S:all=1[tailaudio{number}]"
                         filters.append(tail_chain)
                         audio_labels.append(f'[tailaudio{number}]')
         if audio_labels:

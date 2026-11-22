@@ -160,6 +160,34 @@ class MovieDelivery(unittest.TestCase):
                     self.assertLess(rms[1 if pan<0 else 0],.001)
                     self.assertGreater(rms[0 if pan<0 else 1],.11)
 
+    def test_camera_dissolve_preserves_audible_tail_through_native_save(self):
+        from array import array
+        from premiere import MEDIA_ROOT, open_project, save_project
+        MEDIA_ROOT.mkdir(parents=True,exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=MEDIA_ROOT) as directory:
+            source=Path(directory)/'camera.mp4'
+            subprocess.run(['ffmpeg','-nostdin','-v','error','-f','lavfi','-i','color=red:s=160x90:r=25:d=3',
+                '-f','lavfi','-i','sine=frequency=440:sample_rate=48000:duration=3',
+                '-c:v','libx264','-threads','1','-c:a','aac','-shortest',str(source)],check=True,timeout=10)
+            self.project['media']=[dict(id='camera',name=source.name,src='/media/'+str(source.relative_to(MEDIA_ROOT)))]
+            outgoing=self.clip('out','camera',0,1,fadeOut=.5)
+            incoming=self.clip('in','camera',1,1,volume=0,transition='dissolve',transitionDuration=.48)
+            self.project['clips']=[outgoing,incoming]
+            def rms(project):
+                output=Path(directory)/'mix.wav'
+                render_to_file(project,output,options={'codec':'wav'})
+                samples=array('f',subprocess.check_output(['ffmpeg','-nostdin','-v','error','-ss','1.1',
+                    '-i',str(output),'-t','0.1','-f','f32le','pipe:1'],timeout=10))
+                return (sum(sample*sample for sample in samples)/len(samples))**.5
+            self.assertLess(rms(self.project),.0001)
+            self.assertLess(rms(open_project(save_project(self.project))),.0001)
+            outgoing['fadeOut']=0
+            before=rms(self.project)
+            self.assertGreater(before,.03)
+            native=open_project(save_project(self.project))
+            self.assertEqual([c['transition'] for c in native['clips'] if c['type']=='audio'],['none','dissolve'])
+            self.assertAlmostEqual(rms(native),before,places=4)
+
     def test_250_cuts_frame_count_and_selectable_subtitles(self):
         self.project['clips']=[self.clip(str(i),'ridge',i/25,.04) for i in range(250)]
         self.project['captions']=[dict(start=6.2,duration=1,text='Across the segment boundary')]

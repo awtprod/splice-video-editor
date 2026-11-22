@@ -2,10 +2,7 @@
   let dialog, media, player, markIn = 0, markOut = 0, fps = 25, shuttleTimer, shuttleRate = 0;
   const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const snap = value => Math.round(value * fps) / fps;
-  const format = seconds => {
-    const frames = Math.round(seconds * fps), whole = Math.floor(frames / fps);
-    return [Math.floor(whole/3600),Math.floor(whole/60)%60,whole%60,frames%fps].map(n=>String(n).padStart(2,'0')).join(':');
-  };
+  const format = seconds => Editor.formatTimecode(seconds,fps);
   const show = message => {const node=dialog.querySelector('.source-status');node.textContent=message;node.classList.toggle('error',!!message);};
   const current = () => Math.max(0,Math.min(media.duration,player?.currentTime || 0));
   function update() {
