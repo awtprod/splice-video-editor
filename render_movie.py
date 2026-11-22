@@ -344,9 +344,9 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
             active = f'base{number+1}'
     with tempfile.TemporaryDirectory(prefix='splice-render-') as work:
         for number, clip in enumerate(c for c in clips if c['type'] == 'title' and c.get('title') and not muted.get('title')):
-            text_file = Path(work) / f'title-{number}.txt'
-            text_file.write_text(str(clip['title'])[:500])
             begin = float(clip['start']); end = begin + float(clip['duration'])
+            first_frame = math.ceil(begin * fps - 1e-6)
+            out_frame = math.ceil(end * fps - 1e-6)
             style=clip.get('titleStyle') or {}
             font_path=_font_path(style.get('fontFamily','DM Sans'))
             fontsize=round(height*_number(style.get('fontSize',8),'title size',2,20)/100)
@@ -362,8 +362,20 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
             if len(stroke)!=7 or not stroke.startswith('#') or any(c not in '0123456789abcdefABCDEF' for c in stroke[1:]):
                 raise ValueError('Invalid title outline color')
             border=int(_number(style.get('strokeWidth',0),'title outline',0,8)*height/180)
-            filters.append(f'[{active}]drawtext=fontfile={font_path}:textfile={text_file}:expansion=none:fontsize={fontsize}:fontcolor=0x{color[1:]}:borderw={border}:bordercolor=0x{stroke[1:]}:shadowcolor=black:shadowx=3:shadowy=3:x={xpos}:y=h*{y:.5f}-text_h/2:enable=between(t\\,{begin:.6f}\\,{end:.6f})[title{number}]')
-            active = f'title{number}'
+            lines = str(clip['title'])[:500].split('\n')[:20]
+            for row, line in enumerate(lines):
+                if not line.strip():
+                    continue
+                text_file = Path(work) / f'title-{number}-{row}.txt'
+                text_file.write_text(line.rstrip('\r'), encoding='utf-8')
+                offset = (row - (len(lines) - 1) / 2) * fontsize * 1.2
+                label = f'title{number}line{row}'
+                filters.append(
+                    f'[{active}]drawtext=fontfile={font_path}:textfile={text_file}:expansion=none:'
+                    f'fontsize={fontsize}:fontcolor=0x{color[1:]}:borderw={border}:bordercolor=0x{stroke[1:]}:'
+                    f'shadowcolor=black:shadowx=3:shadowy=3:x={xpos}:y=h*{y:.5f}+({offset:.3f})-text_h/2:'
+                    f'enable=gte(n\\,{first_frame})*lt(n\\,{out_frame})[{label}]')
+                active = label
         audio_labels = []
         track_mix=project.get('trackMix') or {}
         solo=any(v.get('solo') for v in track_mix.values() if isinstance(v,dict))

@@ -11,15 +11,22 @@ window.SpliceSession = (() => {
     tx.onabort = () => fail(tx.error || Error('Session transaction interrupted'));
   });
   const dbReady = new Promise((ok, fail) => {
-    const req = indexedDB.open('splice-sessions', 1);
-    req.onupgradeneeded = () => {
+    const req = indexedDB.open('splice-sessions', 2);
+    req.onupgradeneeded = event => {
       const db = req.result;
-      db.createObjectStore('sessions', {keyPath:'id'});
-      db.createObjectStore('versions', {keyPath:'id'}).createIndex('session','session');
-      db.createObjectStore('originals');
-      db.createObjectStore('handles');
+      if (event.oldVersion === 0) {
+        db.createObjectStore('sessions', {keyPath:'id'});
+        db.createObjectStore('versions', {keyPath:'id'}).createIndex('session','session');
+        db.createObjectStore('originals');
+        db.createObjectStore('handles');
+      }
+      db.createObjectStore('metadata');
     };
-    req.onsuccess = () => ok(req.result);
+    req.onsuccess = () => {
+      req.result.onversionchange = () => req.result.close();
+      ok(req.result);
+    };
+    req.onblocked = () => fail(Error('Close other Splice windows so recovery can be upgraded.'));
     req.onerror = () => fail(req.error);
   });
   const get = async (store, id) => request((await dbReady).transaction(store).objectStore(store).get(id));
@@ -51,7 +58,7 @@ window.SpliceSession = (() => {
       while (pending) {
         const payload = pending;
         pending = undefined;
-        const tx = db.transaction(['sessions','versions','originals','handles'],'readwrite');
+        const tx = db.transaction(['sessions','versions','originals','handles','metadata'],'readwrite',{durability:'strict'});
         const done = complete(tx);
         const sessions = tx.objectStore('sessions');
         const current = await request(sessions.get(payload.id));
@@ -71,6 +78,7 @@ window.SpliceSession = (() => {
                      originalKey:payload.originalKey,touched:payload.touched,format:payload.format,diskSignature:payload.diskSignature,
                      versionAt:current && !payload.checkpoint && now-current.versionAt<30000 ? current.versionAt : now};
         sessions.put(row);
+        tx.objectStore('metadata').put(row.id,'lastSession');
         if (payload.originalKey && payload.originalKey !== current?.originalKey)
           tx.objectStore('originals').put(payload.original,payload.originalKey);
         if (payload.handle) tx.objectStore('handles').put(payload.handle,payload.id);
@@ -79,7 +87,6 @@ window.SpliceSession = (() => {
         older.sort((a,b)=>b.stamp-a.stamp).slice(12).forEach(v=>versions.delete(v.id));
         await done;
         lastRecord = row;
-        localStorage.setItem('splice.lastSession',row.id);
       }
       status(touched ? 'Draft saved locally' : 'Saved');
     })().catch(err=>{signal('Recovery unavailable: '+err.message); throw err;})
@@ -109,7 +116,7 @@ window.SpliceSession = (() => {
   }
   const ready = (async () => {
     try {
-      const last = localStorage.getItem('splice.lastSession');
+      const last = await get('metadata','lastSession') || localStorage.getItem('splice.lastSession');
       if (last) {
         const row = await get('sessions',last);
         if (row) await restore(row);
@@ -224,7 +231,10 @@ window.SpliceSession = (() => {
       ...versions.sort((a,b)=>b.stamp-a.stamp).map(v=>({label:'Restore version · '+new Date(v.stamp).toLocaleString(),value:v}))
     ];
     const choice=await choose('Recent projects and versions',rows);
-    if(choice) await restore(choice,!!choice.session);
+    if(choice) {
+      await restore(choice,!!choice.session);
+      if (!choice.session) await persist();
+    }
   }
   async function sequence(requestedIndex) {
     await leave();

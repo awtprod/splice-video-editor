@@ -105,7 +105,7 @@
         (points.length ? `<div class="splice-key-list">${points.map(point=>`<button type="button" data-key-time="${point.time}" title="Go to keyframe at ${point.time.toFixed(2)} seconds">${point.time.toFixed(2)}s · ${point.value}</button>`).join('')}</div><button type="button" class="splice-key-delete" data-key-delete>Delete keyframe at playhead</button>` : '<p class="splice-handle">No keyframes. Add one at the playhead to animate this property.</p>'));
     }
     if (clip.type === 'audio' || clip.type === 'video' && clip.embeddedAudio !== false) {
-      const track = clip.type === 'audio' ? clip.track : 1;
+      const track = clip.track;
       const mix = state.project.trackMix?.[track] || {};
       html += section('Track mixer',
         label('Track gain', 'gain', number(mix.gain, 100), 0, 200, 1, '%', 'trackMix') +
@@ -119,6 +119,8 @@
     if (clip.keyframes?.volume?.length && (number(clip.fadeIn,0)||number(clip.fadeOut,0))) nativeLimits.push('combined gain keyframes and fades');
     if (text.align && text.align!=='center') nativeLimits.push('left/right title alignment');
     if (number(clip.pan,0)) nativeLimits.push('clip audio pan');
+    const videoMix = clip.type === 'video' && state.project.trackMix?.[clip.track];
+    if (videoMix && (videoMix.gain!==100 || videoMix.pan || videoMix.mute || videoMix.solo)) nativeLimits.push('embedded video-track mix');
     if (nativeLimits.length) html += section('Premiere compatibility',
       `<p class="splice-compat">${escape(nativeLimits.join(', '))} will not save to Premiere. Save a Splice working copy to keep this edit.</p>`);
     if(clip.transition==='native') html += section('Render compatibility',
@@ -154,8 +156,7 @@
         const group = input.dataset.group;
         try {
           if (group === 'trackMix') {
-            const track = active.type === 'audio' ? active.track : 1;
-            editor.updateTrackMix(track, {[key]: value});
+            editor.updateTrackMix(active.track, {[key]: value});
           } else {
             editor.updateClip(active.id, group ? {[group]: {...(active[group] || {}), [key]: value}} : {[key]: value});
             if(['align','pan','fadeIn','fadeOut','transition','transitionDuration'].includes(key)) render(editor.get(),element,editor);

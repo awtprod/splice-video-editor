@@ -483,16 +483,60 @@
     audio = audioClips.length ? audioElements.get(audioClips[0].id) : null;
     if (clip) setAudio(video,clip);
   }
-  function animated(clip,key,base) {
-    const points=(clip.keyframes?.[key]||[]).filter(p=>Number.isFinite(p.time)&&Number.isFinite(p.value)).sort((a,b)=>a.time-b.time);
+  function curveValue(points,local,base) {
     if (!points.length) return base;
-    const local=time-clip.start;
     if (local<=points[0].time) return points[0].value;
     for (let i=1;i<points.length;i++) if(local<=points[i].time) {
       const a=points[i-1],b=points[i],u=(local-a.time)/(b.time-a.time);
       return a.value+(b.value-a.value)*u;
     }
     return points.at(-1).value;
+  }
+  function animated(clip,key,base) {
+    const points=(clip.keyframes?.[key]||[]).filter(p=>Number.isFinite(p.time)&&Number.isFinite(p.value)).sort((a,b)=>a.time-b.time);
+    return curveValue(points,time-clip.start,base);
+  }
+  function splitClipAt(clip,cut) {
+    const offset=cut-clip.start, duration=clip.duration;
+    if (offset<=1e-6 || offset>=duration-1e-6) return null;
+    if (['dissolve','wipe','fade'].includes(clip.transition) && offset<transitionLength(clip)-transitionBefore(clip)-1e-6)
+      throw new Error('Move the cut outside the transition before splitting this clip.');
+    if (clip.transition==='native') throw new Error('Replace the imported transition before splitting this clip.');
+    const speed=Number(clip.speed)||1;
+    const right={...structuredClone(clip),id:uid(),start:cut,duration:duration-offset,
+      in:clip.reverse?clip.in:clip.in+offset*speed,transition:'none'};
+    for (const key of ['premiereTrack','premiereIndex','transitionBefore','transitionDuration','transitionMatchName']) delete right[key];
+    const keys=structuredClone(clip.keyframes||{});
+    const fadeIn=Number(clip.fadeIn)||0, fadeOut=Number(clip.fadeOut)||0;
+    if (offset<fadeIn || offset>duration-fadeOut) {
+      if (keys.volume?.length) throw new Error('Move the cut outside the combined fade and gain automation.');
+      const gain=clip.volume??100;
+      const times=[0, duration, Math.min(fadeIn,duration), Math.max(0,duration-fadeOut)];
+      if (fadeIn && fadeOut && fadeIn+fadeOut>duration) times.push(duration*fadeIn/(fadeIn+fadeOut));
+      keys.volume=[...new Set(times)].sort((a,b)=>a-b).map(t=>({time:t,
+        value:gain*Math.min(1,fadeIn?t/fadeIn:1,fadeOut?(duration-t)/fadeOut:1)}));
+      clip.fadeIn=0;
+      right.fadeOut=0;
+    }
+    clip.fadeOut=0;
+    right.fadeIn=0;
+    for(const [piece,from,to] of [[clip,0,offset],[right,offset,duration]]) {
+      if (!Object.values(keys).some(points=>points.length)) continue;
+      piece.keyframes={};
+      for(const [key,points] of Object.entries(keys)) {
+        if(!points.length) continue;
+        const ordered=[...points].sort((a,b)=>a.time-b.time);
+        piece.keyframes[key]=[
+          {time:0,value:curveValue(ordered,from,0)},
+          ...ordered.filter(point=>point.time>from+1e-6 && point.time<to-1e-6)
+            .map(point=>({time:point.time-from,value:point.value})),
+          {time:to-from,value:curveValue(ordered,to,0)},
+        ];
+      }
+    }
+    clip.duration=offset;
+    if(clip.reverse) clip.in+=(duration-offset)*speed;
+    return right;
   }
   const layerCanvases = new Map();
   const blackGenerator=document.createElement('canvas');blackGenerator.width=16;blackGenerator.height=9;
@@ -577,10 +621,10 @@
     for (const title of titles) {
       ctx.fillStyle = "#fff";
       const style=title.titleStyle||{};
-      ctx.font = `bold ${Math.round(canvas.height * (Number(style.fontSize)||8)/100)}px "${style.fontFamily||'DM Sans'}"`;
+      ctx.font = `${Math.round(canvas.height * (Number(style.fontSize)||8)/100)}px "${style.fontFamily||'DM Sans'}"`;
       ctx.fillStyle=style.color||'#ffffff';
       ctx.textAlign = ['left','center','right'].includes(style.align) ? style.align : 'center';
-      ctx.textBaseline = "middle";
+      ctx.textBaseline = "alphabetic";
       ctx.shadowColor = "#000";
       ctx.shadowBlur = 0;
       ctx.shadowOffsetX=3;ctx.shadowOffsetY=3;
@@ -588,9 +632,11 @@
       const lines=title.title.split(/\r?\n/).slice(0,20);
       const lineHeight=Math.round(canvas.height * (Number(style.fontSize)||8)/100)*1.2;
       for (let i=0;i<lines.length;i++) {
-        const lineY=ty+(i-(lines.length-1)/2)*lineHeight;
+        const metrics=ctx.measureText(lines[i]);
+        const lineY=ty+(i-(lines.length-1)/2)*lineHeight+
+          (metrics.actualBoundingBoxAscent-metrics.actualBoundingBoxDescent)/2;
         if (Number(style.strokeWidth)>0) {
-          ctx.lineWidth=Number(style.strokeWidth)*canvas.height/180;
+          ctx.lineWidth=Number(style.strokeWidth)*canvas.height/90;
           ctx.strokeStyle=style.strokeColor||'#000000';
           ctx.strokeText(lines[i],tx,lineY);
         }
@@ -621,8 +667,12 @@
   }
   function checkReplacement(item,replacement) {
     if(replacement.type!==item.type) throw Error('Choose a '+item.type+' file for '+item.name+'.');
-    const end=Math.max(0,...project.clips.filter(c=>c.mediaId===item.id).map(c=>c.in+c.duration));
-    if(replacement.duration+.5/project.fps<end) throw Error(replacement.name+' is shorter than the source used on this timeline.');
+    const end=Math.max(0,...project.clips.filter(c=>c.mediaId===item.id).map(c=>{
+      const next=followingTransition(c);
+      const handle=c.reverse?transitionBefore(c):next?transitionLength(next)-transitionBefore(next):0;
+      return c.in+(c.duration+handle)*(Number(c.speed)||1);
+    }));
+    if(replacement.duration+1e-6<end) throw Error(replacement.name+' is shorter than the source used on this timeline.');
   }
   function download(blob, name) {
     const url = URL.createObjectURL(blob);
@@ -997,6 +1047,7 @@
       if (!shift) return;
       Editor.editProject(next=>{for(const member of next.clips.filter(c=>members.some(m=>m.id===c.id)))member.in=Math.max(0,member.in+shift);});
     },
+    splitClipAt,
     split() {
       const clip = selected() || at("video", time);
       const cut = snap(time);
@@ -1007,16 +1058,10 @@
       const rightGroup=clip.linkGroup?uid():null;
       Editor.editProject(next=>{
         for(const member of next.clips.filter(c=>members.some(m=>m.id===c.id))){
-          const length=cut-member.start;
-          if(length<=0 || length>=member.duration)throw new Error("Linked clip does not cross the playhead.");
-          const originalIn=Number(member.in)||0,originalDuration=member.duration,speed=Number(member.speed)||1;
-          const right={...structuredClone(member),id:uid(),start:cut,
-            in:member.reverse?originalIn:originalIn+length*speed,duration:originalDuration-length};
-          delete right.premiereIndex;
+          const right=splitClipAt(member,cut);
+          if (!right) throw new Error("Linked clip does not cross the playhead.");
           if(rightGroup)right.linkGroup=rightGroup;
           next.clips.push(right);
-          member.duration=length;
-          if(member.reverse)member.in=originalIn+(originalDuration-length)*speed;
         }
       });
       time = cut;

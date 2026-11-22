@@ -81,6 +81,19 @@ class MovieDelivery(unittest.TestCase):
         self.assertEqual(next(s['nb_frames'] for s in self.streams() if s['codec_type']=='video'),'25')
         self.assertGreater(statistics.mean(self.frame(.8)),30)
 
+    def test_title_lines_center_independently_and_end_on_out_frame(self):
+        self.project.update(width=640,height=360,clips=[
+            {'type':'title','start':0,'duration':1,'title':'WIDE FIRST LINE\nI',
+             'titleStyle':{'align':'center','x':50,'y':50,'fontSize':10}},
+            {'type':'title','start':0,'duration':2,'title':''},
+        ])
+        render_to_file(self.project,self.destination)
+        inside=self.frame(.96)
+        coords=[x for y in range(184,235) for x in range(640) if inside[(y*640+x)*3]>180]
+        self.assertTrue(coords)
+        self.assertAlmostEqual(statistics.mean(coords),320,delta=6)
+        self.assertLess(max(self.frame(1.0)),16)
+
     def test_export_pan_routes_both_stereo_channels(self):
         from array import array
         from premiere import MEDIA_ROOT

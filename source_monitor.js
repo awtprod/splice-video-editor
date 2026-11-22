@@ -39,17 +39,6 @@
   function newClip(start,track) {
     return {id:crypto.randomUUID(),mediaId:media.id,start:snap(start),duration:snap(markOut-markIn),in:snap(markIn),track,type:media.type,title:'',color:{brightness:100,contrast:100,saturation:100},volume:100,transition:'none'};
   }
-  function cutAt(clip,time) {
-    const end=clip.start+clip.duration;
-    if (time<=clip.start+1e-5 || time>=end-1e-5) return null;
-    const leftDuration=time-clip.start,originalDuration=clip.duration,speed=Number(clip.speed)||1;
-    const right={...structuredClone(clip),id:crypto.randomUUID(),start:time,
-      in:clip.reverse?clip.in:clip.in+leftDuration*speed,duration:end-time};
-    clip.duration=leftDuration;
-    if(clip.reverse)clip.in+= (originalDuration-leftDuration)*speed;
-    delete right.premiereIndex;delete right.premiereTrack;
-    return right;
-  }
   function place(mode) {
     show('');
     if (markOut-markIn < 1/fps) return show('Mark a range at least one frame long.');
@@ -68,7 +57,7 @@
           if ((existing.track !== track || existing.type !== media.type) && !Editor.isTrackSyncLocked(existing.track, existing.type)) continue;
           if (existing.start >= start-1e-5) existing.start+=length;
           else if (existing.start+existing.duration > start+1e-5) {
-            const right=cutAt(existing,start);
+            const right=Editor.splitClipAt(existing,start);
             if(right){if(right.linkGroup){if(!rightGroups.has(right.linkGroup))rightGroups.set(right.linkGroup,crypto.randomUUID());right.linkGroup=rightGroups.get(right.linkGroup);}
               right.start+=length;additions.push(right);}
           }
@@ -79,21 +68,25 @@
           if(existing.track!==track || existing.type!==media.type) continue;
           const a=existing.start,b=a+existing.duration;
           if(b<=start+1e-5 || a>=end-1e-5) continue;
-          if(a>=start-1e-5 && b<=end+1e-5){project.clips.splice(i,1);continue;}
-          if(a<start && b>end){
-            const right=cutAt(existing,start);
-            if(!right.reverse)right.in+=(end-start)*(Number(right.speed)||1);
-            right.start=end;right.duration=b-end;
+          const head=a<start-1e-5, tail=b>end+1e-5;
+          if(!head && !tail){project.clips.splice(i,1);continue;}
+          if(head && tail){
+            const middle=Editor.splitClipAt(existing,start);
+            const right=Editor.splitClipAt(middle,end);
             delete existing.linkGroup;delete right.linkGroup;
             additions.push(right);continue;
           }
-          if(a<start){
-            if(existing.reverse)existing.in+=(b-start)*(Number(existing.speed)||1);
-            existing.duration=start-a;delete existing.linkGroup;continue;
+          if(head){
+            Editor.splitClipAt(existing,start);
+            delete existing.linkGroup;continue;
           }
-          const removed=end-a;existing.start=end;
-          if(!existing.reverse)existing.in+=removed*(Number(existing.speed)||1);
-          existing.duration=b-end;delete existing.linkGroup;
+          const right=Editor.splitClipAt(existing,end);
+          const {id,premiereIndex,premiereTrack}=existing;
+          for (const key of Object.keys(existing)) delete existing[key];
+          Object.assign(existing,right,{id});
+          if(premiereIndex!==undefined)existing.premiereIndex=premiereIndex;
+          if(premiereTrack!==undefined)existing.premiereTrack=premiereTrack;
+          delete existing.linkGroup;
         }
       }
       project.clips.push(...additions,clip);

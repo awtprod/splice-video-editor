@@ -48,6 +48,22 @@ async function main() {
     await waitState(()=>Editor.get().video.readyState>=2);
     const screenshots=process.env.SPLICE_PROOF_DIR;
     if(screenshots){fs.mkdirSync(screenshots,{recursive:true});await page.screenshot({path:path.join(screenshots,'Splice-workspace.png')});}
+    const split=await page.evaluate(()=>{
+      Editor.select('clip-1');Editor.seek(12);Editor.split();
+      const clips=Editor.get().project.clips;
+      const video=[clips.find(c=>c.id==='clip-1'),clips.find(c=>c.start===12&&c.type==='video')];
+      Editor.updateClip('clip-score',{fadeOut:2});
+      Editor.select('clip-score');Editor.seek(10);Editor.split();
+      const audio=Editor.get().project.clips.filter(c=>c.type==='audio');
+      const fades=audio.map(c=>c.fadeOut);
+      Editor.select(audio[1].id);Editor.seek(31);Editor.split();
+      const outgoing=Editor.get().project.clips.find(c=>c.id===audio[1].id);
+      const incoming=Editor.get().project.clips.find(c=>c.type==='audio'&&c.start===31);
+      return {transitions:video.map(c=>c.transition),fades,
+        splitGain:[outgoing.keyframes.volume.at(-1).value,
+          incoming.keyframes.volume[0].value,incoming.keyframes.volume.at(-1).value]};
+    });
+    assert.deepEqual(split,{transitions:['dissolve','none'],fades:[0,2],splitGain:[27.5,27.5,0]});
     const cameraOriginal=path.join(temp,'camera-original.mov');
     execFileSync('ffmpeg',['-nostdin','-v','error','-threads','1','-i',path.join(root,'assets/ridge.mp4'),
       '-t','4','-vf','scale=320:180','-c:v','prores_ks','-profile:v','2','-threads','1','-an',cameraOriginal]);
@@ -171,6 +187,14 @@ async function main() {
     assert.ok(frames.every(f=>f.ready>=2),JSON.stringify(frames));
     await click('#play-toggle');
     console.log('Both video layers stayed decoded across cuts and contributed overlapping camera audio.');
+    await page.evaluate(()=>{Editor.seek(.72);Editor.select('video-2');});
+    await page.locator('#inspector-content [data-group=trackMix][data-field=mute]').check();
+    assert.equal(await page.evaluate(()=>Editor.get().project.trackMix[2]?.mute),true);
+    assert.notEqual(await page.evaluate(()=>Editor.get().project.trackMix[1]?.mute),true);
+    await click('#play-toggle');
+    await waitState(()=>Editor.get().audioMeters[1]>.02&&Editor.get().audioMeters[2]<.002);
+    await click('#play-toggle');
+    console.log('The V2 mixer mutes embedded sound on V2 while V1 remains audible.');
     await require('./recovery-flow.cjs')(page,page.context(),url,root);
     assert.deepEqual(errors,[]);
   } finally {
