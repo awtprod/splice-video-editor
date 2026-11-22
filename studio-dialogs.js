@@ -30,31 +30,39 @@ window.SpliceDialogs = (() => {
     if(activeExport?.isConnected){activeExport.showModal();return;}
     const node=dialog('Export video');activeExport=node;
     const state=Editor.get(), form=document.createElement('form');
-    form.innerHTML='<p class="export-spec"></p><label>Quality<select name="quality"><option value="16">Master · CRF 16</option><option value="20" selected>Delivery · CRF 20</option><option value="26">Review copy · CRF 26</option></select></label><label>Audio bitrate<select name="bitrate"><option>128</option><option selected>192</option><option>320</option></select></label><progress max="1" value="0" hidden></progress><p role="status" class="render-state"></p><footer><button type="button" data-cancel>Close</button><button type="submit" class="primary">Render MP4</button></footer>';
-    form.querySelector('.export-spec').textContent=state.project.name+' · '+state.project.width+' × '+state.project.height+' · '+Number(state.project.fps.toFixed(3))+' fps · H.264 / AAC';
+    form.innerHTML='<p class="export-spec"></p><label>Format<select name="codec"><option value="h264">H.264 / AAC · MP4</option><option value="prores">ProRes 422 HQ / PCM · MOV</option><option value="wav">Audio mix · WAV</option></select></label><label>Quality<select name="quality"><option value="16">Master · CRF 16</option><option value="20" selected>Delivery · CRF 20</option><option value="26">Review copy · CRF 26</option></select></label><label>Audio bitrate<select name="bitrate"><option>128</option><option selected>192</option><option>320</option></select></label><progress max="1" value="0" hidden></progress><p role="status" class="render-state"></p><footer><button type="button" data-cancel>Close</button><button type="submit" class="primary">Render MP4</button></footer>';
+    form.querySelector('.export-spec').textContent=state.project.name+' · '+state.project.width+' × '+state.project.height+' · '+Number(state.project.fps.toFixed(3))+' fps';
     const render=form.querySelector('[type=submit]'), cancel=form.querySelector('[data-cancel]'), progress=form.querySelector('progress'), status=form.querySelector('[role=status]');
-    let controller;
+    let controller, renderWarnings=[];
+    const syncFormat=()=>{
+      const h264=form.elements.codec.value==='h264';
+      form.elements.quality.closest('label').hidden=!h264;
+      form.elements.bitrate.closest('label').hidden=!h264;
+      render.textContent='Render '+({h264:'MP4',prores:'MOV',wav:'WAV'}[form.elements.codec.value]);
+    };
+    form.elements.codec.onchange=syncFormat;syncFormat();
     cancel.onclick=()=>{if(controller){controller.abort();cancel.disabled=true;status.textContent='Cancelling…';}else node.close();};
     node.oncancel=e=>{if(controller){e.preventDefault();cancel.click();}};
     form.onsubmit=async e=>{
       e.preventDefault();if(controller)return;
-      controller=new AbortController();render.disabled=true;cancel.textContent='Cancel render';progress.hidden=false;
-      form.elements.quality.disabled=form.elements.bitrate.disabled=true;status.textContent='Preparing media…';
+      controller=new AbortController();renderWarnings=[];render.disabled=true;cancel.textContent='Cancel render';progress.hidden=false;
+      form.elements.codec.disabled=form.elements.quality.disabled=form.elements.bitrate.disabled=true;status.textContent='Preparing media…';
       try {
-        const result=await Editor.exportVideo({crf:Number(form.elements.quality.value),audioBitrate:Number(form.elements.bitrate.value)},job=>{
-          progress.value=job.progress;status.textContent='Rendering · '+Math.round(100*job.progress)+'%';
+        const result=await Editor.exportVideo({codec:form.elements.codec.value,crf:Number(form.elements.quality.value),audioBitrate:Number(form.elements.bitrate.value)},job=>{
+          renderWarnings=job.warnings||[]; progress.value=job.progress;status.textContent='Rendering · '+Math.round(100*job.progress)+'%';
         },controller.signal);
-        progress.value=1;status.textContent='MP4 exported. Review the rendered sequence below.';
+        progress.value=1;status.textContent=({h264:'MP4',prores:'MOV',wav:'WAV'}[form.elements.codec.value])+' exported.'+(result?.url?' Review the render below.':'')+(renderWarnings.length?' '+renderWarnings.join(' '):'');
+        form.querySelector('.export-review')?.remove();
         if(result?.url){
-          let movie=form.querySelector('video');
-          if(!movie){movie=document.createElement('video');movie.controls=true;movie.className='export-review';movie.setAttribute('aria-label','Rendered sequence');form.querySelector('footer').before(movie);}
+          let movie=document.createElement(form.elements.codec.value==='wav'?'audio':'video');
+          {movie.controls=true;movie.className='export-review';movie.setAttribute('aria-label','Rendered sequence');form.querySelector('footer').before(movie);}
           movie.src=result.url;
         }
       } catch(err) {
         status.textContent=controller.signal.aborted?'Render cancelled.':err.message;
       } finally {
         controller=null;cancel.disabled=false;render.disabled=false;cancel.textContent='Close';
-        form.elements.quality.disabled=form.elements.bitrate.disabled=false;
+        form.elements.codec.disabled=form.elements.quality.disabled=form.elements.bitrate.disabled=false;
       }
     };
     node.append(form);node.showModal();
@@ -74,5 +82,24 @@ window.SpliceDialogs = (() => {
     const close=document.createElement('button');close.textContent='Close';close.onclick=()=>node.close();
     node.append(list,close);node.showModal();
   }
-  return {newSequence,exportVideo,shortcuts};
+  function compatibility(project=Editor.get().project) {
+    const issues=[];
+    for(const clip of project.clips){
+      const name=clip.title||project.media.find(m=>m.id===clip.mediaId)?.name||'Clip';
+      if(clip.nativeTimeRemap) issues.push(name+' has native time remapping. Its speed curve is preserved in the Premiere project.');
+      if(clip.transition==='native') issues.push(name+' uses a native Premiere transition. Its transition is preserved in the original project.');
+      if(clip.color?.lut) issues.push(name+' has an applied LUT. A working project or rendered video retains this grade.');
+      if(clip.nativeUnsupported) issues.push(name+' · '+String(clip.nativeUnsupported));
+    }
+    for(const issue of project.compatibilityWarnings||[])issues.push(String(issue));
+    return [...new Set(issues)];
+  }
+  function projectReport(){
+    const node=dialog('Project compatibility');
+    const list=document.createElement('ul'), issues=compatibility();
+    for(const text of issues){const li=document.createElement('li');li.textContent=text;list.append(li);}
+    if(issues.length)node.append(list);else{const p=document.createElement('p');p.textContent='No flagged items in this sequence.';node.append(p);}
+    const close=document.createElement('button');close.textContent='Close';close.onclick=()=>node.close();node.append(close);node.showModal();
+  }
+  return {newSequence,exportVideo,shortcuts,compatibility,projectReport};
 })();

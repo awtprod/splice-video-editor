@@ -1103,3 +1103,12 @@ button svg {
 #bin-filter{max-width:92px}.edit-marker{position:absolute;z-index:2;top:0;min-width:9px;width:9px;height:9px;padding:0;transform:translateX(-4px);background:#ffcf64;clip-path:polygon(0 0,100% 0,100% 55%,50% 100%,0 55%)}.timeline-clip.group-selected{outline:2px solid #c0ef70;outline-offset:-2px}button:focus-visible,summary:focus-visible{outline:2px solid #c0ef70;outline-offset:2px}
 
 .export-review {width:100%; max-height:42vh; display:block; background:black;}
+
+.pool-tools[hidden],.save-status[hidden],#monitor-caption[hidden]{display:none}
+#monitor-caption{position:absolute;z-index:2;bottom:5%;left:50%;transform:translateX(-50%);max-width:88%;width:max-content;text-align:center;color:#fff;background:#000b;padding:.15em .45em;white-space:pre-line;font-size:clamp(12px,1.3vw,28px);line-height:1.2;pointer-events:none}
+.caption-actions,.caption-timing{display:flex;flex-wrap:wrap;gap:5px;align-items:center}
+.caption-actions button,.caption-card button{color:inherit;background:#262c24;border:1px solid #46503f;border-radius:3px;padding:4px 6px;font-size:11px}
+.caption-card{margin-top:10px;padding:8px 0;border-top:1px solid #3a4238;display:grid;gap:6px}
+.caption-card textarea,.caption-timing input{box-sizing:border-box;width:100%;background:#242923;border:1px solid #44503e;color:white;font:inherit;padding:4px}
+.caption-timing label{flex:1;min-width:0}.caption-card textarea{min-height:42px}
+.studio-dialog label[hidden]{display:none}

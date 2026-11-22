@@ -245,7 +245,10 @@ MOVIE_STREAM_PROFILES = {
         orientation=True,
         codec_type="HEVC",
     ),
-    ("mov", "apch"): VideoStreamProfile(_STILL_COLOR_SPACE, orientation=True),
+    # The opaque 4:2:2 editions share a field layout. Preserve the source
+    # fourcc in CodecType when the media is a proxy, LT, standard or HQ file.
+    **{("mov", fourcc): VideoStreamProfile(_STILL_COLOR_SPACE, orientation=True)
+       for fourcc in ("apco", "apcs", "apcn", "apch")},
     ("mov", "AVdh"): VideoStreamProfile(_STILL_COLOR_SPACE, orientation=True),
     ("mxf", "MPEG"): VideoStreamProfile(_STILL_COLOR_SPACE),
 }

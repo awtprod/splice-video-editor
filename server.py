@@ -18,9 +18,11 @@ from premiere import open_project, save_project
 
 ROOT = Path(__file__).resolve().parent
 from premiere import MEDIA_ROOT
-MAX_PROJECT = 50 * 1024 * 1024
+MAX_NATIVE_PROJECT = 50 * 1024 * 1024
+# JSON also carries the base64 original graph plus the current editing model.
+MAX_PROJECT = 112 * 1024 * 1024
 MAX_MEDIA = 256 * 1024 ** 3
-STATIC_EXTENSIONS = {'.html', '.css', '.js', '.svg', '.png', '.jpg', '.jpeg', '.webp', '.mp4', '.mov', '.webm', '.wav', '.mp3', '.m4a', '.mkv', '.aac', '.ogg', '.flac', '.avi', '.mxf', '.aiff', '.bmp', '.woff', '.woff2', '.ttf'}
+STATIC_EXTENSIONS = {'.html', '.css', '.js', '.svg', '.png', '.jpg', '.jpeg', '.webp', '.mp4', '.mov', '.webm', '.wav', '.mp3', '.m4a', '.mkv', '.aac', '.ogg', '.flac', '.avi', '.mxf', '.aiff', '.m4v', '.bmp', '.woff', '.woff2', '.ttf'}
 
 class Handler(BaseHTTPRequestHandler):
     def _reply(self, status, data, content_type):
@@ -49,6 +51,13 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(403)
             return
         path = unquote(urlsplit(self.path).path)
+        if path == '/api/media/info':
+            from media_proxy import describe
+            try:
+                self._json(200, describe(parse_qs(urlsplit(self.path).query).get('src',[''])[0]))
+            except (ValueError, OSError, subprocess.SubprocessError) as error:
+                self._json(422, {'error':str(error)})
+            return
         if path == '/api/media/waveform':
             from media_peaks import waveform
             try:
@@ -61,9 +70,10 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 if job.group(2):
                     with self.server.jobs.open_file(job.group(1)) as source:
-                        filename = Path(parse_qs(urlsplit(self.path).query).get('name', ['Splice export.mp4'])[0]).name
+                        spec = self.server.jobs.status(job.group(1))
+                        filename = Path(parse_qs(urlsplit(self.path).query).get('name', ['Splice export.' + spec['extension']])[0]).name
                         disposition = "attachment; filename*=UTF-8''" + quote(filename, safe='') if job.group(2) == '/file' else None
-                        self._serve_file(source, 'video/mp4', disposition)
+                        self._serve_file(source, spec['mime'], disposition)
                 else:
                     self._json(200, self.server.jobs.status(job.group(1)))
             except KeyError:
@@ -138,18 +148,19 @@ class Handler(BaseHTTPRequestHandler):
             except KeyError:
                 self._json(404, {'error': 'Unknown export'})
             return
-        if route not in ('/api/exports', '/api/premiere/sequence', '/api/premiere/open', '/api/premiere/save', '/api/media/upload', '/api/render'):
+        if route not in ('/api/exports', '/api/media/proxy', '/api/premiere/sequence', '/api/premiere/open', '/api/premiere/save', '/api/media/upload', '/api/render'):
             self.send_error(404)
             return
         try:
             length = int(self.headers.get('Content-Length', '0'))
-            limit = MAX_MEDIA if route == '/api/media/upload' else MAX_PROJECT
+            limit = (MAX_MEDIA if route == '/api/media/upload' else
+                     MAX_NATIVE_PROJECT + 1024 * 1024 if route == '/api/premiere/open' else MAX_PROJECT)
             if length <= 0 or length > limit:
                 raise ValueError('Upload size is invalid')
             if route == '/api/media/upload':
                 name = Path(parse_qs(urlsplit(self.path).query).get('name', ['media'])[0]).name
                 suffix = Path(name).suffix.lower()
-                if suffix not in {'.mp4', '.mov', '.mkv', '.webm', '.wav', '.mp3', '.m4a', '.jpg', '.jpeg', '.png', '.aac', '.ogg', '.flac', '.avi', '.mxf', '.aiff', '.bmp'}:
+                if suffix not in {'.mp4', '.mov', '.mkv', '.webm', '.wav', '.mp3', '.m4a', '.jpg', '.jpeg', '.png', '.aac', '.ogg', '.flac', '.avi', '.mxf', '.aiff', '.m4v', '.bmp'}:
                     raise ValueError('Unsupported media extension')
                 MEDIA_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
                 if shutil.disk_usage(MEDIA_ROOT).free < length + 512 * 1024 ** 2:
@@ -182,6 +193,11 @@ class Handler(BaseHTTPRequestHandler):
             body = self.rfile.read(length)
             if len(body) != length:
                 raise ValueError('Incomplete request')
+            if route == '/api/media/proxy':
+                from media_proxy import proxy
+                payload=json.loads(body)
+                self._json(200, {'src':proxy(payload['src'])})
+                return
             if route == '/api/exports':
                 payload = json.loads(body)
                 self._json(202, {'id': self.server.jobs.start(payload['project'], payload.get('options', {}))})

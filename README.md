@@ -14,7 +14,7 @@ The launcher opens a dedicated application window and stops its loopback server 
 
 ## Edit
 
-Use **File → New project** to choose a name, frame size, and frame rate. The media pool accepts files from **Import media**. Click a source to open its monitor, set In and Out, and insert, overwrite, or append to a target track. A bin path in the source monitor organizes the pool. A click on an offline item opens its individual relink picker.
+Use **File → New project** to choose a name, frame size, and frame rate. The media pool accepts files from **Import media**. Splice probes camera originals with FFmpeg and builds local proxies for formats such as ProRes MOV. Preview uses the proxy. Premiere save and final export use the original. Click a source to open its monitor, set In and Out, and insert, overwrite, or append to a target track. A bin path in the source monitor organizes the pool. A click on an offline item opens its individual relink picker.
 
 Drag a clip body to move it, drag an edge to trim, Shift-drag a shared edge to roll, or Alt-drag the body to slip. The **Snap** and **Ripple** switches control trims. Use **S** to split at the playhead. Ctrl-click selects multiple clips. The ruler supports scrubbing and markers. The File menu includes the keyboard reference.
 
@@ -22,13 +22,13 @@ Select a clip to adjust its transform, color, transition, level, or pan. The Col
 
 **Save** writes an editable Premiere project. The native file picker can update a file you select. Browsers without filesystem access download a copy. **File → Save working project** retains Splice-specific state. Edits are also checkpointed to a local session. **File → Recent projects & recovery** opens earlier projects and versions. Recovering media across computers requires the original sources.
 
-**Export video** renders a local H.264/AAC MP4 with selectable video quality and audio bitrate, progress, cancellation, and a rendered-video monitor. The renderer processes video in segments to bound memory. The sequence frame size and frame rate determine the output dimensions and timing.
+**Export video** offers H.264/AAC MP4, ProRes 422 HQ with 24-bit PCM in MOV, and a separate 48 kHz 24-bit WAV mix. MP4 delivery includes selectable video quality and audio bitrate. Export supports progress, cancellation, and in-app MP4 and WAV review. The Captions panel imports, edits, and exports SRT. MP4/MOV can carry a selectable subtitle stream. The renderer processes video in segments to bound memory. The sequence frame size and frame rate determine the output dimensions and timing.
 
 ## Premiere compatibility
 
 Splice reads and writes the gzip-compressed Premiere project graph. Open a multi-sequence project and use the sequence selector to edit its sequences. The bridge retains the original graph when saving existing projects. Its Linux test suite compares timing with Adobe-authored reference data and verifies that unchanged native objects survive round trips in projects containing multicam, nested sequences, proxies, titles, wipes, audio automation, and retiming.
 
-A preserved native object can have no live editing or rendering equivalent in Splice. Support depends on the feature and its parameters. When a Premiere save reports an unsupported setting, the working project format retains the edit. Direct verification of Splice-authored output inside Adobe Premiere desktop is still pending.
+A preserved native object can have no live editing or rendering equivalent in Splice. Support depends on the feature and its parameters. When a Premiere save reports an unsupported setting, the working project format retains the edit. Open **File → Project compatibility** to inspect flagged effects and sources. The Adobe-authored regression corpus and reference model files are attributed in tests/test_adobe_corpus.py. Direct verification of Splice-authored output inside Adobe Premiere desktop is still pending.
 
 ## Included materials
 
@@ -38,4 +38,4 @@ DM Sans and IBM Plex Mono are distributed under the SIL Open Font License. Licen
 
 ## Verify locally
 
-From the extracted application directory, run the Python suite with `python3 -m unittest discover -s tests`. For the two-pass browser and render verification, install Node 20 or later and run `npm ci && npm test`. Set `SPLICE_CHROME` if Chromium is installed outside the standard paths. The test uses an isolated local media store, imports real footage, trims a clip, styles a title, reloads the session, saves and reopens a native project, and checks the exported video and audio streams.
+From the extracted application directory, run the Python suite with `python3 -m unittest discover -s tests`. For the two-pass browser and render verification, install Node 20 or later and run `npm ci && npm test`. Set `SPLICE_CHROME` if Chromium is installed outside the standard paths. The test uses an isolated local media store, imports real footage, trims a clip, styles a title, reloads the session, saves and reopens a native project, and checks the exported video and audio streams. It also tests camera-original relinking, short-source rejection, concurrent-window edits and recovery.

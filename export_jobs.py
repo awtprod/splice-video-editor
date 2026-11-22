@@ -7,6 +7,11 @@ import tempfile
 import threading
 import time
 import uuid
+import warnings
+
+
+FORMATS = {'h264':('mp4','video/mp4',True), 'prores':('mov','video/quicktime',False),
+           'wav':('wav','audio/wav',True)}
 
 
 def _worker(project, options, output, progress, cancelled, connection):
@@ -19,8 +24,10 @@ def _worker(project, options, output, progress, cancelled, connection):
         def advance(fraction):
             progress.value = min(1, max(0, float(fraction)))
 
-        render_to_file(project, output, options=options, progress=advance, cancelled=cancelled)
-        connection.send(('done', None))
+        with warnings.catch_warnings(record=True) as notices:
+            warnings.simplefilter('once')
+            render_to_file(project, output, options=options, progress=advance, cancelled=cancelled)
+        connection.send(('done', list(dict.fromkeys(str(note.message) for note in notices))))
     except Exception as error:
         connection.send(('error', str(error)))
     finally:
@@ -36,13 +43,17 @@ class ExportJobs:
     def start(self, project, options):
         if not isinstance(project, dict) or not isinstance(options, dict):
             raise ValueError('Invalid export settings')
+        codec = options.get('codec','h264')
+        if codec not in FORMATS:
+            raise ValueError('Unknown export format')
+        extension, mime, previewable = FORMATS[codec]
         with self.lock:
             self.reap()
             if any(job['state'] == 'rendering' for job in self.jobs.values()):
                 raise ValueError('An export is already running')
             identifier = uuid.uuid4().hex
             temp = tempfile.TemporaryDirectory(prefix='splice-export-')
-            out = Path(temp.name) / 'output.mp4'
+            out = Path(temp.name) / ('output.'+extension)
             progress = self.context.Value('d', 0)
             cancelled = self.context.Event()
             reader, writer = self.context.Pipe(duplex=False)
@@ -56,8 +67,8 @@ class ExportJobs:
                 raise
             finally:
                 writer.close()
-            job = dict(state='rendering', directory=temp, output=out, process=process,
-                       progress=progress, cancelled=cancelled, error='', finished=0, settled=threading.Event())
+            job = dict(state='rendering', directory=temp, output=out, process=process, extension=extension, mime=mime, previewable=previewable,
+                       progress=progress, cancelled=cancelled, error='', warnings=[], finished=0, settled=threading.Event())
             self.jobs[identifier] = job
             threading.Thread(target=self._watch, args=(job, reader), daemon=True).start()
             return identifier
@@ -77,6 +88,7 @@ class ExportJobs:
                         grouped = True
                     elif kind == 'done':
                         done = True
+                        job['warnings'] = message or []
                     elif kind == 'error':
                         error = message
                 if job['cancelled'].is_set() or time.monotonic() > deadline:
@@ -121,7 +133,8 @@ class ExportJobs:
             job['settled'].wait(timeout=6)
         with self.lock:
             return {'state': job['state'], 'progress': 1 if job['state'] == 'complete' else job['progress'].value,
-                    'error': job['error']}
+                    'error': job['error'], 'warnings':job['warnings'], 'extension':job['extension'],
+                    'mime':job['mime'], 'previewable':job['previewable']}
 
     def open_file(self, identifier):
         with self.lock:

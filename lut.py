@@ -7,14 +7,21 @@ def cube_text(lut, intensity=100):
         raise ValueError('Invalid LUT')
     size = lut.get('size')
     data = lut.get('data')
-    if not isinstance(size, int) or not 2 <= size <= 33 or not isinstance(data, list) or len(data) != size**3*3:
+    if isinstance(size, bool) or not isinstance(size, int) or not 2 <= size <= 33 or not isinstance(data, list) or len(data) != size**3*3:
         raise ValueError('Invalid 3D LUT shape')
     if any(not isinstance(value,(float,int)) or not math.isfinite(value) or not 0 <= value <= 1 for value in data):
         raise ValueError('Invalid 3D LUT sample')
     domain_min = lut.get('domainMin', [0,0,0])
     domain_max = lut.get('domainMax', [1,1,1])
-    if len(domain_min)!=3 or len(domain_max)!=3 or any(not math.isfinite(a) or not math.isfinite(b) or a>=b for a,b in zip(domain_min,domain_max)):
+    if (not isinstance(domain_min, list) or not isinstance(domain_max, list) or
+        len(domain_min)!=3 or len(domain_max)!=3 or any(
+            isinstance(a, bool) or isinstance(b, bool) or
+            not isinstance(a,(float,int)) or not isinstance(b,(float,int)) or
+            not math.isfinite(a) or not math.isfinite(b) or a>=b or abs(a)>16 or abs(b)>16
+            for a,b in zip(domain_min,domain_max))):
         raise ValueError('Invalid 3D LUT domain')
+    if isinstance(intensity, bool) or not isinstance(intensity, (float,int)):
+        raise ValueError('Invalid LUT intensity')
     alpha = float(intensity)/100
     if not math.isfinite(alpha) or not 0 <= alpha <= 1:
         raise ValueError('Invalid LUT intensity')

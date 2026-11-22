@@ -19,6 +19,21 @@ class PremiereRoundTrip(unittest.TestCase):
         self.assertEqual(edited['volume'], 45)
         self.assertEqual(project['media'][0]['path'], reopened['media'][0]['path'])
 
+    def test_wipe_alignment_resize_and_style_survive_native_save(self):
+        media = [dict(id=n, src=f'assets/{n}.mp4') for n in ('ridge','valley')]
+        clips = [dict(type='video', mediaId=m['id'], start=2*i, duration=2, track=1, **{'in':1})
+                 for i,m in enumerate(media)]
+        clips[1].update(transition='wipe',transitionDuration=.8)
+        native = open_project(save_project(dict(name='Wipe',fps=25,clips=clips,media=media)))
+        wipe = native['clips'][1]
+        self.assertEqual((wipe['transition'],wipe['transitionMatchName'],wipe['transitionBefore']),('wipe','ADBE Wipe',0))
+        self.assertAlmostEqual(wipe['transitionDuration'],.8)
+        wipe.update(transition='dissolve',transitionDuration=.4,transitionBefore=.2)
+        edited = open_project(save_project(native))['clips'][1]
+        self.assertEqual(edited['transition'],'dissolve')
+        self.assertAlmostEqual(edited['transitionDuration'],.4)
+        self.assertAlmostEqual(edited['transitionBefore'],.2)
+
     def test_color_titles_and_dissolve(self):
         media = [{'id': name, 'src': f'assets/{name}.mp4'} for name in ('ridge', 'valley')]
         clips = [dict(type='video', mediaId=item['id'], start=i * 2, duration=2,

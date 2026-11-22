@@ -67,6 +67,50 @@ if __name__ == '__main__':
 
 
 class NativeMotionAndFade(unittest.TestCase):
+    def test_lumetri_white_balance_roundtrip(self):
+        app = py_premiere.new()
+        sequence = app.project.add_sequence('Balance', '1080p25')
+        item = app.project.import_files(['assets/ridge.mp4'])[0]
+        clip = sequence.video_tracks[0].add_clip(item, py_premiere.Time.from_seconds(0))
+        premiere_effects.apply(clip, {'temperature':35,'tint':-15}, 100)
+        with tempfile.TemporaryDirectory() as directory:
+            output = str(Path(directory) / 'balance.prproj')
+            app.project.save(output)
+            reopened = py_premiere.parse(output).project.sequences[0].video_tracks[0].clips[0]
+            color, _ = premiere_effects.read(reopened)
+            self.assertEqual((color['temperature'],color['tint']),(35,-15))
+
+    def test_native_scalar_animation_roundtrip(self):
+        app = py_premiere.new()
+        sequence = app.project.add_sequence('Animate', '1080p25')
+        item = app.project.import_files(['assets/ridge.mp4'])[0]
+        clip = sequence.video_tracks[0].add_clip(item, py_premiere.Time.from_seconds(1))
+        clip.end = py_premiere.Time.from_seconds(5)
+        properties = {'opacity':80,'keyframes':{
+            'opacity':[{'time':0,'value':0},{'time':2,'value':80}],
+            'scale':[{'time':0,'value':100},{'time':2,'value':150}],
+            'rotation':[{'time':0,'value':0},{'time':2,'value':15}],
+        }}
+        premiere_effects.apply_extended(clip, properties)
+        with tempfile.TemporaryDirectory() as directory:
+            output = str(Path(directory) / 'animate.prproj')
+            app.project.save(output)
+            reopened = py_premiere.parse(output).project.sequences[0].video_tracks[0].clips[0]
+            effects = premiere_effects.read_extended(reopened)
+            self.assertEqual(effects['opacity'],80)
+            self.assertEqual(effects['transform']['scale'],100)
+            self.assertEqual(effects['keyframes'],properties['keyframes'])
+
+    def test_adobe_opacity_curves_unchanged_on_native_save(self):
+        fixture = Path(__file__).resolve().parent / 'fixtures' / '09_keyframes.prproj'
+        app = py_premiere.parse(str(fixture))
+        clip = app.project.sequences[0].video_tracks[0].clips[0]
+        opacity = next(param for component in clip.components if component.match_name=='AE.ADBE Opacity'
+                       for param in component.properties if param.display_name=='Opacity')
+        before = opacity._element.findtext('Keyframes')
+        premiere_effects.apply_extended(clip,premiere_effects.read_extended(clip))
+        self.assertEqual(opacity._element.findtext('Keyframes'),before)
+
     def test_new_video_motion_roundtrip(self):
         app = py_premiere.new()
         sequence = app.project.add_sequence('Motion', '1080p25')

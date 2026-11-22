@@ -25,7 +25,8 @@ window.SpliceSession = (() => {
   const get = async (store, id) => request((await dbReady).transaction(store).objectStore(store).get(id));
   const tab = uuid();
   let id = uuid(), revision, touched = false, persisting = false, suppress = false;
-  let fileHandle, savedFormat, original, originalKey, lastRecord, pending;
+  let fileHandle, diskSignature, savedFormat, original, originalKey, lastRecord, pending;
+  const signature=file=>[file.lastModified,file.size].join(':');
   let chain = Promise.resolve();
   function status(message) {
     const node = document.getElementById('session-status');
@@ -42,7 +43,7 @@ window.SpliceSession = (() => {
     }
     const {premiereOriginal, ...remainder} = source;
     pending = {id, data:structuredClone(remainder), original:premiereOriginal, originalKey,
-               touched, checkpoint:checkpoint || !!pending?.checkpoint, handle:fileHandle, format:savedFormat};
+               touched, checkpoint:checkpoint || !!pending?.checkpoint, handle:fileHandle, diskSignature, format:savedFormat};
     if (persisting) return chain;
     persisting = true;
     chain = (async () => {
@@ -54,10 +55,10 @@ window.SpliceSession = (() => {
         const done = complete(tx);
         const sessions = tx.objectStore('sessions');
         const current = await request(sessions.get(payload.id));
-        if (current && current.writer !== tab && current.stamp !== lastRecord?.stamp) {
+        if (current && current.writer !== tab && (current.token || current.stamp) !== (lastRecord?.token || lastRecord?.stamp)) {
           // Another window edited this recovery slot. Preserve both edits.
           id = payload.id = uuid();
-          fileHandle = payload.handle = null;
+          fileHandle = payload.handle = null; diskSignature = payload.diskSignature = undefined;
           if (pending) { pending.id = id; pending.handle = null; }
         }
         const now = Date.now(), versions = tx.objectStore('versions');
@@ -66,8 +67,8 @@ window.SpliceSession = (() => {
           versions.put({id:uuid(),session:payload.id,name:current.name,stamp:current.stamp,
                         data:current.data,originalKey:current.originalKey});
         }
-        const row = {id:payload.id,name:payload.data.name,stamp:now,writer:tab,data:payload.data,
-                     originalKey:payload.originalKey,touched:payload.touched,format:payload.format,
+        const row = {id:payload.id,name:payload.data.name,stamp:now,writer:tab,token:uuid(),data:payload.data,
+                     originalKey:payload.originalKey,touched:payload.touched,format:payload.format,diskSignature:payload.diskSignature,
                      versionAt:current && !payload.checkpoint && now-current.versionAt<30000 ? current.versionAt : now};
         sessions.put(row);
         if (payload.originalKey && payload.originalKey !== current?.originalKey)
@@ -98,6 +99,7 @@ window.SpliceSession = (() => {
     id = row.session || row.id;
     touched = historical || row.touched;
     fileHandle = await get('handles', id);
+    diskSignature=(await get('sessions',id))?.diskSignature;
     savedFormat = row.format || (await get('sessions',id))?.format;
     original = project.premiereOriginal;
     originalKey = row.originalKey;
@@ -126,11 +128,11 @@ window.SpliceSession = (() => {
     if (persisting) await chain;
     if (touched) await persist(true);
   }
-  async function start(action, handle, format) {
+  async function start(action, handle, format, fingerprint) {
     await leave();
     await activate(action);
     id = uuid(); lastRecord = undefined; original = undefined; originalKey = null;
-    fileHandle = handle; savedFormat = format; touched = false;
+    fileHandle = handle; diskSignature=fingerprint; savedFormat = format; touched = false;
     await persist();
   }
   function choose(title, rows) {
@@ -153,7 +155,7 @@ window.SpliceSession = (() => {
     });
   }
   async function openFile(file,handle=null) {
-    await start(()=>editor.openProject(file),handle,/\.prproj$/i.test(file.name)?'prproj':'splice');
+    await start(()=>editor.openProject(file),handle,/\.prproj$/i.test(file.name)?'prproj':'splice',handle?signature(file):undefined);
   }
   function pickerTypes(format) {
     const entries = {
@@ -172,6 +174,7 @@ window.SpliceSession = (() => {
   async function save(format='prproj', forceAs=false) {
     // Invoke the native picker in the click's activation window.
     let handle = !forceAs && savedFormat===format ? fileHandle : null;
+    const reusing=!!handle;
     const suffix = format==='prproj'?'.prproj':'.splice.json';
     const filename = (editor.get().project.name.replace(/[\\/:*?"<>|]/g,'-')||'Untitled')+suffix;
     try {
@@ -181,6 +184,8 @@ window.SpliceSession = (() => {
         throw Error('Write permission was declined. Use Save as to choose another file.');
     } catch(e) { if(e.name==='AbortError') return false; throw e; }
     await ready;
+    if(persisting) await chain;
+    if(reusing && handle!==fileHandle)throw Error('Another editing window was recovered. Use Save as to choose a separate project file.');
     const savedRevision = editor.get().revision;
     const project = structuredClone(editor.get().project);
     let blob;
@@ -194,9 +199,12 @@ window.SpliceSession = (() => {
       blob = new Blob([JSON.stringify(project)],{type:'application/json'});
     }
     if (handle) {
+      if(reusing && diskSignature && signature(await handle.getFile())!==diskSignature)
+        throw Error('The file on disk changed after it was opened. Use Save as to keep both versions.');
       const stream = await handle.createWritable();
       try { await stream.write(blob); await stream.close(); }
       catch(e) { await stream.abort().catch(()=>{}); throw e; }
+      diskSignature=signature(await handle.getFile());
     } else {
       const anchor=document.createElement('a'),url=URL.createObjectURL(blob);
       anchor.download=filename; anchor.href=url; anchor.click();

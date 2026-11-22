@@ -1,5 +1,6 @@
 """Premiere project bridge, backed by py-premiere's Premiere object graph writer."""
 import base64
+import hashlib
 import math
 import uuid
 import zlib
@@ -12,6 +13,15 @@ sys.path.insert(0, str(Path(__file__).parent / 'vendor'))
 import py_premiere
 import premiere_effects
 from py_premiere.models.sequence_builder import FORMATS, SequenceFormat
+from py_premiere.models.color import Color
+from py_premiere.xml.mutations import insert_leaf_before, remove_child
+
+TRANSITIONS = {
+    'dissolve': ('AE.ADBE Cross Dissolve New', 'Cross Dissolve'),
+    'fade': ('AE.ADBE Dip To Black', 'Dip To Black'),
+    'wipe': ('ADBE Wipe', 'Wipe'),
+}
+TRANSITION_BY_MATCH = {match:style for style,(match,_) in TRANSITIONS.items()}
 
 ROOT = Path(__file__).resolve().parent
 MEDIA_ROOT = Path.home() / '.local' / 'share' / 'splice' / 'media'
@@ -92,6 +102,126 @@ def _nested_sequence_index(clip, project):
                  if sequence._element.get('ObjectUID') == uid), None)
 
 
+def _audio_track_param(track, name):
+    document = track.sequence.project._document
+    reference = track._element.find('AudioTrack/ComponentOwner/Components')
+    if reference is None:
+        return None
+    chain = document.resolve(reference)
+    for component_ref in chain.findall('ComponentChain/Components/Component'):
+        component = document.resolve(component_ref)
+        for param_ref in component.findall('AudioComponent/Component/Params/Param'):
+            param = document.resolve(param_ref)
+            if param.findtext('Name') == name:
+                return param
+    if name == 'Balance':
+        panner_ref = track._element.find('AudioTrack/Panner')
+        if panner_ref is not None:
+            panner = document.resolve(panner_ref)
+            for param_ref in panner.findall('PanProcessor/AudioComponent/Component/Params/Param'):
+                param = document.resolve(param_ref)
+                if param.findtext('Name') == name:
+                    return param
+    return None
+
+
+def _static_audio_value(param, default):
+    if param is None:
+        return default
+    raw = param.findtext('CurrentValue')
+    if raw is None:
+        start = param.findtext('StartKeyframe')
+        raw = start.split(',')[1] if start and len(start.split(',')) > 1 else None
+    return float(raw) if raw is not None else default
+
+
+def _set_static_audio_value(param, value):
+    if param is None:
+        raise ValueError('Premiere audio track has no editable mixer parameter')
+    if param.find('Keyframes') is not None:
+        raise ValueError('Keyframed Premiere track mixer automation is unsupported')
+    rendered = format(value, '.9g')
+    start = param.find('StartKeyframe')
+    keyframe = f'-91445760000000000,{rendered},0,0,0,0,0,0'
+    if start is None:
+        insert_leaf_before(param, 'Name', 'StartKeyframe', keyframe)
+    else:
+        start.text = keyframe
+    current = param.find('CurrentValue')
+    if current is None:
+        insert_leaf_before(param, 'Name', 'CurrentValue', rendered)
+    else:
+        current.text = rendered
+
+
+def _caption_color(value):
+    if not isinstance(value, str) or len(value) != 7 or not value.startswith('#'):
+        raise ValueError('Caption fill must be a #RRGGBB color')
+    try:
+        return Color(*(int(value[index:index + 2], 16) for index in (1, 3, 5)))
+    except ValueError as exc:
+        raise ValueError('Caption fill must be a #RRGGBB color') from exc
+
+
+def _caption_time(value):
+    millis = round(value * 1000)
+    hours, rest = divmod(millis, 3600000)
+    minutes, rest = divmod(rest, 60000)
+    seconds, milli = divmod(rest, 1000)
+    return f'{hours:02}:{minutes:02}:{seconds:02},{milli:03}'
+
+
+def _retime_caption(caption, start, duration):
+    sequence = caption.track.sequence
+    timebase = sequence.timebase
+    ticks = py_premiere.TICKS_PER_SECOND
+    first = round(start * ticks / timebase) * timebase
+    last = round((start + duration) * ticks / timebase) * timebase
+    if first < 0 or last <= first:
+        raise ValueError('Caption timing must span at least one frame')
+    placement = caption._element.find('DataClipTrackItem/ClipTrackItem/TrackItem')
+    start_node = placement.find('Start')
+    if first == 0 and start_node is not None:
+        remove_child(placement, start_node)
+    elif first and start_node is None:
+        insert_leaf_before(placement, 'End', 'Start', str(first))
+    elif start_node is not None:
+        start_node.text = str(first)
+    placement.find('End').text = str(last)
+    document = sequence.project._document
+    subclip = document.resolve(caption._element.find('DataClipTrackItem/ClipTrackItem/SubClip'))
+    source_clip = document.resolve(subclip.find('Clip'))
+    core = source_clip.find('DataClip/Clip')
+    base = (3600 * ticks // timebase) * timebase
+    core.find('InPoint').text = str(base + first)
+    core.find('OutPoint').text = str(base + last)
+
+
+def _set_clip_speed(clip, speed):
+    if not math.isfinite(speed) or not .1 <= speed <= 8:
+        raise ValueError('Premiere clip speed must be 0.1x to 8x')
+    core = clip._clip_element.find('Clip')
+    element = core.find('PlaybackSpeed')
+    if abs(speed - 1) < .000001:
+        if element is not None:
+            remove_child(core, element)
+    elif element is None:
+        insert_leaf_before(core, 'OutPoint', 'PlaybackSpeed', format(speed, '.9g'))
+    else:
+        element.text = format(speed, '.9g')
+
+
+def _read_transition(track, item, clip_data):
+    matching = next((transition for transition in track.transitions
+                     if abs(transition.cut_point.seconds - item.start.seconds) < .05), None)
+    if matching is None:
+        return
+    clip_data['transition'] = TRANSITION_BY_MATCH.get(matching.match_name, 'native')
+    clip_data['transitionBefore'] = matching.cut_point_offset.seconds
+    clip_data['transitionDuration'] = matching.duration.seconds
+    clip_data['transitionMatchName'] = matching.match_name
+
+
 def open_project(data, index=0, _seen=()):
     _check_size(data)
     if index in _seen:
@@ -118,7 +248,8 @@ def open_project(data, index=0, _seen=()):
             if project.root_item:
                 visit(project.root_item)
             return {'name': 'New sequence', 'width': 1920, 'height': 1080, 'fps': 25,
-                    'media': media, 'clips': [], 'markers': [], 'duration': 0,
+                    'media': media, 'clips': [], 'captions': [], 'markers': [], 'duration': 0,
+                    'trackState': {}, 'trackCounts': {'video': 3, 'audio': 3},
                     'premiereOriginal': base64.b64encode(data).decode('ascii'), 'premiereManaged': [],
                     'premiereSequences': [], 'premiereSequence': 0}
         sequence = project.sequences[index]
@@ -127,6 +258,7 @@ def open_project(data, index=0, _seen=()):
         managed = []
         identities = {}
         nested_identities = {}
+        native_identities = {}
         for track_type, tracks in (('video', sequence.video_tracks), ('audio', sequence.audio_tracks)):
             for track_number, track in enumerate(tracks):
                 for clip_index, item in enumerate(track.clips):
@@ -160,9 +292,38 @@ def open_project(data, index=0, _seen=()):
                                           'start': item.start.seconds, 'duration': item.duration.seconds,
                                           'in': item.in_point.seconds, 'track': (-(track_number + 1) if track_type == 'audio' else track_number + 1),
                                           'type': track_type, 'nestedSequence': nested,
+                                          'speed': item.speed, 'reverse': item.is_speed_reversed,
+                                          'nativeTimeRemap': item._clip_element.find('Clip/TimeRemapping') is not None,
                                           'premiereTrack': track_number, 'premiereIndex': clip_index,
                                           'title': '', 'color': {}, 'volume': 100,
                                           'transition': 'none'})
+                            _read_transition(track, item, clips[-1])
+                            continue
+                        uid = source_item._element.get('ObjectUID') if source_item is not None else None
+                        identity_key = (uid or f'{track_type}-{track_number}-{clip_index}', track_type)
+                        if identity_key not in native_identities:
+                            identity = f'm{len(media) + 1}'
+                            native_identities[identity_key] = identity
+                            media.append({'id': identity, 'name': source_item.name if source_item is not None else item.name,
+                                          'src': '', 'duration': 0, 'thumb': '', 'type': track_type,
+                                          'premiereItemUID': uid,
+                                          'nativeGenerator': source_item.generator_type if source_item is not None else None,
+                                          'nativeUnsupported': source_item is None or source_item.generator_type is None})
+                        identity = native_identities[identity_key]
+                        source_media = next(m for m in media if m['id'] == identity)
+                        source_media['duration'] = max(source_media['duration'], item.in_point.seconds + item.duration.seconds)
+                        managed.append([track_type, track_number, clip_index])
+                        clips.append({'id': f'c{len(clips) + 1}', 'mediaId': identity,
+                                      'start': item.start.seconds, 'duration': item.duration.seconds,
+                                      'in': item.in_point.seconds,
+                                      'track': (-(track_number + 1) if track_type == 'audio' else track_number + 1),
+                                      'type': track_type, 'speed': item.speed, 'reverse': item.is_speed_reversed,
+                                      'nativeTimeRemap': item._clip_element.find('Clip/TimeRemapping') is not None,
+                                      'nativeUnsupported': None if source_item is not None and source_item.generator_type is not None else 'Premiere source type is unavailable for preview and export',
+                                      'premiereTrack': track_number, 'premiereIndex': clip_index,
+                                      'title': '', 'color': {}, 'volume': 100,
+                                      'transition': 'none'})
+                        _read_transition(track, item, clips[-1])
                         continue
                     path = source_item.media_path
                     if path not in identities:
@@ -177,13 +338,26 @@ def open_project(data, index=0, _seen=()):
                     clips.append({'id': f'c{len(clips) + 1}', 'mediaId': identities[path],
                                   'start': item.start.seconds, 'duration': item.duration.seconds,
                                   'in': item.in_point.seconds, 'track': (-(track_number + 1) if track_type == 'audio' else track_number + 1),
-                                  'type': track_type, 'embeddedAudio': False, 'premiereTrack': track_number, 'premiereIndex': clip_index, 'title': '', 'color': color,
+                                  'type': track_type, 'embeddedAudio': False,
+                                  'speed': item.speed, 'reverse': item.is_speed_reversed,
+                                  'nativeTimeRemap': item._clip_element.find('Clip/TimeRemapping') is not None,
+                                  'premiereTrack': track_number, 'premiereIndex': clip_index, 'title': '', 'color': color,
                                   'volume': volume, 'transition': 'none', **premiere_effects.read_extended(item)})
-                    matching = next((t for t in track.transitions if abs(t.cut_point.seconds - item.start.seconds) < .05), None)
-                    if matching is not None:
-                        clips[-1]['transition'] = 'fade' if matching.match_name == 'AE.ADBE Dip To Black' else 'dissolve' if matching.match_name == 'AE.ADBE Cross Dissolve New' else 'native'
-                        clips[-1]['transitionDuration'] = matching.duration.seconds
-                        clips[-1]['transitionMatchName'] = matching.match_name
+                    _read_transition(track, item, clips[-1])
+        native_clip_ids = {}
+        for clip_data in clips:
+            kind = 'audio' if clip_data['type'] == 'audio' else 'video'
+            tracks = sequence.audio_tracks if kind == 'audio' else sequence.video_tracks
+            number, position = clip_data['premiereTrack'], clip_data['premiereIndex']
+            native_clip_ids[tracks[number].clips[position]._element.get('ObjectID')] = clip_data
+        for link_ref in sequence._element.findall('PersistentGroupContainer/LinkContainer/Links/Link'):
+            link = project._document.resolve(link_ref)
+            members = [native_clip_ids.get(ref.get('ObjectRef'))
+                       for ref in link.findall('TrackItemGroup/TrackItems/TrackItem')]
+            if len([member for member in members if member is not None]) >= 2:
+                for member in members:
+                    if member is not None:
+                        member['linkGroup'] = f"premiere-link-{link.get('ObjectID')}"
         if project.root_item:
             def include_unused(folder):
                 for source_item in folder.children:
@@ -196,6 +370,17 @@ def open_project(data, index=0, _seen=()):
                         media.append({'id': identity, 'name': PureWindowsPath(path).name, 'src': src,
                                       'duration': max(0, source_item.out_point.seconds) if source_item.out_point else 0,
                                       'thumb': '', 'type': kind, 'path': str(path), 'bin': _bin_path(source_item)})
+                    elif path is None and source_item.generator_type is not None:
+                        uid = source_item._element.get('ObjectUID')
+                        identity_key = (uid, 'video')
+                        if identity_key not in native_identities:
+                            identity = f'm{len(media) + 1}'
+                            native_identities[identity_key] = identity
+                            media.append({'id': identity, 'name': source_item.name, 'src': '',
+                                          'duration': max(0, source_item.out_point.seconds) if source_item.out_point else 5,
+                                          'thumb': '', 'type': 'video', 'bin': _bin_path(source_item),
+                                          'premiereItemUID': uid,
+                                          'nativeGenerator': source_item.generator_type})
                     include_unused(source_item)
             include_unused(project.root_item)
         for item in media:
@@ -209,11 +394,51 @@ def open_project(data, index=0, _seen=()):
                 item['nestedProject'] = child
         width, height = sequence.frame_size or (1920, 1080)
         fps = py_premiere.TICKS_PER_SECOND / sequence.timebase if sequence.timebase else 30
+        track_mix = {}
+        track_state = {}
+        for kind, tracks in (('video', sequence.video_tracks), ('audio', sequence.audio_tracks)):
+            for number, track in enumerate(tracks):
+                key = f'{kind}:{number + 1 if kind == "video" else -number - 1}'
+                if track.is_locked or not track.is_sync_locked:
+                    track_state[key] = {'locked': track.is_locked, 'syncLocked': track.is_sync_locked}
+                if kind == 'video' and number == 3 and (track.is_locked or not track.is_sync_locked):
+                    track_state['title:4'] = {'locked': track.is_locked, 'syncLocked': track.is_sync_locked}
+        for number, track in enumerate(sequence.audio_tracks):
+            volume = _static_audio_value(_audio_track_param(track, 'Volume'), 1)
+            balance = _static_audio_value(_audio_track_param(track, 'Balance'), .5)
+            state = {'gain': round(volume * 100, 4), 'pan': round((balance - .5) * 200, 4),
+                     'mute': track.is_muted, 'solo': False}
+            if state != {'gain': 100, 'pan': 0, 'mute': False, 'solo': False}:
+                track_mix[str(-number - 1)] = state
+        captions = []
+        for track_index, track in enumerate(sequence.caption_tracks):
+            for caption_index, caption in enumerate(track.captions):
+                fill = caption.fill_color
+                captions.append({'id': f'caption-{track_index}-{caption_index}',
+                                 'start': caption.start.seconds,
+                                 'duration': (caption.end - caption.start).seconds,
+                                 'text': caption.text, 'track': track_index,
+                                 'fontFamily': caption.font_family,
+                                 'fontSize': caption.font_size,
+                                 'fillColor': '#%02x%02x%02x' % fill[:3] if fill else None,
+                                 'premiereCaptionTrack': track_index,
+                                 'premiereCaptionIndex': caption_index})
+        warnings = []
+        if sequence._element.findtext('Node/Properties/AMM.CurrentSolo') not in (None, '', '[]'):
+            warnings.append('Native Premiere track solo is preserved but cannot be edited in Splice.')
+        for clip in clips:
+            source_media = next((media_item for media_item in media if media_item['id'] == clip.get('mediaId')), None)
+            if source_media is not None and source_media.get('nativeGenerator') is not None:
+                warnings.append(f"{source_media['name']} is a native Premiere generator; preview and export are unavailable.")
         return {'name': sequence.name, 'width': width, 'height': height, 'fps': fps,
                 'premiereSequences': [item.name for item in project.sequences], 'premiereSequence': index,
-                'media': media, 'clips': clips,
+                'media': media, 'clips': clips, 'captions': captions,
+                'trackState': track_state,
+                'trackCounts': {'video': len(sequence.video_tracks), 'audio': len(sequence.audio_tracks)},
+                'compatibilityWarnings': warnings,
                 'duration': max((c['start'] + c['duration'] for c in clips), default=0),
                 'premiereOriginal': base64.b64encode(data).decode('ascii'), 'premiereManaged': managed,
+                'trackMix': track_mix,
                 'markers': [{'id': marker.guid, 'name': marker.name, 'time': marker.start.seconds} for marker in sequence.markers]}
 
 
@@ -223,10 +448,8 @@ def save_project(data):
     for clip in data.get('clips', []):
         if (clip.get('color') or {}).get('lut'):
             raise ValueError('Premiere export cannot write imported LUTs; save a Splice project or remove the LUT')
-    for mix in (data.get('trackMix') or {}).values():
-        if (float(mix.get('gain', 100)) != 100 or float(mix.get('pan', 0)) != 0
-                or mix.get('mute', False) or mix.get('solo', False)):
-            raise ValueError('Premiere export cannot write track mixer changes; save a Splice project or reset the mixer')
+    if any(mix.get('solo', False) for mix in (data.get('trackMix') or {}).values()):
+        raise ValueError('Premiere export cannot write track solo; save a Splice project or disable solo')
     original = data.get('premiereOriginal')
     if original and len(original) > 70 * 1024 * 1024:
         raise ValueError('Original Premiere project is too large')
@@ -264,6 +487,105 @@ def save_project(data):
         base = FORMATS['1080p25']
         custom = base._replace(frame_rate=chosen[0], width=width, height=height, time_display=chosen[1], video_tracks=4)
         sequence = project.add_sequence(str(data.get('name') or 'Untitled')[:120], sequence_format=custom)
+    for key, state in (data.get('trackState') or {}).items():
+        try:
+            kind, raw_track = key.split(':', 1)
+            number = int(raw_track)
+        except (ValueError, AttributeError) as exc:
+            raise ValueError('Invalid Premiere track state target') from exc
+        tracks = sequence.audio_tracks if kind == 'audio' else sequence.video_tracks if kind in ('video', 'title') else None
+        if tracks is None:
+            raise ValueError('Invalid Premiere track state target')
+        index = -number - 1 if kind == 'audio' else number - 1
+        if not 0 <= index < len(tracks):
+            raise ValueError('Premiere track state target is unavailable')
+        track = tracks[index]
+        if bool(state.get('locked', False)) != track.is_locked:
+            track.is_locked = bool(state['locked'])
+        if bool(state.get('syncLocked', True)) != track.is_sync_locked:
+            track.is_sync_locked = bool(state['syncLocked'])
+    for key, mix in (data.get('trackMix') or {}).items():
+        number = int(key)
+        if number >= 0 or -number > len(sequence.audio_tracks):
+            raise ValueError('Premiere audio track mixer target is unavailable')
+        track = sequence.audio_tracks[-number - 1]
+        gain = float(mix.get('gain', 100))
+        pan = float(mix.get('pan', 0))
+        if not math.isfinite(gain) or not 0 <= gain <= 200 or not math.isfinite(pan) or not -100 <= pan <= 100:
+            raise ValueError('Premiere audio mixer value is out of range')
+        current_gain = _static_audio_value(_audio_track_param(track, 'Volume'), 1) * 100
+        current_pan = (_static_audio_value(_audio_track_param(track, 'Balance'), .5) - .5) * 200
+        if abs(gain - current_gain) > .0001:
+            _set_static_audio_value(_audio_track_param(track, 'Volume'), gain / 100)
+        if abs(pan - current_pan) > .0001:
+            _set_static_audio_value(_audio_track_param(track, 'Balance'), (pan + 100) / 200)
+        if bool(mix.get('mute', False)) != track.is_muted:
+            track.is_muted = bool(mix['mute'])
+    native_captions = {(track_index, caption_index): caption
+                       for track_index, track in enumerate(sequence.caption_tracks)
+                       for caption_index, caption in enumerate(track.captions)}
+    incoming_captions = data.get('captions', [])
+    retained_captions = set()
+    new_captions = []
+    for item in incoming_captions:
+        if item.get('premiereCaptionIndex') is None:
+            new_captions.append(item)
+            continue
+        key = (item.get('premiereCaptionTrack'), item.get('premiereCaptionIndex'))
+        caption = native_captions.get(key)
+        if caption is None or key in retained_captions:
+            raise ValueError('Native Premiere caption reference is unavailable')
+        retained_captions.add(key)
+        start = float(item.get('start', 0))
+        duration = float(item.get('duration', 0))
+        if not math.isfinite(start) or not math.isfinite(duration) or start < 0 or duration <= 0:
+            raise ValueError('Caption timing is invalid')
+        if abs(start - caption.start.seconds) > .0001 or abs(duration - (caption.end - caption.start).seconds) > .0001:
+            _retime_caption(caption, start, duration)
+        if item.get('text') != caption.text:
+            caption.text = str(item.get('text') or '')
+        if item.get('fontFamily') and item['fontFamily'] != caption.font_family:
+            caption.font_family = str(item['fontFamily'])
+        if item.get('fontSize') is not None and abs(float(item['fontSize']) - caption.font_size) > .0001:
+            caption.font_size = float(item['fontSize'])
+        if item.get('fillColor'):
+            color = _caption_color(item['fillColor'])
+            if caption.fill_color != color:
+                caption.fill_color = color
+    for key, caption in native_captions.items():
+        if key in retained_captions:
+            continue
+        items = caption.track._element.find('DataClipTrack/ClipTrack/ClipItems/TrackItems')
+        reference = next((node for node in items if node.get('ObjectRef') == caption._element.get('ObjectID')), None)
+        if reference is None:
+            raise ValueError('Native Premiere caption track item is unavailable')
+        remove_child(items, reference)
+        for number, node in enumerate(items):
+            node.set('Index', str(number))
+    if new_captions:
+        lines = []
+        for number, item in enumerate(sorted(new_captions, key=lambda value: float(value.get('start', 0))), 1):
+            start = float(item.get('start', 0))
+            duration = float(item.get('duration', 0))
+            caption_text = str(item.get('text') or '').strip()
+            if not math.isfinite(start) or not math.isfinite(duration) or start < 0 or duration <= 0 or not caption_text:
+                raise ValueError('New caption needs text and valid timing')
+            lines.extend([str(number), f'{_caption_time(start)} --> {_caption_time(start + duration)}', caption_text, ''])
+        content = '\n'.join(lines) + '\n'
+        folder = MEDIA_ROOT / 'captions'
+        folder.mkdir(parents=True, exist_ok=True)
+        source_path = folder / (hashlib.sha256(content.encode('utf-8')).hexdigest() + '.srt')
+        if not source_path.exists():
+            source_path.write_text(content)
+        imported = project.import_files([source_path])[0]
+        caption_track = sequence.create_caption_track(imported)
+        for item, caption in zip(sorted(new_captions, key=lambda value: float(value.get('start', 0))), caption_track.captions):
+            if item.get('fontFamily') and item['fontFamily'] != caption.font_family:
+                caption.font_family = str(item['fontFamily'])
+            if item.get('fontSize') is not None and abs(float(item['fontSize']) - caption.font_size) > .0001:
+                caption.font_size = float(item['fontSize'])
+            if item.get('fillColor'):
+                caption.fill_color = _caption_color(item['fillColor'])
     existing_markers = {marker.guid: marker for marker in sequence.markers}
     if 'markers' in data:
         retained_markers = set()
@@ -289,16 +611,22 @@ def save_project(data):
                     original_clips[(kind, track_index, clip_index)] = clip
     available = {}
     existing = {}
+    existing_uid = {}
     if original and project.root_item:
         def collect(folder):
             for child in folder.children:
                 if child.media_path:
                     existing[str(child.media_path)] = child
+                if child._element.get('ObjectUID'):
+                    existing_uid[child._element.get('ObjectUID')] = child
                 collect(child)
         collect(project.root_item)
     bin_cache = {}
     for item in data.get('media', []):
         src = item.get('src', '')
+        if original and item.get('premiereItemUID') in existing_uid:
+            available[item['id']] = existing_uid[item['premiereItemUID']]
+            continue
         if original and item.get('path') in existing:
             previous = existing[item['path']]
             if src.startswith('/media/'):
@@ -375,6 +703,13 @@ def save_project(data):
                 clip = tracks[index].add_graphic(str(item.get('title') or 'Title'),
                     py_premiere.Time.from_seconds(float(item.get('start', 0))),
                     py_premiere.Time.from_seconds(max(0.001, float(item.get('duration', 1)))))
+                # The Adobe fixture used to author a new graphic defaults to
+                # LucidaConsole, which is absent on Linux. Write the bundled
+                # face only for new Splice titles; retain native title fonts.
+                item = {**item, 'titleStyle': {
+                    'fontFamily': 'DM Sans', 'x': 50, 'y': 78, 'fontSize': 8,
+                    'strokeWidth': 0, **(item.get('titleStyle') or {}),
+                }}
             else:
                 if source is None:
                     raise ValueError('A clip has media that must be relinked before saving to Premiere')
@@ -390,6 +725,20 @@ def save_project(data):
                     audio_regions[free].append((begin, end))
                 else:
                     clip = tracks[index].add_clip(source, placement)
+        speed = float(item.get('speed', clip.speed))
+        if item.get('type') != 'title' and abs(speed - clip.speed) > .000001:
+            if clip._clip_element.find('Clip/TimeRemapping') is not None:
+                raise ValueError('Changing speed on a keyframed Premiere time remap is unsupported')
+            _set_clip_speed(clip, speed)
+        if item.get('type') != 'title' and bool(item.get('reverse', clip.is_speed_reversed)) != clip.is_speed_reversed:
+            core = clip._clip_element.find('Clip')
+            backwards = core.find('PlayBackwards')
+            if item['reverse'] and backwards is None:
+                insert_leaf_before(core, 'OutPoint', 'PlayBackwards', 'true')
+            elif item['reverse']:
+                backwards.text = 'true'
+            else:
+                remove_child(core, backwards)
         start = max(0, float(item.get('in', 0)))
         duration = max(0.001, float(item.get('duration', 1)))
         # A retimed Premiere clip can have a different source span than its
@@ -399,7 +748,7 @@ def save_project(data):
         if source_changed:
             clip.in_point = py_premiere.Time.from_seconds(start)
         if source_changed or length_changed or 'premiereIndex' not in item:
-            clip.out_point = py_premiere.Time.from_seconds(start + duration)
+            clip.out_point = py_premiere.Time.from_seconds(start + duration * speed)
             clip.end = py_premiere.Time.from_seconds(float(item.get('start', 0)) + duration)
         if companion is not None:
             companion.in_point = clip.in_point
@@ -408,7 +757,7 @@ def save_project(data):
             premiere_effects.apply(companion, {}, float(item.get('volume', 100)))
         premiere_effects.apply(clip, item.get('color') or {}, float(item.get('volume', 100)))
         premiere_effects.apply_extended(clip, item)
-        if item.get('transition') in ('dissolve', 'fade') and not is_audio:
+        if item.get('transition') in TRANSITIONS and not is_audio:
             pending_transitions.append((clip, item))
     if original:
         retained = {(('video' if c.get('type') == 'title' else c.get('type')), c.get('premiereTrack'), c.get('premiereIndex')) for c in data.get('clips', []) if 'premiereIndex' in c}
@@ -419,12 +768,16 @@ def save_project(data):
                         clip.track.remove_transition(transition)
                 clip.track.remove_clip(clip)
     for clip, item in pending_transitions:
-        match = 'AE.ADBE Dip To Black' if item['transition'] == 'fade' else 'AE.ADBE Cross Dissolve New'
-        if any(abs(t.cut_point.seconds - clip.start.seconds) < .05 for t in clip.track.transitions):
-            continue
-        clip.track.add_transition(clip, match, at_start=True,
-            name='Dip To Black' if item['transition'] == 'fade' else 'Cross Dissolve',
-            duration=py_premiere.Time.from_seconds(float(item.get('transitionDuration', .6))))
+        match, label = TRANSITIONS[item['transition']]
+        length = py_premiere.Time.from_seconds(float(item.get('transitionDuration', .5)))
+        before = py_premiere.Time.from_seconds(float(item.get('transitionBefore', 0)))
+        existing = next((t for t in clip.track.transitions if abs(t.cut_point.seconds-clip.start.seconds)<.5/requested_fps), None)
+        if existing:
+            if (existing.match_name == match and abs(existing.duration.seconds-length.seconds)<.5/requested_fps and
+                    abs(existing.cut_point_offset.seconds-before.seconds)<.5/requested_fps):
+                continue
+            clip.track.remove_transition(existing)
+        clip.track.add_transition(clip, match, at_start=True, name=label, duration=length,cut_offset=before)
     with tempfile.TemporaryDirectory() as temp:
         destination = Path(temp) / 'project.prproj'
         project.save(destination)

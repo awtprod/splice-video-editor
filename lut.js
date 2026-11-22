@@ -33,19 +33,37 @@
     const {size,data,domainMin=[0,0,0],domainMax=[1,1,1]}=lut;
     if (!Number.isInteger(size)||size<2||size>MAX_SIZE||!Array.isArray(data)||data.length!==size**3*3) throw new Error('Invalid project LUT.');
     const pixels=imageData.data, mix=Math.max(0,Math.min(1,Number(intensity)/100));
-    const scale=size-1;
-    const index=(r,g,b)=>3*(r+size*(g+size*b));
+    if (mix===0) return imageData;
+    const low=[],high=[],fraction=[];
+    for(let channel=0;channel<3;channel++) {
+      const lo=new Uint8Array(256),hi=new Uint8Array(256),weight=new Float32Array(256);
+      const min=domainMin[channel],max=domainMax[channel];
+      if (!Number.isFinite(min)||!Number.isFinite(max)||min>=max) throw new Error('Invalid project LUT domain.');
+      for(let value=0;value<256;value++) {
+        const position=Math.max(0,Math.min(size-1,(value/255-min)/(max-min)*(size-1)));
+        lo[value]=Math.floor(position);hi[value]=Math.min(size-1,lo[value]+1);weight[value]=position-lo[value];
+      }
+      low.push(lo);high.push(hi);fraction.push(weight);
+    }
+    const redLow=low[0],greenLow=low[1],blueLow=low[2];
+    const redHigh=high[0],greenHigh=high[1],blueHigh=high[2];
+    const redFraction=fraction[0],greenFraction=fraction[1],blueFraction=fraction[2];
+    const plane=size*size;
     for(let p=0;p<pixels.length;p+=4){
-      const source=[pixels[p],pixels[p+1],pixels[p+2]];
-      const coords=source.map((v,c)=>Math.max(0,Math.min(scale,(v/255-domainMin[c])/(domainMax[c]-domainMin[c])*scale)));
-      const lo=coords.map(Math.floor),hi=lo.map(v=>Math.min(size-1,v+1)),t=coords.map((v,i)=>v-lo[i]);
-      for(let c=0;c<3;c++){
-        let output=0;
-        for(let b=0;b<2;b++)for(let g=0;g<2;g++)for(let r=0;r<2;r++){
-          const weight=(r?t[0]:1-t[0])*(g?t[1]:1-t[1])*(b?t[2]:1-t[2]);
-          output+=weight*data[index(r?hi[0]:lo[0],g?hi[1]:lo[1],b?hi[2]:lo[2])+c];
-        }
-        pixels[p+c]=Math.round(source[c]*(1-mix)+Math.max(0,Math.min(255,output*255))*mix);
+      const red=pixels[p],green=pixels[p+1],blue=pixels[p+2];
+      const r0=redLow[red],r1=redHigh[red],g0=greenLow[green],g1=greenHigh[green],b0=blueLow[blue],b1=blueHigh[blue];
+      const fr=redFraction[red],fg=greenFraction[green],fb=blueFraction[blue];
+      const i000=3*(r0+size*g0+plane*b0),i100=3*(r1+size*g0+plane*b0);
+      const i010=3*(r0+size*g1+plane*b0),i110=3*(r1+size*g1+plane*b0);
+      const i001=3*(r0+size*g0+plane*b1),i101=3*(r1+size*g0+plane*b1);
+      const i011=3*(r0+size*g1+plane*b1),i111=3*(r1+size*g1+plane*b1);
+      for(let channel=0;channel<3;channel++) {
+        const c00=data[i000+channel]+fr*(data[i100+channel]-data[i000+channel]);
+        const c10=data[i010+channel]+fr*(data[i110+channel]-data[i010+channel]);
+        const c01=data[i001+channel]+fr*(data[i101+channel]-data[i001+channel]);
+        const c11=data[i011+channel]+fr*(data[i111+channel]-data[i011+channel]);
+        const c0=c00+fg*(c10-c00),c1=c01+fg*(c11-c01);
+        pixels[p+channel]=Math.round(pixels[p+channel]*(1-mix)+255*mix*(c0+fb*(c1-c0)));
       }
     }
     return imageData;

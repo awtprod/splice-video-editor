@@ -8,6 +8,10 @@
     `<label class="splice-number"><span>${title}</span><input aria-label="${title}" type="number" data-field="${key}" data-group="${group}" min="${min}" max="${max}" step="${step}" value="${value}"></label>`;
   const section = (title, body) => `<section class="splice-section"><h3>${title}</h3>${body}</section>`;
   const option = (key, title, selected) => `<option value="${key}" ${key === selected ? 'selected' : ''}>${title}</option>`;
+  let lastScopePaint = 0;
+  let automationProperty = 'opacity';
+  let showSafeArea = false;
+  const automation = {opacity:['Opacity',0,100,1],x:['Horizontal',-100,100,1],y:['Vertical',-100,100,1],scale:['Scale',10,400,1],rotation:['Rotation',-180,180,1],volume:['Audio gain',0,200,1]};
   function render(state, element, editor) {
     const clip = state.selected;
     if (!clip) {
@@ -20,18 +24,24 @@
     const transform = clip.transform || {};
     const text = clip.titleStyle || {};
     const fps = state.project.fps || 25;
+    const locked=!!editor.isTrackLocked?.(clip.track,clip.type);
     const maximumDuration = source?.duration ? Math.max(1/fps, source.duration - (clip.in || 0)) : 7200;
     let html = `<div class="splice-clip-heading"><small>${escape(clip.type)} · ${clip.track > 0 ? 'V' + clip.track : 'A' + Math.abs(clip.track)}</small><strong>${escape(title)}</strong></div>`;
+    if(locked) html += '<p class="splice-compat">This track is locked. Unlock it in the timeline to edit this clip.</p>';
     html += section('Timing',
       field('Timeline start', 'start', number(clip.start, 0).toFixed(2), 0, 7200, 1/fps) +
       (clip.type === 'title' ? '' : field('Source in', 'in', number(clip.in, 0).toFixed(2), 0, source?.duration || 7200, 1/fps)) +
       field('Duration', 'duration', number(clip.duration, 1).toFixed(2), 1/fps, maximumDuration, 1/fps));
     if (clip.type === 'video') {
+      const previous = state.project.clips.filter(item => item.type === 'video' && item.id !== clip.id && item.start < clip.start && item.start + item.duration >= clip.start - .05).sort((a,b)=>b.start-a.start)[0];
+      const previousMedia = previous && state.project.media.find(item=>item.id===previous.mediaId);
+      const handle = previous && previousMedia ? Math.max(0,previousMedia.duration - previous.in - previous.duration) : 0;
       html += section('Transform',
         label('Scale', 'scale', number(transform.scale, 100), 10, 400, 1, '%', 'transform') +
         label('Horizontal', 'x', number(transform.x, 0), -100, 100, 1, '%', 'transform') +
         label('Vertical', 'y', number(transform.y, 0), -100, 100, 1, '%', 'transform') +
-        label('Rotation', 'rotation', number(transform.rotation, 0), -180, 180, 1, '°', 'transform'));
+        label('Rotation', 'rotation', number(transform.rotation, 0), -180, 180, 1, '°', 'transform') +
+        label('Opacity', 'opacity', number(clip.opacity, 100), 0, 100, 1, '%'));
       html += section('Color',
         label('Brightness', 'brightness', number(color.brightness, 100), 0, 200, 1, '%', 'color') +
         label('Contrast', 'contrast', number(color.contrast, 100), 0, 200, 1, '%', 'color') +
@@ -44,8 +54,9 @@
         '<input type="file" class="splice-lut-input" accept=".cube" hidden>' +
         '<canvas class="splice-scope" width="240" height="210" aria-label="RGB parade, luma waveform, and vectorscope from graded frame"></canvas>');
       html += section('Incoming transition',
-        `<label class="splice-number"><span>Style</span><select aria-label="Transition style" data-field="transition">${option('none','Cut',clip.transition || 'none')}${option('dissolve','Cross dissolve',clip.transition || 'none')}${option('fade','Fade through black',clip.transition || 'none')}</select></label>` +
-        field('Length', 'transitionDuration', number(clip.transitionDuration, .6).toFixed(2), .04, 2, .04));
+        `<label class="splice-number"><span>Style</span><select aria-label="Transition style" data-field="transition">${option('none','Cut',clip.transition || 'none')}${option('dissolve','Cross dissolve',clip.transition || 'none')}${option('fade','Fade through black',clip.transition || 'none')}${option('wipe','Wipe left to right',clip.transition || 'none')}</select></label>` +
+        field('Length', 'transitionDuration', number(clip.transitionDuration, .5).toFixed(2), .04, 2, .04) +
+        (['dissolve','wipe'].includes(clip.transition) ? `<p class="splice-handle ${handle < number(clip.transitionDuration,.5) ? 'splice-handle-warn' : ''}">Outgoing source handle: ${handle.toFixed(2)} s. ${previous ? '' : 'Place a video clip directly before this one.'}</p>` : ''));
     }
     if (clip.type === 'title') {
       html += section('Title',
@@ -57,7 +68,8 @@
         `<label class="splice-number"><span>Alignment</span><select aria-label="Title alignment" data-field="align" data-group="titleStyle">${['left','center','right'].map(name => option(name,name,text.align || 'center')).join('')}</select></label>` +
         label('Outline', 'strokeWidth', number(text.strokeWidth, 0), 0, 8, .5, ' px', 'titleStyle') +
         `<label class="splice-number"><span>Outline color</span><input aria-label="Title outline color" type="color" data-field="strokeColor" data-group="titleStyle" value="${escape(text.strokeColor || '#000000')}"></label>` +
-        `<label class="splice-number"><span>Text color</span><input aria-label="Title text color" type="color" data-field="color" data-group="titleStyle" value="${escape(text.color || '#ffffff')}"></label>`);
+        `<label class="splice-number"><span>Text color</span><input aria-label="Title text color" type="color" data-field="color" data-group="titleStyle" value="${escape(text.color || '#ffffff')}"></label>` +
+        `<label class="splice-safe-toggle"><input type="checkbox" data-safe-area ${showSafeArea ? 'checked' : ''}> Show title and action safe areas</label>`);
     }
     if (clip.type === 'audio' || clip.type === 'video' && clip.embeddedAudio !== false) {
       html += section('Audio',
@@ -66,15 +78,40 @@
         field('Fade in', 'fadeIn', number(clip.fadeIn, 0).toFixed(2), 0, clip.duration, .04) +
         field('Fade out', 'fadeOut', number(clip.fadeOut, 0).toFixed(2), 0, clip.duration, .04));
     }
+    if (clip.type === 'video' || clip.type === 'audio') {
+      const available=clip.type==='audio' ? ['volume'] : ['opacity','x','y','scale','rotation',...(clip.embeddedAudio===false?[]:['volume'])];
+      if(!available.includes(automationProperty))automationProperty=available[0];
+      const spec=automation[automationProperty], local=Math.max(0,Math.min(clip.duration,number(state.time,clip.start)-clip.start));
+      const points=(clip.keyframes?.[automationProperty] || []).slice().sort((a,b)=>a.time-b.time);
+      const base=automationProperty==='opacity' ? number(clip.opacity,100) : automationProperty==='volume' ? number(clip.volume,100) : number(transform[automationProperty],automationProperty==='scale'?100:0);
+      html += section('Keyframes',
+        `<label class="splice-number"><span>Property</span><select aria-label="Keyframe property" data-key-property>${available.map(key=>option(key,automation[key][0],automationProperty)).join('')}</select></label>` +
+        `<div class="splice-key-edit"><label>Value at ${local.toFixed(2)} s<input aria-label="Keyframe value" type="number" class="splice-key-value" min="${spec[1]}" max="${spec[2]}" step="${spec[3]}" value="${base}"></label><button type="button" data-key-add>Add / update</button></div>` +
+        (points.length ? `<div class="splice-key-list">${points.map(point=>`<button type="button" data-key-time="${point.time}" title="Go to keyframe at ${point.time.toFixed(2)} seconds">${point.time.toFixed(2)}s · ${point.value}</button>`).join('')}</div><button type="button" class="splice-key-delete" data-key-delete>Delete keyframe at playhead</button>` : '<p class="splice-handle">No keyframes. Add one at the playhead to animate this property.</p>'));
+    }
     if (clip.type === 'audio' || clip.type === 'video' && clip.embeddedAudio !== false) {
       const track = clip.type === 'audio' ? clip.track : 1;
       const mix = state.project.trackMix?.[track] || {};
       html += section('Track mixer',
         label('Track gain', 'gain', number(mix.gain, 100), 0, 200, 1, '%', 'trackMix') +
         label('Track pan', 'pan', number(mix.pan, 0), -100, 100, 1, '', 'trackMix') +
+        `<div class="splice-meter" data-track="${track}" aria-label="Track peak meter"><span></span></div>` +
         `<div class="splice-toggles"><label><input type="checkbox" data-field="mute" data-group="trackMix" ${mix.mute ? 'checked' : ''}> Mute</label><label><input type="checkbox" data-field="solo" data-group="trackMix" ${mix.solo ? 'checked' : ''}> Solo</label></div>`);
     }
+    const nativeLimits=[];
+    if (color.lut) nativeLimits.push('3D LUT');
+    if (['x','y'].some(key=>Array.isArray(clip.keyframes?.[key])&&clip.keyframes[key].length)) nativeLimits.push('position keyframes');
+    if (text.align && text.align!=='center') nativeLimits.push('left/right title alignment');
+    if (number(clip.pan,0)) nativeLimits.push('clip audio pan');
+    if (nativeLimits.length) html += section('Premiere compatibility',
+      `<p class="splice-compat">${escape(nativeLimits.join(', '))} will not save to Premiere. Save a Splice working copy to keep this edit.</p>`);
     element.innerHTML = html;
+    if(locked) for(const input of element.querySelectorAll('[data-field]:not([data-group="trackMix"]),[data-key-add],[data-key-delete],[data-key-property],.splice-key-value,[data-action="import-lut"],[data-action="remove-lut"]')) input.disabled=true;
+    document.querySelector('#monitor-frame')?.classList.toggle('show-safe-area', showSafeArea);
+    element.querySelector('[data-safe-area]')?.addEventListener('change',event=>{
+      showSafeArea=event.target.checked;
+      document.querySelector('#monitor-frame')?.classList.toggle('show-safe-area',showSafeArea);
+    });
     for (const input of element.querySelectorAll('[data-field]')) {
       input.addEventListener('input', () => {
         const output = input.closest("label")?.querySelector("output");
@@ -94,10 +131,12 @@
         }
         input.setCustomValidity('');
         const group = input.dataset.group;
-        if (group === 'trackMix') {
-          const track = active.type === 'audio' ? active.track : 1;
-          editor.updateTrackMix(track, {[key]: value});
-        } else editor.updateClip(active.id, group ? {[group]: {...(active[group] || {}), [key]: value}} : {[key]: value});
+        try {
+          if (group === 'trackMix') {
+            const track = active.type === 'audio' ? active.track : 1;
+            editor.updateTrackMix(track, {[key]: value});
+          } else editor.updateClip(active.id, group ? {[group]: {...(active[group] || {}), [key]: value}} : {[key]: value});
+        } catch(error) { window.alert(error.message || 'This clip cannot be changed.'); }
       });
     }
     const picker = element.querySelector('.splice-lut-input');
@@ -114,10 +153,48 @@
         editor.updateClip(clip.id,{color:{...color,lut,lutIntensity:100}});
       } catch(error) { window.alert(error.message || 'Cannot read this LUT.'); }
     });
+    element.querySelector('[data-key-property]')?.addEventListener('change', event=>{
+      automationProperty=event.target.value;
+      render(editor.get(),element,editor);
+    });
+    element.querySelector('[data-key-add]')?.addEventListener('click',()=>{
+      const active=editor.get().selected;
+      if (!active || active.id!==clip.id) return;
+      const value=Number(element.querySelector('.splice-key-value')?.value),spec=automation[automationProperty];
+      if (!Number.isFinite(value)||value<spec[1]||value>spec[2]) return window.alert(`Enter ${spec[0]} between ${spec[1]} and ${spec[2]}.`);
+      const time=Math.round(Math.max(0,Math.min(active.duration,editor.get().time-active.start))*fps)/fps;
+      const points=(active.keyframes?.[automationProperty]||[]).filter(point=>Math.abs(point.time-time)>=.5/fps);
+      points.push({time,value});points.sort((a,b)=>a.time-b.time);
+      editor.updateClip(active.id,{keyframes:{...(active.keyframes||{}),[automationProperty]:points}});
+      render(editor.get(),element,editor);
+    });
+    element.querySelector('[data-key-delete]')?.addEventListener('click',()=>{
+      const active=editor.get().selected;
+      if (!active || active.id!==clip.id) return;
+      const time=editor.get().time-active.start;
+      const points=(active.keyframes?.[automationProperty]||[]).filter(point=>Math.abs(point.time-time)>=.5/fps);
+      editor.updateClip(active.id,{keyframes:{...(active.keyframes||{}),[automationProperty]:points}});
+      render(editor.get(),element,editor);
+    });
+    for(const button of element.querySelectorAll('[data-key-time]')) button.addEventListener('click',()=>{
+      editor.seek(clip.start+Number(button.dataset.keyTime));
+      render(editor.get(),element,editor);
+    });
     paintScope(element.querySelector('.splice-scope'));
+    paintMeters(state);
+  }
+  function paintMeters(state=window.Editor?.get()) {
+    for (const meter of document.querySelectorAll('.splice-meter')) {
+      const peak=Number(state?.audioMeters?.[meter.dataset.track] || 0);
+      meter.firstElementChild.style.width=`${Math.min(100,Math.max(0,peak*100))}%`;
+      meter.setAttribute('aria-valuenow',String(Math.round(peak*100)));
+    }
   }
   function paintScope(canvas=document.querySelector('.splice-scope')) {
     if (!canvas) return;
+    const now=performance.now();
+    if (now-lastScopePaint < 100) return;
+    lastScopePaint=now;
     const video=document.querySelector('#preview-canvas');
     if (!video || !video.width || !video.height) return;
     const small = document.createElement('canvas');
@@ -145,5 +222,5 @@
     ctx.fillStyle='#b9c9b5';ctx.font='10px monospace';
     ctx.fillText('RGB PARADE',5,10);ctx.fillText('LUMA WAVEFORM',5,80);ctx.fillText('VECTORSCOPE',5,150);
   }
-  window.SpliceInspector = {render,paintScope};
+  window.SpliceInspector = {render,paintScope,paintMeters};
 })();

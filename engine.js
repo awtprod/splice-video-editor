@@ -35,6 +35,7 @@
         color: { brightness: 100, contrast: 100, saturation: 100 },
         volume: 100,
         transition: index ? "dissolve" : "none",
+        transitionDuration: .48,
       })),
       {
         id: "opening-title",
@@ -138,6 +139,26 @@
     future = [];
   };
   const mediaOf = (clip) => project.media.find((m) => m.id === clip.mediaId);
+  const trackKey = (kind, track) => `${kind}:${track}`;
+  const trackState = (kind, track, source = project) =>
+    source.trackState?.[trackKey(kind, track)] ||
+    (kind === "title" ? source.trackState?.[trackKey("video", track)] : null) || {};
+  const trackLocked = (kind, track, source = project) => !!trackState(kind, track, source).locked;
+  const syncLocked = (kind, track, source = project) => trackState(kind, track, source).syncLocked !== false;
+  const ensureEditable = (clip, destination = clip.track) => {
+    if (trackLocked(clip.type, clip.track) || trackLocked(clip.type, destination))
+      throw new Error(`Unlock ${clip.type} track ${Math.abs(clip.track)} before editing.`);
+  };
+  const assertLockedTracksUnchanged = (before, after) => {
+    const oldClips = new Map(before.clips.map((clip) => [clip.id, clip]));
+    const newClips = new Map(after.clips.map((clip) => [clip.id, clip]));
+    for (const clip of before.clips)
+      if (trackLocked(clip.type, clip.track, before) && JSON.stringify(clip) !== JSON.stringify(newClips.get(clip.id)))
+        throw new Error(`Unlock ${clip.type} track ${Math.abs(clip.track)} before editing.`);
+    for (const clip of after.clips)
+      if (trackLocked(clip.type, clip.track, after) && JSON.stringify(clip) !== JSON.stringify(oldClips.get(clip.id)))
+        throw new Error(`Unlock ${clip.type} track ${Math.abs(clip.track)} before editing.`);
+  };
   const at = (kind, t) =>
     project.clips
       .filter(
@@ -145,16 +166,35 @@
       )
       .sort((a, b) => b.track - a.track)[0];
   const transitionLength = clip => clamp(Number(clip.transitionDuration || .5), 1 / project.fps, 2);
+  const transitionBefore = clip => clamp(Number(clip.transitionBefore)||0,0,transitionLength(clip));
+  const sourceTime = (clip, atTime) => {
+    const speed=clamp(Number(clip.speed)||1,.1,16), local=atTime-clip.start;
+    return Number(clip.in||0)+(clip.reverse ? clip.duration-local : local)*speed;
+  };
   const trackSettings = track => project.trackMix?.[String(track)] || {};
   const soloActive = () => Object.values(project.trackMix || {}).some(m => m.solo);
+  let transitionFollowers=new Map();
+  const followingTransition = clip => transitionFollowers.get(clip.id);
+  function indexTransitions() {
+    const cuts=new Map();transitionFollowers=new Map();
+    for(const clip of project.clips) if(['dissolve','wipe'].includes(clip.transition))
+      cuts.set(`${clip.type}:${clip.track}:${Math.round(clip.start*project.fps)}`,clip);
+    for(const clip of project.clips) {
+      const next=cuts.get(`${clip.type}:${clip.track}:${Math.round((clip.start+clip.duration)*project.fps)}`);
+      if(next && next.id!==clip.id) transitionFollowers.set(clip.id,next);
+    }
+  }
   const audibility = clip => {
     const mix = trackSettings(clip.track);
     if (mutedTracks.audio || mix.mute || (soloActive() && !mix.solo)) return 0;
     const local = time - clip.start;
     const fadeIn = Math.max(0,Number(clip.fadeIn||0));
     const fadeOut = Math.max(0,Number(clip.fadeOut||0));
-    const fade = Math.min(1, fadeIn ? local/fadeIn : 1, fadeOut ? (clip.duration-local)/fadeOut : 1);
-    return clamp((clip.volume??100)/100,0,2) * clamp((mix.gain??100)/100,0,2) * clamp(fade,0,1);
+    let fade = Math.min(1, fadeIn ? local/fadeIn : 1, fadeOut ? (clip.duration-local)/fadeOut : 1);
+    if(['dissolve','wipe','fade'].includes(clip.transition)) fade*=clamp((time-clip.start+transitionBefore(clip))/transitionLength(clip),0,1);
+    const next=followingTransition(clip);
+    if(next) fade*=clamp(1-(time-next.start+transitionBefore(next))/transitionLength(next),0,1);
+    return clamp(animated(clip,'volume',Number(clip.volume??100))/100,0,2) * clamp((mix.gain??100)/100,0,2) * clamp(fade,0,1);
   };
   const filterFor = (clip) => {
     const c = clip.color || {};
@@ -189,6 +229,7 @@
           (c) =>
             c.type === "video" &&
             c.id !== clip.id &&
+            c.track === clip.track &&
             c.start < clip.start &&
             c.start + c.duration >= clip.start - 0.05,
         )
@@ -197,11 +238,10 @@
   }
   function syncMedia(forceSeek = false) {
     ensureElements();
+    indexTransitions();
     const clip = at("video", time);
-    const audioClips = project.clips.filter(
-      (c) =>
-        c.type === "audio" && c.start <= time && time < c.start + c.duration,
-    );
+    const audioClips = project.clips.filter(c=>c.type==='audio' && c.start-transitionBefore(c)<=time &&
+      time<c.start+c.duration+(followingTransition(c)?transitionLength(followingTransition(c))-transitionBefore(followingTransition(c)):0));
     const mediaItem = clip && mediaOf(clip);
     if (clip?.id === preloadClipId && clip.id !== activeVideoId) {
       const outgoing = video;
@@ -225,7 +265,8 @@
       }
     }
     if (clip && mediaItem) {
-      const target = (clip.in || 0) + time - clip.start;
+      video.muted=false;
+      const target = sourceTime(clip,time);
       if (forceSeek || Math.abs(video.currentTime - target) > 0.3) {
         try {
           video.currentTime = target;
@@ -234,7 +275,8 @@
         }
       }
       video.style.filter = filterFor(clip);
-      if (playing && playbackRate > 0) video.play().catch(() => {});
+      video.playbackRate=clamp((Number(clip.speed)||1)*Math.max(.25,Math.abs(playbackRate)),.25,16);
+      if (playing && playbackRate > 0 && !clip.reverse) video.play().catch(() => {});
       else video.pause();
     }
     const previous = clip && time < clip.start + transitionLength(clip) ? preceding(clip) : null;
@@ -253,12 +295,16 @@
       }
     }
     if (previous) {
-      const target = (previous.in || 0) + previous.duration + time - clip.start;
+      const target = sourceTime(previous,previous.start+previous.duration+time-clip.start);
       if (forceSeek || Math.abs(transitionVideo.currentTime - target) > .3) {
         try { transitionVideo.currentTime = target; } catch (_) { /* Metadata pending. */ }
       }
-      if (playing && playbackRate > 0) transitionVideo.play().catch(() => {});
+      transitionVideo.playbackRate=clamp((Number(previous.speed)||1)*Math.max(.25,Math.abs(playbackRate)),.25,16);
+      if (playing && playbackRate > 0 && !previous.reverse) transitionVideo.play().catch(() => {});
       else transitionVideo.pause();
+      transitionVideo.muted=false;
+      setAudio(transitionVideo,previous);
+      if(previous.embeddedAudio===false) audioNodes.get(transitionVideo).gain.gain.value=0;
     } else transitionVideo.pause();
     if (playing && playbackRate > 0 && clip && !previous) {
       const upcoming = project.clips.find(c => c.type === "video" && c.track === clip.track &&
@@ -267,23 +313,34 @@
         const next = mediaOf(upcoming);
         if (next?.src) {
           transitionVideo.pause();
+          transitionVideo.muted=true;
           transitionVideo.src = next.src;
           transitionVideo.load();
           transitionVideo.addEventListener("loadedmetadata", () => {
-            if (preloadClipId === upcoming.id) transitionVideo.currentTime = upcoming.in || 0;
+            if (preloadClipId === upcoming.id) transitionVideo.currentTime = sourceTime(upcoming,time);
           }, { once: true });
           preloadClipId = upcoming.id;
           transitionVideoId = null;
         }
       }
+      if(upcoming && preloadClipId===upcoming.id && time>=upcoming.start-transitionBefore(upcoming)) {
+        const target=sourceTime(upcoming,time);
+        if(forceSeek||Math.abs(transitionVideo.currentTime-target)>.3) try{transitionVideo.currentTime=target}catch(_){}
+        if(!upcoming.reverse) transitionVideo.play().catch(()=>{});
+        if(transitionBefore(upcoming)>0) {
+          transitionVideo.muted=false;
+          setAudio(transitionVideo,upcoming);
+          if(upcoming.embeddedAudio===false) audioNodes.get(transitionVideo).gain.gain.value=0;
+        }
+      }
     }
-    const visible = project.clips.filter(c=>c.type==='video' && c.start<=time && time<c.start+c.duration);
+    const visible = project.clips.filter(c=>c.type==='video' && c.start-transitionBefore(c)<=time && time<c.start+c.duration);
     const currentVideoIds=new Set(visible.map(c=>c.id));
-    for (const [id,element] of layerVideos) if (!currentVideoIds.has(id) || id===activeVideoId) {
+    for (const [id,element] of layerVideos) if (!currentVideoIds.has(id) || id===activeVideoId || id===preloadClipId) {
       element.pause();element.removeAttribute('src');element.load();element.remove();layerVideos.delete(id);
     }
     for (const layer of visible) {
-      if (layer.id===activeVideoId) continue;
+      if (layer.id===activeVideoId || layer.id===preloadClipId) continue;
       const item=mediaOf(layer);
       if (!item?.src) continue;
       let element=layerVideos.get(layer.id);
@@ -291,9 +348,10 @@
         element=document.createElement('video');element.muted=true;element.playsInline=true;
         element.preload='auto';element.style.display='none';element.src=item.src;document.body.append(element);layerVideos.set(layer.id,element);
       }
-      const target=(layer.in||0)+time-layer.start;
+      const target=sourceTime(layer,time);
       if(forceSeek||Math.abs(element.currentTime-target)>.3) try{element.currentTime=target}catch(_){}
-      if(playing && playbackRate > 0) element.play().catch(()=>{}); else element.pause();
+      element.playbackRate=clamp((Number(layer.speed)||1)*Math.max(.25,Math.abs(playbackRate)),.25,16);
+      if(playing && playbackRate > 0 && !layer.reverse) element.play().catch(()=>{}); else element.pause();
     }
     const currentIds = new Set(audioClips.map((c) => c.id));
     for (const [id, element] of audioElements)
@@ -319,14 +377,15 @@
         audioElements.set(audioClip.id, element);
       }
       if (element.getAttribute("src") !== item.src) element.src = item.src;
-      const target = (audioClip.in || 0) + time - audioClip.start;
+      const target = sourceTime(audioClip,time);
       if (forceSeek || Math.abs(element.currentTime - target) > 0.3)
         try {
           element.currentTime = target;
         } catch (_) {
           /* Metadata may still be loading. */
         }
-      if (playing && playbackRate > 0) element.play().catch(() => {});
+      element.playbackRate=clamp((Number(audioClip.speed)||1)*Math.max(.25,Math.abs(playbackRate)),.25,16);
+      if (playing && playbackRate > 0 && !audioClip.reverse) element.play().catch(() => {});
       else element.pause();
       setAudio(element,audioClip);
     }
@@ -350,31 +409,34 @@
   const layerCanvases = new Map();
   function paintVideo(ctx,element,clip,canvas,alpha=1) {
     if (!element || element.readyState < 2) return;
+    const lut=clip.color?.lut;
+    const previewScale=lut && playing ? .5 : 1;
+    const drawWidth=Math.max(1,Math.round(canvas.width*previewScale));
+    const drawHeight=Math.max(1,Math.round(canvas.height*previewScale));
     const sourceWidth=element.videoWidth||canvas.width;
     const sourceHeight=element.videoHeight||canvas.height;
-    const fit=Math.min(canvas.width/sourceWidth,canvas.height/sourceHeight);
+    const fit=Math.min(drawWidth/sourceWidth,drawHeight/sourceHeight);
     const scale=clamp(animated(clip,"scale",Number(clip.transform?.scale??100))/100,.1,4);
-    const x=clamp(animated(clip,"x",Number(clip.transform?.x??0)),-100,100)*canvas.width/100;
-    const y=clamp(animated(clip,"y",Number(clip.transform?.y??0)),-100,100)*canvas.height/100;
+    const x=clamp(animated(clip,"x",Number(clip.transform?.x??0)),-100,100)*drawWidth/100;
+    const y=clamp(animated(clip,"y",Number(clip.transform?.y??0)),-100,100)*drawHeight/100;
     const rotation=clamp(animated(clip,"rotation",Number(clip.transform?.rotation??0)),-180,180)*Math.PI/180;
-    const lut=clip.color?.lut;
     let target=ctx;
     const gains=gradeGains(clip.color||{});
     const graded=gains.some(g=>Math.abs(g-1)>.0001);
     if ((lut && window.SpliceLUT) || graded) {
       let layer=layerCanvases.get(clip.id);
       if (!layer) { layer=document.createElement('canvas'); layerCanvases.set(clip.id,layer); }
-      if (layer.width!==canvas.width || layer.height!==canvas.height) {layer.width=canvas.width;layer.height=canvas.height;}
+      if (layer.width!==drawWidth || layer.height!==drawHeight) {layer.width=drawWidth;layer.height=drawHeight;}
       target=layer.getContext('2d',{willReadFrequently:true});
       target.clearRect(0,0,layer.width,layer.height);
     }
     alpha *= clamp(animated(clip,"opacity",Number(clip.opacity??100))/100,0,1);
     target.save(); target.globalAlpha=target===ctx?alpha:1; target.filter=filterFor(clip);
-    target.translate(canvas.width/2+x,canvas.height/2+y); target.rotate(rotation);
+    target.translate(drawWidth/2+x,drawHeight/2+y); target.rotate(rotation);
     target.drawImage(element,-sourceWidth*fit*scale/2,-sourceHeight*fit*scale/2,sourceWidth*fit*scale,sourceHeight*fit*scale);
     target.restore();
     if (target!==ctx) {
-      const image=target.getImageData(0,0,canvas.width,canvas.height);
+      const image=target.getImageData(0,0,drawWidth,drawHeight);
       if (graded) {
         const pixels=image.data;
         for(let i=0;i<pixels.length;i+=4) {
@@ -385,7 +447,7 @@
       }
       if (lut && window.SpliceLUT) window.SpliceLUT.applyImageData(image,lut,clip.color.lutIntensity??100);
       target.putImageData(image,0,0);
-      ctx.save();ctx.globalAlpha=alpha;ctx.drawImage(target.canvas,0,0);ctx.restore();
+      ctx.save();ctx.globalAlpha=alpha;ctx.drawImage(target.canvas,0,0,canvas.width,canvas.height);ctx.restore();
     }
   }
   function drawFrame(canvas) {
@@ -393,24 +455,26 @@
     ctx.fillStyle = "#080a0a";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     if (!mutedTracks.video) {
-      const visible=project.clips.filter(c=>c.type==='video' && c.start<=time && time<c.start+c.duration)
+      const visible=project.clips.filter(c=>c.type==='video' && c.start-transitionBefore(c)<=time && time<c.start+c.duration)
         .sort((a,b)=>a.track-b.track || a.start-b.start);
       for (const clip of visible) {
-        const element=clip.id===activeVideoId ? video : layerVideos.get(clip.id);
-        const previous=clip.id===activeVideoId && time<clip.start+transitionLength(clip) ? preceding(clip) : null;
+        const element=clip.id===activeVideoId ? video : clip.id===preloadClipId ? transitionVideo : layerVideos.get(clip.id);
+        const previous=clip.id===activeVideoId && time<clip.start+transitionLength(clip)-transitionBefore(clip) ? preceding(clip) : null;
         if(previous && transitionVideo.readyState>=2) paintVideo(ctx,transitionVideo,previous,canvas);
-        const alpha=(previous && clip.transition==='dissolve') || clip.transition==='fade' ?
-          clamp((time-clip.start)/transitionLength(clip),0,1) : 1;
-        if (previous && clip.transition==='wipe') {
-          ctx.save();ctx.beginPath();ctx.rect(0,0,canvas.width*clamp((time-clip.start)/transitionLength(clip),0,1),canvas.height);ctx.clip();
+        const progress=clamp((time-(clip.start-transitionBefore(clip)))/transitionLength(clip),0,1);
+        const alpha=(clip.transition==='dissolve' || clip.transition==='fade') ? progress : 1;
+        if (clip.transition==='fade' && progress<1) { ctx.fillStyle='#000';ctx.fillRect(0,0,canvas.width,canvas.height); }
+        if (clip.transition==='wipe') {
+          ctx.save();ctx.beginPath();ctx.rect(0,0,canvas.width*progress,canvas.height);ctx.clip();
         }
         paintVideo(ctx,element,clip,canvas,alpha);
-        if (previous && clip.transition==='wipe') ctx.restore();
+        if (clip.transition==='wipe') ctx.restore();
       }
       ctx.globalAlpha=1;ctx.filter='none';
     }
-    const title = mutedTracks.title ? null : at("title", time);
-    if (title?.title) {
+    const titles = mutedTracks.title ? [] : project.clips.filter(c=>c.type==='title'&&c.title&&c.start<=time&&time<c.start+c.duration)
+      .sort((a,b)=>a.track-b.track||a.start-b.start);
+    for (const title of titles) {
       ctx.fillStyle = "#fff";
       const style=title.titleStyle||{};
       ctx.font = `bold ${Math.round(canvas.height * (Number(style.fontSize)||8)/100)}px "${style.fontFamily||'DM Sans'}"`;
@@ -418,7 +482,8 @@
       ctx.textAlign = ['left','center','right'].includes(style.align) ? style.align : 'center';
       ctx.textBaseline = "middle";
       ctx.shadowColor = "#000";
-      ctx.shadowBlur = canvas.height * 0.025;
+      ctx.shadowBlur = 0;
+      ctx.shadowOffsetX=3;ctx.shadowOffsetY=3;
       const tx=canvas.width * (Number(style.x??50)/100), ty=canvas.height * (Number(style.y??78)/100);
       const lines=title.title.split(/\r?\n/).slice(0,20);
       const lineHeight=Math.round(canvas.height * (Number(style.fontSize)||8)/100)*1.2;
@@ -432,6 +497,7 @@
         ctx.fillText(lines[i],tx,lineY);
       }
       ctx.shadowBlur = 0;
+      ctx.shadowOffsetX=0;ctx.shadowOffsetY=0;
     }
   }
   function tick(timestamp) {
@@ -442,7 +508,7 @@
         video?.pause();
         audio?.pause();
       }
-      syncMedia(playbackRate < 0);
+      syncMedia(playbackRate < 0 || project.clips.some(c=>c.reverse && c.start<=time && time<c.start+c.duration));
       const frame = Math.floor(time * project.fps);
       if (frame !== lastPaintedFrame) { lastPaintedFrame = frame; notify(); }
     }
@@ -451,24 +517,12 @@
   }
   requestAnimationFrame(tick);
   async function fileToMedia(file) {
-    const src = URL.createObjectURL(file);
-    const isAudio = file.type.startsWith("audio/");
-    const element = document.createElement(isAudio ? "audio" : "video");
-    element.preload = "metadata";
-    element.src = src;
-    const length = await new Promise((resolve, reject) => {
-      element.onloadedmetadata = () => resolve(element.duration);
-      element.onerror = () => reject(new Error(`Could not read ${file.name}.`));
-    });
-    if (!Number.isFinite(length) || length <= 0)
-      throw new Error(`Could not determine the duration of ${file.name}.`);
-    return {
-      id: uid(),
-      name: file.name,
-      src,
-      duration: length,
-      type: isAudio ? "audio" : "video",
-    };
+    return {id:uid(), ...await SpliceMedia.importFile(file)};
+  }
+  function checkReplacement(item,replacement) {
+    if(replacement.type!==item.type) throw Error('Choose a '+item.type+' file for '+item.name+'.');
+    const end=Math.max(0,...project.clips.filter(c=>c.mediaId===item.id).map(c=>c.in+c.duration));
+    if(replacement.duration+.5/project.fps<end) throw Error(replacement.name+' is shorter than the source used on this timeline.');
   }
   function download(blob, name) {
     const url = URL.createObjectURL(blob);
@@ -550,11 +604,21 @@
     }),
     drawFrame,
     editProject(fn) {
-      const previous=structuredClone(project);
-      snapshot();
-      try { fn(project); validateProject(project); }
-      catch(error) { project=previous; history.pop(); revision += 1; throw error; }
+      const next=structuredClone(project);
+      fn(next); validateProject(next); assertLockedTracksUnchanged(project,next);
+      if (JSON.stringify(project)===JSON.stringify(next)) return;
+      snapshot(); project=next;
       project.duration=duration(); time=clamp(time,0,project.duration); syncMedia(true); notify();
+    },
+    isTrackLocked(track, kind) { return trackLocked(kind || (track < 0 ? "audio" : "video"), track); },
+    isTrackSyncLocked(track, kind) { return syncLocked(kind || (track < 0 ? "audio" : "video"), track); },
+    setTrackState(track, kind, patch) {
+      const key=trackKey(kind, track);
+      const current={locked:false,syncLocked:true,...project.trackState?.[key]};
+      const next={...current,...patch};
+      if (next.locked===current.locked && next.syncLocked===current.syncLocked) return;
+      if (typeof next.locked!=="boolean" || typeof next.syncLocked!=="boolean") throw new Error("Invalid track state.");
+      snapshot(); project.trackState ||= {}; project.trackState[key]=next; notify();
     },
     updateTrackMix(track, patch) {
       const key=String(track);
@@ -618,64 +682,45 @@
       notify();
     },
     async addMedia(files) {
-      const accepted = Array.from(files).filter(
-        (f) => f.type.startsWith("video/") || f.type.startsWith("audio/"),
-      );
-      if (!accepted.length)
-        throw new Error(
-          "Choose a video or audio file supported by your browser.",
-        );
-      snapshot();
-      for (const file of accepted) {
-        const offline = project.media.find((item) =>
-          window.SpliceMedia?.matches(item, file),
-        );
-        const decoded = await fileToMedia(file);
-        const item = offline || decoded;
-        if (offline) {
-          item.duration = decoded.duration;
-          item.src = decoded.src;
-        }
-        if (window.SpliceMedia) await window.SpliceMedia.remember(item, file);
-        if (!offline) project.media.push(item);
-        item.offline = false;
+      const imports=Array.from(files);
+      if (!imports.length) return;
+      const sequence=project;
+      const rows=[];
+      for (const file of imports) {
+        const candidates=project.media.filter(item=>SpliceMedia.matches(item,file));
+        if (candidates.length>1) throw Error('Multiple offline sources match '+file.name+'. Relink them individually.');
+        const decoded=await fileToMedia(file), offline=candidates[0];
+        if(offline) checkReplacement(offline,decoded);
+        const item=offline ? {...offline,...decoded,id:offline.id,path:offline.path} : decoded;
+        await SpliceMedia.remember(item);
+        rows.push(item);
       }
-      activeVideoId = null;
-      syncMedia(true);
-      notify();
-    },
-    async relinkMediaItem(itemId, file) {
-      const item = project.media.find(m => m.id === itemId);
-      if (!item) throw new Error("Media item is unavailable.");
-      const kind = file.type.startsWith("audio/") ? "audio" : file.type.startsWith("video/") ? "video" : "";
-      if (kind !== item.type) throw new Error("Choose a " + item.type + " file.");
-      const decoded = await fileToMedia(file);
-      const needed = Math.max(0,...project.clips.filter(c=>c.mediaId===itemId).map(c=>c.in+c.duration));
-      if (decoded.duration + .02 < needed) throw new Error(file.name + " is shorter than the source used on this timeline.");
+      if(project!==sequence) throw Error('The active sequence changed during import. Import again in the intended sequence.');
       snapshot();
-      item.duration=decoded.duration; item.src=decoded.src; item.offline=false;
-      item.path=file.name;
-      await SpliceMedia.remember(item,file);
-      activeVideoId=null; syncMedia(true); notify();
+      for(const row of rows){
+        const existing=project.media.find(m=>m.id===row.id);
+        if(existing) Object.assign(existing,row); else project.media.push(row);
+      }
+      activeVideoId=null;syncMedia(true);notify();
+    },
+    async relinkMediaItem(itemId,file) {
+      const original=project.media.find(m=>m.id===itemId);
+      if(!original) throw Error('Media item is unavailable.');
+      const decoded=await fileToMedia(file);
+      checkReplacement(original,decoded);
+      const item={...original,...decoded,id:itemId,path:original.path||file.name};
+      await SpliceMedia.remember(item);
+      if(!project.media.includes(original)) throw Error('The active media changed during relink.');
+      snapshot();Object.assign(original,item);activeVideoId=null;syncMedia(true);notify();
     },
     async relinkMedia(files) {
-      const matches = Array.from(files).filter((file) =>
-        project.media.some((item) => SpliceMedia.matches(item, file)),
-      );
-      for (const file of matches) {
-        const count=project.media.filter(item=>SpliceMedia.matches(item,file)).length;
-        if(count!==1) throw new Error("Choose a file for each offline media item individually.");
-      }
-      if (!matches.length)
-        throw new Error(
-          "None of the selected files match the offline media names.",
-        );
-      return Editor.addMedia(matches);
+      const matched=Array.from(files).filter(f=>project.media.some(m=>SpliceMedia.matches(m,f)));
+      if(!matched.length) throw Error('No selected files match the offline sources.');
+      await Editor.addMedia(matched);
     },
     addToTimeline(id) {
       const item = project.media.find((m) => m.id === id);
       if (!item) return;
-      snapshot();
       const start =
         item.type === "audio"
           ? time
@@ -699,6 +744,8 @@
         volume: 100,
         transition: "none",
       };
+      ensureEditable(clip);
+      snapshot();
       project.clips.push(clip);
       selectedId = clip.id;
       project.duration = duration();
@@ -707,11 +754,14 @@
     updateClip(id, patch) {
       const clip = project.clips.find((c) => c.id === id);
       if (!clip) return;
+      ensureEditable(clip, "track" in patch ? Number(patch.track) : clip.track);
       const item = mediaOf(clip);
       const requestedIn = "in" in patch ? Number(patch.in) : clip.in;
       const requestedDuration = "duration" in patch ? Number(patch.duration) : clip.duration;
+      const requestedSpeed = "speed" in patch ? Number(patch.speed) : Number(clip.speed)||1;
       if (!Number.isFinite(requestedIn) || requestedIn < 0 || !Number.isFinite(requestedDuration) || requestedDuration <= 0 ||
-          (item?.duration && requestedIn + requestedDuration > item.duration + .01)) {
+          !Number.isFinite(requestedSpeed) || requestedSpeed < .1 || requestedSpeed > 16 ||
+          (item?.duration && requestedIn + requestedDuration*requestedSpeed > item.duration + .01)) {
         throw new Error("Clip extends beyond available source footage.");
       }
       if (Object.entries(patch).every(([key,value]) => JSON.stringify(clip[key])===JSON.stringify(value))) return;
@@ -728,33 +778,49 @@
     trimEdge(id, edge, atTime, { ripple = false } = {}) {
       const clip = project.clips.find(c => c.id === id);
       if (!clip) return;
+      ensureEditable(clip);
       const oldStart = clip.start, oldEnd = oldStart + clip.duration;
       const boundary = snap(atTime);
-      const newStart = edge === "start" ? clamp(boundary, Math.max(0, oldStart - clip.in), oldEnd - 1/project.fps) : oldStart;
+      const speed=Number(clip.speed)||1;
       const mediaItem = mediaOf(clip);
       const sourceEnd = mediaItem?.duration || Infinity;
-      const newEnd = edge === "end" ? clamp(boundary, oldStart + 1/project.fps, oldStart + sourceEnd - clip.in) : oldEnd;
+      const earliest=clip.reverse ? oldStart-(sourceEnd-clip.in-clip.duration*speed)/speed : oldStart-clip.in/speed;
+      const latest=clip.reverse ? oldEnd+clip.in/speed : oldStart+(sourceEnd-clip.in)/speed;
+      const newStart = edge === "start" ? clamp(boundary, Math.max(0, earliest), oldEnd - 1/project.fps) : oldStart;
+      const newEnd = edge === "end" ? clamp(boundary, oldStart + 1/project.fps, latest) : oldEnd;
       const shift = (edge === "start" ? newStart - oldStart : newEnd - oldEnd);
       if (!shift) return;
       snapshot();
-      if (edge === "start") { clip.start = newStart; clip.in += shift; clip.duration = oldEnd - newStart; }
-      else clip.duration = newEnd - oldStart;
-      if (ripple) for (const next of project.clips) if (next.id !== id && next.start >= oldEnd - .001) next.start = Math.max(0, snap(next.start + shift));
+      if (edge === "start") { clip.start = newStart; if(!clip.reverse) clip.in += shift*speed; clip.duration = oldEnd - newStart; }
+      else { clip.duration = newEnd - oldStart; if(clip.reverse) clip.in -= shift*speed; }
+      if (ripple) for (const next of project.clips)
+        if (next.id !== id && next.start >= oldEnd - .001 && !trackLocked(next.type, next.track) && syncLocked(next.type, next.track))
+          next.start = Math.max(0, snap(next.start + shift));
       project.duration = duration(); syncMedia(true); notify();
     },
     rollEdit(leftId, rightId, boundary) {
       const left = project.clips.find(c => c.id === leftId), right = project.clips.find(c => c.id === rightId);
       if (!left || !right || left.type !== right.type || left.track !== right.track || Math.abs(left.start + left.duration - right.start) > .05) return;
-      const end = right.start + right.duration, source = mediaOf(left)?.duration || Infinity;
-      const cut = clamp(snap(boundary), Math.max(left.start+1/project.fps,right.start-right.in), Math.min(end-1/project.fps,left.start+source-left.in));
+      ensureEditable(left); ensureEditable(right);
+      const end = right.start + right.duration, leftSource = mediaOf(left)?.duration || Infinity, rightSource=mediaOf(right)?.duration||Infinity;
+      const leftSpeed=Number(left.speed)||1,rightSpeed=Number(right.speed)||1;
+      const rightEarliest=right.reverse ? right.start-(rightSource-right.in-right.duration*rightSpeed)/rightSpeed : right.start-right.in/rightSpeed;
+      const leftLatest=left.reverse ? right.start+left.in/leftSpeed : left.start+(leftSource-left.in)/leftSpeed;
+      const cut = clamp(snap(boundary), Math.max(left.start+1/project.fps,rightEarliest), Math.min(end-1/project.fps,leftLatest));
       if (!Number.isFinite(cut) || cut === right.start) return;
-      snapshot(); left.duration = cut-left.start; right.in += cut-right.start; right.duration = end-cut; right.start=cut;
+      snapshot();
+      const shift=cut-right.start;
+      left.duration = cut-left.start;
+      if(left.reverse) left.in-=shift*leftSpeed;
+      if(!right.reverse) right.in+=shift*rightSpeed;
+      right.duration = end-cut; right.start=cut;
       syncMedia(true); notify();
     },
     slipClip(id, delta) {
       const clip = project.clips.find(c => c.id === id), source = clip && mediaOf(clip)?.duration;
       if (!clip || !source) return;
-      const next = clamp(snap(clip.in+delta),0,Math.max(0,source-clip.duration));
+      ensureEditable(clip);
+      const next = clamp(snap(clip.in+delta),0,Math.max(0,source-clip.duration*(Number(clip.speed)||1)));
       if (next === clip.in) return;
       snapshot(); clip.in=next; syncMedia(true); notify();
     },
@@ -763,24 +829,28 @@
       const cut = snap(time);
       if (!clip || cut <= clip.start || cut >= clip.start + clip.duration)
         return;
+      ensureEditable(clip);
       snapshot();
       const length = cut - clip.start;
+      const originalIn=Number(clip.in)||0, originalDuration=clip.duration, speed=Number(clip.speed)||1;
       const right = {
         ...structuredClone(clip),
         id: uid(),
         start: cut,
-        in: (clip.in || 0) + length,
+        in: clip.reverse ? originalIn : originalIn + length*speed,
         duration: clip.duration - length,
       };
       delete right.premiereIndex;
       project.clips.push(right);
       clip.duration = length;
+      if(clip.reverse) clip.in=originalIn+(originalDuration-length)*speed;
       time = cut;
       notify();
     },
     deleteSelected() {
       const index = project.clips.findIndex((c) => c.id === selectedId);
       if (index < 0) return;
+      ensureEditable(project.clips[index]);
       snapshot();
       project.clips.splice(index, 1);
       selectedId = project.clips[0]?.id || null;
@@ -792,6 +862,7 @@
       Editor.updateClip(id, { start, track });
     },
     addTitle() {
+      if (trackLocked("title", 4)) throw new Error("Unlock the title track before editing.");
       snapshot();
       const clip = {
         id: uid(),
@@ -823,6 +894,8 @@
       future.push(structuredClone(project));
       project = history.pop();
       revision += 1;
+      time=clamp(time,0,duration());
+      if (!project.clips.some(c=>c.id===selectedId)) selectedId=project.clips[0]?.id||null;
       syncMedia(true);
       notify();
     },
@@ -831,6 +904,8 @@
       history.push(structuredClone(project));
       project = future.pop();
       revision += 1;
+      time=clamp(time,0,duration());
+      if (!project.clips.some(c=>c.id===selectedId)) selectedId=project.clips[0]?.id||null;
       syncMedia(true);
       notify();
     },
@@ -839,7 +914,7 @@
       const width=Number(settings.width||1920), height=Number(settings.height||1080), fps=Number(settings.fps||25);
       if (!name || !Number.isInteger(width) || !Number.isInteger(height) || width<16 || height<16 || width>3840 || height>2160 ||
           !Number.isFinite(fps) || fps<1 || fps>60) throw new Error("Invalid sequence settings.");
-      snapshot();
+      history=[];future=[];gesture=false;gestureBefore=null;revision++;
       project = {
         name,
         width,
@@ -871,7 +946,7 @@
       } else imported = JSON.parse(await file.text());
       validateProject(imported);
       if (window.SpliceMedia) await window.SpliceMedia.restore(imported);
-      snapshot();
+      history=[];future=[];gesture=false;gestureBefore=null;revision++;
       project = imported;
       selectedId = project.clips[0]?.id || null;
       time = 0;
@@ -911,6 +986,7 @@
         ? await window.SpliceMedia.forPremiere(project)
         : structuredClone(project);
       if (signal?.aborted) throw signal.reason || new DOMException("Export cancelled", "AbortError");
+      delete prepared.premiereOriginal; delete prepared.premiereManaged;
       prepared.renderOptions = { mutedTracks };
       const response = await fetch("/api/exports", {
         method: "POST",
@@ -946,12 +1022,14 @@
           if (job.state === "cancelled") throw new Error("Export cancelled.");
           if (job.state === "complete") {
             const safe = (project.name || "Untitled").replace(/[^a-z0-9_-]+/gi, "-").replace(/^-+|-+$/g, "") || "Untitled";
-            const downloadURL = endpoint + "/file?name=" + encodeURIComponent(safe + ".mp4");
+            const extension = ["mp4","mov","wav"].includes(job.extension) ? job.extension : "mp4";
+            const downloadURL = endpoint + "/file?name=" + encodeURIComponent(safe + "." + extension);
             const anchor = document.createElement("a");
             anchor.href = downloadURL;
-            anchor.download = safe + ".mp4";
+            anchor.download = safe + "." + extension;
             anchor.click();
-            return { id, url: endpoint + "/preview", downloadURL };
+            return { id, url: job.previewable === false ? null : endpoint + "/preview", downloadURL,
+              extension, mime: job.mime, previewable: job.previewable !== false };
           }
         }
       } catch (error) {

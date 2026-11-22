@@ -71,19 +71,43 @@ window.SpliceMedia = (() => {
     if (!localMedia(src) && !bundled(src)) return false;
     return (await fetch(src,{method:'HEAD',cache:'no-store',signal:AbortSignal.timeout(15000)})).ok;
   }
-  async function remember(item, file) {
-    item.path ||= file.name;
-    const serverSrc = await upload(file);
-    await put({id:key(item),path:item.path,serverSrc});
-    if (item.src?.startsWith('blob:')) URL.revokeObjectURL(item.src);
-    item.src=serverSrc;
-    item.offline=false;
-    return item;
+  async function probe(src) {
+    const response=await fetch('/api/media/info?src='+encodeURIComponent(src),{signal:AbortSignal.timeout(30000)});
+    const data=await response.json();
+    if(!response.ok) throw Error(data.error||'Could not inspect the original source');
+    return data;
+  }
+  async function makeProxy(src) {
+    const response=await fetch('/api/media/proxy',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({src}),signal:AbortSignal.timeout(3650000)});
+    const data=await response.json();
+    if(!response.ok || !localMedia(data.src)) throw Error(data.error||'Could not create edit proxy');
+    return data.src;
+  }
+  async function importFile(file) {
+    const originalSrc=await upload(file);
+    const info=await probe(originalSrc);
+    const src=info.proxyRecommended?await makeProxy(originalSrc):originalSrc;
+    return {...info,src,originalSrc,name:file.name,path:file.name,offline:false};
+  }
+  async function remember(item) {
+    await put({id:key(item),path:item.path,serverSrc:item.originalSrc,previewSrc:item.src});
   }
   async function restore(project) {
     const db = await open();
     for (const item of project.media) {
+      if (Number.isInteger(item.nestedSequence)) {
+        if(item.nestedProject) await restore(item.nestedProject);
+        continue;
+      }
       if ((bundled(item.src) || localMedia(item.src)) && await exists(item.src)) {
+        if (!item.originalSrc && localMedia(item.src)) {
+          const original=item.src, metadata=await probe(original);
+          if(metadata.proxyRecommended) {
+            item.src=await makeProxy(original);
+            Object.assign(item,metadata,{originalSrc:original});
+          }
+        }
         item.offline = false;
         continue;
       }
@@ -106,7 +130,11 @@ window.SpliceMedia = (() => {
         }
       }
       if (record?.serverSrc && await exists(record.serverSrc)) {
-        item.src=record.serverSrc; item.storageKey=record.id; item.offline=false;
+        item.originalSrc=record.serverSrc;
+        item.src=record.previewSrc && await exists(record.previewSrc) ? record.previewSrc : record.serverSrc;
+        if(item.src===record.serverSrc && (await probe(record.serverSrc)).proxyRecommended)
+          item.src=await makeProxy(record.serverSrc);
+        item.storageKey=record.id; item.offline=false;
       } else if (record?.file) {
         if (!urls.has(record.id))
           urls.set(record.id, URL.createObjectURL(record.file));
@@ -124,6 +152,9 @@ window.SpliceMedia = (() => {
     const copy = structuredClone(project);
     const db = await open();
     for (const item of copy.media) {
+      delete item.thumb;
+      if(Number.isInteger(item.nestedSequence)) {if(item.nestedProject) item.nestedProject=await forPremiere(item.nestedProject);continue;}
+      if(item.originalSrc && localMedia(item.originalSrc)) {item.src=item.originalSrc;continue;}
       if (!item.src || bundled(item.src) || localMedia(item.src)) continue;
       const record = await read(
         db
@@ -154,5 +185,5 @@ window.SpliceMedia = (() => {
     }
     return copy;
   }
-  return { remember, restore, matches, forPremiere };
+  return { importFile, remember, restore, matches, forPremiere };
 })();

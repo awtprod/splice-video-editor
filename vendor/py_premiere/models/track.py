@@ -577,6 +577,7 @@ class Track:
         at_start: bool = True,
         duration: Time | None = None,
         name: str | None = None,
+        cut_offset: Time | None = None,
     ) -> Transition:
         """Put a transition on one end of a clip and return it.
 
@@ -622,7 +623,17 @@ class Track:
             start, end, offset = self._single_sided_span(clip, at_start, duration)
         else:
             outgoing, incoming = (neighbour, clip) if at_start else (clip, neighbour)
-            start, end, offset = self._cut_span(outgoing, incoming, duration)
+            if cut_offset is None:
+                start, end, offset = self._cut_span(outgoing, incoming, duration)
+            else:
+                validate_time(cut_offset)
+                if duration is None or not 0 <= cut_offset.ticks <= duration.ticks:
+                    raise ValueError("transition cut offset must fall within its duration")
+                before = self._frames(cut_offset.ticks)
+                after = self._frames(duration.ticks) - before
+                if before > min(_handle_before(incoming), outgoing.duration.ticks) or after > min(_handle_after(outgoing), incoming.duration.ticks):
+                    raise ValueError("trim the shots to leave more source footage for this transition")
+                start, end, offset = outgoing.end.ticks-before, outgoing.end.ticks+after, before
         core = clip._element.find("ClipTrackItem")
         if core is None:
             raise ValueError("clip has no ClipTrackItem")

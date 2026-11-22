@@ -16,7 +16,7 @@ from py_premiere.models.caption import (
 from py_premiere.models.color import Color
 
 TEMPLATES = Path(__file__).resolve().parent / 'vendor' / 'splice-effects'
-NEUTRAL = {'brightness': 100, 'contrast': 100, 'saturation': 100}
+NEUTRAL = {'brightness': 100, 'contrast': 100, 'saturation': 100, 'temperature': 0, 'tint': 0}
 
 
 def _component(clip, name):
@@ -59,12 +59,41 @@ def _write_graphic_color(payload, slot, color):
     return bytes(with_field)
 
 
+def _read_keys(param, clip, convert=lambda value: value):
+    if param is None or not param.is_time_varying:
+        return []
+    return [{'time': round(key.seconds - clip.start.seconds, 5),
+             'value': round(convert(param.get_value_at_key(key)), 5)} for key in param.keys]
+
+
+def _apply_scalar_keys(param, clip, points, decode=lambda value: value, encode=lambda value: value):
+    if not isinstance(points, list) or not 1 <= len(points) <= 200:
+        raise ValueError('Invalid Premiere keyframe count')
+    prepared=[]
+    for point in points:
+        if not isinstance(point, dict):
+            raise ValueError('Invalid Premiere keyframe')
+        time=float(point.get('time', float('nan')))
+        value=float(point.get('value', float('nan')))
+        if not math.isfinite(time) or not math.isfinite(value) or not 0 <= time <= clip.duration.seconds + .001:
+            raise ValueError('Invalid Premiere keyframe time or value')
+        prepared.append((round(time,5),round(value,5)))
+    if len({time for time,_ in prepared}) != len(prepared):
+        raise ValueError('Duplicate Premiere keyframe time')
+    if _read_keys(param,clip,decode) == [{'time':t,'value':v} for t,v in prepared]:
+        return
+    param.set_keyframes([(Time.from_seconds(clip.start.seconds+t),encode(v),KeyframeInterpolation.LINEAR)
+                         for t,v in prepared])
+
+
 def read(clip):
     lumetri = _component(clip, 'AE.ADBE Lumetri')
     volume = next((c for c in clip.components if c.match_name.startswith('Internal Volume')), None)
     color = {'brightness': round(100 * 2 ** _value(lumetri, 'Exposure', 0), 5),
              'contrast': 100 + _value(lumetri, 'Contrast', 0),
-             'saturation': _value(lumetri, 'Saturation', 100)}
+             'saturation': _value(lumetri, 'Saturation', 100),
+             'temperature': _value(lumetri, 'Temperature', 0),
+             'tint': _value(lumetri, 'Tint', 0)}
     return color, round(100 * _value(volume, 'Level', 1), 5)
 
 
@@ -72,6 +101,14 @@ def _attach(clip, name):
     # These isolated component templates come from py-premiere's Adobe-saved
     # fixtures. Allocate new IDs for every parameter and all internal edges.
     template = ET.fromstring(gzip.decompress((TEMPLATES / (name + '.xml.gz')).read_bytes()))
+    if name == 'opacity':
+        # The Adobe fixture is animated. An attached default intrinsic starts
+        # static so both a plain opacity value and new keyframes can be set.
+        for obj in template:
+            if obj.findtext('Name') == 'Opacity':
+                for tag in ('Keyframes','IsTimeVarying'):
+                    field=obj.find(tag)
+                    if field is not None: obj.remove(field)
     doc = clip.track.sequence.project._document
     chain = doc.resolve(clip._element.find('ClipTrackItem/ComponentOwner/Components'))
     core = chain.find('ComponentChain')
@@ -84,6 +121,11 @@ def _attach(clip, name):
                 for e in doc.resolve(ref).findall('.//Component/ID') if (e.text or '').isdigit()]
     if name == 'motion':
         for tag in ('DefaultMotionComponentID', 'DefaultMotion'):
+            flag = chain.find(tag)
+            if flag is not None:
+                chain.remove(flag)
+    if name == 'opacity':
+        for tag in ('DefaultOpacityComponentID', 'DefaultOpacity'):
             flag = chain.find(tag)
             if flag is not None:
                 chain.remove(flag)
@@ -102,7 +144,7 @@ def _attach(clip, name):
                 ref.set('ObjectRef', mapping[ref.get('ObjectRef')])
     root_id = mapping[template.get('root')]
     element = doc.by_object_id[root_id]
-    element.find('.//Component/ID').text = '1' if name in ('motion', 'volume') else str(max(existing + [2]) + 1)
+    element.find('.//Component/ID').text = {'motion':'1','opacity':'2','volume':'1'}.get(name,str(max(existing + [2]) + 1))
     ET.SubElement(holder, 'Component', Index=str(len(holder)), ObjectRef=root_id)
     component = Component(element, clip)
     for ref in element.findall('.//Params/Param'):
@@ -114,8 +156,8 @@ def _attach(clip, name):
 def apply(clip, color, volume):
     current, old_volume = read(clip)
     color = {**NEUTRAL, **(color or {})}
-    if color.get('lut') or color.get('temperature', 0) or color.get('tint', 0):
-        raise ValueError('Premiere export cannot preserve this LUT or white balance edit. Save a Splice working copy to keep it.')
+    if color.get('lut'):
+        raise ValueError('Premiere export cannot preserve this 3D LUT. Save a Splice working copy to keep it.')
     exposure = float(color.get('exposure', 0))
     if not math.isfinite(exposure) or not -4 <= exposure <= 4:
         raise ValueError('Invalid exposure')
@@ -129,10 +171,15 @@ def apply(clip, color, volume):
         # Exposure is logarithmic. Contrast and saturation use percentage points.
         values = [('brightness', 'Exposure', math.log2(max(.01, color['brightness']) / 100)),
                   ('contrast', 'Contrast', color['contrast'] - 100),
-                  ('saturation', 'Saturation', color['saturation'])]
+                  ('saturation', 'Saturation', color['saturation']),
+                  ('temperature', 'Temperature', color['temperature']),
+                  ('tint', 'Tint', color['tint'])]
         for key, name, value in values:
             if created or color[key] != current[key]:
-                _parameter(component, name).value = float(value)
+                param = _parameter(component, name)
+                if param.is_time_varying:
+                    raise ValueError('An existing Premiere Lumetri animation needs manual review before replacing it.')
+                param.value = float(value)
     if clip._element.tag == 'AudioClipTrackItem' and abs(volume - old_volume) > .00001:
         component = next((c for c in clip.components if c.match_name.startswith('Internal Volume')), None)
         if component is None:
@@ -176,6 +223,15 @@ def read_extended(clip):
             'scale': _value(motion, 'Scale', 100),
             'rotation': _value(motion, 'Rotation', 0),
         }
+        for key, name in (('scale','Scale'),('rotation','Rotation')):
+            points=_read_keys(_parameter(motion,name),clip)
+            if points: result.setdefault('keyframes',{})[key]=points
+    opacity_component = _component(clip, 'AE.ADBE Opacity')
+    opacity_param = _parameter(opacity_component, 'Opacity')
+    if opacity_param is not None:
+        result['opacity'] = _value(opacity_component, 'Opacity', 100)
+        points=_read_keys(opacity_param,clip)
+        if points: result.setdefault('keyframes',{})['opacity']=points
     volume_component = next((c for c in clip.components if c.match_name.startswith('Internal Volume')), None)
     level = _parameter(volume_component, 'Level')
     if level is not None and level.is_time_varying:
@@ -187,20 +243,39 @@ def read_extended(clip):
                 result['volume'] = round(100 * max(value for _, value in keys), 4)
                 result['fadeIn'] = round(keys[1][0] - start, 4) if first[1] == 0 and len(keys) > 2 else 0
                 result['fadeOut'] = round(end - keys[-2][0], 4) if last[1] == 0 and len(keys) > 2 else 0
+                if result['fadeIn'] or result['fadeOut']:
+                    return result
+        result['keyframes'] = {**result.get('keyframes',{}), 'volume':_read_keys(level,clip,lambda value:value*100)}
+        result['volume'] = round(100 * max(value for _,value in keys),4)
     return result
 
 
 def apply_extended(clip, item):
     """Write supported static effects and reject values that would be lost."""
+    automation = item.get('keyframes') or {}
+    if not isinstance(automation, dict):
+        raise ValueError('Invalid transform keyframes')
+    if any(automation.get(key) for key in ('x','y')):
+        raise ValueError('Premiere export cannot preserve animated position yet. Save a Splice working copy to keep it.')
     style = item.get('titleStyle') or {}
+    if style.get('align', 'center') != 'center':
+        raise ValueError('Premiere export cannot preserve left or right title alignment yet. Save a Splice working copy to keep it.')
     text_component = _component(clip, 'AE.ADBE Text')
     if text_component is not None:
         pos = _parameter(text_component, 'Position')
         if pos is not None and ('x' in style or 'y' in style):
-            pos.value = [float(style.get('x', 50)) / 100, float(style.get('y', 50)) / 100]
+            wanted = [float(style.get('x', 50)) / 100, float(style.get('y', 50)) / 100]
+            if not isinstance(pos.value, list) or any(abs(a-b) > .00001 for a,b in zip(wanted,pos.value)):
+                if pos.is_time_varying:
+                    raise ValueError('An existing Premiere title position animation needs manual review before replacing it.')
+                pos.value = wanted
         size = _parameter(text_component, 'Scale')
         if size is not None and 'fontSize' in style:
-            size.value = float(style['fontSize']) / .08
+            wanted = float(style['fontSize']) / .08
+            if abs(wanted - float(size.value or 0)) > .0001:
+                if size.is_time_varying:
+                    raise ValueError('An existing Premiere title size animation needs manual review before replacing it.')
+                size.value = wanted
         source = _parameter(text_component, 'Source Text')
         if source is not None and style.get('fontFamily'):
             source.font_family = style['fontFamily']
@@ -231,19 +306,58 @@ def apply_extended(clip, item):
     if transform:
         motion = _component(clip, 'AE.ADBE Motion')
         neutral = {'x': 0, 'y': 0, 'scale': 100, 'rotation': 0}
-        if motion is None and any(float(transform.get(key, default)) != default for key, default in neutral.items()):
+        if motion is None and (any(float(transform.get(key, default)) != default for key, default in neutral.items()) or
+                               any(automation.get(key) for key in ('scale','rotation'))):
             motion = _attach(clip, 'motion')
         if motion is not None:
             position = _parameter(motion, 'Position')
             if position is not None and ('x' in transform or 'y' in transform):
-                position.value = [.5 + float(transform.get('x', 0)) / 100, .5 + float(transform.get('y', 0)) / 100]
+                wanted = [.5 + float(transform.get('x', 0)) / 100, .5 + float(transform.get('y', 0)) / 100]
+                if not isinstance(position.value, list) or any(abs(a-b) > .00001 for a,b in zip(wanted,position.value)):
+                    if position.is_time_varying:
+                        raise ValueError('An existing Premiere Motion animation needs manual review before replacing it.')
+                    position.value = wanted
             for key, name in (('scale', 'Scale'), ('rotation', 'Rotation')):
                 value = _parameter(motion, name)
                 if value is not None and key in transform:
-                    value.value = float(transform[key])
+                    wanted = float(transform[key])
+                    if abs(wanted - float(value.value or 0)) > .0001:
+                        if value.is_time_varying:
+                            raise ValueError('An existing Premiere Motion animation needs manual review before replacing it.')
+                        value.value = wanted
+    for key,name in (('scale','Scale'),('rotation','Rotation')):
+        if automation.get(key):
+            motion = _component(clip, 'AE.ADBE Motion') or _attach(clip,'motion')
+            param=_parameter(motion,name)
+            base=float(transform.get(key,100 if key=='scale' else 0))
+            if not param.is_time_varying and abs(float(param.value or 0)-base)>.0001:
+                param.value=base
+            _apply_scalar_keys(param,clip,automation[key])
+    opacity = float(item.get('opacity',100))
+    if not math.isfinite(opacity) or not 0 <= opacity <= 100:
+        raise ValueError('Invalid clip opacity')
+    if automation.get('opacity') or opacity != 100:
+        component = _component(clip,'AE.ADBE Opacity') or _attach(clip,'opacity')
+        param = _parameter(component,'Opacity')
+        if automation.get('opacity'):
+            if not param.is_time_varying and abs(float(param.value or 0)-opacity)>.0001:
+                param.value=opacity
+            _apply_scalar_keys(param,clip,automation['opacity'])
+        elif abs(float(param.value or 0)-opacity)>.0001:
+            if param.is_time_varying:
+                raise ValueError('An existing Premiere opacity animation needs manual review before replacing it.')
+            param.value=opacity
     if item.get('pan', 0):
         raise ValueError('Premiere export cannot preserve audio pan yet. Save a Splice working copy to keep this edit.')
     fade_in, fade_out = float(item.get('fadeIn', 0)), float(item.get('fadeOut', 0))
+    if automation.get('volume'):
+        if fade_in or fade_out:
+            raise ValueError('Premiere export cannot combine audio gain keyframes with clip fades. Save a Splice working copy to keep both.')
+        if clip._element.tag != 'AudioClipTrackItem':
+            raise ValueError('Premiere export cannot preserve camera sound gain keyframes on a video-only clip.')
+        component = next((c for c in clip.components if c.match_name.startswith('Internal Volume')), None) or _attach(clip,'volume')
+        _apply_scalar_keys(_parameter(component,'Level'),clip,automation['volume'],
+                           decode=lambda value:value*100,encode=lambda value:value/100)
     if fade_in or fade_out:
         if clip._element.tag != 'AudioClipTrackItem':
             raise ValueError('Premiere export cannot preserve camera sound fades on a video-only clip.')

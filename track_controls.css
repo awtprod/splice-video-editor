@@ -1,0 +1,10 @@
+.track-heads { width: 188px; }
+.track-head { padding: 0 8px; gap: 6px; }
+.track-name { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.track-controls { display: flex; gap: 2px; flex: none; }
+.track-controls button { width: 24px; height: 28px; padding: 0; border: 1px solid transparent; border-radius: 4px; background: transparent; color: #b1bfab; font-size: 12px; cursor: pointer; }
+.track-controls button:hover, .track-controls button:focus-visible { background: #344033; border-color: #607356; }
+.track-controls button.active { color: #d1f6a3; background: #394e2d; }
+.track-head.is-locked { background: #242a22; }
+.track-lane.is-locked { background-image: repeating-linear-gradient(135deg, transparent 0 12px, #ffffff05 12px 13px); }
+@media (max-width: 1050px) { .track-heads { width: 164px; } .track-icon { display: none; } .track-controls button { width: 22px; } }

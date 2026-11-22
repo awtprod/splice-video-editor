@@ -36,14 +36,17 @@
     show('');
     if (markOut-markIn < 1/fps) return show('Mark a range at least one frame long.');
     const track=Number(dialog.querySelector('.source-track').value);
+    if (Editor.isTrackLocked(track, media.type)) return show(`Unlock ${media.type} track ${Math.abs(track)} before editing.`);
     const state=Editor.get(), time=mode==='append' ? Math.max(0,...state.project.clips.filter(c=>c.type===media.type && c.track===track).map(c=>c.start+c.duration)) : state.time;
     const start=snap(time), length=snap(markOut-markIn), end=start+length;
     if (typeof Editor.editProject !== 'function') return show('Timeline edit service is unavailable.');
     const clip=newClip(start,track);
-    Editor.editProject(project => {
+    try { Editor.editProject(project => {
       const additions=[];
       if (mode==='insert') {
         for (const existing of project.clips) {
+          if (Editor.isTrackLocked(existing.track, existing.type)) continue;
+          if ((existing.track !== track || existing.type !== media.type) && !Editor.isTrackSyncLocked(existing.track, existing.type)) continue;
           if (existing.start >= start-1e-5) existing.start+=length;
           else if (existing.start+existing.duration > start+1e-5) {
             const right=cutAt(existing,start);
@@ -67,7 +70,7 @@
       }
       project.clips.push(...additions,clip);
       project.duration=Math.max(0,...project.clips.map(item=>item.start+item.duration));
-    });
+    }); } catch (error) { return show(error.message); }
     Editor.select(clip.id);
     close();
   }
@@ -84,14 +87,26 @@
   }
   function open(id) {
     close();
-    media=Editor.get().project.media.find(item=>item.id===id);
-    if(!media) throw new Error('Media is unavailable.');
-    if(!media.src || media.offline) throw new Error('Relink '+media.name+' before opening it.');
+    const item=Editor.get().project.media.find(entry=>entry.id===id);
+    if(!item){window.alert('Media is unavailable.');return;}
+    if(!item.src || item.offline){window.alert('Relink '+item.name+' before opening it.');return;}
+    media={...item};
     fps=Editor.get().project.fps || 25;
+    const state=Editor.get().project;
+    const trackCount=Math.min(64,Math.max(state.trackCounts?.[media.type] || 3,
+      ...state.clips.filter(clip=>clip.type===media.type).map(clip=>Math.abs(clip.track)),2)+1);
     markIn=0;markOut=media.duration;
     dialog=document.createElement('dialog');dialog.className='source-dialog';
-    dialog.innerHTML=`<div class="source-head"><div><small>SOURCE MONITOR</small><strong>${esc(media.name)}</strong></div><button class="source-close" aria-label="Close source monitor">×</button></div><div class="source-stage"><${media.type==='audio'?'audio':'video'} controls playsinline preload="auto"></${media.type==='audio'?'audio':'video'}></div><div class="source-controls"><input class="source-scrub" type="range" min="0" max="${media.duration}" step="${1/fps}" value="0" aria-label="Source playhead"><span class="source-time"></span><div class="source-buttons"><button data-action="back">−1 frame</button><button data-action="play">Play / Pause</button><button data-action="forward">+1 frame</button><button data-action="in">Mark In (I)</button><button data-action="out">Mark Out (O)</button></div><span class="source-range"></span><label class="source-bin">Bin path <input type="text" value="${esc(media.bin || '')}" placeholder="e.g. Interview / Camera A" aria-label="Media bin path"></label><label class="source-track-label">Timeline track <select class="source-track">${(media.type==='video'?[1,2,3]:[-1,-2,-3]).map(n=>`<option value="${n}">${media.type==='video'?'Video':'Audio'} ${Math.abs(n)}</option>`).join('')}</select></label><div class="source-actions"><button data-action="append">Append</button><button data-action="overwrite">Overwrite</button><button class="source-primary" data-action="insert">Insert at playhead</button></div><p class="source-status" role="status"></p></div>`;
+    dialog.innerHTML=`<div class="source-head"><div><small>SOURCE MONITOR</small><strong>${esc(media.name)}</strong></div><button class="source-close" aria-label="Close source monitor">×</button></div><div class="source-stage"><${media.type==='audio'?'audio':'video'} controls playsinline preload="auto"></${media.type==='audio'?'audio':'video'}></div><div class="source-controls"><input class="source-scrub" type="range" min="0" max="${media.duration}" step="${1/fps}" value="0" aria-label="Source playhead"><span class="source-time"></span><div class="source-buttons"><button data-action="back">−1 frame</button><button data-action="play">Play / Pause</button><button data-action="forward">+1 frame</button><button data-action="in">Mark In (I)</button><button data-action="out">Mark Out (O)</button></div><span class="source-range"></span><label class="source-bin">Bin path <input type="text" value="${esc(media.bin || '')}" placeholder="e.g. Interview / Camera A" aria-label="Media bin path"></label><label class="source-track-label">Timeline track <select class="source-track">${Array.from({length:trackCount},(_,i)=>media.type==='video'?i+1:-i-1).map(n=>`<option value="${n}">${media.type==='video'?'Video':'Audio'} ${Math.abs(n)}</option>`).join('')}</select></label><div class="source-actions"><button data-action="append">Append</button><button data-action="overwrite">Overwrite</button><button class="source-primary" data-action="insert">Insert at playhead</button></div><p class="source-status" role="status"></p></div>`;
     document.body.append(dialog);player=dialog.querySelector('video,audio');player.src=media.src;player.onerror=()=>show('The source file could not be decoded.');player.onended=()=>player.pause();
+    player.onloadedmetadata=()=>{
+      if(!dialog?.open)return;
+      if(Number.isFinite(player.duration)&&player.duration>0){
+        const old=media.duration;
+        media.duration=player.duration;
+        if(!Number.isFinite(old)||old<=0||markOut>media.duration) markOut=media.duration;
+      }
+    };
     dialog.querySelector('.source-close').onclick=close;
     dialog.querySelector('.source-scrub').oninput=event=>{player.pause();player.currentTime=Number(event.target.value);};
     dialog.querySelector('.source-bin input').onchange=event=>{
