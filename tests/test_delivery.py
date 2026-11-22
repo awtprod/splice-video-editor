@@ -94,6 +94,21 @@ class MovieDelivery(unittest.TestCase):
         self.assertAlmostEqual(statistics.mean(coords),320,delta=6)
         self.assertLess(max(self.frame(1.0)),16)
 
+    def test_growing_rotated_clip_keeps_picture_at_the_edges(self):
+        self.project['media']=[dict(id='still',src='/assets/ridge.jpg')]
+        self.project['clips']=[self.clip('still','still',0,1.2,keyframes={
+            'scale':[{'time':0,'value':40},{'time':1.2,'value':100}],
+            'rotation':[{'time':0,'value':0},{'time':1.2,'value':8}],
+        })]
+        render_to_file(self.project,self.destination)
+        def visible_width(time):
+            frame = self.frame(time)
+            columns = [pixel % 160 for pixel in range(160*90)
+                       if max(frame[pixel*3:pixel*3+3]) > 35]
+            return max(columns) - min(columns)
+        self.assertLess(visible_width(0),70)
+        self.assertGreater(visible_width(1.16),140)
+
     def test_export_pan_routes_both_stereo_channels(self):
         from array import array
         from premiere import MEDIA_ROOT

@@ -59,11 +59,20 @@ async function main() {
       Editor.select(audio[1].id);Editor.seek(31);Editor.split();
       const outgoing=Editor.get().project.clips.find(c=>c.id===audio[1].id);
       const incoming=Editor.get().project.clips.find(c=>c.type==='audio'&&c.start===31);
+      Editor.editProject(project=>project.clips.push(
+        {id:'lead-source',type:'audio',track:-2,mediaId:'score',start:0,duration:4,in:0},
+        {id:'lead-effect',type:'audio',track:-2,mediaId:'score',start:4,duration:4,in:1,
+          transition:'dissolve',transitionDuration:1,transitionBefore:.5}));
+      Editor.select('lead-source'); Editor.seek(3.8);
+      let leadBlocked=false;
+      try { Editor.split(); } catch(error) { leadBlocked=error.message.includes('following transition'); }
       return {transitions:video.map(c=>c.transition),fades,
         splitGain:[outgoing.keyframes.volume.at(-1).value,
-          incoming.keyframes.volume[0].value,incoming.keyframes.volume.at(-1).value]};
+          incoming.keyframes.volume[0].value,incoming.keyframes.volume.at(-1).value],
+        leadBlocked,leadClipCount:Editor.get().project.clips.filter(c=>c.track===-2).length};
     });
-    assert.deepEqual(split,{transitions:['dissolve','none'],fades:[0,2],splitGain:[27.5,27.5,0]});
+    assert.deepEqual(split,{transitions:['dissolve','none'],fades:[0,2],splitGain:[27.5,27.5,0],
+      leadBlocked:true,leadClipCount:2});
     const cameraOriginal=path.join(temp,'camera-original.mov');
     execFileSync('ffmpeg',['-nostdin','-v','error','-threads','1','-i',path.join(root,'assets/ridge.mp4'),
       '-t','4','-vf','scale=320:180','-c:v','prores_ks','-profile:v','2','-threads','1','-an',cameraOriginal]);

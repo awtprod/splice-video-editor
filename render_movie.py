@@ -108,12 +108,26 @@ def _transform(clip, width, height, local_offset=0):
     x_expr=_keyframe_expr(clip,'x',x*100,-100,100,f'(t-{float(clip["start"]):.6f})')
     y_expr=_keyframe_expr(clip,'y',y*100,-100,100,f'(t-{float(clip["start"]):.6f})')
     angle_expr=_keyframe_expr(clip,'rotation',angle,-180,180,local_clock)
-    if clip.get('keyframes',{}).get('scale'):
+    scale_keys = (clip.get('keyframes') or {}).get('scale')
+    angle_keys = (clip.get('keyframes') or {}).get('rotation')
+    if scale_keys:
         filters=f",scale=w='trunc(iw*({scale_expr})/200)*2':h='trunc(ih*({scale_expr})/200)*2':eval=frame"
     else:
         filters=f',scale=trunc(iw*{scale:.5f}/2)*2:trunc(ih*{scale:.5f}/2)*2'
-    if angle or clip.get('keyframes',{}).get('rotation'):
-        if clip.get('keyframes',{}).get('rotation'):
+    if angle or angle_keys:
+        # FFmpeg configures rotate's output dimensions from the first input
+        # frame. Reserve space for the largest animated scale up front.
+        if scale_keys:
+            peak = max(float(point['value']) for point in scale_keys)/100
+            if angle_keys:
+                canvas_width = canvas_height = math.hypot(width,height)*peak
+            else:
+                sin, cos = abs(math.sin(math.radians(angle))), abs(math.cos(math.radians(angle)))
+                canvas_width = (width*cos+height*sin)*peak
+                canvas_height = (width*sin+height*cos)*peak
+            out_width, out_height = 2*math.ceil(canvas_width/2), 2*math.ceil(canvas_height/2)
+            filters += f",rotate=a='({angle_expr})*PI/180':ow={out_width}:oh={out_height}:c=none"
+        elif angle_keys:
             filters += f",rotate=a='({angle_expr})*PI/180':ow=hypot(iw\\,ih):oh=ow:c=none"
         else:
             filters += f',rotate={angle:.5f}*PI/180:ow=rotw(iw):oh=roth(ih):c=none'

@@ -502,6 +502,9 @@
     if (['dissolve','wipe','fade'].includes(clip.transition) && offset<transitionLength(clip)-transitionBefore(clip)-1e-6)
       throw new Error('Move the cut outside the transition before splitting this clip.');
     if (clip.transition==='native') throw new Error('Replace the imported transition before splitting this clip.');
+    const following = followingTransition(clip);
+    if (following && cut>following.start-transitionBefore(following)+1e-6)
+      throw new Error('Move the cut outside the start of the following transition.');
     const speed=Number(clip.speed)||1;
     const right={...structuredClone(clip),id:uid(),start:cut,duration:duration-offset,
       in:clip.reverse?clip.in:clip.in+offset*speed,transition:'none'};
