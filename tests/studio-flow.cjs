@@ -138,6 +138,21 @@ async function main() {
       assert.ok(await page.locator('#export-video').isVisible());
       console.log('Linux edit, recovery, Premiere save/reopen and H.264/AAC render passed, run '+pass);
     }
+    // Both visible video layers can carry camera sound in a working project.
+    const av=path.join(temp,'camera-audio.mp4');
+    execFileSync('ffmpeg',['-nostdin','-v','error','-i',path.join(root,'assets/ridge.mp4'),
+      '-f','lavfi','-i','sine=frequency=750:sample_rate=48000','-t','3','-map','0:v:0','-map','1:a:0','-c:v','copy','-c:a','aac',av]);
+    await page.evaluate(()=>SpliceSession.newProject({name:'Layer audio',width:1280,height:720,fps:25}));
+    await page.locator('#media-input').setInputFiles(av);
+    await waitState(()=>Editor.get().project.media.length===1);
+    await page.evaluate(()=>Editor.editProject(project=>{
+      for(const track of [1,2]) project.clips.push({id:'video-'+track,mediaId:project.media[0].id,
+        type:'video',track,start:0,in:0,duration:2,volume:100});
+    }));
+    await click('#play-toggle');
+    await waitState(()=>Editor.get().audioMeters[1]>.02&&Editor.get().audioMeters[2]>.02);
+    await click('#play-toggle');
+    console.log('Both video layers contribute camera audio during overlapping playback.');
     await require('./recovery-flow.cjs')(page,page.context(),url,root);
     assert.deepEqual(errors,[]);
   } finally {

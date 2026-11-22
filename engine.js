@@ -96,29 +96,41 @@
       const analyser=audioContext.createAnalyser();
       analyser.fftSize=256;
       source.connect(gain).connect(pan).connect(analyser).connect(audioContext.destination);
-      route={source,gain,pan,analyser};
+      route={source,gain,pan,analyser,samples:new Float32Array(analyser.fftSize)};
       audioNodes.set(element,route);
     }
     element.volume=1;
     return route;
   }
+  let meterSampleAt=-Infinity, meterValues={};
   function meters() {
-    const result={};
-    for (const clip of project.clips.filter(c=>c.type==='audio')) {
-      const route=audioNodes.get(audioElements.get(clip.id));
-      if (!route) continue;
-      const samples=new Float32Array(route.analyser.fftSize);
-      route.analyser.getFloatTimeDomainData(samples);
-      const peak=Math.max(...samples.map(Math.abs));
-      result[String(clip.track)]=Math.max(result[String(clip.track)]||0,peak);
+    const now=performance.now();
+    if(now-meterSampleAt<100)return meterValues;
+    meterSampleAt=now; meterValues={};
+    const active = new Map([...audioElements,...layerVideos]);
+    if(activeVideoId && video)active.set(activeVideoId,video);
+    for(const clip of project.clips) {
+      const route=audioNodes.get(active.get(clip.id));
+      if(!route)continue;
+      route.analyser.getFloatTimeDomainData(route.samples);
+      let peak=0;
+      for(const sample of route.samples)peak=Math.max(peak,Math.abs(sample));
+      meterValues[clip.track]=Math.max(meterValues[clip.track]||0,peak);
     }
-    return result;
+    return meterValues;
+  }
+  function disconnectAudio(element) {
+    const route=audioNodes.get(element);
+    if(!route)return;
+    route.source.disconnect();route.gain.disconnect();route.pan.disconnect();route.analyser.disconnect();
+    audioNodes.delete(element);
   }
   function setAudio(element,clip) {
     if (!element || !clip) return;
     const route=routeAudio(element);
     const mix=trackSettings(clip.track);
-    route.gain.gain.setTargetAtTime(audibility(clip),audioContext.currentTime,.012);
+    const gain=clip.type==='video' && clip.embeddedAudio===false ? 0 : audibility(clip);
+    route.gain.gain.setTargetAtTime(gain,audioContext.currentTime,.012);
     route.pan.pan.setTargetAtTime(clamp(((Number(clip.pan)||0)+(Number(mix.pan)||0))/100,-1,1),audioContext.currentTime,.012);
   }
   let history = [];
@@ -292,13 +304,31 @@
     const audioClips = project.clips.filter(c=>c.type==='audio' && c.start-transitionBefore(c)<=time &&
       time<c.start+c.duration+(followingTransition(c)?transitionLength(followingTransition(c))-transitionBefore(followingTransition(c)):0));
     const mediaItem = clip && mediaOf(clip);
-    if (clip?.id === preloadClipId && clip.id !== activeVideoId) {
-      const outgoing = video;
-      video = transitionVideo;
-      transitionVideo = outgoing;
-      transitionVideoId = activeVideoId;
-      activeVideoId = clip.id;
-      preloadClipId = null;
+    if (clip && clip.id !== activeVideoId) {
+      const preparedLayer=layerVideos.get(clip.id);
+      const prepared=clip.id===preloadClipId?transitionVideo:preparedLayer;
+      if(prepared){
+        const outgoing=video, outgoingId=activeVideoId;
+        const staysVisible=project.clips.some(c=>c.id===outgoingId && c.start<=time && time<c.start+c.duration);
+        video=prepared;
+        activeVideoId=clip.id;
+        if(preparedLayer)layerVideos.delete(clip.id);
+        if(staysVisible){
+          layerVideos.set(outgoingId,outgoing);
+          if (!preparedLayer) {
+            transitionVideo = null;
+            transitionVideoId = null;
+            preloadClipId = null;
+            ensureElements();
+          }
+        }else{
+          if(preparedLayer){
+            transitionVideo.pause();disconnectAudio(transitionVideo);
+            transitionVideo.removeAttribute('src');transitionVideo.load();transitionVideo.remove();
+          }
+          transitionVideo=outgoing;transitionVideoId=outgoingId;preloadClipId=null;
+        }
+      }
     }
     if (
       clip?.id !== activeVideoId ||
@@ -316,7 +346,7 @@
     if (clip && mediaItem) {
       video.muted=false;
       const target = sourceTime(clip,time);
-      if (forceSeek || Math.abs(video.currentTime - target) > 0.3) {
+      if (forceSeek || Math.abs(video.currentTime - target) > (clip.reverse ? .5/project.fps : .3)) {
         try {
           video.currentTime = target;
         } catch (_) {
@@ -345,7 +375,7 @@
     }
     if (previous) {
       const target = sourceTime(previous,previous.start+previous.duration+time-clip.start);
-      if (forceSeek || Math.abs(transitionVideo.currentTime - target) > .3) {
+      if (forceSeek || Math.abs(transitionVideo.currentTime - target) > (previous.reverse ? .5/project.fps : .3)) {
         try { transitionVideo.currentTime = target; } catch (_) { /* Metadata pending. */ }
       }
       transitionVideo.playbackRate=clamp((Number(previous.speed)||1)*Math.max(.25,Math.abs(playbackRate)),.25,16);
@@ -353,11 +383,13 @@
       else transitionVideo.pause();
       transitionVideo.muted=false;
       setAudio(transitionVideo,previous);
-      if(previous.embeddedAudio===false) audioNodes.get(transitionVideo).gain.gain.value=0;
     } else transitionVideo.pause();
     if (playing && playbackRate > 0 && clip && !previous) {
-      const upcoming = project.clips.find(c => c.type === "video" && c.track === clip.track &&
-        c.start >= time && c.start <= time + 1.5 && c.id !== clip.id);
+      const upcoming = project.clips
+        .filter(c=>c.type==='video' && c.start>=time && c.start<=time+1.5 &&
+          (c.track>clip.track || c.start>=clip.start+clip.duration-1e-6))
+        .sort((a,b)=>a.start-b.start || b.track-a.track)
+        .find(c=>at('video',c.start)?.id===c.id);
       if (upcoming && upcoming.id !== preloadClipId) {
         const next = mediaOf(upcoming);
         if (next?.src) {
@@ -365,8 +397,10 @@
           transitionVideo.muted=true;
           transitionVideo.src = next.src;
           transitionVideo.load();
-          transitionVideo.addEventListener("loadedmetadata", () => {
-            if (preloadClipId === upcoming.id) transitionVideo.currentTime = sourceTime(upcoming,upcoming.start-transitionBefore(upcoming));
+          const decoder = transitionVideo;
+          decoder.addEventListener("loadedmetadata", () => {
+            if (decoder === transitionVideo && preloadClipId === upcoming.id)
+              decoder.currentTime = sourceTime(upcoming,upcoming.start-transitionBefore(upcoming));
           }, { once: true });
           preloadClipId = upcoming.id;
           transitionVideoId = null;
@@ -379,14 +413,13 @@
         if(transitionBefore(upcoming)>0) {
           transitionVideo.muted=false;
           setAudio(transitionVideo,upcoming);
-          if(upcoming.embeddedAudio===false) audioNodes.get(transitionVideo).gain.gain.value=0;
         }
       }
     }
     const visible = project.clips.filter(c=>c.type==='video' && c.start-transitionBefore(c)<=time && time<c.start+c.duration);
     const currentVideoIds=new Set(visible.map(c=>c.id));
     for (const [id,element] of layerVideos) if (!currentVideoIds.has(id) || id===activeVideoId || id===preloadClipId) {
-      element.pause();element.removeAttribute('src');element.load();element.remove();layerVideos.delete(id);
+      element.pause();disconnectAudio(element);element.removeAttribute('src');element.load();element.remove();layerVideos.delete(id);
     }
     for (const layer of visible) {
       if (layer.id===activeVideoId || layer.id===preloadClipId) continue;
@@ -397,17 +430,19 @@
         element=document.createElement('video');element.muted=true;element.playsInline=true;
         element.preload='auto';element.style.display='none';element.src=item.src;document.body.append(element);layerVideos.set(layer.id,element);
       }
+      if (element.getAttribute('src') !== item.src) element.src = item.src;
       const target=sourceTime(layer,time);
-      if(forceSeek||Math.abs(element.currentTime-target)>.3) try{element.currentTime=target}catch(_){}
+      if (forceSeek || Math.abs(element.currentTime-target) > (layer.reverse ? .5/project.fps : .3))
+        element.currentTime = target;
       element.playbackRate=clamp((Number(layer.speed)||1)*Math.max(.25,Math.abs(playbackRate)),.25,16);
       if(playing && playbackRate > 0 && !layer.reverse) element.play().catch(()=>{}); else element.pause();
+      element.muted=false; setAudio(element,layer);
     }
     const currentIds = new Set(audioClips.map((c) => c.id));
     for (const [id, element] of audioElements)
       if (!currentIds.has(id)) {
         element.pause();
-        const route=audioNodes.get(element);
-        if (route) { route.source.disconnect(); route.gain.disconnect(); route.pan.disconnect(); route.analyser.disconnect(); audioNodes.delete(element); }
+        disconnectAudio(element);
         element.removeAttribute("src");
         element.load();
         element.remove();
@@ -439,10 +474,7 @@
       setAudio(element,audioClip);
     }
     audio = audioClips.length ? audioElements.get(audioClips[0].id) : null;
-    if (clip) {
-      setAudio(video,clip);
-      if (clip.embeddedAudio === false) audioNodes.get(video).gain.gain.value=0;
-    }
+    if (clip) setAudio(video,clip);
   }
   function animated(clip,key,base) {
     const points=(clip.keyframes?.[key]||[]).filter(p=>Number.isFinite(p.time)&&Number.isFinite(p.value)).sort((a,b)=>a.time-b.time);
