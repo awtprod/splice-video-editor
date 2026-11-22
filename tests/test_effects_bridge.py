@@ -170,6 +170,22 @@ class NativeMotionAndFade(unittest.TestCase):
             self.assertEqual(effects['keyframes']['volume'],points)
             self.assertEqual(effects['volume'],100)
 
+    def test_overlapping_clip_fades_preserve_peak_in_premiere_project(self):
+        app = py_premiere.new()
+        sequence = app.project.add_sequence('Overlapping fades', '1080p25')
+        item = app.project.import_files(['assets/score.wav'])[0]
+        clip = sequence.audio_tracks[0].add_clip(item, py_premiere.Time.from_seconds(0))
+        clip.end = py_premiere.Time.from_seconds(4)
+        premiere_effects.apply_extended(clip, {'volume':100,'fadeIn':3,'fadeOut':3})
+        with tempfile.TemporaryDirectory() as directory:
+            output = str(Path(directory) / 'overlap.prproj')
+            app.project.save(output)
+            reopened = py_premiere.parse(output).project.sequences[0].audio_tracks[0].clips[0]
+            effects = premiere_effects.read_extended(reopened)
+            self.assertAlmostEqual(effects['volume'],200/3,places=3)
+            self.assertEqual((effects['fadeIn'],effects['fadeOut']),(2,2))
+            premiere_effects.apply_extended(reopened,effects)
+
     def test_adobe_audio_keys_outside_trimmed_source_are_preserved(self):
         fixture = Path(__file__).resolve().parent / 'fixtures' / '63_audio_keyframes.prproj'
         app = py_premiere.parse(str(fixture))

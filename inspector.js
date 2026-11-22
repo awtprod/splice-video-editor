@@ -161,7 +161,10 @@
             editor.updateClip(active.id, group ? {[group]: {...(active[group] || {}), [key]: value}} : {[key]: value});
             if(['align','pan','fadeIn','fadeOut','transition','transitionDuration'].includes(key)) render(editor.get(),element,editor);
           }
-        } catch(error) { window.alert(error.message || 'This clip cannot be changed.'); }
+        } catch(error) {
+          window.alert(error.message || 'This clip cannot be changed.');
+          render(editor.get(),element,editor);
+        }
       });
     }
     const picker = element.querySelector('.splice-lut-input');

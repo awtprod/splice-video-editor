@@ -107,7 +107,26 @@ class MovieDelivery(unittest.TestCase):
                        if max(frame[pixel*3:pixel*3+3]) > 35]
             return max(columns) - min(columns)
         self.assertLess(visible_width(0),70)
-        self.assertGreater(visible_width(1.16),140)
+        # The 3:2 source fits to 134 pixels before rotation in this 16:9 sequence.
+        self.assertGreater(visible_width(1.16),130)
+
+    def test_narrow_upper_picture_preserves_lower_layer_at_edges(self):
+        from premiere import MEDIA_ROOT
+        MEDIA_ROOT.mkdir(parents=True,exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=MEDIA_ROOT) as directory:
+            for color, size in [('red','160x90'),('blue','120x90')]:
+                file=Path(directory)/f'{color}.mp4'
+                subprocess.run(['ffmpeg','-nostdin','-v','error','-f','lavfi','-i',
+                    f'color={color}:s={size}:r=25:d=1','-c:v','libx264','-threads','1',str(file)],
+                    timeout=10,check=True)
+                self.project['media'].append(dict(id=color,src='/media/'+str(file.relative_to(MEDIA_ROOT))))
+            self.project['clips'] = [dict(type='video',mediaId='red',track=1,start=0,duration=1),
+                                     dict(type='video',mediaId='blue',track=2,start=0,duration=1)]
+            render_to_file(self.project,self.destination)
+            frame=self.frame(.4)
+            edge,center=(45*160+5)*3,(45*160+80)*3
+            self.assertGreater(frame[edge],235)
+            self.assertGreater(frame[center+2],235)
 
     def test_export_pan_routes_both_stereo_channels(self):
         from array import array

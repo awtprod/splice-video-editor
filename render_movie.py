@@ -75,6 +75,11 @@ def _css_color_filter(color):
     return f'format=rgb24,lutrgb={brightness_filter},lutrgb={contrast_filter},colorchannelmixer={mixer},lutrgb={grade_filter},format=yuva420p'
 
 
+def _fit_picture(width, height, color, lut):
+    return (f'scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2,'
+            f'{_css_color_filter(color)}{lut},pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black@0')
+
+
 def _run_controlled(command, cancelled, timeout):
     import time
     process=subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -301,7 +306,8 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
             opacity_keys=(clip.get('keyframes') or {}).get('opacity')
             prefix=(f'color=c=black:s={width}x{height}:r={fps}:d={render_length:.6f},setpts=PTS-STARTPTS' if index is None else
                     f'[{index}:v]trim=start={render_source:.6f}:duration={render_length*speed:.6f}{reverse},setpts=(PTS-STARTPTS)/{speed:.6f},fps={fps}')
-            chain = f'{prefix},scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,{_css_color_filter(color)}{lut_filter}{transform},format=yuva420p,colorchannelmixer=aa={1 if opacity_keys else opacity:.6f}'
+            fit = _fit_picture(width,height,color,lut_filter)
+            chain = f'{prefix},{fit}{transform},format=yuva420p,colorchannelmixer=aa={1 if opacity_keys else opacity:.6f}'
             if opacity_keys:
                 opacity_expr=_keyframe_expr(clip,'opacity',opacity*100,0,100,f'(T-{before:.6f})')
                 chain += f",format=yuva444p,geq=lum='p(X,Y)':cb='p(X,Y)':cr='p(X,Y)':a='p(X,Y)*({opacity_expr})/100',format=yuva420p"
@@ -339,7 +345,8 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
                 if tail + 1e-6 >= frame_duration:
                     prior_prefix=(f'color=c=black:s={width}x{height}:r={fps}:d={tail:.6f},setpts=PTS-STARTPTS' if prior_index is None else
                                   f'[{prior_index}:v]trim=start={prior_source:.6f}:duration={tail*prior_speed:.6f}{prior_reverse},setpts=(PTS-STARTPTS)/{prior_speed:.6f},fps={fps}')
-                    filters.append(f'{prior_prefix},scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,{_css_color_filter(prior_color)}{prior_lut}{prior_transform},format=yuva420p,colorchannelmixer=aa={prior_opacity:.6f},setpts=PTS+{start:.6f}/TB[tail{number}]')
+                    prior_fit = _fit_picture(width,height,prior_color,prior_lut)
+                    filters.append(f'{prior_prefix},{prior_fit}{prior_transform},format=yuva420p,colorchannelmixer=aa={prior_opacity:.6f},setpts=PTS+{start:.6f}/TB[tail{number}]')
                     filters.append(f'[{active}][tail{number}]overlay={prior_position}:eof_action=pass:shortest=0[under{number}]')
                     active = f'under{number}'
                 if clip.get('transition') == 'dissolve':
@@ -423,9 +430,10 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
                 while remaining<.5:
                     chain += ',atempo=0.5';remaining*=2
                 chain += f',atempo={remaining:.6f},volume={gain:.4f},{panner}'
+                envelope=[]
                 if volume_keys:
                     volume_expr=_keyframe_expr(clip,'volume',float(clip.get('volume',100)),0,200,f'(t-{before:.6f})')
-                    chain += f",volume='({volume_expr})/100':eval=frame"
+                    envelope.append(f'({volume_expr})/100')
                 if clip.get('transition') in ('dissolve','wipe','fade'):
                     chain += f',afade=t=in:st=0:d={min(float(clip.get("transitionDuration",.5)),render_length):.6f}'
                 next_clip=next((candidate for candidate in clips if candidate is not clip and candidate.get('type')==clip['type'] and candidate.get('track')==clip.get('track') and candidate.get('transition') in ('dissolve','wipe') and abs(float(candidate['start'])-(start+length))<.05),None)
@@ -434,8 +442,13 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
                     next_duration=_number(next_clip.get('transitionDuration',.5),'transition duration',1/float(fps),2)
                     fade_start=before+length-next_before
                     chain += f",volume='if(lt(t,{fade_start:.6f}),1,max(0,1-(t-{fade_start:.6f})/{next_duration:.6f}))':eval=frame"
-                if fade_in: chain += f',afade=t=in:st=0:d={fade_in:.6f}'
-                if fade_out: chain += f',afade=t=out:st={render_length-fade_out:.6f}:d={fade_out:.6f}'
+                if fade_in or fade_out:
+                    head = f'max(0,(t-{before:.9f})/{fade_in:.9f})' if fade_in else '1'
+                    tail = f'max(0,({render_length:.9f}-t)/{fade_out:.9f})' if fade_out else '1'
+                    envelope.append(f'min(1,min({head},{tail}))')
+                if envelope:
+                    gain_expr='*'.join(envelope)
+                    chain += f",aeval=exprs='val(ch)*{gain_expr}':channel_layout=stereo"
                 filters.append(chain + f',adelay={delay}|{delay}[audio{number}]')
                 audio_labels.append(f'[audio{number}]')
                 if next_clip:

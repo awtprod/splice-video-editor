@@ -254,8 +254,8 @@
     const mix = trackSettings(clip.track);
     if (mutedTracks.audio || mix.mute || (soloActive() && !mix.solo)) return 0;
     const local = time - clip.start;
-    const fadeIn = Math.max(0,Number(clip.fadeIn||0));
-    const fadeOut = Math.max(0,Number(clip.fadeOut||0));
+    const fadeIn = clamp(Number(clip.fadeIn)||0,0,clip.duration);
+    const fadeOut = clamp(Number(clip.fadeOut)||0,0,clip.duration);
     let fade = Math.min(1, fadeIn ? local/fadeIn : 1, fadeOut ? (clip.duration-local)/fadeOut : 1);
     if(['dissolve','wipe','fade'].includes(clip.transition)) fade*=clamp((time-clip.start+transitionBefore(clip))/transitionLength(clip),0,1);
     const next=followingTransition(clip);
@@ -287,21 +287,37 @@
       document.body.append(transitionVideo);
     }
   }
-  function preceding(clip) {
+  function preceding(clip, source = project) {
     if (!clip || !["dissolve", "wipe"].includes(clip.transition)) return null;
     return (
-      project.clips
+      source.clips
         .filter(
           (c) =>
             c.type === "video" &&
             c.id !== clip.id &&
-            mediaOf(c)?.nativeGenerator !== 1414680150 &&
+            source.media.find(m=>m.id===c.mediaId)?.nativeGenerator !== 1414680150 &&
             c.track === clip.track &&
             c.start < clip.start &&
             c.start + c.duration >= clip.start - 0.05,
         )
         .sort((a, b) => b.start - a.start)[0] || null
     );
+  }
+  function transitionTail(clip, position) {
+    if (position>=clip.start && position<clip.start+transitionLength(clip)-transitionBefore(clip))
+      return preceding(clip);
+  }
+  function validateNewTransition(clip, source) {
+    if (!['dissolve','wipe'].includes(clip.transition)) return;
+    const prior = preceding(clip, source);
+    if (!prior) return;
+    const media = source.media.find(m=>m.id===prior.mediaId);
+    if (!media || media.offline) return;
+    const speed = Number(prior.speed)||1;
+    const available = prior.reverse ? prior.in/speed : (media.duration-prior.in-prior.duration*speed)/speed;
+    const needed = Math.min(transitionLength(clip)-transitionBefore(clip), clip.duration);
+    if (available+1e-6<needed)
+      throw Error('This transition needs '+needed.toFixed(2)+' s of unused outgoing footage.');
   }
   function syncMedia(forceSeek = false) {
     ensureElements();
@@ -367,7 +383,7 @@
       video.playbackRate=clamp((Number(clip.speed)||1)*Math.max(.25,Math.abs(playbackRate)),.25,16);
       setMediaPlaying(video,playing && playbackRate>0 && !clip.reverse);
     }
-    const previous = clip && time < clip.start + transitionLength(clip) ? preceding(clip) : null;
+    const previous = clip ? transitionTail(clip,time) : null;
     const previousMedia = previous && mediaOf(previous);
     if (
       (previous?.id || null) !== transitionVideoId ||
@@ -425,11 +441,31 @@
       }
     }
     const visible = project.clips.filter(c=>c.type==='video' && c.start-transitionBefore(c)<=time && time<c.start+c.duration);
-    const currentVideoIds=new Set(visible.map(c=>c.id));
+    const layers = new Map(visible.map(layer=>[layer.id,layer]));
+    for (const layer of visible) {
+      const tail = transitionTail(layer,time);
+      if (tail && tail.id!==previous?.id) layers.set(tail.id,tail);
+    }
+    const preloading = new Set();
+    if (playing && playbackRate>0) {
+      const waiting = new Map();
+      for (const next of project.clips) {
+        if (next.type!=='video' || next.id===preloadClipId || layers.has(next.id)) continue;
+        const first = next.start-transitionBefore(next);
+        if (first<=time || first>time+.75 || !preceding(next)) continue;
+        const prior = waiting.get(next.track);
+        if (!prior || first<prior.start-transitionBefore(prior)) waiting.set(next.track,next);
+      }
+      for (const next of waiting.values()) {
+        layers.set(next.id,next);
+        preloading.add(next.id);
+      }
+    }
+    const currentVideoIds=new Set(layers.keys());
     for (const [id,element] of layerVideos) if (!currentVideoIds.has(id) || id===activeVideoId || id===preloadClipId) {
       element.pause();disconnectAudio(element);element.removeAttribute('src');element.load();element.remove();layerVideos.delete(id);
     }
-    for (const layer of visible) {
+    for (const layer of layers.values()) {
       if (layer.id===activeVideoId || layer.id===preloadClipId) continue;
       const item=mediaOf(layer);
       if (!item?.src) continue;
@@ -439,12 +475,14 @@
         element.preload='auto';element.style.display='none';element.src=item.src;document.body.append(element);layerVideos.set(layer.id,element);
       }
       if (element.getAttribute('src') !== item.src) element.src = item.src;
-      const target=sourceTime(layer,time);
+      const preload = preloading.has(layer.id);
+      const target=sourceTime(layer,preload?layer.start-transitionBefore(layer):time);
       if (forceSeek || Math.abs(element.currentTime-target) > (layer.reverse ? .5/project.fps : .3))
         element.currentTime = target;
       element.playbackRate=clamp((Number(layer.speed)||1)*Math.max(.25,Math.abs(playbackRate)),.25,16);
-      setMediaPlaying(element,playing && playbackRate>0 && !layer.reverse);
-      element.muted=false; setAudio(element,layer);
+      setMediaPlaying(element,!preload && playing && playbackRate>0 && !layer.reverse);
+      element.muted=preload;
+      if (!preload) setAudio(element,layer);
     }
     const currentIds = new Set(audioClips.map((c) => c.id));
     for (const [id, element] of audioElements)
@@ -496,6 +534,25 @@
     const points=(clip.keyframes?.[key]||[]).filter(p=>Number.isFinite(p.time)&&Number.isFinite(p.value)).sort((a,b)=>a.time-b.time);
     return curveValue(points,time-clip.start,base);
   }
+  function clipKeyframeWindow(keys,from,to) {
+    const cropped={};
+    for (const [key,points] of Object.entries(keys||{})) {
+      if (!points.length) continue;
+      const ordered=[...points].sort((a,b)=>a.time-b.time);
+      cropped[key]=[
+        {time:0,value:curveValue(ordered,from,0)},
+        ...ordered.filter(point=>point.time>from+1e-6 && point.time<to-1e-6)
+          .map(point=>({time:point.time-from,value:point.value})),
+        {time:to-from,value:curveValue(ordered,to,0)},
+      ];
+    }
+    return cropped;
+  }
+  function resizeKeyframes(clip, original, shift) {
+    if (!original?.keyframes) return;
+    clip.keyframes = Math.abs(shift)<1e-6 && Math.abs(original.duration-clip.duration)<1e-6 ?
+      structuredClone(original.keyframes) : clipKeyframeWindow(original.keyframes,shift,shift+clip.duration);
+  }
   function splitClipAt(clip,cut) {
     const offset=cut-clip.start, duration=clip.duration;
     if (offset<=1e-6 || offset>=duration-1e-6) return null;
@@ -510,7 +567,7 @@
       in:clip.reverse?clip.in:clip.in+offset*speed,transition:'none'};
     for (const key of ['premiereTrack','premiereIndex','transitionBefore','transitionDuration','transitionMatchName']) delete right[key];
     const keys=structuredClone(clip.keyframes||{});
-    const fadeIn=Number(clip.fadeIn)||0, fadeOut=Number(clip.fadeOut)||0;
+    const fadeIn=clamp(Number(clip.fadeIn)||0,0,duration), fadeOut=clamp(Number(clip.fadeOut)||0,0,duration);
     if (offset<fadeIn || offset>duration-fadeOut) {
       if (keys.volume?.length) throw new Error('Move the cut outside the combined fade and gain automation.');
       const gain=clip.volume??100;
@@ -523,19 +580,9 @@
     }
     clip.fadeOut=0;
     right.fadeIn=0;
-    for(const [piece,from,to] of [[clip,0,offset],[right,offset,duration]]) {
-      if (!Object.values(keys).some(points=>points.length)) continue;
-      piece.keyframes={};
-      for(const [key,points] of Object.entries(keys)) {
-        if(!points.length) continue;
-        const ordered=[...points].sort((a,b)=>a.time-b.time);
-        piece.keyframes[key]=[
-          {time:0,value:curveValue(ordered,from,0)},
-          ...ordered.filter(point=>point.time>from+1e-6 && point.time<to-1e-6)
-            .map(point=>({time:point.time-from,value:point.value})),
-          {time:to-from,value:curveValue(ordered,to,0)},
-        ];
-      }
+    if (Object.values(keys).some(points=>points.length)) {
+      clip.keyframes=clipKeyframeWindow(keys,0,offset);
+      right.keyframes=clipKeyframeWindow(keys,offset,duration);
     }
     clip.duration=offset;
     if(clip.reverse) clip.in+=(duration-offset)*speed;
@@ -603,10 +650,11 @@
         const generator=mediaOf(clip)?.nativeGenerator;
         if(generator===1414680150) continue;
         const element=generator===1112293707 ? blackGenerator : clip.id===activeVideoId ? video : clip.id===preloadClipId ? transitionVideo : layerVideos.get(clip.id);
-        const previous=clip.id===activeVideoId && time<clip.start+transitionLength(clip)-transitionBefore(clip) ? preceding(clip) : null;
+        const previous=transitionTail(clip,time);
         if(previous) {
-          const priorSource=mediaOf(previous)?.nativeGenerator===1112293707 ? blackGenerator : transitionVideo;
-          if (priorSource===blackGenerator || transitionVideo.readyState>=2) paintVideo(ctx,priorSource,previous,canvas);
+          const priorSource=mediaOf(previous)?.nativeGenerator===1112293707 ? blackGenerator :
+            clip.id===activeVideoId ? transitionVideo : layerVideos.get(previous.id);
+          paintVideo(ctx,priorSource,previous,canvas);
         }
         const progress=clamp((time-(clip.start-transitionBefore(clip)))/transitionLength(clip),0,1);
         const alpha=(clip.transition==='dissolve' || clip.transition==='fade') ? progress : 1;
@@ -670,7 +718,12 @@
   }
   function checkReplacement(item,replacement) {
     if(replacement.type!==item.type) throw Error('Choose a '+item.type+' file for '+item.name+'.');
-    const end=Math.max(0,...project.clips.filter(c=>c.mediaId===item.id).map(c=>{
+    const clips=project.clips.filter(c=>c.mediaId===item.id);
+    const needsAudio = item.type==='audio' || clips.some(c=>c.embeddedAudio===true ||
+      (item.audioChannels>0 && c.embeddedAudio!==false));
+    if (needsAudio && !(replacement.audioChannels>0))
+      throw Error(replacement.name+' has no audio stream. Choose a replacement that includes the original sound.');
+    const end=Math.max(0,...clips.map(c=>{
       const next=followingTransition(c);
       const handle=c.reverse?transitionBefore(c):next?transitionLength(next)-transitionBefore(next):0;
       return c.in+(c.duration+handle)*(Number(c.speed)||1);
@@ -968,8 +1021,13 @@
           throw new Error("Clip extends beyond available source footage.");
       }
       Editor.editProject(next=>{
-        for(const change of changes){const target=next.clips.find(c=>c.id===change.id);Object.assign(target,change.patch);
-          for(const key of ["start","duration"])if(key in change.patch)target[key]=snap(target[key]);}
+        for(const change of changes){
+          const target=next.clips.find(c=>c.id===change.id), original={...target};
+          Object.assign(target,change.patch);
+          for(const key of ["start","duration"])if(key in change.patch)target[key]=snap(target[key]);
+          if ('duration' in change.patch && !('keyframes' in change.patch)) resizeKeyframes(target,original,0);
+          if (['transition','transitionDuration','transitionBefore'].some(key=>key in change.patch)) validateNewTransition(target,next);
+        }
       });
     },
     trimEdge(id, edge, atTime, { ripple = false } = {}) {
@@ -998,8 +1056,11 @@
       }
       Editor.editProject(next=>{
         for(const member of next.clips.filter(c=>memberIds.has(c.id))){
+          const original=(gestureBefore||project).clips.find(c=>c.id===member.id);
           if(edge==="start"){if(!ripple)member.start=snap(member.start+shift);if(!member.reverse)member.in=Math.max(0,member.in+shift*(Number(member.speed)||1));member.duration=snap(member.duration-shift);}
           else{member.duration=snap(member.duration+shift);if(member.reverse)member.in=Math.max(0,member.in-shift*(Number(member.speed)||1));}
+          const headShift = ripple ? original.duration-member.duration : member.start-original.start;
+          resizeKeyframes(member,original,edge==='start'?headShift:0);
         }
         if(ripple)for(const following of next.clips)
           if(!memberIds.has(following.id)&&following.start>=oldEnd-.001&&!trackLocked(following.type,following.track)&&syncLocked(following.type,following.track))
@@ -1029,12 +1090,16 @@
         for (const clip of next.clips) {
           const speed = Number(clip.speed) || 1;
           if (leftIds.has(clip.id)) {
+            const original=(gestureBefore||project).clips.find(c=>c.id===clip.id);
             clip.duration += shift;
             if (clip.reverse) clip.in = Math.max(0,clip.in-shift*speed);
+            resizeKeyframes(clip,original,0);
           } else if (rightIds.has(clip.id)) {
+            const original=(gestureBefore||project).clips.find(c=>c.id===clip.id);
             clip.start += shift;
             clip.duration -= shift;
             if (!clip.reverse) clip.in = Math.max(0,clip.in+shift*speed);
+            resizeKeyframes(clip,original,clip.start-original.start);
           }
         }
       });

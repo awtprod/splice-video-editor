@@ -22,6 +22,12 @@ module.exports=async function recoveryFlow(page,context,url,root) {
   await retimedChooser.setFiles({name:'retimed-short-ridge.mp4',mimeType:'video/mp4',buffer:fs.readFileSync(real)});
   await page.waitForFunction(()=>document.querySelector('.toast')?.textContent.includes('retimed-short-ridge.mp4 is shorter'));
   assert.ok(await page.evaluate(()=>Editor.get().project.media[0].offline));
+  await load({...base,name:'Camera relink with sound',media:[{...source,audioChannels:1}],
+    clips:[{...base.clips[0],in:0,embeddedAudio:true}]});
+  const [silentChooser]=await Promise.all([page.waitForEvent('filechooser'),page.locator('[data-media=first]').click()]);
+  await silentChooser.setFiles(real);
+  await page.waitForFunction(()=>document.querySelector('.toast')?.textContent.includes('has no audio stream'));
+  assert.ok(await page.evaluate(()=>Editor.get().project.media[0].offline));
   const duplicate={...source,id:'second',path:'/camera-b/ridge.mp4'};
   await load({...base,name:'Camera A and B',media:[source,duplicate],clips:[{...base.clips[0],in:1}]});
   await page.locator('#relink-input').setInputFiles(real);

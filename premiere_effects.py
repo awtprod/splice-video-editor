@@ -389,6 +389,8 @@ def apply_extended(clip, item):
     if item.get('pan', 0):
         raise ValueError('Premiere export cannot preserve audio pan yet. Save a Splice working copy to keep this edit.')
     fade_in, fade_out = float(item.get('fadeIn', 0)), float(item.get('fadeOut', 0))
+    if not math.isfinite(fade_in) or not math.isfinite(fade_out) or min(fade_in,fade_out)<0:
+        raise ValueError('Invalid audio fade')
     if automation.get('volume'):
         if fade_in or fade_out:
             raise ValueError('Premiere export cannot combine audio gain keyframes with clip fades. Save a Splice working copy to keep both.')
@@ -405,17 +407,17 @@ def apply_extended(clip, item):
             component = _attach(clip, 'volume')
         level = _parameter(component, 'Level')
         if level.is_time_varying:
-            raise ValueError('An existing Premiere audio envelope needs manual review before replacing it.')
-        start = clip.in_point.seconds
+            original = read_extended(clip)
+            if not (original.get('fadeIn') or original.get('fadeOut')):
+                raise ValueError('An existing Premiere audio envelope needs manual review before replacing it.')
         duration = clip.duration.seconds
-        rate = clip.speed
-        volume = float(item.get('volume', 100)) / 100
-        points = [(start, 0 if fade_in else volume)]
-        if fade_in:
-            points.append((start + min(fade_in, duration/2)*rate, volume))
-        if fade_out:
-            points.append((start + (duration - min(fade_out, duration/2))*rate, volume))
-            points.append((start + duration*rate, 0))
+        head, tail = min(fade_in, duration), min(fade_out, duration)
+        volume = float(item.get('volume', 100))
+        points = {0, duration}
+        if head+tail > duration:
+            points.add(duration*head/(head+tail))
         else:
-            points.append((start + duration*rate, volume))
-        level.set_keyframes([(Time.from_seconds(t), v, KeyframeInterpolation.LINEAR) for t, v in points])
+            points.update([head,duration-tail])
+        keys = [{'time':t,'value':volume*min(1,t/head if head else 1,(duration-t)/tail if tail else 1)}
+                for t in sorted(points)]
+        _apply_scalar_keys(level,clip,keys,decode=lambda v:v*100,encode=lambda v:v/100,low=0,high=200)

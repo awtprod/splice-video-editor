@@ -204,6 +204,37 @@ async function main() {
     await waitState(()=>Editor.get().audioMeters[1]>.02&&Editor.get().audioMeters[2]<.002);
     await click('#play-toggle');
     console.log('The V2 mixer mutes embedded sound on V2 while V1 remains audible.');
+    await page.evaluate(()=>SpliceSession.newProject({name:'Picture in picture',width:640,height:360,fps:25}));
+    for(const color of ['red','lime']) execFileSync('ffmpeg',['-nostdin','-v','error','-f','lavfi','-i',
+      'color='+color+':s=320x180:r=25:d=3','-c:v','libx264','-threads','1',path.join(temp,color+'.mp4')]);
+    await page.locator('#media-input').setInputFiles(['red','lime'].map(color=>path.join(temp,color+'.mp4')));
+    await waitState(()=>Editor.get().project.media.length===2);
+    await page.evaluate(()=>{
+      Editor.editProject(p=>{
+        const media=name=>p.media.find(m=>m.name===name+'.mp4').id;
+        p.clips=[
+          {id:'under-out',mediaId:media('red'),type:'video',track:1,start:0,duration:1,in:0},
+          {id:'under-in',mediaId:media('lime'),type:'video',track:1,start:1,duration:1.5,in:0,
+            transition:'dissolve',transitionDuration:.48},
+          {id:'above',mediaId:media('red'),type:'video',track:2,start:0,duration:2.5,in:0,transform:{scale:30}},
+        ];
+      });
+      Editor.seek(1.24);
+    });
+    await waitState(()=>{
+      const rgba=document.querySelector('#preview-canvas').getContext('2d').getImageData(30,240,1,1).data;
+      return rgba[0]>100&&rgba[1]>100&&rgba[2]<10;
+    });
+    const keys=await page.evaluate(()=>{
+      Editor.updateClip('under-in',{transition:'none',keyframes:{opacity:[{time:0,value:0},{time:1,value:100}]}});
+      Editor.beginGesture();
+      Editor.trimEdge('under-in','start',1.8);
+      Editor.trimEdge('under-in','start',1.4);
+      Editor.endGesture();
+      return Editor.get().project.clips.find(clip=>clip.id==='under-in').keyframes.opacity;
+    });
+    assert.ok(Math.abs(keys[0].value-40)<1e-6&&Math.abs(keys[1].time-.6)<1e-6&&keys[1].value===100,JSON.stringify(keys));
+    console.log('Lower-track dissolve remains visible beneath picture-in-picture. Head trim keeps retained opacity keys in place.');
     await require('./recovery-flow.cjs')(page,page.context(),url,root);
     assert.deepEqual(errors,[]);
   } finally {
