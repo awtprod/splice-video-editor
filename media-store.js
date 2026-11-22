@@ -140,6 +140,9 @@ window.SpliceMedia = (() => {
     const src=metadata.proxyRecommended||item.seekOptimized?await makeProxy(original,item.seekOptimized===true,item.audioStream??null):original;
     Object.assign(item,metadata,{src,originalSrc:original});
   }
+  function needsSourceProbe(item) {
+    return !Number.isInteger(item.audioStreams) || (item.audioStreams>1 && !Array.isArray(item.audioStreamChannels));
+  }
   async function restore(project) {
     const db = await open();
     for (const item of project.media) {
@@ -155,7 +158,7 @@ window.SpliceMedia = (() => {
       }
       if ((bundled(item.src) || localMedia(item.src)) && await exists(item.src)) {
         const original=item.originalSrc||item.src;
-        if (localMedia(item.src) && (!item.originalSrc || !Number.isInteger(item.audioStreams)) &&
+        if (localMedia(item.src) && (!item.originalSrc || needsSourceProbe(item)) &&
             (original===item.src || await exists(original))) await restoreSource(item,original);
         item.offline = false;
         continue;
@@ -181,7 +184,7 @@ window.SpliceMedia = (() => {
       if (record?.serverSrc && await exists(record.serverSrc)) {
         item.originalSrc=record.serverSrc;
         item.src=record.previewSrc && await exists(record.previewSrc) ? record.previewSrc : record.serverSrc;
-        if(item.src===record.serverSrc || !Number.isInteger(item.audioStreams))
+        if(item.src===record.serverSrc || needsSourceProbe(item))
           await restoreSource(item,record.serverSrc);
         item.storageKey=record.id; item.offline=false;
       } else if (record?.file) {
