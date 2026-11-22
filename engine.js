@@ -130,8 +130,19 @@
     const route=routeAudio(element);
     const mix=trackSettings(clip.track);
     const gain=clip.type==='video' && clip.embeddedAudio===false ? 0 : audibility(clip);
-    route.gain.gain.setTargetAtTime(gain,audioContext.currentTime,.012);
-    route.pan.pan.setTargetAtTime(clamp(((Number(clip.pan)||0)+(Number(mix.pan)||0))/100,-1,1),audioContext.currentTime,.012);
+    const pan=clamp(((Number(clip.pan)||0)+(Number(mix.pan)||0))/100,-1,1);
+    if (gain!==route.gainLevel) {
+      route.gain.gain.setTargetAtTime(gain,audioContext.currentTime,.012);
+      route.gainLevel=gain;
+    }
+    if (pan!==route.panLevel) {
+      route.pan.pan.setTargetAtTime(pan,audioContext.currentTime,.012);
+      route.panLevel=pan;
+    }
+  }
+  function setMediaPlaying(element, shouldPlay) {
+    if (shouldPlay && element.paused) element.play().catch(() => {});
+    else if (!shouldPlay && !element.paused) element.pause();
   }
   let history = [];
   let future = [];
@@ -353,10 +364,8 @@
           /* Metadata may still be loading. */
         }
       }
-      video.style.filter = filterFor(clip);
       video.playbackRate=clamp((Number(clip.speed)||1)*Math.max(.25,Math.abs(playbackRate)),.25,16);
-      if (playing && playbackRate > 0 && !clip.reverse) video.play().catch(() => {});
-      else video.pause();
+      setMediaPlaying(video,playing && playbackRate>0 && !clip.reverse);
     }
     const previous = clip && time < clip.start + transitionLength(clip) ? preceding(clip) : null;
     const previousMedia = previous && mediaOf(previous);
@@ -379,8 +388,7 @@
         try { transitionVideo.currentTime = target; } catch (_) { /* Metadata pending. */ }
       }
       transitionVideo.playbackRate=clamp((Number(previous.speed)||1)*Math.max(.25,Math.abs(playbackRate)),.25,16);
-      if (playing && playbackRate > 0 && !previous.reverse) transitionVideo.play().catch(() => {});
-      else transitionVideo.pause();
+      setMediaPlaying(transitionVideo,playing && playbackRate>0 && !previous.reverse);
       transitionVideo.muted=false;
       setAudio(transitionVideo,previous);
     } else transitionVideo.pause();
@@ -409,7 +417,7 @@
       if(upcoming && preloadClipId===upcoming.id && time>=upcoming.start-transitionBefore(upcoming)) {
         const target=sourceTime(upcoming,time);
         if(forceSeek||Math.abs(transitionVideo.currentTime-target)>.3) try{transitionVideo.currentTime=target}catch(_){}
-        if(!upcoming.reverse) transitionVideo.play().catch(()=>{});
+        setMediaPlaying(transitionVideo,!upcoming.reverse);
         if(transitionBefore(upcoming)>0) {
           transitionVideo.muted=false;
           setAudio(transitionVideo,upcoming);
@@ -435,7 +443,7 @@
       if (forceSeek || Math.abs(element.currentTime-target) > (layer.reverse ? .5/project.fps : .3))
         element.currentTime = target;
       element.playbackRate=clamp((Number(layer.speed)||1)*Math.max(.25,Math.abs(playbackRate)),.25,16);
-      if(playing && playbackRate > 0 && !layer.reverse) element.play().catch(()=>{}); else element.pause();
+      setMediaPlaying(element,playing && playbackRate>0 && !layer.reverse);
       element.muted=false; setAudio(element,layer);
     }
     const currentIds = new Set(audioClips.map((c) => c.id));
@@ -469,8 +477,7 @@
           /* Metadata may still be loading. */
         }
       element.playbackRate=clamp((Number(audioClip.speed)||1)*Math.max(.25,Math.abs(playbackRate)),.25,16);
-      if (playing && playbackRate > 0 && !audioClip.reverse) element.play().catch(() => {});
-      else element.pause();
+      setMediaPlaying(element,playing && playbackRate>0 && !audioClip.reverse);
       setAudio(element,audioClip);
     }
     audio = audioClips.length ? audioElements.get(audioClips[0].id) : null;
@@ -778,12 +785,13 @@
       notify();
     },
     togglePlay() {
+      const previousTime = time;
       playing = !playing;
       if (playing && playbackRate < 0) playbackRate=1;
       if (playing && time >= duration()) time = 0;
       if (!playing) time = snap(time);
       if (playing) audioContext?.resume().catch(() => {});
-      syncMedia(true);
+      syncMedia(!playing || time !== previousTime);
       notify();
     },
     select(id) {

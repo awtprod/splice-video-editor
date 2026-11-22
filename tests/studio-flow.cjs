@@ -147,12 +147,30 @@ async function main() {
     await waitState(()=>Editor.get().project.media.length===1);
     await page.evaluate(()=>Editor.editProject(project=>{
       for(const track of [1,2]) project.clips.push({id:'video-'+track,mediaId:project.media[0].id,
-        type:'video',track,start:0,in:0,duration:2,volume:100});
+        type:'video',track,start:track===2?.5:0,in:0,duration:track===2?.7:2,volume:100});
     }));
+    await waitState(()=>Editor.get().video?.readyState>=2);
+    await page.evaluate(()=>{
+      let previous, probe=[];
+      function capture(){
+        const s=Editor.get();
+        if(s.playing && s.activeClip?.id!==previous) {
+          previous=s.activeClip?.id;
+          probe.push({clip:previous,ready:s.video.readyState});
+        }
+        if(s.time<1.4)requestAnimationFrame(capture);
+        else window.spliceLayerProbe=probe;
+      }
+      requestAnimationFrame(capture);
+    });
     await click('#play-toggle');
     await waitState(()=>Editor.get().audioMeters[1]>.02&&Editor.get().audioMeters[2]>.02);
+    await waitState(()=>window.spliceLayerProbe);
+    const frames=await page.evaluate(()=>window.spliceLayerProbe);
+    assert.deepEqual(frames.map(f=>f.clip),['video-1','video-2','video-1']);
+    assert.ok(frames.every(f=>f.ready>=2),JSON.stringify(frames));
     await click('#play-toggle');
-    console.log('Both video layers contribute camera audio during overlapping playback.');
+    console.log('Both video layers stayed decoded across cuts and contributed overlapping camera audio.');
     await require('./recovery-flow.cjs')(page,page.context(),url,root);
     assert.deepEqual(errors,[]);
   } finally {
