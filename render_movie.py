@@ -299,9 +299,10 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
                 prior_speed=_number(previous.get('speed',1),'speed',.1,16)
                 prior_available=(float(previous.get('in',0))/prior_speed if previous.get('reverse') else
                                  (media_by_id[previous['mediaId']]['_actualDuration']-(float(previous.get('in',0))+float(previous['duration'])*prior_speed))/prior_speed)
-                tail = min(max(0,transition_duration-before), float(previous['duration']), float(clip['duration']), prior_available)
-                if tail < 1 / float(fps) and transition_duration-before >= 1/float(fps):
-                    raise ValueError('Cross dissolve needs more footage after the outgoing clip')
+                frame_duration = 1 / float(fps)
+                tail = max(0, transition_duration - before)
+                if tail >= frame_duration - 1e-6 and prior_available + 1e-6 < tail:
+                    raise ValueError(f'Transition at {start:.2f}s needs {tail:.2f}s of unused outgoing footage')
                 prior_source = float(previous.get('in',0))-tail*prior_speed if previous.get('reverse') else float(previous.get('in',0))+float(previous['duration'])*prior_speed
                 prior_source-=source_offsets.get(previous['mediaId'],0)
                 prior_reverse=',reverse' if previous.get('reverse') else ''
@@ -321,7 +322,7 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
                     prior_file.write_text(cube_text(prior_color['lut'],prior_color.get('lutIntensity',100)))
                     prior_lut=f',lut3d=file={prior_file}:interp=trilinear,format=yuva420p'
                 prior_opacity=_number(prior_tail.get('opacity',100),'opacity',0,100)/100
-                if tail >= 1/float(fps):
+                if tail + 1e-6 >= frame_duration:
                     prior_prefix=(f'color=c=black:s={width}x{height}:r={fps}:d={tail:.6f},setpts=PTS-STARTPTS' if prior_index is None else
                                   f'[{prior_index}:v]trim=start={prior_source:.6f}:duration={tail*prior_speed:.6f}{prior_reverse},setpts=(PTS-STARTPTS)/{prior_speed:.6f},fps={fps}')
                     filters.append(f'{prior_prefix},scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,{_css_color_filter(prior_color)}{prior_lut}{prior_transform},format=yuva420p,colorchannelmixer=aa={prior_opacity:.6f},setpts=PTS+{start:.6f}/TB[tail{number}]')
@@ -513,26 +514,32 @@ def _render_prepared(project, output_path, *, options=None, progress=None, cance
             _run_controlled(['ffmpeg','-nostdin','-hide_banner','-loglevel','error','-y','-i',str(intermediate),'-map','0:a:0','-c:a','pcm_s24le','-ar','48000','-t',f'{total:.6f}',str(output_path)],cancelled,120)
             if progress: progress(1.0)
             return Path(output_path).stat().st_size
-    # Bound the number of simultaneous filter chains. Avoid splitting inside a transition.
-    boundaries = [0.0]
-    current = 0.0
-    while True:
-        proposed = min(current + 6,total)
-        starts=sorted(float(clip['start'])-float(clip.get('transitionBefore',0) or 0) for clip in project['clips']
-                      if float(clip['start'])-float(clip.get('transitionBefore',0) or 0)>current+1e-6 and
-                      float(clip['start'])-float(clip.get('transitionBefore',0) or 0)<proposed)
-        if len(starts)>24: proposed=starts[24]
-        for clip in project['clips']:
-            if clip.get('transition') in ('dissolve','wipe','fade'):
-                start = float(clip['start'])-float(clip.get('transitionBefore',0) or 0); end = start + float(clip.get('transitionDuration', .5))
-                if start - .001 <= proposed <= end + .001:
-                    proposed = start-1/fps if start-current>2/fps else end+1/fps
-        next_frame = min(total, math.ceil(proposed * fps) / fps)
-        if next_frame <= current: raise ValueError('Could not segment timeline')
-        if next_frame >= total-1e-9: break
-        boundaries.append(next_frame)
-        current = next_frame
-    boundaries.append(total)
+    # Keep transitions and the preceding frame in a single window. Work in
+    # frame numbers so snapping cannot move a boundary back into an effect.
+    starts = []
+    protected = []
+    total_frames = round(total * fps)
+    for clip in project['clips']:
+        start = float(clip['start']) - float(clip.get('transitionBefore', 0) or 0)
+        frame = math.ceil(start * fps - 1e-6)
+        starts.append(frame)
+        if clip.get('transition') in ('dissolve', 'wipe', 'fade'):
+            end = start + float(clip.get('transitionDuration', .5))
+            protected.append((frame - 1, math.ceil(end * fps - 1e-6)))
+    starts.sort()
+    protected.sort()
+    frames = [0]
+    while frames[-1] < total_frames:
+        current = frames[-1]
+        proposed = min(current + round(6 * fps), total_frames)
+        eligible = [frame for frame in starts if current < frame < proposed]
+        if len(eligible) > 24:
+            proposed = eligible[24]
+        for first, after in protected:
+            if first <= proposed < after:
+                proposed = after
+        frames.append(min(total_frames, proposed))
+    boundaries = [frame / fps for frame in frames]
     with tempfile.TemporaryDirectory(prefix='splice-segments-') as directory:
         segments = []
         for index,(begin,end) in enumerate(zip(boundaries,boundaries[1:])):

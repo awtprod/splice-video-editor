@@ -430,6 +430,9 @@ def open_project(data, index=0, _seen=()):
             warnings.append('Native Premiere track solo is preserved but cannot be edited in Splice.')
         for clip in clips:
             source_media = next((media_item for media_item in media if media_item['id'] == clip.get('mediaId')), None)
+            if clip.get('nativeVolumeOutsideTrim'):
+                label = (source_media or {}).get('name', 'Audio clip')
+                warnings.append(f"{label} at {clip['start']:.2f}s: Premiere volume keys outside the source trim are preserved; preview and export use the clip's static volume.")
             if source_media is not None and source_media.get('nativeGenerator') is not None:
                 warnings.append(f"{source_media['name']} is a native Premiere generator; preview and export are unavailable.")
         return {'name': sequence.name, 'width': width, 'height': height, 'fps': fps,
@@ -606,7 +609,7 @@ def save_project(data):
         for marker_data in data['markers']:
             identity = marker_data.get('id')
             marker = existing_markers.get(identity)
-            name = str(marker_data.get('name') or 'Marker')
+            name = str(marker_data.get('name', 'Marker'))
             when = py_premiere.Time.from_seconds(float(marker_data.get('time', 0)))
             if marker is None:
                 marker = sequence.add_marker(name, when)

@@ -53,6 +53,27 @@ class MovieDelivery(unittest.TestCase):
         self.assertGreater(statistics.mean(left),30)
         self.assertLess(statistics.mean(right),7)
 
+    def test_dissolve_adjacent_to_segment_boundary_keeps_outgoing_picture(self):
+        for cut in (11.8, 12.0):
+            with self.subTest(cut=cut):
+                self.project['clips'] = [
+                    self.clip('out', 'ridge', 6, cut-6),
+                    self.clip('in', 'valley', cut, 2, transition='dissolve', transitionDuration=.48),
+                ]
+                render_to_file(self.project, self.destination)
+                before = statistics.mean(self.frame(cut-.04))
+                self.assertGreater(before, 35)
+                self.assertAlmostEqual(statistics.mean(self.frame(cut)), before, delta=7)
+                self.assertGreater(statistics.mean(self.frame(cut+.24)), 35)
+
+    def test_dissolve_requires_the_full_outgoing_handle(self):
+        self.project['clips'] = [
+            self.clip('out', 'ridge', 0, 7.76),
+            self.clip('in', 'valley', 7.76, 1, transition='dissolve', transitionDuration=.48),
+        ]
+        with self.assertRaisesRegex(ValueError, 'needs 0.48s of unused outgoing footage'):
+            render_to_file(self.project, self.destination)
+
     def test_final_render_uses_original_still(self):
         self.project['media']=[dict(id='still',src='/assets/ridge.jpg')]
         self.project['clips']=[self.clip('still','still',0,1)]

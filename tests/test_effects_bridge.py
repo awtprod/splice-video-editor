@@ -177,7 +177,7 @@ class NativeMotionAndFade(unittest.TestCase):
         level = next(param for component in clip.components for param in component.properties
                      if param.display_name=='Level')
         before = level._element.findtext('Keyframes')
-        self.assertEqual(premiere_effects.read_extended(clip),{})
+        self.assertEqual(premiere_effects.read_extended(clip),{'nativeVolumeOutsideTrim': True})
         _,volume=premiere_effects.read(clip)
         premiere_effects.apply(clip,{},volume)
         premiere_effects.apply_extended(clip,{})

@@ -122,7 +122,7 @@ async function main() {
           {id: 'audio', name: 'Long sound', src: 'assets/score.wav', type: 'audio', duration: 32},
         ];
         project.clips = [
-          {id: 'head', mediaId: 'video', type: 'video', start: 8, duration: 8, in: 0,
+          {id: 'head', mediaId: 'video', type: 'video', start: 8, duration: 8, in: .5,
             track: 1, color: {}, volume: 100, transition: 'none'},
           {id: 'tail', mediaId: 'video', type: 'video', start: 16, duration: 4, in: 0,
             track: 1, color: {}, volume: 100, transition: 'none'},
@@ -133,7 +133,7 @@ async function main() {
       Editor.trimEdge('head', 'start', 9, {ripple: true});
       let clips = Editor.get().project.clips;
       const trimmed = clips.find(c => c.id === 'head').start === 8 &&
-        clips.find(c => c.id === 'head').in === 1 && clips.find(c => c.id === 'head').duration === 7 &&
+        clips.find(c => c.id === 'head').in === 1.5 && clips.find(c => c.id === 'head').duration === 7 &&
         clips.find(c => c.id === 'tail').start === 15 && clips.find(c => c.id === 'sound').start === 15;
       Editor.deleteClips(['head'], {ripple: true});
       clips = Editor.get().project.clips;
@@ -146,6 +146,20 @@ async function main() {
       return {trimmed, deleted, rejectedMove, unchanged: before === JSON.stringify(Editor.get().project.clips)};
     });
     assert.deepEqual(ripple, {trimmed: true, deleted: true, rejectedMove: true, unchanged: true});
+    const rolled = await page.evaluate(() => {
+      Editor.editProject(project => {
+        project.clips = [];
+        for (const [group, start] of [['left', 0], ['right', 3]]) {
+          for (const [type, track] of [['video', 1], ['audio', -1]]) {
+            project.clips.push({id: `${group}-${type}`, mediaId: type, type, track,
+              linkGroup: group, start, duration: 3, in: .5});
+          }
+        }
+      });
+      Editor.rollEdit('left-video', 'right-video', 4);
+      return Editor.get().project.clips.map(({start,duration,in:sourceIn}) => [start,duration,sourceIn]);
+    });
+    assert.deepEqual(rolled, [[0,4,.5],[0,4,.5],[4,2,1.5],[4,2,1.5]]);
     assert.deepEqual(errors, []);
     console.log('Track locks, linked edits, source insert guard and narrow UI passed; screenshot: ' + screenshot);
   } finally {

@@ -61,6 +61,13 @@ class NativeSequenceTests(unittest.TestCase):
         self.assertEqual(reopened['clips'][0]['track'], 3)
         self.assertEqual(reopened['media'][0]['bin'], 'Day 1/Camera A')
 
+    def test_unnamed_marker_stays_unnamed(self):
+        model = {'name': 'Markers', 'width': 1920, 'height': 1080, 'fps': 25,
+                 'media': [], 'clips': [], 'markers': [{'id': 'm', 'name': '', 'time': 1}]}
+        reopened = open_project(save_project(model))
+        self.assertEqual(reopened['markers'][0]['name'], '')
+        self.assertEqual(open_project(save_project(reopened))['markers'], reopened['markers'])
+
 
 if __name__ == '__main__':
     unittest.main()

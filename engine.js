@@ -540,7 +540,12 @@
       ctx.save();ctx.globalAlpha=alpha;ctx.drawImage(target.canvas,0,0,canvas.width,canvas.height);ctx.restore();
     }
   }
+  const previewProjects = new WeakMap();
   function drawFrame(canvas) {
+    const active = at('video', time);
+    if (!mutedTracks.video && active && mediaOf(active)?.src &&
+        video?.readyState < 2 && previewProjects.get(canvas) === project) return;
+    previewProjects.set(canvas, project);
     const ctx = canvas.getContext("2d");
     ctx.fillStyle = "#080a0a";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -911,7 +916,7 @@
       }
       Editor.editProject(next=>{
         for(const change of changes){const target=next.clips.find(c=>c.id===change.id);Object.assign(target,change.patch);
-          for(const key of ["start","duration","in"])if(key in change.patch)target[key]=snap(target[key]);}
+          for(const key of ["start","duration"])if(key in change.patch)target[key]=snap(target[key]);}
       });
     },
     trimEdge(id, edge, atTime, { ripple = false } = {}) {
@@ -940,8 +945,8 @@
       }
       Editor.editProject(next=>{
         for(const member of next.clips.filter(c=>memberIds.has(c.id))){
-          if(edge==="start"){if(!ripple)member.start=snap(member.start+shift);if(!member.reverse)member.in=snap(member.in+shift*(Number(member.speed)||1));member.duration=snap(member.duration-shift);}
-          else{member.duration=snap(member.duration+shift);if(member.reverse)member.in=snap(member.in-shift*(Number(member.speed)||1));}
+          if(edge==="start"){if(!ripple)member.start=snap(member.start+shift);if(!member.reverse)member.in=Math.max(0,member.in+shift*(Number(member.speed)||1));member.duration=snap(member.duration-shift);}
+          else{member.duration=snap(member.duration+shift);if(member.reverse)member.in=Math.max(0,member.in-shift*(Number(member.speed)||1));}
         }
         if(ripple)for(const following of next.clips)
           if(!memberIds.has(following.id)&&following.start>=oldEnd-.001&&!trackLocked(following.type,following.track)&&syncLocked(following.type,following.track))
@@ -951,22 +956,35 @@
     rollEdit(leftId, rightId, boundary) {
       const left = project.clips.find(c => c.id === leftId), right = project.clips.find(c => c.id === rightId);
       if (!left || !right || left.type !== right.type || left.track !== right.track || Math.abs(left.start + left.duration - right.start) > .05) return;
-      if (linkedClips(left).length || linkedClips(right).length)
-        throw new Error("Roll linked audio and video after unlinking them in Premiere.");
-      ensureEditable(left); ensureEditable(right);
-      const end = right.start + right.duration, leftSource = mediaOf(left)?.duration || Infinity, rightSource=mediaOf(right)?.duration||Infinity;
-      const leftSpeed=Number(left.speed)||1,rightSpeed=Number(right.speed)||1;
-      const rightEarliest=right.reverse ? right.start-(rightSource-right.in-right.duration*rightSpeed)/rightSpeed : right.start-right.in/rightSpeed;
-      const leftLatest=left.reverse ? right.start+left.in/leftSpeed : left.start+(leftSource-left.in)/leftSpeed;
-      const cut = clamp(snap(boundary), Math.max(left.start+1/project.fps,rightEarliest), Math.min(end-1/project.fps,leftLatest));
-      if (!Number.isFinite(cut) || cut === right.start) return;
-      snapshot();
-      const shift=cut-right.start;
-      left.duration = cut-left.start;
-      if(left.reverse) left.in-=shift*leftSpeed;
-      if(!right.reverse) right.in+=shift*rightSpeed;
-      right.duration = end-cut; right.start=cut;
-      syncMedia(true); notify();
+      const outgoing = [left, ...linkedClips(left)], incoming = [right, ...linkedClips(right)];
+      const leftIds = new Set(outgoing.map(clip => clip.id)), rightIds = new Set(incoming.map(clip => clip.id));
+      if (incoming.some(clip => leftIds.has(clip.id))) return;
+      for (const clip of [...outgoing,...incoming]) ensureEditable(clip);
+      const frame = 1/project.fps;
+      const head = clip => clip.in / (Number(clip.speed) || 1);
+      const tail = clip => ((mediaOf(clip)?.duration || Infinity) - clip.in) / (Number(clip.speed) || 1) - clip.duration;
+      const earliest = Math.max(...outgoing.map(clip => frame-clip.duration),
+        ...incoming.map(clip => Math.max(-clip.start, -(clip.reverse ? tail(clip) : head(clip)))));
+      const latest = Math.min(...outgoing.map(clip => clip.reverse ? head(clip) : tail(clip)),
+        ...incoming.map(clip => clip.duration-frame));
+      const lower = Math.ceil((earliest-1e-7)*project.fps)*frame;
+      const upper = Math.floor((latest+1e-7)*project.fps)*frame;
+      if (lower > upper) return;
+      const shift = clamp(snap(boundary-right.start),lower,upper);
+      if (!Number.isFinite(shift) || Math.abs(shift)<1e-7) return;
+      Editor.editProject(next => {
+        for (const clip of next.clips) {
+          const speed = Number(clip.speed) || 1;
+          if (leftIds.has(clip.id)) {
+            clip.duration += shift;
+            if (clip.reverse) clip.in = Math.max(0,clip.in-shift*speed);
+          } else if (rightIds.has(clip.id)) {
+            clip.start += shift;
+            clip.duration -= shift;
+            if (!clip.reverse) clip.in = Math.max(0,clip.in+shift*speed);
+          }
+        }
+      });
     },
     slipClip(id, delta) {
       const clip = project.clips.find(c => c.id === id), source = clip && mediaOf(clip)?.duration;
@@ -977,7 +995,7 @@
       const upper=Math.min(...members.map(member=>(mediaOf(member)?.duration||0)-member.in-member.duration*(Number(member.speed)||1)));
       const shift=clamp(snap(delta),lower,upper);
       if (!shift) return;
-      Editor.editProject(next=>{for(const member of next.clips.filter(c=>members.some(m=>m.id===c.id)))member.in=snap(member.in+shift);});
+      Editor.editProject(next=>{for(const member of next.clips.filter(c=>members.some(m=>m.id===c.id)))member.in=Math.max(0,member.in+shift);});
     },
     split() {
       const clip = selected() || at("video", time);

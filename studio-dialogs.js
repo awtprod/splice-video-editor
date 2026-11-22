@@ -42,6 +42,12 @@ window.SpliceDialogs = (() => {
       }).join('. ')+'. Replace the unsupported item to render this sequence.';
       form.querySelector('.export-spec').after(preview);
     }
+    if (state.project.clips.some(c => c.nativeVolumeOutsideTrim)) {
+      const notice = document.createElement('p');
+      notice.className = 'render-blocked';
+      notice.textContent = "This render uses static gain for clips with Premiere volume keys outside their source trim.";
+      form.querySelector('.export-spec').after(notice);
+    }
     const render=form.querySelector('[type=submit]'), cancel=form.querySelector('[data-cancel]'), progress=form.querySelector('progress'), status=form.querySelector('[role=status]');
     let controller, renderWarnings=[];
     const syncFormat=()=>{

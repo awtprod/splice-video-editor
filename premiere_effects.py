@@ -258,6 +258,7 @@ def read_extended(clip):
         keys = [(time.seconds, level.get_value_at_key(time)) for time in level.keys]
         source_end=clip.in_point.seconds + clip.duration.seconds*clip.speed
         if not keys or any(t < clip.in_point.seconds-.001 or t > source_end+.001 for t,_ in keys):
+            result['nativeVolumeOutsideTrim'] = True
             return result
         if 2 <= len(keys) <= 4 and all(isinstance(value, (int, float)) for _, value in keys):
             start, end = clip.in_point.seconds, source_end
