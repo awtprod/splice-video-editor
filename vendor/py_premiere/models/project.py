@@ -123,7 +123,7 @@ from .project_item import (
     _detach_item_ref,
     item_container,
 )
-from .sequence_builder import DEFAULT_PRESET, FORMATS, build_sequence
+from .sequence_builder import DEFAULT_PRESET, FORMATS, SequenceFormat, build_sequence
 from .time import TICKS_PER_SECOND
 from .validators import validate_path, validate_string, validate_track_count
 
@@ -604,6 +604,7 @@ class Project:
         name: str,
         preset: str = DEFAULT_PRESET,
         video_tracks: int | None = None,
+        sequence_format: SequenceFormat | None = None,
     ) -> Sequence:
         """Create a new sequence and return it.
 
@@ -629,7 +630,7 @@ class Project:
         if video_tracks is not None:
             validate_track_count(video_tracks)
         document = self._document
-        fragment = build_sequence(name, preset, video_tracks=video_tracks)
+        fragment = build_sequence(name, preset, video_tracks=video_tracks, sequence_format=sequence_format)
         spliced = self._splice_fragment(fragment)
         sequence_element = spliced.get("Sequence")
         item_element = spliced.get("ClipProjectItem")

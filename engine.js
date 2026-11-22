@@ -42,7 +42,7 @@
         start: 0.8,
         duration: 3,
         in: 0,
-        track: 2,
+        track: 4,
         type: "title",
         title: "ALPINE PASSAGE",
         color: {},
@@ -69,13 +69,57 @@
   let time = 0;
   let playing = false;
   let lastTick = 0;
+  let playbackRate = 1;
+  let lastPaintedFrame = -1;
   let video = null;
   let transitionVideo = null;
   let audio = null;
   const audioElements = new Map();
+  const layerVideos = new Map();
   let activeVideoId = null;
   let transitionVideoId = null;
+  let preloadClipId = null;
   let mutedTracks = { audio: false, video: false, title: false };
+  let revision = 0;
+  let gesture = false;
+  let gestureBefore = null;
+  let audioContext;
+  const audioNodes = new WeakMap();
+  function routeAudio(element) {
+    if (!audioContext) audioContext = new AudioContext();
+    let route = audioNodes.get(element);
+    if (!route) {
+      const source = audioContext.createMediaElementSource(element);
+      const gain = audioContext.createGain();
+      const pan = audioContext.createStereoPanner();
+      const analyser=audioContext.createAnalyser();
+      analyser.fftSize=256;
+      source.connect(gain).connect(pan).connect(analyser).connect(audioContext.destination);
+      route={source,gain,pan,analyser};
+      audioNodes.set(element,route);
+    }
+    element.volume=1;
+    return route;
+  }
+  function meters() {
+    const result={};
+    for (const clip of project.clips.filter(c=>c.type==='audio')) {
+      const route=audioNodes.get(audioElements.get(clip.id));
+      if (!route) continue;
+      const samples=new Float32Array(route.analyser.fftSize);
+      route.analyser.getFloatTimeDomainData(samples);
+      const peak=Math.max(...samples.map(Math.abs));
+      result[String(clip.track)]=Math.max(result[String(clip.track)]||0,peak);
+    }
+    return result;
+  }
+  function setAudio(element,clip) {
+    if (!element || !clip) return;
+    const route=routeAudio(element);
+    const mix=trackSettings(clip.track);
+    route.gain.gain.setTargetAtTime(audibility(clip),audioContext.currentTime,.012);
+    route.pan.pan.setTargetAtTime(clamp(((Number(clip.pan)||0)+(Number(mix.pan)||0))/100,-1,1),audioContext.currentTime,.012);
+  }
   let history = [];
   let future = [];
   const subscribers = new Set();
@@ -87,6 +131,8 @@
     Math.max(0, ...project.clips.map((c) => c.start + c.duration));
   const notify = () => subscribers.forEach((fn) => fn(Editor.get()));
   const snapshot = () => {
+    if (gesture) return;
+    revision += 1;
     history.push(structuredClone(project));
     if (history.length > 50) history.shift();
     future = [];
@@ -98,9 +144,26 @@
         (c) => c.type === kind && c.start <= t && t < c.start + c.duration,
       )
       .sort((a, b) => b.track - a.track)[0];
+  const transitionLength = clip => clamp(Number(clip.transitionDuration || .5), 1 / project.fps, 2);
+  const trackSettings = track => project.trackMix?.[String(track)] || {};
+  const soloActive = () => Object.values(project.trackMix || {}).some(m => m.solo);
+  const audibility = clip => {
+    const mix = trackSettings(clip.track);
+    if (mutedTracks.audio || mix.mute || (soloActive() && !mix.solo)) return 0;
+    const local = time - clip.start;
+    const fadeIn = Math.max(0,Number(clip.fadeIn||0));
+    const fadeOut = Math.max(0,Number(clip.fadeOut||0));
+    const fade = Math.min(1, fadeIn ? local/fadeIn : 1, fadeOut ? (clip.duration-local)/fadeOut : 1);
+    return clamp((clip.volume??100)/100,0,2) * clamp((mix.gain??100)/100,0,2) * clamp(fade,0,1);
+  };
   const filterFor = (clip) => {
     const c = clip.color || {};
     return `brightness(${Number(c.brightness ?? 100)}%) contrast(${Number(c.contrast ?? 100)}%) saturate(${Number(c.saturation ?? 100)}%)`;
+  };
+  const gradeGains = c => {
+    const exposure=clamp(Number(c.exposure)||0,-4,4), temperature=clamp(Number(c.temperature)||0,-100,100)/100;
+    const tint=clamp(Number(c.tint)||0,-100,100)/100, gain=2**exposure;
+    return [gain*(1+.35*temperature-.1*tint),gain*(1+.2*tint),gain*(1-.35*temperature-.1*tint)];
   };
   function ensureElements() {
     if (!video) {
@@ -119,7 +182,7 @@
     }
   }
   function preceding(clip) {
-    if (!clip || clip.transition !== "dissolve") return null;
+    if (!clip || !["dissolve", "wipe"].includes(clip.transition)) return null;
     return (
       project.clips
         .filter(
@@ -140,6 +203,14 @@
         c.type === "audio" && c.start <= time && time < c.start + c.duration,
     );
     const mediaItem = clip && mediaOf(clip);
+    if (clip?.id === preloadClipId && clip.id !== activeVideoId) {
+      const outgoing = video;
+      video = transitionVideo;
+      transitionVideo = outgoing;
+      transitionVideoId = activeVideoId;
+      activeVideoId = clip.id;
+      preloadClipId = null;
+    }
     if (
       clip?.id !== activeVideoId ||
       (video.getAttribute("src") || "") !== (mediaItem?.src || "")
@@ -163,10 +234,10 @@
         }
       }
       video.style.filter = filterFor(clip);
-      if (playing) video.play().catch(() => {});
+      if (playing && playbackRate > 0) video.play().catch(() => {});
       else video.pause();
     }
-    const previous = clip && time < clip.start + 0.6 ? preceding(clip) : null;
+    const previous = clip && time < clip.start + transitionLength(clip) ? preceding(clip) : null;
     const previousMedia = previous && mediaOf(previous);
     if (
       previous?.id !== transitionVideoId ||
@@ -182,19 +253,54 @@
       }
     }
     if (previous) {
-      const target =
-        (previous.in || 0) + previous.duration - 0.6 + (time - clip.start);
-      if (Math.abs(transitionVideo.currentTime - target) > 1 / project.fps)
-        try {
-          transitionVideo.currentTime = target;
-        } catch (_) {
-          /* Metadata pending. */
+      const target = (previous.in || 0) + previous.duration + time - clip.start;
+      if (forceSeek || Math.abs(transitionVideo.currentTime - target) > .3) {
+        try { transitionVideo.currentTime = target; } catch (_) { /* Metadata pending. */ }
+      }
+      if (playing && playbackRate > 0) transitionVideo.play().catch(() => {});
+      else transitionVideo.pause();
+    } else transitionVideo.pause();
+    if (playing && playbackRate > 0 && clip && !previous) {
+      const upcoming = project.clips.find(c => c.type === "video" && c.track === clip.track &&
+        c.start >= time && c.start <= time + 1.5 && c.id !== clip.id);
+      if (upcoming && upcoming.id !== preloadClipId) {
+        const next = mediaOf(upcoming);
+        if (next?.src) {
+          transitionVideo.pause();
+          transitionVideo.src = next.src;
+          transitionVideo.load();
+          transitionVideo.addEventListener("loadedmetadata", () => {
+            if (preloadClipId === upcoming.id) transitionVideo.currentTime = upcoming.in || 0;
+          }, { once: true });
+          preloadClipId = upcoming.id;
+          transitionVideoId = null;
         }
+      }
+    }
+    const visible = project.clips.filter(c=>c.type==='video' && c.start<=time && time<c.start+c.duration);
+    const currentVideoIds=new Set(visible.map(c=>c.id));
+    for (const [id,element] of layerVideos) if (!currentVideoIds.has(id) || id===activeVideoId) {
+      element.pause();element.removeAttribute('src');element.load();element.remove();layerVideos.delete(id);
+    }
+    for (const layer of visible) {
+      if (layer.id===activeVideoId) continue;
+      const item=mediaOf(layer);
+      if (!item?.src) continue;
+      let element=layerVideos.get(layer.id);
+      if(!element) {
+        element=document.createElement('video');element.muted=true;element.playsInline=true;
+        element.preload='auto';element.style.display='none';element.src=item.src;document.body.append(element);layerVideos.set(layer.id,element);
+      }
+      const target=(layer.in||0)+time-layer.start;
+      if(forceSeek||Math.abs(element.currentTime-target)>.3) try{element.currentTime=target}catch(_){}
+      if(playing && playbackRate > 0) element.play().catch(()=>{}); else element.pause();
     }
     const currentIds = new Set(audioClips.map((c) => c.id));
     for (const [id, element] of audioElements)
       if (!currentIds.has(id)) {
         element.pause();
+        const route=audioNodes.get(element);
+        if (route) { route.source.disconnect(); route.gain.disconnect(); route.pan.disconnect(); route.analyser.disconnect(); audioNodes.delete(element); }
         element.removeAttribute("src");
         element.load();
         element.remove();
@@ -220,61 +326,125 @@
         } catch (_) {
           /* Metadata may still be loading. */
         }
-      element.volume = mutedTracks.audio
-        ? 0
-        : clamp((audioClip.volume ?? 100) / 100, 0, 1);
-      if (playing) element.play().catch(() => {});
+      if (playing && playbackRate > 0) element.play().catch(() => {});
       else element.pause();
+      setAudio(element,audioClip);
     }
     audio = audioClips.length ? audioElements.get(audioClips[0].id) : null;
-    video.volume =
-      mutedTracks.audio || clip?.embeddedAudio === false
-        ? 0
-        : clamp((clip?.volume ?? 100) / 100, 0, 1);
+    if (clip) {
+      setAudio(video,clip);
+      if (clip.embeddedAudio === false) audioNodes.get(video).gain.gain.value=0;
+    }
+  }
+  function animated(clip,key,base) {
+    const points=(clip.keyframes?.[key]||[]).filter(p=>Number.isFinite(p.time)&&Number.isFinite(p.value)).sort((a,b)=>a.time-b.time);
+    if (!points.length) return base;
+    const local=time-clip.start;
+    if (local<=points[0].time) return points[0].value;
+    for (let i=1;i<points.length;i++) if(local<=points[i].time) {
+      const a=points[i-1],b=points[i],u=(local-a.time)/(b.time-a.time);
+      return a.value+(b.value-a.value)*u;
+    }
+    return points.at(-1).value;
+  }
+  const layerCanvases = new Map();
+  function paintVideo(ctx,element,clip,canvas,alpha=1) {
+    if (!element || element.readyState < 2) return;
+    const sourceWidth=element.videoWidth||canvas.width;
+    const sourceHeight=element.videoHeight||canvas.height;
+    const fit=Math.min(canvas.width/sourceWidth,canvas.height/sourceHeight);
+    const scale=clamp(animated(clip,"scale",Number(clip.transform?.scale??100))/100,.1,4);
+    const x=clamp(animated(clip,"x",Number(clip.transform?.x??0)),-100,100)*canvas.width/100;
+    const y=clamp(animated(clip,"y",Number(clip.transform?.y??0)),-100,100)*canvas.height/100;
+    const rotation=clamp(animated(clip,"rotation",Number(clip.transform?.rotation??0)),-180,180)*Math.PI/180;
+    const lut=clip.color?.lut;
+    let target=ctx;
+    const gains=gradeGains(clip.color||{});
+    const graded=gains.some(g=>Math.abs(g-1)>.0001);
+    if ((lut && window.SpliceLUT) || graded) {
+      let layer=layerCanvases.get(clip.id);
+      if (!layer) { layer=document.createElement('canvas'); layerCanvases.set(clip.id,layer); }
+      if (layer.width!==canvas.width || layer.height!==canvas.height) {layer.width=canvas.width;layer.height=canvas.height;}
+      target=layer.getContext('2d',{willReadFrequently:true});
+      target.clearRect(0,0,layer.width,layer.height);
+    }
+    alpha *= clamp(animated(clip,"opacity",Number(clip.opacity??100))/100,0,1);
+    target.save(); target.globalAlpha=target===ctx?alpha:1; target.filter=filterFor(clip);
+    target.translate(canvas.width/2+x,canvas.height/2+y); target.rotate(rotation);
+    target.drawImage(element,-sourceWidth*fit*scale/2,-sourceHeight*fit*scale/2,sourceWidth*fit*scale,sourceHeight*fit*scale);
+    target.restore();
+    if (target!==ctx) {
+      const image=target.getImageData(0,0,canvas.width,canvas.height);
+      if (graded) {
+        const pixels=image.data;
+        for(let i=0;i<pixels.length;i+=4) {
+          pixels[i]=Math.min(255,pixels[i]*gains[0]);
+          pixels[i+1]=Math.min(255,pixels[i+1]*gains[1]);
+          pixels[i+2]=Math.min(255,pixels[i+2]*gains[2]);
+        }
+      }
+      if (lut && window.SpliceLUT) window.SpliceLUT.applyImageData(image,lut,clip.color.lutIntensity??100);
+      target.putImageData(image,0,0);
+      ctx.save();ctx.globalAlpha=alpha;ctx.drawImage(target.canvas,0,0);ctx.restore();
+    }
   }
   function drawFrame(canvas) {
     const ctx = canvas.getContext("2d");
     ctx.fillStyle = "#080a0a";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
-    const clip = at("video", time);
-    if (!mutedTracks.video && clip) {
-      const previous = time < clip.start + 0.6 ? preceding(clip) : null;
-      if (previous && transitionVideo.readyState >= 2) {
-        ctx.filter = filterFor(previous);
-        ctx.drawImage(transitionVideo, 0, 0, canvas.width, canvas.height);
+    if (!mutedTracks.video) {
+      const visible=project.clips.filter(c=>c.type==='video' && c.start<=time && time<c.start+c.duration)
+        .sort((a,b)=>a.track-b.track || a.start-b.start);
+      for (const clip of visible) {
+        const element=clip.id===activeVideoId ? video : layerVideos.get(clip.id);
+        const previous=clip.id===activeVideoId && time<clip.start+transitionLength(clip) ? preceding(clip) : null;
+        if(previous && transitionVideo.readyState>=2) paintVideo(ctx,transitionVideo,previous,canvas);
+        const alpha=(previous && clip.transition==='dissolve') || clip.transition==='fade' ?
+          clamp((time-clip.start)/transitionLength(clip),0,1) : 1;
+        if (previous && clip.transition==='wipe') {
+          ctx.save();ctx.beginPath();ctx.rect(0,0,canvas.width*clamp((time-clip.start)/transitionLength(clip),0,1),canvas.height);ctx.clip();
+        }
+        paintVideo(ctx,element,clip,canvas,alpha);
+        if (previous && clip.transition==='wipe') ctx.restore();
       }
-      if (video?.readyState >= 2) {
-        ctx.globalAlpha = previous ? clamp((time - clip.start) / 0.6, 0, 1) : 1;
-        ctx.filter = filterFor(clip);
-        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-      }
-      ctx.globalAlpha = 1;
-      ctx.filter = "none";
+      ctx.globalAlpha=1;ctx.filter='none';
     }
     const title = mutedTracks.title ? null : at("title", time);
     if (title?.title) {
       ctx.fillStyle = "#fff";
-      ctx.font = `bold ${Math.round(canvas.height * 0.08)}px sans-serif`;
-      ctx.textAlign = "center";
+      const style=title.titleStyle||{};
+      ctx.font = `bold ${Math.round(canvas.height * (Number(style.fontSize)||8)/100)}px "${style.fontFamily||'DM Sans'}"`;
+      ctx.fillStyle=style.color||'#ffffff';
+      ctx.textAlign = ['left','center','right'].includes(style.align) ? style.align : 'center';
+      ctx.textBaseline = "middle";
       ctx.shadowColor = "#000";
       ctx.shadowBlur = canvas.height * 0.025;
-      ctx.fillText(title.title, canvas.width / 2, canvas.height * 0.78);
+      const tx=canvas.width * (Number(style.x??50)/100), ty=canvas.height * (Number(style.y??78)/100);
+      const lines=title.title.split(/\r?\n/).slice(0,20);
+      const lineHeight=Math.round(canvas.height * (Number(style.fontSize)||8)/100)*1.2;
+      for (let i=0;i<lines.length;i++) {
+        const lineY=ty+(i-(lines.length-1)/2)*lineHeight;
+        if (Number(style.strokeWidth)>0) {
+          ctx.lineWidth=Number(style.strokeWidth)*canvas.height/180;
+          ctx.strokeStyle=style.strokeColor||'#000000';
+          ctx.strokeText(lines[i],tx,lineY);
+        }
+        ctx.fillText(lines[i],tx,lineY);
+      }
       ctx.shadowBlur = 0;
     }
   }
   function tick(timestamp) {
     if (playing) {
-      time = Math.min(
-        duration(),
-        time + Math.min((timestamp - lastTick) / 1000, 0.1),
-      );
-      if (time >= duration()) {
+      time = clamp(time + Math.min((timestamp - lastTick) / 1000, 0.1) * playbackRate, 0, duration());
+      if ((playbackRate > 0 && time >= duration()) || (playbackRate < 0 && time <= 0)) {
         playing = false;
         video?.pause();
         audio?.pause();
       }
-      syncMedia();
-      notify();
+      syncMedia(playbackRate < 0);
+      const frame = Math.floor(time * project.fps);
+      if (frame !== lastPaintedFrame) { lastPaintedFrame = frame; notify(); }
     }
     lastTick = timestamp;
     requestAnimationFrame(tick);
@@ -364,11 +534,13 @@
   const Editor = {
     get: () => ({
       project,
+      revision,
       selectedId,
       selected: selected(),
       time,
       playing,
       mutedTracks,
+      audioMeters: meters(),
       duration: duration(),
       video,
       audio,
@@ -377,6 +549,44 @@
       activeAudio: at("audio", time),
     }),
     drawFrame,
+    editProject(fn) {
+      const previous=structuredClone(project);
+      snapshot();
+      try { fn(project); validateProject(project); }
+      catch(error) { project=previous; history.pop(); revision += 1; throw error; }
+      project.duration=duration(); time=clamp(time,0,project.duration); syncMedia(true); notify();
+    },
+    updateTrackMix(track, patch) {
+      const key=String(track);
+      const next={ gain:100, pan:0, mute:false, solo:false, ...project.trackMix?.[key], ...patch };
+      if (JSON.stringify(next)===JSON.stringify(project.trackMix?.[key])) return;
+      snapshot();
+      project.trackMix ||= {};
+      project.trackMix[key] = next;
+      syncMedia(); notify();
+    },
+    beginGesture() { if (gesture) return; gestureBefore=structuredClone(project); gesture=true; },
+    endGesture() {
+      if (!gesture) return;
+      gesture=false;
+      if (JSON.stringify(gestureBefore)!==JSON.stringify(project)) {
+        history.push(gestureBefore);if(history.length>50) history.shift();future=[];revision++;
+      }
+      gestureBefore=null;notify();
+    },
+    renameProject(name) { const next=String(name).trim(); if (!next || next===project.name) return; snapshot(); project.name=next; notify(); },
+    setRate(rate) {
+      const requested=Number(rate);
+      if (!Number.isFinite(requested)) return;
+      if (requested===0) { playing=false;syncMedia(true);notify();return; }
+      playbackRate=clamp(requested,-4,4);
+      if(time>=duration()&&playbackRate>0) time=0;
+      if(time<=0&&playbackRate<0) time=duration();
+      playing=true;
+      for (const element of [video,transitionVideo,...audioElements.values(),...layerVideos.values()]) if(element) element.playbackRate=Math.max(.25,Math.abs(playbackRate));
+      if(playbackRate>0) audioContext?.resume().catch(()=>{});
+      syncMedia(true);notify();
+    },
     setTrackMuted(track, muted) {
       if (track in mutedTracks) {
         mutedTracks[track] = !!muted;
@@ -396,8 +606,10 @@
     },
     togglePlay() {
       playing = !playing;
+      if (playing && playbackRate < 0) playbackRate=1;
       if (playing && time >= duration()) time = 0;
       if (!playing) time = snap(time);
+      if (playing) audioContext?.resume().catch(() => {});
       syncMedia(true);
       notify();
     },
@@ -432,10 +644,28 @@
       syncMedia(true);
       notify();
     },
+    async relinkMediaItem(itemId, file) {
+      const item = project.media.find(m => m.id === itemId);
+      if (!item) throw new Error("Media item is unavailable.");
+      const kind = file.type.startsWith("audio/") ? "audio" : file.type.startsWith("video/") ? "video" : "";
+      if (kind !== item.type) throw new Error("Choose a " + item.type + " file.");
+      const decoded = await fileToMedia(file);
+      const needed = Math.max(0,...project.clips.filter(c=>c.mediaId===itemId).map(c=>c.in+c.duration));
+      if (decoded.duration + .02 < needed) throw new Error(file.name + " is shorter than the source used on this timeline.");
+      snapshot();
+      item.duration=decoded.duration; item.src=decoded.src; item.offline=false;
+      item.path=file.name;
+      await SpliceMedia.remember(item,file);
+      activeVideoId=null; syncMedia(true); notify();
+    },
     async relinkMedia(files) {
       const matches = Array.from(files).filter((file) =>
         project.media.some((item) => SpliceMedia.matches(item, file)),
       );
+      for (const file of matches) {
+        const count=project.media.filter(item=>SpliceMedia.matches(item,file)).length;
+        if(count!==1) throw new Error("Choose a file for each offline media item individually.");
+      }
       if (!matches.length)
         throw new Error(
           "None of the selected files match the offline media names.",
@@ -477,6 +707,14 @@
     updateClip(id, patch) {
       const clip = project.clips.find((c) => c.id === id);
       if (!clip) return;
+      const item = mediaOf(clip);
+      const requestedIn = "in" in patch ? Number(patch.in) : clip.in;
+      const requestedDuration = "duration" in patch ? Number(patch.duration) : clip.duration;
+      if (!Number.isFinite(requestedIn) || requestedIn < 0 || !Number.isFinite(requestedDuration) || requestedDuration <= 0 ||
+          (item?.duration && requestedIn + requestedDuration > item.duration + .01)) {
+        throw new Error("Clip extends beyond available source footage.");
+      }
+      if (Object.entries(patch).every(([key,value]) => JSON.stringify(clip[key])===JSON.stringify(value))) return;
       snapshot();
       Object.assign(clip, patch);
       for (const key of ["start", "duration", "in"])
@@ -486,6 +724,39 @@
       project.duration = duration();
       syncMedia(true);
       notify();
+    },
+    trimEdge(id, edge, atTime, { ripple = false } = {}) {
+      const clip = project.clips.find(c => c.id === id);
+      if (!clip) return;
+      const oldStart = clip.start, oldEnd = oldStart + clip.duration;
+      const boundary = snap(atTime);
+      const newStart = edge === "start" ? clamp(boundary, Math.max(0, oldStart - clip.in), oldEnd - 1/project.fps) : oldStart;
+      const mediaItem = mediaOf(clip);
+      const sourceEnd = mediaItem?.duration || Infinity;
+      const newEnd = edge === "end" ? clamp(boundary, oldStart + 1/project.fps, oldStart + sourceEnd - clip.in) : oldEnd;
+      const shift = (edge === "start" ? newStart - oldStart : newEnd - oldEnd);
+      if (!shift) return;
+      snapshot();
+      if (edge === "start") { clip.start = newStart; clip.in += shift; clip.duration = oldEnd - newStart; }
+      else clip.duration = newEnd - oldStart;
+      if (ripple) for (const next of project.clips) if (next.id !== id && next.start >= oldEnd - .001) next.start = Math.max(0, snap(next.start + shift));
+      project.duration = duration(); syncMedia(true); notify();
+    },
+    rollEdit(leftId, rightId, boundary) {
+      const left = project.clips.find(c => c.id === leftId), right = project.clips.find(c => c.id === rightId);
+      if (!left || !right || left.type !== right.type || left.track !== right.track || Math.abs(left.start + left.duration - right.start) > .05) return;
+      const end = right.start + right.duration, source = mediaOf(left)?.duration || Infinity;
+      const cut = clamp(snap(boundary), Math.max(left.start+1/project.fps,right.start-right.in), Math.min(end-1/project.fps,left.start+source-left.in));
+      if (!Number.isFinite(cut) || cut === right.start) return;
+      snapshot(); left.duration = cut-left.start; right.in += cut-right.start; right.duration = end-cut; right.start=cut;
+      syncMedia(true); notify();
+    },
+    slipClip(id, delta) {
+      const clip = project.clips.find(c => c.id === id), source = clip && mediaOf(clip)?.duration;
+      if (!clip || !source) return;
+      const next = clamp(snap(clip.in+delta),0,Math.max(0,source-clip.duration));
+      if (next === clip.in) return;
+      snapshot(); clip.in=next; syncMedia(true); notify();
     },
     split() {
       const clip = selected() || at("video", time);
@@ -528,7 +799,7 @@
         start: time,
         duration: 4,
         in: 0,
-        track: 2,
+        track: 4,
         type: "title",
         title: "Your title",
         color: { brightness: 100, contrast: 100, saturation: 100 },
@@ -551,6 +822,7 @@
       if (!history.length) return;
       future.push(structuredClone(project));
       project = history.pop();
+      revision += 1;
       syncMedia(true);
       notify();
     },
@@ -558,16 +830,21 @@
       if (!future.length) return;
       history.push(structuredClone(project));
       project = future.pop();
+      revision += 1;
       syncMedia(true);
       notify();
     },
-    newProject() {
+    newProject(settings = {}) {
+      const name=String(settings.name||"Untitled project").trim();
+      const width=Number(settings.width||1920), height=Number(settings.height||1080), fps=Number(settings.fps||25);
+      if (!name || !Number.isInteger(width) || !Number.isInteger(height) || width<16 || height<16 || width>3840 || height>2160 ||
+          !Number.isFinite(fps) || fps<1 || fps>60) throw new Error("Invalid sequence settings.");
       snapshot();
       project = {
-        name: "Untitled project",
-        width: 1920,
-        height: 1080,
-        fps: 25,
+        name,
+        width,
+        height,
+        fps,
         media: [],
         clips: [],
         duration: 0,
@@ -627,24 +904,60 @@
           `${safe}.splice.json`,
         );
     },
-    async exportVideo() {
-      if (!duration())
-        throw new Error("Add clips to the timeline before exporting.");
+    async exportVideo(options = {}, onProgress = () => {}, signal) {
+      if (!duration()) throw new Error("Add clips to the timeline before exporting.");
+      if (signal?.aborted) throw signal.reason || new DOMException("Export cancelled", "AbortError");
       const prepared = window.SpliceMedia?.forPremiere
         ? await window.SpliceMedia.forPremiere(project)
         : structuredClone(project);
+      if (signal?.aborted) throw signal.reason || new DOMException("Export cancelled", "AbortError");
       prepared.renderOptions = { mutedTracks };
-      const response = await fetch("/api/render", {
+      const response = await fetch("/api/exports", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ project: prepared }),
-        signal: AbortSignal.timeout(3600000),
+        body: JSON.stringify({ project: prepared, options }),
+        signal: AbortSignal.timeout(120000),
       });
       if (!response.ok) throw new Error(await response.text());
-      download(
-        await response.blob(),
-        `${project.name.replace(/[^a-z0-9_-]+/gi, "-")}.mp4`,
-      );
+      const { id } = await response.json();
+      if (typeof id !== "string" || !id) throw new Error("Export server did not return a job ID.");
+      const endpoint = "/api/exports/" + encodeURIComponent(id);
+      let cancelSent = false;
+      const cancelJob = async () => {
+        if (cancelSent) return;
+        cancelSent = true;
+        const cancelled = await fetch(endpoint + "/cancel", { method: "POST", signal: AbortSignal.timeout(120000) });
+        if (!cancelled.ok) throw new Error(await cancelled.text());
+      };
+      try {
+        if (signal?.aborted) { await cancelJob(); throw signal.reason || new DOMException("Export cancelled", "AbortError"); }
+        while (true) {
+          await new Promise((resolve, reject) => {
+            if (signal?.aborted) { reject(signal.reason || new DOMException("Export cancelled", "AbortError")); return; }
+            const onAbort = () => { clearTimeout(timer); reject(signal.reason || new DOMException("Export cancelled", "AbortError")); };
+            const timer = setTimeout(() => { signal?.removeEventListener("abort", onAbort); resolve(); }, 500);
+            signal?.addEventListener("abort", onAbort, { once: true });
+          });
+          const status = await fetch(endpoint, { signal });
+          if (!status.ok) throw new Error(await status.text());
+          const job = await status.json();
+          onProgress(job);
+          if (job.state === "failed") throw new Error(job.error || "Export failed.");
+          if (job.state === "cancelled") throw new Error("Export cancelled.");
+          if (job.state === "complete") {
+            const safe = (project.name || "Untitled").replace(/[^a-z0-9_-]+/gi, "-").replace(/^-+|-+$/g, "") || "Untitled";
+            const downloadURL = endpoint + "/file?name=" + encodeURIComponent(safe + ".mp4");
+            const anchor = document.createElement("a");
+            anchor.href = downloadURL;
+            anchor.download = safe + ".mp4";
+            anchor.click();
+            return { id, url: endpoint + "/preview", downloadURL };
+          }
+        }
+      } catch (error) {
+        if (signal?.aborted) await cancelJob();
+        throw error;
+      }
     },
   };
   window.Editor = Editor;

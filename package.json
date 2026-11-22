@@ -1,0 +1,8 @@
+{
+  "name": "splice-linux",
+  "private": true,
+  "scripts": {
+    "test": "python3 -m unittest discover -s tests && node tests/studio-flow.cjs"
+  },
+  "devDependencies": {"playwright-core":"1.65.1"}
+}

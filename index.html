@@ -7,7 +7,9 @@
     <title>Splice — Video editor</title>
     <link rel="icon" href="assets/icon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="assets/fonts/fonts.css" />
+    <link rel="stylesheet" href="source_monitor.css">
     <link rel="stylesheet" href="studio.css" />
+    <link rel="stylesheet" href="inspector.css" />
   </head>
   <body>
     <div class="app-shell">
@@ -31,7 +33,7 @@
           ><button data-workspace="audio">Audio</button>
         </nav>
         <div class="header-spacer"></div>
-        <span id="save-status" class="save-status">Ready</span>
+        <span id="session-status" class="save-status" aria-live="polite">Ready</span><span id="save-status" class="save-status">Ready</span>
         <button
           class="quiet header-icon"
           id="open-project"
@@ -52,15 +54,18 @@
       </header>
       <div class="utility-bar">
         <div class="utility-left">
-          <button id="new-project" class="menu-button">New project</button
-          ><button id="import-media" class="menu-button">
+          <details class="file-menu"><summary>File</summary><div>
+            <button id="new-project">New project…</button><button id="save-as">Save Premiere as…</button>
+            <button id="save-working">Save working project…</button>
+            <button id="versions">Recent projects &amp; recovery</button>
+            <button id="shortcuts">Keyboard and mouse</button></div></details><button id="import-media" class="menu-button">
             Import media <span>+</span></button
           ><span class="utility-sep"></span
           ><span class="sequence-label">SEQUENCE 01</span
-          ><span class="sequence-name">Alpine Passage — Main Edit</span>
+          ><span class="sequence-name">Alpine Passage — Main Edit</span><select id="sequence-select" aria-label="Sequence" hidden></select>
         </div>
         <div class="utility-right">
-          <span class="format-pill">1920 × 1080</span
+          <span class="format-pill" id="size-label">1920 × 1080</span
           ><span class="format-pill" id="fps-label">24 FPS</span
           ><span class="utility-sep"></span
           ><span class="timecode" id="header-time">00:00:00:00</span>
@@ -86,7 +91,7 @@
             ><button data-library="effects">Effects</button
             ><button data-library="titles">Titles</button>
           </div>
-          <div class="library-body" id="library-body"></div>
+          <div class="pool-tools"><select id="bin-filter" aria-label="Media bin"><option value="">All bins</option></select><input id="media-search" type="search" placeholder="Search media" aria-label="Search media" /><select id="media-filter" aria-label="Filter media"><option value="all">All media</option><option value="video">Video</option><option value="audio">Audio</option><option value="offline">Offline</option></select></div><div class="library-body" id="library-body"></div>
           <div class="library-footer">
             <span class="status-dot"></span
             ><span id="asset-footer">Project ready</span>
@@ -177,63 +182,19 @@
             ><button id="delete-selected" title="Delete selected clip">
               ⌫ <span>Delete</span></button
             ><span class="tool-sep"></span
-            ><button id="zoom-out" title="Zoom out">−</button
+            ><button id="add-marker" title="Add marker (M)">Marker</button><button id="snap-toggle" class="active" title="Snap to edit points (N)">Snap</button><button id="ripple-toggle" title="Ripple trim (R)">Ripple</button><button id="zoom-out" title="Zoom out">−</button
             ><span id="zoom-label">55%</span
             ><button id="zoom-in" title="Zoom in">+</button>
           </div>
         </div>
         <div class="timeline-body" id="timeline-body">
-          <div class="track-heads">
+          <div class="track-heads" id="track-heads">
             <div class="ruler-head">TIMECODE</div>
-            <div class="track-head" data-track="title">
-              <span class="track-icon">T</span><span>Titles</span
-              ><button
-                class="track-mute"
-                data-track="title"
-                title="Toggle track"
-              >
-                ◉
-              </button>
-            </div>
-            <div class="track-head" data-track="video">
-              <span class="track-icon">▣</span><span>Video 1</span
-              ><button
-                class="track-mute"
-                data-track="video"
-                title="Toggle track"
-              >
-                ◉
-              </button>
-            </div>
-            <div class="track-head" data-track="audio">
-              <span class="track-icon">♫</span><span>Audio 1</span
-              ><button
-                class="track-mute"
-                data-track="audio"
-                title="Toggle track"
-              >
-                ◉
-              </button>
-            </div>
           </div>
           <div class="track-scroll" id="track-scroll">
             <div class="timeline-surface" id="timeline-surface">
               <div class="time-ruler" id="time-ruler"></div>
-              <div
-                class="track-lane title-lane"
-                id="title-lane"
-                data-track="title"
-              ></div>
-              <div
-                class="track-lane video-lane"
-                id="video-lane"
-                data-track="video"
-              ></div>
-              <div
-                class="track-lane audio-lane"
-                id="audio-lane"
-                data-track="audio"
-              ></div>
+              <div id="track-lanes"></div>
               <div class="playhead" id="playhead"><i></i></div>
             </div>
           </div>
@@ -267,8 +228,14 @@
       accept=".prproj,.splice,.json,application/json"
       hidden
     />
+    <input type="file" id="specific-relink-input" hidden />
     <script src="media-store.js"></script>
+    <script src="lut.js"></script>
     <script src="engine.js"></script>
+    <script src="inspector.js"></script>
+    <script src="source_monitor.js"></script>
+    <script src="studio-dialogs.js"></script>
+    <script src="recovery.js"></script>
     <script src="workspace.js"></script>
   </body>
 </html>

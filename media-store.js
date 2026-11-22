@@ -59,18 +59,31 @@ window.SpliceMedia = (() => {
     transaction.objectStore("files").put(record);
     await committed;
   }
+  async function upload(file) {
+    const response = await fetch('/api/media/upload?name='+encodeURIComponent(file.name), {
+      method:'POST',body:file,signal:AbortSignal.timeout(60 * 60 * 1000)
+    });
+    const result = await response.json();
+    if (!response.ok || !localMedia(result.src)) throw Error(result.error || 'Import failed.');
+    return result.src;
+  }
+  async function exists(src) {
+    if (!localMedia(src) && !bundled(src)) return false;
+    return (await fetch(src,{method:'HEAD',cache:'no-store',signal:AbortSignal.timeout(15000)})).ok;
+  }
   async function remember(item, file) {
     item.path ||= file.name;
-    await put({ id: key(item), path: item.path, file });
-    item.src ||= URL.createObjectURL(file);
-    item.offline = false;
-    if (item.src.startsWith("blob:")) urls.set(key(item), item.src);
+    const serverSrc = await upload(file);
+    await put({id:key(item),path:item.path,serverSrc});
+    if (item.src?.startsWith('blob:')) URL.revokeObjectURL(item.src);
+    item.src=serverSrc;
+    item.offline=false;
     return item;
   }
   async function restore(project) {
     const db = await open();
     for (const item of project.media) {
-      if (bundled(item.src) || localMedia(item.src)) {
+      if ((bundled(item.src) || localMedia(item.src)) && await exists(item.src)) {
         item.offline = false;
         continue;
       }
@@ -92,7 +105,9 @@ window.SpliceMedia = (() => {
           );
         }
       }
-      if (record) {
+      if (record?.serverSrc && await exists(record.serverSrc)) {
+        item.src=record.serverSrc; item.storageKey=record.id; item.offline=false;
+      } else if (record?.file) {
         if (!urls.has(record.id))
           urls.set(record.id, URL.createObjectURL(record.file));
         item.src = urls.get(record.id);
@@ -120,7 +135,7 @@ window.SpliceMedia = (() => {
         throw new Error(
           "Relink " + item.name + " before saving a Premiere project.",
         );
-      if (!record.serverSrc) {
+      if (!record.serverSrc || !await exists(record.serverSrc)) {
         const response = await fetch(
           "/api/media/upload?name=" + encodeURIComponent(record.file.name),
           {

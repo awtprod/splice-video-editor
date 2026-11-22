@@ -1,0 +1,24 @@
+.source-dialog{width:min(920px,calc(100vw - 32px));max-height:min(880px,calc(100vh - 32px));padding:0;color:#edf5e8;background:#181d19;border:1px solid #56634d;border-radius:10px;box-shadow:0 24px 80px #0009;overflow:auto}
+.source-dialog::backdrop{background:#080d08bf}
+.source-head{display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid #374335}
+.source-head>div{display:grid;gap:4px}.source-head small{font:10px 'IBM Plex Mono',monospace;color:#aaca83;letter-spacing:.12em}.source-head strong{font-size:17px}
+.source-close{font-size:27px;line-height:1;background:transparent;border:0;color:#ddebd4;cursor:pointer}
+.source-stage{height:min(45vh,450px);background:#080c09;display:grid;place-items:center}
+.source-stage video{height:100%;max-width:100%;object-fit:contain}
+.source-stage audio{width:min(540px,90%)}
+.source-controls{display:grid;gap:12px;padding:17px 20px 20px}
+.source-scrub{width:100%;accent-color:#c6f178}.source-time,.source-range{font:12px 'IBM Plex Mono',monospace;color:#d7efb8}
+.source-buttons,.source-actions{display:flex;gap:8px;flex-wrap:wrap}
+.source-dialog button:not(.source-close){border:1px solid #4b5948;background:#252e25;color:#ebf4e6;padding:8px 11px;border-radius:5px;cursor:pointer}
+.source-dialog button:hover{border-color:#c6f178}
+.source-bin,.source-track-label{display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:12px;color:#b3c2ac}
+.source-bin input,.source-track-label select{width:min(350px,70%);padding:8px;color:#eef8e9;background:#252e25;border:1px solid #4b5948;border-radius:5px}
+.source-actions{justify-content:flex-end;margin-top:4px}
+.source-dialog .source-primary{background:#c6f178!important;color:#162214!important;border-color:#c6f178!important;font-weight:700}
+.source-status{margin:0;min-height:15px;color:#e4b5a2;font-size:12px}
+.source-stage{overflow:hidden;min-height:0}
+.source-stage video{width:100%;height:100%;min-width:0;min-height:0;max-height:100%;object-fit:contain}
+.source-controls{position:relative;z-index:1}
+.source-stage{height:min(36vh,350px)}
+.source-controls{gap:9px;padding:14px 20px}
+@media(max-height:720px){.source-stage{height:min(30vh,240px)}}

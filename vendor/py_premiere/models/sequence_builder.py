@@ -451,6 +451,7 @@ def build_sequence(
     preset: str = DEFAULT_PRESET,
     uids: dict[str, str] | None = None,
     video_tracks: int | None = None,
+    sequence_format: SequenceFormat | None = None,
 ) -> ET.Element:
     """Return a `PremiereData` fragment holding a new sequence's objects.
 
@@ -461,9 +462,9 @@ def build_sequence(
     `video_tracks` overrides the preset's count, which no preset Adobe ships
     varies - it is 3 in every one of them.
     """
-    if preset not in FORMATS:
+    if sequence_format is None and preset not in FORMATS:
         raise ValueError(f"unknown preset {preset!r}; try {sorted(FORMATS)}")
-    fmt = FORMATS[preset]
+    fmt = sequence_format or FORMATS[preset]
     if video_tracks is not None:
         fmt = fmt._replace(video_tracks=video_tracks)
     # A mono-discrete sequence mixes to a 32-channel bus and carries one
