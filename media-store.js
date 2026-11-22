@@ -56,12 +56,13 @@ window.SpliceMedia = (() => {
         const candidate=parts(file.webkitRelativePath||file.name);
         let count=0;
         while(count<Math.min(source.length,candidate.length) && source.at(-1-count)===candidate.at(-1-count))count++;
-        return {file,count};
+        return {file,count,depth:candidate.length};
       }).sort((a,b)=>b.count-a.count);
       if(!options.length)continue;
       if(options[0].count===options[1]?.count || consumed.has(options[0].file))
         throw Error('Ambiguous copies of '+item.name+'. Relink this source individually.');
-      consumed.add(options[0].file);ordered.push({item,file:options[0].file,nameOnly:options[0].count===1});
+      const {file,count,depth}=options[0];
+      consumed.add(file);ordered.push({item,file,matched:count,needsConfirmation:count===1||count<depth});
     }
     return ordered;
   }
@@ -97,9 +98,9 @@ window.SpliceMedia = (() => {
     if(!response.ok) throw Error(data.error||'Could not inspect the original source');
     return data;
   }
-  async function makeProxy(src) {
+  async function makeProxy(src, seekOptimized=false, audioStream=null) {
     const response=await fetch('/api/media/proxy',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({src}),signal:AbortSignal.timeout(3650000)});
+      body:JSON.stringify({src,seekOptimized,audioStream}),signal:AbortSignal.timeout(3650000)});
     const data=await response.json();
     if(!response.ok || !localMedia(data.src)) throw Error(data.error||'Could not create edit proxy');
     return data.src;
@@ -108,7 +109,7 @@ window.SpliceMedia = (() => {
     const originalSrc=await upload(file);
     const info=await probe(originalSrc);
     const src=info.proxyRecommended?await makeProxy(originalSrc):originalSrc;
-    return {...info,src,originalSrc,name:file.name,path:file.name,offline:false};
+    return {...info,src,originalSrc,name:file.name,path:file.name,offline:false,seekOptimized:false,audioStream:null};
   }
   const nestedRequests=new WeakMap();
   function prepareNested(item,retry=false) {
@@ -136,7 +137,7 @@ window.SpliceMedia = (() => {
   }
   async function restoreSource(item, original) {
     const metadata=await probe(original);
-    const src=metadata.proxyRecommended?await makeProxy(original):original;
+    const src=metadata.proxyRecommended||item.seekOptimized?await makeProxy(original,item.seekOptimized===true,item.audioStream??null):original;
     Object.assign(item,metadata,{src,originalSrc:original});
   }
   async function restore(project) {
@@ -233,5 +234,5 @@ window.SpliceMedia = (() => {
     }
     return copy;
   }
-  return { importFile, remember, rememberMany, prepareNested, restore, matches, matchFolder, forPremiere };
+  return { importFile, remember, rememberMany, makeProxy, prepareNested, restore, matches, matchFolder, forPremiere };
 })();

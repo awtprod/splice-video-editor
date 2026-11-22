@@ -218,9 +218,12 @@ class MovieDelivery(unittest.TestCase):
         MEDIA_ROOT.mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(dir=MEDIA_ROOT) as directory:
             source=Path(directory)/'gradient.mov'
+            neutral=Path(directory)/'neutral.mov'
             subprocess.run(['ffmpeg','-nostdin','-v','error','-f','lavfi','-i',
                 'nullsrc=s=256x64:r=25,format=yuv422p10le,geq=lum=100+3*X:cb=512:cr=512',
-                '-t','1','-c:v','prores_ks','-profile:v','3','-threads','1',str(source)],check=True,timeout=10)
+                '-t','1','-c:v','prores_ks','-profile:v','3','-threads','1',str(neutral)],check=True,timeout=10)
+            subprocess.run(['ffmpeg','-nostdin','-v','error','-i',str(neutral),'-c:v','copy','-color_primaries','bt2020',
+                '-color_trc','arib-std-b67','-colorspace','bt2020nc','-movflags','+write_colr',str(source)],check=True,timeout=10)
             self.project.update(width=256,height=64,media=[dict(id='ramp',src='/media/'+str(source.relative_to(MEDIA_ROOT)))],
                 clips=[dict(type='video',mediaId='ramp',track=1,start=0,duration=1)])
             output=Path(directory)/'master.mov'
@@ -230,10 +233,13 @@ class MovieDelivery(unittest.TestCase):
                     '-pix_fmt','yuv422p10le','-f','rawvideo','pipe:1'],timeout=10)
                 row=raw[32*256*2:33*256*2]
                 self.assertEqual(len({row[i:i+2] for i in range(0,len(row),2)}),256)
+                metadata=json.loads(subprocess.check_output(['ffprobe','-v','error','-select_streams','v:0','-show_entries',
+                    'stream=color_primaries,color_transfer,color_space','-of','json',str(file)],timeout=10))['streams'][0]
+                self.assertEqual(metadata,dict(color_primaries='bt2020',color_transfer='arib-std-b67',color_space='bt2020nc'))
 
     def test_mix_includes_second_discrete_camera_stream(self):
         from array import array
-        from premiere import MEDIA_ROOT, save_project
+        from premiere import MEDIA_ROOT, open_project, save_project
         from media_proxy import describe
         MEDIA_ROOT.mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(dir=MEDIA_ROOT) as directory:
@@ -252,8 +258,24 @@ class MovieDelivery(unittest.TestCase):
             samples=array('f',subprocess.check_output(['ffmpeg','-nostdin','-v','error','-ss','0.2',
                 '-i',str(output),'-t','0.5','-f','f32le','pipe:1'],timeout=10))
             self.assertGreater((sum(sample*sample for sample in samples)/len(samples))**.5,.05)
-            with self.assertRaisesRegex(ValueError,'multiple source audio streams'):
-                save_project(self.project)
+            reopened=open_project(save_project(self.project))
+            self.assertEqual({clip['type'] for clip in reopened['clips']},{'video','audio'})
+            self.assertEqual(len({clip['linkGroup'] for clip in reopened['clips']}),1)
+            self.assertTrue(any(item['name'].endswith('-audio.wav') for item in reopened['media']))
+            native=Path(directory)/'native.wav'
+            render_to_file(reopened,native,options={'codec':'wav'})
+            self.assertEqual(native.read_bytes(),output.read_bytes())
+
+    def test_export_range_retains_frames_inside_long_dissolve(self):
+        self.project['clips'] = [self.clip('a','ridge',0,4),
+            dict(id='b',type='video',mediaId='valley',track=1,start=4,duration=4,
+                 transition='dissolve',transitionDuration=4.8,transitionBefore=2.4,**{'in':2.4})]
+        render_to_file(self.project,self.destination)
+        expected=self.frame(4)
+        render_to_file(self.project,self.destination,options={'range':{'start':4,'end':7}})
+        self.assertEqual(next(s['nb_frames'] for s in self.streams() if s['codec_type']=='video'),'75')
+        delivered=self.frame(0)
+        self.assertLess(statistics.mean(abs(a-b) for a,b in zip(expected,delivered)),5)
 
     def test_fractional_video_origin_and_delayed_audio(self):
         from array import array

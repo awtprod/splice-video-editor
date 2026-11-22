@@ -35,17 +35,23 @@
     const text = clip.titleStyle || {};
     const fps = state.project.fps || 25;
     const locked=!!editor.isTrackLocked?.(clip.track,clip.type);
-    const maximumDuration = source?.duration ? Math.max(1/fps, source.duration - (clip.in || 0)) : 7200;
+    const maximumDuration = source?.duration ? Math.max(1/fps, (source.duration - (clip.in || 0))/number(clip.speed,1)) : 7200;
     let html = `<div class="splice-clip-heading"><small>${escape(clip.type)} · ${clip.track > 0 ? 'V' + clip.track : 'A' + Math.abs(clip.track)}</small><strong>${escape(title)}</strong></div>`;
     if(locked) html += '<p class="splice-compat">This track is locked. Unlock it in the timeline to edit this clip.</p>';
     html += section('Timing',
       field('Timeline start', 'start', number(clip.start, 0).toFixed(2), 0, 7200, 1/fps) +
       (clip.type === 'title' ? '' : field('Source in', 'in', number(clip.in, 0).toFixed(2), 0, source?.duration || 7200, 1/fps)) +
       field('Duration', 'duration', number(clip.duration, 1).toFixed(2), 1/fps, maximumDuration, 1/fps));
+    if (clip.type!=='title' && !clip.nativeTimeRemap) html += section('Speed',
+      field('Speed (%)','speedPercent',Math.round(number(clip.speed,1)*10000)/100,10,800,.01) +
+      `<label class="splice-safe-toggle"><input aria-label="Reverse clip" type="checkbox" data-field="reverse" ${clip.reverse?'checked':''}> Reverse clip</label>`);
     if (clip.type === 'video') {
-      const previous = state.project.clips.filter(item => item.type === 'video' && item.id !== clip.id && item.start < clip.start && item.start + item.duration >= clip.start - .05).sort((a,b)=>b.start-a.start)[0];
+      const previous = state.project.clips.find(item => item.type==='video' && item.track===clip.track && item.id!==clip.id &&
+        Math.round((item.start+item.duration)*fps)===Math.round(clip.start*fps));
       const previousMedia = previous && state.project.media.find(item=>item.id===previous.mediaId);
-      const handle = previous && previousMedia ? Math.max(0,previousMedia.duration - previous.in - previous.duration) : 0;
+      const previousSpeed = number(previous?.speed,1);
+      const handle = previous && previousMedia ? Math.max(0,previous.reverse ? previous.in/previousSpeed :
+        (previousMedia.duration-previous.in)/previousSpeed-previous.duration) : 0;
       html += section('Transform',
         label('Scale', 'scale', number(transform.scale, 100), 10, 400, 1, '%', 'transform') +
         label('Horizontal', 'x', number(transform.x, 0), -100, 100, 1, '%', 'transform') +
@@ -66,8 +72,10 @@
         '<canvas class="splice-scope" width="240" height="210" aria-label="RGB parade, luma waveform, and vectorscope from graded frame"></canvas>');
       html += section('Incoming transition',
         `<label class="splice-number"><span>Style</span><select aria-label="Transition style" data-field="transition">${clip.transition==='native'?option('native','Imported: '+(clip.transitionMatchName||'Premiere effect'),'native'):''}${option('none','Cut',clip.transition || 'none')}${option('dissolve','Cross dissolve',clip.transition || 'none')}${option('fade','Fade through black',clip.transition || 'none')}${option('wipe','Wipe left to right',clip.transition || 'none')}</select></label>` +
-        field('Length', 'transitionDuration', number(clip.transitionDuration, .5).toFixed(2), .04, 2, .04) +
-        (['dissolve','wipe'].includes(clip.transition) ? `<p class="splice-handle ${handle < number(clip.transitionDuration,.5) ? 'splice-handle-warn' : ''}">Outgoing source handle: ${handle.toFixed(2)} s. ${previous ? '' : 'Place a video clip directly before this one.'}</p>` : ''));
+        field('Length', 'transitionDuration', number(clip.transitionDuration, .5).toFixed(2), 1/fps, 7200, 1/fps) +
+        (['dissolve','wipe'].includes(clip.transition) ? `<p class="splice-handle ${handle+1e-6 < number(clip.transitionDuration,.5)-number(clip.transitionBefore,0) ? 'splice-handle-warn' : ''}">Outgoing source handle: ${handle.toFixed(2)} s. ${previous ? '' : 'Place a video clip directly before this one.'}</p>` : '') +
+        (clip.transition!=='none' && clip.transition!=='native' && number(clip.transitionDuration,.5)>clip.duration+number(clip.transitionBefore,0)+1e-6 ?
+          `<p class="splice-handle">The available shot limits playback to ${(clip.duration+number(clip.transitionBefore,0)).toFixed(2)} s.</p>` : ''));
     }
     if (clip.type === 'title') {
       const fonts=['DM Sans','IBM Plex Mono','DejaVu Sans'];
@@ -87,7 +95,7 @@
     }
     if (clip.type === 'audio' || clip.type === 'video' && clip.embeddedAudio !== false) {
       html += section('Audio',
-        (source?.audioStreams>1 ? `<p class="splice-handle">${source.audioStreams} source streams mixed to stereo.</p>` : '') +
+        (source?.audioStreams>1 ? `<p class="splice-handle">${source.audioStream==null?`${source.audioStreams} source streams in stereo`:`Source stream ${source.audioStream+1}`} · Change routing in the Source Monitor.</p>` : '') +
         label('Gain', 'volume', number(clip.volume, 100), 0, 200, 1, '%') +
         (clip.keyframes?.volume?.length ? '<p class="splice-handle">Gain keyframes control the level. Edit them below.</p>' : '') +
         label('Pan', 'pan', number(clip.pan, 0), -100, 100, 1, '', '') +
@@ -97,7 +105,7 @@
     if (clip.type === 'audio') {
       html += section('Incoming transition',
         `<label class="splice-number"><span>Style</span><select aria-label="Audio transition style" data-field="transition">${clip.transition==='native'?option('native','Imported: '+(clip.transitionMatchName||'Premiere effect'),'native'):''}${option('none','Cut',clip.transition || 'none')}${option('dissolve','Crossfade',clip.transition || 'none')}</select></label>` +
-        field('Length','transitionDuration',number(clip.transitionDuration,.5).toFixed(2),1/fps,2,1/fps));
+        field('Length','transitionDuration',number(clip.transitionDuration,.5).toFixed(2),1/fps,7200,1/fps));
     }
     if (['video','audio','title'].includes(clip.type)) {
       const available=clip.type==='audio' ? ['volume'] : clip.type==='title' ? ['opacity'] :
@@ -127,8 +135,6 @@
     if (clip.keyframes?.volume?.length && (number(clip.fadeIn,0)||number(clip.fadeOut,0))) nativeLimits.push('combined gain keyframes and fades');
     if (text.align && text.align!=='center') nativeLimits.push('left/right title alignment');
     if (number(clip.pan,0)) nativeLimits.push('clip audio pan');
-    if (source?.audioStreams>1 && clip.premiereIndex===undefined && (clip.type==='audio'||clip.embeddedAudio!==false))
-      nativeLimits.push('multiple source audio streams');
     const videoMix = clip.type === 'video' && state.project.trackMix?.[clip.track];
     if (videoMix?.pan || videoMix?.solo) nativeLimits.push('embedded video-track pan or solo');
     if (nativeLimits.length) html += section('Premiere compatibility',
@@ -167,6 +173,9 @@
         try {
           if (group === 'trackMix') {
             editor.updateTrackMix(active.track, {[key]: value});
+          } else if (key==='speedPercent') {
+            editor.setClipSpeed(active.id,value/100);
+            render(editor.get(),element,editor);
           } else {
             editor.updateClip(active.id, group ? {[group]: {...(active[group] || {}), [key]: value}} : {[key]: value});
             if(['align','pan','fadeIn','fadeOut','transition','transitionDuration'].includes(key)) render(editor.get(),element,editor);

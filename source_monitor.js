@@ -3,7 +3,7 @@
   const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const snap = value => Math.round(value * fps) / fps;
   const format = seconds => Editor.formatTimecode(seconds,fps);
-  const show = message => {const node=dialog.querySelector('.source-status');node.textContent=message;node.classList.toggle('error',!!message);};
+  const show = (message,error=true) => {const node=dialog.querySelector('.source-status');node.textContent=message;node.classList.toggle('error',!!message&&error);};
   const current = () => Math.max(0,Math.min(media.duration,player?.currentTime || 0));
   function update() {
     if (!dialog?.open) return;
@@ -133,6 +133,53 @@
       }
     };
     dialog.querySelector('.source-close').onclick=close;
+    async function setPreviewSource(settings) {
+      const active=dialog, position=current();
+      stopShuttle();show('Building a playback proxy…',false);
+      const replacement=await Editor.prepareSourceProxy(media.id,settings);
+      if(dialog!==active)return false;
+      media={...media,...replacement};
+      player.addEventListener('loadedmetadata',()=>{if(dialog===active)player.currentTime=position;},{once:true});
+      player.src=media.src;
+      show('Playback proxy updated.',false);
+      return true;
+    }
+    const proxyButton=document.createElement('button');
+    const trackPicker=document.createElement('select');
+    if(media.type==='video' && !media.still && !Number.isInteger(media.nestedSequence)) {
+      const button=proxyButton;button.type='button';
+      button.textContent=media.seekOptimized?'Seek proxy active':'Build seek proxy';
+      button.disabled=!!media.seekOptimized;
+      dialog.querySelector('.source-actions').prepend(button);
+      button.onclick=async()=>{
+        const active=dialog;
+        button.disabled=trackPicker.disabled=true;
+        try {
+          if(!await setPreviewSource({seekOptimized:true}))return;
+          button.textContent='Seek proxy active';
+          show('Preview uses the seek proxy. Export uses the original.',false);
+        } catch(error) {
+          if(dialog!==active)return;
+          button.disabled=false;show(error.message);
+        } finally {trackPicker.disabled=false;}
+      };
+    }
+    if(media.audioStreams>1) {
+      const label=document.createElement('label');label.className='source-track-label';
+      label.append('Source audio ',trackPicker);
+      trackPicker.append(new Option('Default stereo routing',''));
+      for(let i=0;i<media.audioStreams;i++)trackPicker.append(new Option(`Stream ${i+1}`,String(i)));
+      trackPicker.value=media.audioStream??'';
+      dialog.querySelector('.source-actions').before(label);
+      trackPicker.onchange=async()=>{
+        const active=dialog;
+        const choice=trackPicker.value===''?null:Number(trackPicker.value);
+        proxyButton.disabled=trackPicker.disabled=true;
+        try {await setPreviewSource({audioStream:choice});}
+        catch(error){if(dialog===active){trackPicker.value=media.audioStream??'';show(error.message);}}
+        finally {trackPicker.disabled=false;proxyButton.disabled=!!media?.seekOptimized;}
+      };
+    }
     dialog.querySelector('.source-scrub').oninput=event=>{player.pause();player.currentTime=Number(event.target.value);};
     dialog.querySelector('.source-bin input').onchange=event=>{
       const value=event.target.value.trim().replace(/\s*\/\s*/g,'/').replace(/^\/+|\/+$/g,'');

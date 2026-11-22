@@ -200,7 +200,8 @@ class Handler(BaseHTTPRequestHandler):
             if route == '/api/media/proxy':
                 from media_proxy import proxy
                 payload=json.loads(body)
-                self._json(200, {'src':proxy(payload['src'])})
+                self._json(200, {'src':proxy(payload['src'],seek_optimized=payload.get('seekOptimized') is True,
+                                             audio_stream=payload.get('audioStream'))})
                 return
             if route == '/api/exports':
                 payload = json.loads(body)

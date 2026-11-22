@@ -30,7 +30,14 @@ window.SpliceDialogs = (() => {
     if(activeExport?.isConnected){activeExport.showModal();return;}
     const node=dialog('Export video');activeExport=node;
     const state=Editor.get(), form=document.createElement('form');
-    form.innerHTML='<p class="export-spec"></p><label>Format<select name="codec"><option value="h264">H.264 / AAC · MP4</option><option value="prores">ProRes 422 HQ / PCM · MOV</option><option value="wav">Audio mix · WAV</option></select></label><label>Quality<select name="quality"><option value="16">Master · CRF 16</option><option value="20" selected>Delivery · CRF 20</option><option value="26">Review copy · CRF 26</option></select></label><label>Audio bitrate<select name="bitrate"><option>128</option><option selected>192</option><option>320</option></select></label><progress max="1" value="0" hidden></progress><p role="status" class="render-state"></p><footer><button type="button" data-cancel>Close</button><button type="submit" class="primary">Render MP4</button></footer>';
+    form.innerHTML='<p class="export-spec"></p><label>Format<select name="codec"><option value="h264">H.264 / AAC · MP4</option><option value="prores">ProRes 422 HQ / PCM · MOV</option><option value="wav">Audio mix · WAV</option></select></label><label>Range<select name="rangeMode"><option value="all">Entire sequence</option><option value="custom">Custom range</option></select></label><label hidden>Start (seconds)<input name="rangeStart" type="number" min="0" step="any"></label><label hidden>End (seconds)<input name="rangeEnd" type="number" min="0" step="any"></label><label>Quality<select name="quality"><option value="16">Master · CRF 16</option><option value="20" selected>Delivery · CRF 20</option><option value="26">Review copy · CRF 26</option></select></label><label>Audio bitrate<select name="bitrate"><option>128</option><option selected>192</option><option>320</option></select></label><progress max="1" value="0" hidden></progress><p role="status" class="render-state"></p><footer><button type="button" data-cancel>Close</button><button type="submit" class="primary">Render MP4</button></footer>';
+    const rangeFields=[form.elements.rangeStart,form.elements.rangeEnd];
+    rangeFields[0].value=String(Math.min(state.time,Math.max(0,state.duration-1/state.project.fps)).toFixed(6));
+    rangeFields[1].value=String((Math.ceil((state.duration-1e-9)*state.project.fps)/state.project.fps).toFixed(6));
+    form.elements.rangeMode.onchange=()=>{
+      const custom=form.elements.rangeMode.value==='custom';
+      for(const field of rangeFields){field.closest('label').hidden=!custom;field.required=custom;}
+    };
     form.querySelector('.export-spec').textContent=state.project.name+' · '+state.project.width+' × '+state.project.height+' · '+Number(state.project.fps.toFixed(3))+' fps';
     const nativeBlocks=state.project.clips.filter(c=>c.transition==='native'||c.nativeTimeRemap||c.nativeUnsupported);
     if(nativeBlocks.length) {
@@ -62,9 +69,13 @@ window.SpliceDialogs = (() => {
     form.onsubmit=async e=>{
       e.preventDefault();if(controller)return;
       controller=new AbortController();renderWarnings=[];render.disabled=true;cancel.textContent='Cancel render';progress.hidden=false;
-      form.elements.codec.disabled=form.elements.quality.disabled=form.elements.bitrate.disabled=true;status.textContent='Preparing media…';
+      const settings=[form.elements.codec,form.elements.quality,form.elements.bitrate,form.elements.rangeMode,...rangeFields];
+      for(const field of settings)field.disabled=true;
+      status.textContent='Preparing media…';
       try {
-        const result=await Editor.exportVideo({codec:form.elements.codec.value,crf:Number(form.elements.quality.value),audioBitrate:Number(form.elements.bitrate.value)},job=>{
+        const opts={codec:form.elements.codec.value,crf:Number(form.elements.quality.value),audioBitrate:Number(form.elements.bitrate.value)};
+        if(form.elements.rangeMode.value==='custom')opts.range={start:rangeFields[0].valueAsNumber,end:rangeFields[1].valueAsNumber};
+        const result=await Editor.exportVideo(opts,job=>{
           renderWarnings=job.warnings||[]; progress.value=job.progress;status.textContent='Rendering · '+Math.round(100*job.progress)+'%';
         },controller.signal);
         progress.value=1;status.textContent=({h264:'MP4',prores:'MOV',wav:'WAV'}[form.elements.codec.value])+' exported.'+(result?.url?' Review the render below.':'')+(renderWarnings.length?' '+renderWarnings.join(' '):'');
@@ -78,7 +89,7 @@ window.SpliceDialogs = (() => {
         status.textContent=controller.signal.aborted?'Render cancelled.':err.message;
       } finally {
         controller=null;cancel.disabled=false;render.disabled=false;cancel.textContent='Close';
-        form.elements.codec.disabled=form.elements.quality.disabled=form.elements.bitrate.disabled=false;
+        for(const field of settings)field.disabled=false;
       }
     };
     node.append(form);node.showModal();

@@ -570,8 +570,7 @@
       const members=gesture.originals;
       const offset=Math.max(snapTime(start+delta,clip.id)-start,-Math.min(...members.map(c=>c.start)));
       gesture.placements=members.map(original=>{
-        const dest=original.type!==clip.type||clip.type==='title'?original.track:
-            original.type==='audio'?Math.min(-1,original.track+track-gesture.track):Math.max(1,original.track+track-gesture.track);
+        const dest=original.type!==clip.type||clip.type==='title'?original.track:original.track+track-gesture.track;
         return {...original,start:original.start+offset,track:dest};
       });
       for(const placement of gesture.placements){

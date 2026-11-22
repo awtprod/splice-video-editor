@@ -19,7 +19,8 @@ def _number(value, label, low=0, high=7200):
 def _probe(path):
     from fractions import Fraction
     from media_proxy import MAX_AUDIO_STREAMS
-    result = subprocess.run(['ffprobe', '-v', 'error', '-protocol_whitelist', 'file', '-show_entries', 'stream=codec_type,channels,avg_frame_rate,r_frame_rate:format=duration', '-of', 'json', str(path)],
+    result = subprocess.run(['ffprobe', '-v', 'error', '-protocol_whitelist', 'file', '-show_entries',
+                            'stream=codec_type,channels,avg_frame_rate,r_frame_rate,color_primaries,color_transfer,color_space:format=duration', '-of', 'json', str(path)],
                             capture_output=True, text=True, timeout=15, check=True)
     data = json.loads(result.stdout)
     streams=data.get('streams', [])
@@ -29,7 +30,8 @@ def _probe(path):
     video = next((stream for stream in streams if stream['codec_type']=='video'),{})
     average = video.get('avg_frame_rate')
     rate = float(Fraction(average)) if average and average == video.get('r_frame_rate') and average != '0/0' else 0
-    return {stream['codec_type'] for stream in streams}, float(data.get('format', {}).get('duration', 0)), audio, rate
+    profile = tuple(video.get(key) for key in ('color_primaries','color_transfer','color_space'))
+    return {stream['codec_type'] for stream in streams}, float(data.get('format', {}).get('duration', 0)), audio, rate, profile
 
 
 def _stereo_pan(pan, channels):
@@ -108,11 +110,11 @@ def _trim_audio(filters, label, index, streams, start, length, reverse):
     trim = f'atrim=start={start:.9f}:end={start+length:.9f},asetpts={clock},aresample=48000:first_pts=0'
     if len(streams)>1:
         from media_proxy import stereo_mix_filters
-        sources = [f'[{index}:a:{number}]{trim}' for number in range(len(streams))]
-        filters.extend(stereo_mix_filters(sources,label))
+        sources = [f'[{index}:a:{number}]{trim}' for number in streams]
+        filters.extend(stereo_mix_filters(sources,label,list(streams.values()),length))
         result = f'[{label}]'
     else:
-        result = f'[{index}:a:0]{trim},'
+        result = f'[{index}:a:{next(iter(streams))}]{trim},'
     return result + ('areverse,' if reverse else '')
 
 
@@ -265,6 +267,7 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
     muted = render_options.get('mutedTracks', {})
     paths = {}
     kinds = {}
+    probes = (options or {}).get('_probes',{})
     for clip in clips:
         if clip.get('type') not in ('video', 'audio', 'title'):
             raise ValueError('Unsupported timeline item')
@@ -272,7 +275,7 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
             raise ValueError('Keyframed Premiere time remapping is not supported for export')
         if clip.get('transition') == 'native':
             raise ValueError('This Premiere transition is not supported for export')
-        before=_number(clip.get('transitionBefore',0),'transition lead',0,2)
+        before=_number(clip.get('transitionBefore',0),'transition lead')
         if before and clip.get('transition') not in ('dissolve','wipe','fade'):
             raise ValueError('Unsupported centered Premiere transition')
         if before>float(clip.get('start',0))+.001:
@@ -300,7 +303,8 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
             if path.suffix.lower() in STILL_IMAGES:
                 kinds[item['id']], item['_actualDuration'], item['_audioStreams'] = {'video'}, 7200, []
             else:
-                kinds[item['id']], item['_actualDuration'], item['_audioStreams'], item['_videoFPS'] = _probe(path)
+                probe = probes.get(path) or _probe(path)
+                kinds[item['id']], item['_actualDuration'], item['_audioStreams'], item['_videoFPS'], _ = probe
         speed=_number(clip.get('speed',1),'speed',.1,16)
         before=float(clip.get('transitionBefore',0) or 0)
         if before and not clip.get('reverse') and float(clip.get('in',0))-before*speed<-.01:
@@ -349,7 +353,7 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
             start = float(clip['start']); length = float(clip['duration']); source_in = float(clip.get('in', 0))
             speed=_number(clip.get('speed',1),'speed',.1,16)
             reverse=',reverse' if clip.get('reverse') else ''
-            before=_number(clip.get('transitionBefore',0),'transition lead',0,2)
+            before=_number(clip.get('transitionBefore',0),'transition lead')
             transition_duration=min(float(clip.get('transitionDuration',.5)),length+before)
             incoming_dip = clip.get('transition') == 'fade'
             dip_head = transition_duration-before if incoming_dip else 0
@@ -503,15 +507,20 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
                 index = indexes[item['id']]
                 source_in = float(clip.get('in', 0)); length = float(clip['duration']); start=float(clip['start'])
                 speed=_number(clip.get('speed',1),'speed',.1,16)
-                before=_number(clip.get('transitionBefore',0),'transition lead',0,2)
+                before=_number(clip.get('transitionBefore',0),'transition lead')
                 render_source=(source_in if clip.get('reverse') else source_in-before*speed)-source_offsets.get(item['id'],0)
                 render_length=length+before
                 delay=round((start-before)*48000)
                 volume_keys=(clip.get('keyframes') or {}).get('volume')
                 gain = (100 if volume_keys else _number(clip.get('volume',100),'volume',0,200)) * _number(mix.get('gain',100),'track gain',0,200) / 10000
                 pan = max(-1,min(1,(_number(clip.get('pan', 0), 'pan', -100, 100) + _number(mix.get('pan',0),'track pan',-100,100))/100))
-                streams = item['_audioStreams']
-                panner = _stereo_pan(pan,2 if len(streams)>1 else streams[0])
+                streams = dict(enumerate(item['_audioStreams']))
+                selection = item.get('audioStream')
+                if selection is not None:
+                    if type(selection) is not int or selection not in streams:
+                        raise ValueError('The selected source audio stream is unavailable')
+                    streams = {selection:streams[selection]}
+                panner = _stereo_pan(pan,2 if len(streams)>1 else next(iter(streams.values())))
                 fade_in = min(length,_number(clip.get('fadeIn',0),'fade in',0,7200))
                 fade_out = min(length,_number(clip.get('fadeOut',0),'fade out',0,7200))
                 chain = _trim_audio(filters,f'mix{number}',index,streams,render_source,render_length*speed,clip.get('reverse'))
@@ -530,12 +539,12 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
                     volume_expr=_keyframe_expr(clip,'volume',float(clip.get('volume',100)),0,200,f'(t-{before:.6f})')
                     envelope.append(f'({volume_expr})/100')
                 if clip.get('transition') in ('dissolve','wipe','fade'):
-                    incoming=min(_number(clip.get('transitionDuration',.5),'transition duration',1/float(fps),2),render_length)
+                    incoming=min(_number(clip.get('transitionDuration',.5),'transition duration',1/float(fps)),render_length)
                     envelope.append(f'min(1,t/{incoming:.9f})')
                 next_clip=next((candidate for candidate in clips if candidate is not clip and candidate.get('type')==clip['type'] and candidate.get('track')==clip.get('track') and candidate.get('transition') in ('dissolve','wipe') and round(float(candidate['start'])*fps)==round((start+length)*fps)),None)
                 if next_clip:
-                    next_before=_number(next_clip.get('transitionBefore',0),'transition lead',0,2)
-                    next_duration=_number(next_clip.get('transitionDuration',.5),'transition duration',1/float(fps),2)
+                    next_before=_number(next_clip.get('transitionBefore',0),'transition lead')
+                    next_duration=_number(next_clip.get('transitionDuration',.5),'transition duration',1/float(fps))
                     next_duration=min(next_duration,next_before+float(next_clip['duration']))
                     fade_start=before+length-next_before
                     envelope.append(f'max(0,min(1,1-(t-{fade_start:.9f})/{next_duration:.9f}))')
@@ -570,16 +579,32 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
         elif not video_only:
             command.extend(['-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo'])
             filters.append(f'[{base_index+1}:a]atrim=duration={duration:.6f}[aout]')
+        audio_output = 'aout'
+        window = (options or {}).get('_output_frames')
+        if window is not None:
+            first, stop = window
+            filters.append(f'[{active}]trim=start_frame={first}:end_frame={stop},setpts=PTS-STARTPTS[vwindow]')
+            active = 'vwindow'
+            if not video_only:
+                first_sample,stop_sample = (round(frame*48000/fps) for frame in (first,stop))
+                filters.append(f'[aout]atrim=start_sample={first_sample}:end_sample={stop_sample},asetpts=PTS-STARTPTS[awindow]')
+                audio_output = 'awindow'
+            duration = (stop-first)/fps
         output = Path(output_path)
         command.extend(['-filter_complex', ';'.join(filters), '-map', f'[{active}]'])
-        if not video_only: command.extend(['-map', '[aout]'])
+        if not video_only: command.extend(['-map', f'[{audio_output}]'])
         if codec=='prores':
             command.extend(['-t',f'{duration:.6f}','-r',str(fps),'-c:v','prores_ks','-profile:v','3','-pix_fmt','yuv422p10le','-threads','4'])
             if not video_only: command.extend(['-c:a','pcm_s24le','-ar','48000'])
         else:
             command.extend(['-t',f'{duration:.6f}','-r',str(fps),'-c:v','libx264','-threads','4','-preset','veryfast','-crf',str(int(_number((options or {}).get('crf',20),'quality',14,32))),'-pix_fmt','yuv420p'])
             if not video_only: command.extend(['-c:a','aac','-b:a',str(int(_number((options or {}).get('audioBitrate',192),'audio bitrate',64,320)))+'k'])
-        command.extend(['-movflags','+faststart',str(output)])
+        profile = (options or {}).get('_color_profile')
+        if profile:
+            command.extend(['-color_primaries',profile[0],'-color_trc',profile[1],'-colorspace',profile[2]])
+            if high_depth and profile[1] in ('arib-std-b67','smpte2084'):
+                command.extend(['-bsf:v',f'prores_metadata=color_primaries={profile[0]}:color_trc={profile[1]}:colorspace={profile[2]}'])
+        command.extend(['-movflags','+faststart+write_colr' if profile else '+faststart',str(output)])
         _run_controlled(command,cancelled,min(3600,max(120,duration*8)))
         return output.stat().st_size
 
@@ -601,6 +626,7 @@ def render_to_file(project, output_path, *, options=None, progress=None, cancell
             suffix='.mov' if (options or {}).get('codec')=='prores' else '.mp4'
             target=Path(directory)/f'nested-{index}{suffix}'
             child_options={**(options or {}),'codec':'prores' if suffix=='.mov' else 'h264'}
+            child_options.pop('range',None)
             render_to_file(child,target,options=child_options,cancelled=cancelled,_nested_depth=_nested_depth+1)
             item['src']='/media/'+str(target.relative_to(MEDIA_ROOT))
             item['duration']=max((float(c['start'])+float(c['duration']) for c in child['clips']),default=0)
@@ -619,9 +645,39 @@ def _render_prepared(project, output_path, *, options=None, progress=None, cance
     fps = float(project['fps'])
     if total <= 0 or total > 7200: raise ValueError('Invalid timeline duration')
     total=math.ceil((total-1e-9)*fps)/fps
-    codec=(options or {}).get('codec','h264')
+    options={**(options or {}),'_output_frames':None}
+    codec=options.get('codec','h264')
     if codec not in ('h264','prores','wav'): raise ValueError('Unsupported export codec')
     suffix='.mov' if codec=='prores' else '.mp4'
+    total_frames = round(total*fps)
+    first,stop = 0,total_frames
+    requested = options.get('range')
+    if requested is not None:
+        if not isinstance(requested,dict):raise ValueError('Invalid export range')
+        first = round(_number(requested.get('start'),'range start',0,total+.000001)*fps)
+        stop = round(_number(requested.get('end'),'range end',0,total+.000001)*fps)
+        if stop<=first or stop>total_frames:raise ValueError('The export range must contain frames inside the sequence')
+    out_start,out_end = first/fps,stop/fps
+    out_duration = (stop-first)/fps
+    probes = {}
+    profiles = set()
+    if codec!='wav' and not ((project.get('renderOptions') or {}).get('mutedTracks') or {}).get('video'):
+        vid_ids = {c.get('mediaId') for c in project['clips'] if c.get('type')=='video'}
+        for item in project['media']:
+            if item.get('id') not in vid_ids or item.get('nativeGenerator') is not None:continue
+            path = _media_path(item.get('src',''))
+            if path.suffix.lower() not in STILL_IMAGES:
+                if path not in probes:probes[path]=_probe(path)
+                profiles.add(probes[path][-1])
+            else:
+                profiles.add((None,None,None))
+    hdr = any(profile[1] in ('arib-std-b67','smpte2084') for profile in profiles)
+    if hdr and (len(profiles)!=1 or codec!='prores'):
+        raise ValueError('Use ProRes HQ and one HDR color space to preserve HLG or PQ signaling.')
+    profile = next(iter(profiles)) if len(profiles)==1 else None
+    if profile and not all(value and value not in ('unknown','unspecified') for value in profile):profile=None
+    options.update(_probes=probes,_color_profile=profile)
+    audio_options={**options,'_output_frames':(first,stop) if (first,stop)!=(0,total_frames) else None}
     captions=project.get('captions') or []
     if not isinstance(captions,list) or len(captions)>10000: raise ValueError('Invalid captions')
     validated_captions=[]
@@ -631,7 +687,8 @@ def _render_prepared(project, output_path, *, options=None, progress=None, cance
         start=_number(caption.get('start'),'caption start',0,total)
         length=_number(caption.get('duration'),'caption duration',.001,total)
         if start+length>total+.001: raise ValueError('Caption extends past timeline')
-        validated_captions.append((start,start+length,caption['text']))
+        begin,end = max(start,out_start),min(start+length,out_end)
+        if end>begin:validated_captions.append((begin-out_start,end-out_start,caption['text']))
     validated_captions.sort(key=lambda item:item[0])
     def srt_time(seconds):
         ms=round(seconds*1000)
@@ -643,15 +700,14 @@ def _render_prepared(project, output_path, *, options=None, progress=None, cance
             audio_project['renderOptions']={'mutedTracks':{**(project.get('renderOptions') or {}).get('mutedTracks',{}),'video':True,'title':True}}
             audio_project['clips'].append({'type':'title','start':0,'duration':total,'in':0,'title':''})
             intermediate=Path(directory)/'audio.mov'
-            _render_window(audio_project,intermediate,options={**(options or {}),'codec':'prores'},cancelled=cancelled)
-            _run_controlled(['ffmpeg','-nostdin','-hide_banner','-loglevel','error','-y','-i',str(intermediate),'-map','0:a:0','-c:a','pcm_s24le','-ar','48000','-t',f'{total:.6f}',str(output_path)],cancelled,120)
+            _render_window(audio_project,intermediate,options={**audio_options,'codec':'prores'},cancelled=cancelled)
+            _run_controlled(['ffmpeg','-nostdin','-hide_banner','-loglevel','error','-y','-i',str(intermediate),'-map','0:a:0','-c:a','pcm_s24le','-ar','48000','-t',f'{out_duration:.6f}',str(output_path)],cancelled,120)
             if progress: progress(1.0)
             return Path(output_path).stat().st_size
     # Keep transitions and the preceding frame in a single window. Work in
     # frame numbers so snapping cannot move a boundary back into an effect.
     starts = []
     protected = []
-    total_frames = round(total * fps)
     for clip in project['clips']:
         start = float(clip['start']) - float(clip.get('transitionBefore', 0) or 0)
         frame = math.ceil(start * fps - 1e-6)
@@ -668,15 +724,16 @@ def _render_prepared(project, output_path, *, options=None, progress=None, cance
         eligible = [frame for frame in starts if current < frame < proposed]
         if len(eligible) > 24:
             proposed = eligible[24]
-        for first, after in protected:
-            if first <= proposed < after:
-                proposed = after
+        for protect_from, protect_until in protected:
+            if protect_from <= proposed < protect_until:
+                proposed = protect_until
         frames.append(min(total_frames, proposed))
-    boundaries = [frame / fps for frame in frames]
+    windows = [(a,b) for a,b in zip(frames,frames[1:]) if b>first and a<stop]
     with tempfile.TemporaryDirectory(prefix='splice-segments-') as directory:
         segments = []
-        for index,(begin,end) in enumerate(zip(boundaries,boundaries[1:])):
+        for index,(a_frame,b_frame) in enumerate(windows):
             if cancelled and cancelled.is_set(): raise InterruptedError('Export cancelled')
+            begin,end = a_frame/fps,b_frame/fps
             segment = copy.deepcopy(project)
             segment['clips'] = []
             for original in project['clips']:
@@ -701,9 +758,11 @@ def _render_prepared(project, output_path, *, options=None, progress=None, cance
             # Gaps still need a black base track to keep exact segment duration.
             segment['clips'].append({'type':'title','start':0,'duration':end-begin,'in':0,'title':''})
             target=Path(directory)/f'{index:04d}{suffix}'
-            _render_window(segment,target,options={**(options or {}),'_videoOnly':True},cancelled=cancelled)
+            output_window = (max(first,a_frame)-a_frame,min(stop,b_frame)-a_frame)
+            window_options={**options,'_videoOnly':True,'_output_frames':output_window if output_window!=(0,b_frame-a_frame) else None}
+            _render_window(segment,target,options=window_options,cancelled=cancelled)
             segments.append(target)
-            if progress: progress((index+1)/len(boundaries[:-1])*.95)
+            if progress: progress((index+1)/len(windows)*.95)
         manifest=Path(directory)/'segments.txt'
         manifest.write_text(''.join(f"file '{segment}'\n" for segment in segments))
         video=Path(directory)/f'video{suffix}'
@@ -714,7 +773,7 @@ def _render_prepared(project, output_path, *, options=None, progress=None, cance
         audio_project['width']=16; audio_project['height']=16
         audio_project['renderOptions']={'mutedTracks':{**(project.get('renderOptions') or {}).get('mutedTracks',{}),'video':True,'title':True}}
         audio_project['clips'].append({'type':'title','start':0,'duration':total,'in':0,'title':''})
-        _render_window(audio_project,audio,options=options,cancelled=cancelled)
+        _render_window(audio_project,audio,options=audio_options,cancelled=cancelled)
         command=['ffmpeg','-nostdin','-hide_banner','-loglevel','error','-y','-i',str(video),'-i',str(audio)]
         if validated_captions and (options or {}).get('captions',True):
             subtitle=Path(directory)/'captions.srt'
@@ -725,7 +784,9 @@ def _render_prepared(project, output_path, *, options=None, progress=None, cance
         command.extend(['-c','copy'])
         if validated_captions and (options or {}).get('captions',True):
             command.extend(['-c:s','mov_text','-metadata:s:s:0','language=eng','-disposition:s:0','default'])
-        command.extend(['-t',f'{total:.6f}','-movflags','+faststart',str(output_path)])
+        if profile:
+            command.extend(['-color_primaries',profile[0],'-color_trc',profile[1],'-colorspace',profile[2]])
+        command.extend(['-t',f'{out_duration:.6f}','-movflags','+faststart+write_colr' if profile else '+faststart',str(output_path)])
         _run_controlled(command,cancelled,120)
         if cancelled and cancelled.is_set(): raise InterruptedError('Export cancelled')
         if progress: progress(1.0)

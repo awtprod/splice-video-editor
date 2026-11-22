@@ -17,7 +17,14 @@ _locks = tuple(threading.Lock() for _ in range(32))
 MAX_AUDIO_STREAMS = 16
 
 
-def stereo_mix_filters(sources, output):
+def stereo_mix_filters(sources, output, channels, duration):
+    if channels==[1,1]:
+        labels = [f'{output}mono0',f'{output}mono1']
+        filters = [f'{source},apad=whole_dur={duration:.9f},aformat=channel_layouts=mono[{label}]'
+                   for source,label in zip(sources,labels)]
+        inputs = ''.join(f'[{label}]' for label in labels)
+        filters.append(f'{inputs}join=inputs=2:channel_layout=stereo:map=0.0-FL|1.0-FR[{output}]')
+        return filters
     labels = [f'{output}stream{index}' for index in range(len(sources))]
     filters = [f'{source},aformat=channel_layouts=stereo[{label}]' for source,label in zip(sources,labels)]
     inputs = ''.join(f'[{label}]' for label in labels)
@@ -55,18 +62,38 @@ def describe(src):
     native_container = path.suffix.lower() in ('.mp4','.m4v','.m4a','.webm','.wav','.mp3','.ogg','.flac','.aac')
     return dict(type='video' if video else 'audio', duration=duration, width=video.get('width'), height=video.get('height'),
                 fps=fps, videoCodec=vcodec, audioCodec=acodec, audioChannels=2 if len(audio_streams)>1 else audio.get('channels',0),
-                audioStreams=len(audio_streams), still=still,
+                audioStreams=len(audio_streams), audioStreamChannels=[stream.get('channels',1) for stream in audio_streams], still=still,
                 proxyRecommended=len(audio_streams)>1 or not (native_video and native_audio and native_container))
 
 
-def proxy(src):
+def _select_stream(channels, selection):
+    if selection is not None and (type(selection) is not int or not 0<=selection<len(channels)):
+        raise ValueError('The selected source audio stream is unavailable')
+    return list(range(len(channels))) if selection is None else [selection]
+
+
+def _source_audio_map(channels, selection, duration):
+    chosen = _select_stream(channels,selection)
+    if len(chosen)>1:
+        sources = [f'[0:a:{i}]aresample=48000:first_pts=0' for i in chosen]
+        return ['-filter_complex',';'.join(stereo_mix_filters(sources,'mixed',[channels[i] for i in chosen],duration)),'-map','[mixed]']
+    return ['-map',f'0:a:{chosen[0]}' if chosen else '0:a:0?']
+
+
+def proxy(src, seek_optimized=False, audio_stream=None):
     original = _media_path(src)
     info = describe(src)
+    if seek_optimized and (info['type']!='video' or info['still']):
+        raise ValueError('A seek proxy requires moving video')
     stat = original.stat()
-    key = hashlib.sha256(f'proxy-v3:{original}:{stat.st_size}:{stat.st_mtime_ns}'.encode()).hexdigest()
+    profile = 'proxy-seek-v1' if seek_optimized else 'proxy-v3'
+    audio_map = _source_audio_map(info['audioStreamChannels'],audio_stream,info['duration'])
+    if info['audioStreams']>1:
+        profile += f':audio-v2:{audio_stream}'
+    key = hashlib.sha256(f'{profile}:{original}:{stat.st_size}:{stat.st_mtime_ns}'.encode()).hexdigest()
     directory = MEDIA_ROOT / key[:32]
     video = info['type']=='video'
-    target = directory / ('edit.mp4' if video else 'edit.m4a')
+    target = directory / ('seek.mp4' if seek_optimized else 'edit.mp4' if video else 'edit.m4a')
     if target.is_file():
         return _playback_url(target)
     if not _encoders.acquire(timeout=5):
@@ -84,20 +111,54 @@ def proxy(src):
                     cmd += ['-f','image2','-loop','1','-framerate','25']
                 cmd += ['-i',str(original)]
                 if video:
-                    cmd += ['-map','0:V:0','-vf',"scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1",'-c:v','libx264','-threads','2','-preset','veryfast','-crf','19','-maxrate','4M','-bufsize','8M','-g','24','-pix_fmt','yuv420p']
+                    width,height = (960,540) if seek_optimized else (1280,720)
+                    fit = f"scale=w='min({width},iw)':h='min({height},ih)':force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1"
+                    cmd += ['-map','0:V:0','-vf',fit,'-c:v','libx264','-threads','2','-preset','veryfast',
+                            '-crf','22' if seek_optimized else '19','-maxrate','4M','-bufsize','8M',
+                            '-g','1' if seek_optimized else '24','-pix_fmt','yuv420p']
                 else:
                     cmd += ['-vn']
-                if info['audioStreams']>1:
-                    sources = [f'[0:a:{i}]aresample=48000:first_pts=0' for i in range(info['audioStreams'])]
-                    cmd += ['-filter_complex',';'.join(stereo_mix_filters(sources,'mixed')),'-map','[mixed]']
-                else:
-                    cmd += ['-map','0:a:0?']
+                cmd += audio_map
                 cmd += ['-t',str(info['duration']),'-c:a','aac','-b:a','160k','-ac',str(min(2,max(1,info['audioChannels']))),'-movflags','+faststart',out.name]
                 completed = subprocess.run(cmd,capture_output=True,timeout=min(3600,max(60,info['duration']*3)))
                 if completed.returncode:
                     raise ValueError('Proxy creation failed for '+original.name+': '+completed.stderr.decode(errors='replace')[-400:])
                 os.link(out.name,target)
             return _playback_url(target)
+    finally:
+        _encoders.release()
+
+
+def premiere_audio(src, audio_stream=None):
+    original = _media_path(src)
+    info = describe(src)
+    stat = original.stat()
+    key = hashlib.sha256(f'premiere-audio-v1:{original}:{stat.st_size}:{stat.st_mtime_ns}:{audio_stream}'.encode()).hexdigest()
+    target = MEDIA_ROOT/key[:32]/(original.stem+'-audio.wav')
+    if target.is_file():return target
+    if not _encoders.acquire(timeout=5):raise ValueError('Audio encoders are busy. Retry Premiere save after the current job.')
+    try:
+        with _locks[int(key[:2],16)%len(_locks)]:
+            if target.is_file():return target
+            target.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
+            duration = info['duration']
+            if shutil.disk_usage(target.parent).free < 512*1024**2 + duration*288000:
+                raise ValueError('Insufficient free space for Premiere audio media')
+            chosen = _select_stream(info['audioStreamChannels'],audio_stream)
+            if not chosen:raise ValueError('The camera source contains no audio streams')
+            sources = [f'[0:a:{i}]aresample=48000:first_pts=0' for i in chosen]
+            filters = (stereo_mix_filters(sources,'mixed',[info['audioStreamChannels'][i] for i in chosen],duration)
+                       if len(chosen)>1 else [sources[0]+'[mixed]'])
+            filters.append(f'[mixed]apad=whole_dur={duration:.9f}[audio]')
+            with tempfile.NamedTemporaryFile(dir=target.parent,suffix='.wav') as output:
+                cmd=['ffmpeg','-nostdin','-v','error','-y','-threads','2','-filter_complex_threads','2',
+                     '-protocol_whitelist','file','-i',str(original),'-filter_complex',';'.join(filters),
+                     '-map','[audio]','-c:a','pcm_s24le','-t',str(duration),output.name]
+                result=subprocess.run(cmd,capture_output=True,timeout=min(3600,max(60,duration*3)))
+                if result.returncode:
+                    raise ValueError('Could not write Premiere audio: '+result.stderr.decode(errors='replace')[-400:])
+                os.link(output.name,target)
+            return target
     finally:
         _encoders.release()
 

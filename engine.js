@@ -231,11 +231,12 @@
         (c) => c.type === kind && c.start <= t && t < c.start + c.duration,
       )
       .sort((a, b) => b.track - a.track)[0];
-  const transitionLength = clip => clamp(Number(clip.transitionDuration || .5), 1 / project.fps, 2);
-  const transitionBefore = clip => clamp(Number(clip.transitionBefore)||0,0,transitionLength(clip));
+  const requestedTransitionLength = clip => clamp(Number(clip.transitionDuration || .5), 1/project.fps, 7200);
+  const transitionBefore = clip => clamp(Number(clip.transitionBefore)||0,0,requestedTransitionLength(clip));
+  const transitionLength = clip => Math.min(requestedTransitionLength(clip),clip.duration+transitionBefore(clip));
   const sourceTime = (clip, atTime) => {
     const speed=clamp(Number(clip.speed)||1,.1,16), local=atTime-clip.start;
-    return Number(clip.in||0)+(clip.reverse ? clip.duration-local : local)*speed;
+    return Number(clip.in||0)+(clip.reverse ? clip.duration-local : local)*speed-(clip.reverse?1e-6:0);
   };
   const trackSettings = track => project.trackMix?.[String(track)] || {};
   const soloActive = () => Object.values(project.trackMix || {}).some(m => m.solo);
@@ -317,7 +318,7 @@
     for (const clip of source.clips) {
       if (!['dissolve','wipe','fade'].includes(clip.transition)) continue;
       const before=transitionBefore(clip);
-      const after=transitionLength(clip)-before;
+      const after=requestedTransitionLength(clip)-before;
       const prior=ends.get(boundary(clip,clip.start));
       const priorMedia=prior && media.get(prior.mediaId);
       const currentMedia=media.get(clip.mediaId);
@@ -986,6 +987,20 @@
       selectedId = id;
       notify();
     },
+    async prepareSourceProxy(id, settings) {
+      const sequence=project, media=sequence.media.find(item=>item.id===id);
+      if(!media || media.offline || !media.src)throw Error('Relink the source before building its seek proxy.');
+      const originalSrc=media.originalSrc||media.src;
+      const seekOptimized=settings.seekOptimized??media.seekOptimized??false;
+      const audioStream='audioStream' in settings?settings.audioStream:media.audioStream??null;
+      const src=await SpliceMedia.makeProxy(originalSrc,seekOptimized,audioStream);
+      if(sequence!==project)throw Error('The project changed while the proxy was building. Choose the source again.');
+      const update={...media,originalSrc,src,seekOptimized,audioStream};
+      await SpliceMedia.remember(update);
+      if(sequence!==project)throw Error('The project changed while the proxy was building. Choose the source again.');
+      Editor.editProject(next=>Object.assign(next.media.find(item=>item.id===id),update));
+      return update;
+    },
     async addMedia(files) {
       const imports=Array.from(files);
       if (!imports.length) return;
@@ -1030,12 +1045,13 @@
       const sequence=project;
       const matches=SpliceMedia.matchFolder(sequence.media,Array.from(files));
       if(!matches.length)throw Error('The folder contains no matching offline media.');
-      const nameOnly=matches.filter(match=>match.nameOnly);
-      if(nameOnly.length){
-        const examples=nameOnly.slice(0,5).map(({item,file})=>`${item.path||item.name} → ${file.webkitRelativePath||file.name}`);
-        const remaining=nameOnly.length-examples.length;
+      const unverified=matches.filter(match=>match.needsConfirmation);
+      if(unverified.length){
+        const examples=unverified.slice(0,5).map(({item,file})=>`${item.path||item.name} → ${file.webkitRelativePath||file.name}`);
+        const remaining=unverified.length-examples.length;
         if(remaining) examples.push(`and ${remaining} more`);
-        if(!window.confirm('Review these relinks. Only the filenames match:\n\n'+examples.join('\n')+'\n\nUse these files?'))return false;
+        const reason=unverified.every(match=>match.matched===1)?'Only the filenames match':'The selected folders differ from the original paths';
+        if(!window.confirm(`Review these relinks. ${reason}:\n\n${examples.join('\n')}\n\nUse these files?`))return false;
       }
       const rows=[];
       for(const {item,file} of matches){
@@ -1118,9 +1134,27 @@
             delete target.transitionMatchName;
           }
           for(const key of ["start","duration"])if(key in change.patch)target[key]=snap(target[key]);
-          if ('duration' in change.patch && !('keyframes' in change.patch)) resizeKeyframes(target,original,0);
+          if ('duration' in change.patch && !('keyframes' in change.patch)) {
+            if ('speed' in change.patch && original.keyframes) {
+              const ratio=target.duration/original.duration;
+              target.keyframes=Object.fromEntries(Object.entries(original.keyframes).map(([key,points])=>
+                [key,points.map(point=>({...point,time:point.time*ratio}))]));
+            } else resizeKeyframes(target,original,0);
+          }
         }
       });
+    },
+    setClipSpeed(id, speed) {
+      const clip=project.clips.find(c=>c.id===id);
+      if(!clip)return;
+      if(clip.nativeTimeRemap)throw Error('Edit this Premiere speed curve in Premiere.');
+      if(!Number.isFinite(speed) || speed<.1 || speed>8)throw Error('Choose a clip speed between 10% and 800%.');
+      const oldSpeed=Number(clip.speed)||1;
+      if(Math.abs(speed-oldSpeed)<1e-6)return;
+      const sourceLength=clip.duration*oldSpeed;
+      const frames=Math.floor(sourceLength*project.fps/speed+1e-6);
+      if(frames<1)throw Error('This speed would make the clip shorter than a timeline frame.');
+      Editor.updateClip(id,{speed,duration:frames/project.fps});
     },
     trimEdge(id, edge, atTime, { ripple = false } = {}) {
       const clip = project.clips.find(c => c.id === id);
@@ -1204,7 +1238,7 @@
       const bounds=members.map(member=>{
         const following=followingTransition(member);
         const before=transitionBefore(member);
-        const after=following ? transitionLength(following)-transitionBefore(following) : 0;
+        const after=following ? requestedTransitionLength(following)-transitionBefore(following) : 0;
         const speed=Number(member.speed)||1;
         const sourceHead=(member.reverse?after:before)*speed;
         const sourceTail=(member.duration+(member.reverse?before:after))*speed;
@@ -1268,6 +1302,8 @@
         for(const clip of next.clips){
           const placement=byId.get(clip.id);
           if(!placement)continue;
+          if(clip.type==='audio'?placement.track>=0:placement.track<1)
+            throw Error('There is no room to move the selection and keep its track spacing.');
           clip.start=snap(placement.start);
           clip.track=placement.track;
         }

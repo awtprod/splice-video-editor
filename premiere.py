@@ -213,6 +213,19 @@ def _set_clip_speed(clip, speed):
         element.text = format(speed, '.9g')
 
 
+def _set_clip_reverse(clip, reverse):
+    if reverse == clip.is_speed_reversed:
+        return
+    core = clip._clip_element.find('Clip')
+    backwards = core.find('PlayBackwards')
+    if reverse and backwards is None:
+        insert_leaf_before(core, 'OutPoint', 'PlayBackwards', 'true')
+    elif reverse:
+        backwards.text = 'true'
+    else:
+        remove_child(core, backwards)
+
+
 def _read_transition(track, item, clip_data):
     matching = next((transition for transition in track.transitions
                      if abs(transition.cut_point.seconds - item.start.seconds) < .05), None)
@@ -455,12 +468,7 @@ def save_project(data):
     if not isinstance(data, dict):
         raise ValueError('Invalid project')
     lanes = {}
-    multistream = {item.get('id') for item in data.get('media',[])
-                   if isinstance(item.get('audioStreams'),int) and item['audioStreams']>1}
     for item in data.get('clips', []):
-        if (item.get('mediaId') in multistream and 'premiereIndex' not in item and
-                (item.get('type')=='audio' or item.get('embeddedAudio') is not False)):
-            raise ValueError('Premiere save cannot assign multiple source audio streams for a new placement. Save a Splice working copy to keep the stereo mix.')
         lane = ('audio' if item.get('type') == 'audio' else 'video', int(item.get('track', 1)))
         lanes.setdefault(lane, []).append(item)
     for lane, clips in lanes.items():
@@ -706,6 +714,29 @@ def save_project(data):
         available[item['id']] = project.import_files([path])[0]
         if item.get('bin'):
             available[item['id']].move_to(_ensure_bin(project, item['bin'], bin_cache))
+    media_by_id = {item.get('id'): item for item in data.get('media',[])}
+    generated_audio = {}
+
+    def source_audio(identity):
+        item = media_by_id.get(identity,{})
+        if item.get('audioStream') is None and (not isinstance(item.get('audioStreams'),int) or item['audioStreams']<=1):
+            return available.get(identity)
+        if identity not in generated_audio:
+            from media_proxy import premiere_audio
+            handoff = premiere_audio(item.get('src',''),item.get('audioStream'))
+            generated_audio[identity] = project.import_files([handoff])[0]
+        return generated_audio[identity]
+
+    def place_linked(identity, position, video_track, audio_track, audio_identity=None):
+        video_source = available[identity]
+        audio_source = source_audio(audio_identity if audio_identity is not None else identity)
+        if audio_source is video_source:
+            return sequence.add_linked_clip(video_source,position,video_track,audio_track)
+        picture = sequence.video_tracks[video_track].add_clip(video_source,position)
+        sound = sequence.audio_tracks[audio_track].add_clip(audio_source,position)
+        sequence._link([picture,sound])
+        return picture,sound
+
     new_link_groups = {}
     for item in data.get('clips', []):
         if item.get('linkGroup') and 'premiereIndex' not in item:
@@ -717,8 +748,8 @@ def save_project(data):
         if len(group) != 2 or video is None or audio is None:
             raise ValueError('A native linked placement needs one video and one audio clip')
         source = available.get(video.get('mediaId'))
-        if source is None or source is not available.get(audio.get('mediaId')):
-            raise ValueError('Linked Premiere audio and video need the same source item')
+        if source is None or available.get(audio.get('mediaId')) is None:
+            raise ValueError('Relink both sources before saving linked audio and video to Premiere')
         if any(abs(float(video[key]) - float(audio[key])) > .001 for key in ('start', 'duration', 'in')):
             raise ValueError('Linked Premiere audio and video must stay aligned')
         video_track = int(video['track']) - 1
@@ -753,9 +784,9 @@ def save_project(data):
             pair = new_link_groups[group_key]
             video = next(member for member in pair if member['type'] == 'video')
             audio = next(member for member in pair if member['type'] == 'audio')
-            linked_video, linked_audio = sequence.add_linked_clip(
-                available[video['mediaId']], py_premiere.Time.from_seconds(float(video['start'])),
-                int(video['track']) - 1, -int(audio['track']) - 1)
+            linked_video, linked_audio = place_linked(
+                video['mediaId'], py_premiere.Time.from_seconds(float(video['start'])),
+                int(video['track']) - 1, -int(audio['track']) - 1,audio['mediaId'])
             linked_placements[video['id']] = linked_video
             linked_placements[audio['id']] = linked_audio
             linked_groups_placed.add(group_key)
@@ -816,27 +847,21 @@ def save_project(data):
                         if paired:
                             raise ValueError('Linked camera sound needs one free audio track across the crossfade')
                         raise ValueError('No free audio track for linked camera sound')
-                    clip, companion = sequence.add_linked_clip(source, placement, index, free)
+                    clip, companion = place_linked(item['mediaId'], placement, index, free)
                     audio_regions[free].append((begin, end))
                     camera_audio[id(item)] = (companion, free)
                     if paired or (previous is None and item.get('transition') in ('dissolve','wipe','fade')):
                         pending_transitions.append((companion, item, AUDIO_CROSSFADE, AUDIO_CROSSFADE))
                 else:
-                    clip = tracks[index].add_clip(source, placement)
+                    clip = tracks[index].add_clip(source_audio(item['mediaId']) if is_audio else source, placement)
         speed = float(item.get('speed', clip.speed))
         if item.get('type') != 'title' and abs(speed - clip.speed) > .000001:
             if clip._clip_element.find('Clip/TimeRemapping') is not None:
                 raise ValueError('Changing speed on a keyframed Premiere time remap is unsupported')
             _set_clip_speed(clip, speed)
-        if item.get('type') != 'title' and bool(item.get('reverse', clip.is_speed_reversed)) != clip.is_speed_reversed:
-            core = clip._clip_element.find('Clip')
-            backwards = core.find('PlayBackwards')
-            if item['reverse'] and backwards is None:
-                insert_leaf_before(core, 'OutPoint', 'PlayBackwards', 'true')
-            elif item['reverse']:
-                backwards.text = 'true'
-            else:
-                remove_child(core, backwards)
+        reverse = bool(item.get('reverse',clip.is_speed_reversed))
+        if item.get('type') != 'title':
+            _set_clip_reverse(clip,reverse)
         start = max(0, float(item.get('in', 0)))
         duration = max(0.001, float(item.get('duration', 1)))
         # A retimed Premiere clip can have a different source span than its
@@ -849,6 +874,9 @@ def save_project(data):
             clip.out_point = py_premiere.Time.from_seconds(start + duration * speed)
             clip.end = py_premiere.Time.from_seconds(float(item.get('start', 0)) + duration)
         if companion is not None:
+            if abs(speed-companion.speed)>.000001:
+                _set_clip_speed(companion,speed)
+            _set_clip_reverse(companion,reverse)
             companion.in_point = clip.in_point
             companion.out_point = clip.out_point
             companion.end = clip.end
