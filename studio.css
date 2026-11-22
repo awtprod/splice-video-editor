@@ -1112,3 +1112,15 @@ button svg {
 .caption-card textarea,.caption-timing input{box-sizing:border-box;width:100%;background:#242923;border:1px solid #44503e;color:white;font:inherit;padding:4px}
 .caption-timing label{flex:1;min-width:0}.caption-card textarea{min-height:42px}
 .studio-dialog label[hidden]{display:none}
+@media(max-width:1100px){
+  .library-tabs{justify-content:space-between;gap:3px;padding:0 8px}
+  .library-tabs button{font-size:11px}
+  .pool-tools{display:grid;grid-template-columns:1fr 1fr;gap:4px;padding:6px 8px}
+  .pool-tools input{grid-column:1/-1;grid-row:1;width:100%}
+  .pool-tools select,#bin-filter{width:100%;max-width:none;min-width:0}
+  .pool-tools[hidden]{display:none}
+  .viewer-bottom{gap:4px;padding:0 8px}
+  .viewer-info{flex-direction:column;gap:0}
+  .transport{gap:4px}
+  .viewer-scale{display:none}
+}

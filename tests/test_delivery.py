@@ -53,6 +53,38 @@ class MovieDelivery(unittest.TestCase):
         self.assertGreater(statistics.mean(left),30)
         self.assertLess(statistics.mean(right),7)
 
+    def test_final_render_uses_original_still(self):
+        self.project['media']=[dict(id='still',src='/assets/ridge.jpg')]
+        self.project['clips']=[self.clip('still','still',0,1)]
+        render_to_file(self.project,self.destination)
+        self.assertEqual(next(s['nb_frames'] for s in self.streams() if s['codec_type']=='video'),'25')
+        self.assertGreater(statistics.mean(self.frame(.8)),30)
+
+    def test_export_pan_routes_both_stereo_channels(self):
+        from array import array
+        from premiere import MEDIA_ROOT
+        MEDIA_ROOT.mkdir(parents=True,exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=MEDIA_ROOT) as directory:
+            source=Path(directory)/'stereo.wav'
+            subprocess.run(['ffmpeg','-nostdin','-y','-v','error','-f','lavfi',
+                            '-i','aevalsrc=0.12*sin(2*PI*440*t)|0.12*sin(2*PI*990*t):s=48000:d=1',
+                            str(source)],check=True,timeout=10)
+            self.project['media']=[dict(id='score',src='/media/'+str(source.relative_to(MEDIA_ROOT)))]
+            for pan in (-100,0,100):
+                self.project['clips']=[dict(type='audio',start=0,duration=1,mediaId='score',track=-1,pan=pan)]
+                movie=Path(directory)/'mix.wav'
+                render_to_file(self.project,movie,options={'codec':'wav'})
+                pcm=subprocess.check_output(['ffmpeg','-nostdin','-v','error','-ss','0.25','-i',str(movie),
+                    '-t','0.25','-f','f32le','pipe:1'],timeout=10)
+                samples=array('f',pcm)
+                channels=[samples[i::2] for i in range(2)]
+                rms=[(sum(n*n for n in channel)/len(channel))**.5 for channel in channels]
+                if pan==0:
+                    self.assertAlmostEqual(rms[0],rms[1],places=3)
+                else:
+                    self.assertLess(rms[1 if pan<0 else 0],.001)
+                    self.assertGreater(rms[0 if pan<0 else 1],.11)
+
     def test_250_cuts_frame_count_and_selectable_subtitles(self):
         self.project['clips']=[self.clip(str(i),'ridge',i/25,.04) for i in range(250)]
         self.project['captions']=[dict(start=6.2,duration=1,text='Across the segment boundary')]

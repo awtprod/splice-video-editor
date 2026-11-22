@@ -1,5 +1,7 @@
 const assert=require('node:assert/strict');
 const path=require('node:path');
+const fs=require('node:fs');
+const os=require('node:os');
 
 module.exports=async function recoveryFlow(page,context,url,root) {
   const load=async project=>{
@@ -23,6 +25,20 @@ module.exports=async function recoveryFlow(page,context,url,root) {
   await chooser.setFiles(real);
   await page.waitForFunction(()=>!Editor.get().project.media[0].offline);
   assert.equal(await page.evaluate(()=>Editor.get().project.media[1].offline),true);
+  const tree=fs.mkdtempSync(path.join(os.tmpdir(),'splice-relink-'));
+  try {
+    for(const [sub,asset] of [['camera-a','ridge'],['camera-b','valley']]){
+      fs.mkdirSync(path.join(tree,sub));fs.copyFileSync(path.join(root,'assets',asset+'.mp4'),path.join(tree,sub,'ridge.mp4'));
+    }
+    await load({...base,name:'Folder matching',media:[{...source,path:'/previous/location/camera-a/ridge.mp4'}, {...duplicate,path:'/previous/location/camera-b/ridge.mp4'}],clips:[{...base.clips[0],in:0}]});
+    await page.locator('#folder-relink-input').setInputFiles(tree);
+    await page.waitForFunction(()=>Editor.get().project.media.every(m=>!m.offline));
+    const media=await page.evaluate(()=>Editor.get().project.media);
+    assert.notEqual(media[0].originalSrc,media[1].originalSrc);
+    assert.ok(media[0].path.includes('camera-a'));assert.ok(media[1].path.includes('camera-b'));
+    // Start the concurrent-window exercise from the folder-relinked project.
+    await page.evaluate(()=>Editor.renameProject('Camera A and B'));
+  } finally {fs.rmSync(tree,{recursive:true,force:true});}
   await page.waitForFunction(()=>document.querySelector('#session-status').textContent==='Draft saved locally');
   const other=await context.newPage();
   try {

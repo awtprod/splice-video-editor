@@ -22,3 +22,4 @@
 .source-stage{height:min(36vh,350px)}
 .source-controls{gap:9px;padding:14px 20px}
 @media(max-height:720px){.source-stage{height:min(30vh,240px)}}
+.source-shortcuts{color:#9aaa98;font:11px 'IBM Plex Mono',monospace}

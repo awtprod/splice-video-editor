@@ -23,6 +23,7 @@ TRANSITIONS = {
 }
 TRANSITION_BY_MATCH = {match:style for style,(match,_) in TRANSITIONS.items()}
 
+STILL_IMAGES = frozenset({".png", ".bmp", ".jpg", ".jpeg"})
 ROOT = Path(__file__).resolve().parent
 MEDIA_ROOT = Path.home() / '.local' / 'share' / 'splice' / 'media'
 
@@ -283,7 +284,8 @@ def open_project(data, index=0, _seen=()):
                                 nested_identities[identity_key] = identity
                                 media.append({'id': identity, 'name': project.sequences[nested].name,
                                               'src': '', 'duration': 0, 'thumb': '',
-                                              'type': track_type, 'nestedSequence': nested})
+                                              'type': track_type, 'nestedSequence': nested,
+                                              'premiereItemUID': source_item._element.get('ObjectUID') if source_item is not None else None})
                             identity = nested_identities[identity_key]
                             source_media = next(m for m in media if m['id'] == identity)
                             source_media['duration'] = max(source_media['duration'], item.in_point.seconds + item.duration.seconds)
@@ -445,6 +447,15 @@ def open_project(data, index=0, _seen=()):
 def save_project(data):
     if not isinstance(data, dict):
         raise ValueError('Invalid project')
+    lanes = {}
+    for item in data.get('clips', []):
+        lane = ('audio' if item.get('type') == 'audio' else 'video', int(item.get('track', 1)))
+        lanes.setdefault(lane, []).append(item)
+    for lane, clips in lanes.items():
+        ordered = sorted(clips, key=lambda item: float(item['start']))
+        for previous, current in zip(ordered, ordered[1:]):
+            if float(current['start']) < float(previous['start']) + float(previous['duration']) - .001:
+                raise ValueError(f'Premiere track {lane[1]} contains overlapping clips')
     for clip in data.get('clips', []):
         if (clip.get('color') or {}).get('lut'):
             raise ValueError('Premiere export cannot write imported LUTs; save a Splice project or remove the LUT')
@@ -487,7 +498,10 @@ def save_project(data):
         base = FORMATS['1080p25']
         custom = base._replace(frame_rate=chosen[0], width=width, height=height, time_display=chosen[1], video_tracks=4)
         sequence = project.add_sequence(str(data.get('name') or 'Untitled')[:120], sequence_format=custom)
-    for key, state in (data.get('trackState') or {}).items():
+    track_states = data.get('trackState') or {}
+    if 'title:4' in track_states and 'video:4' in track_states and track_states['title:4'] != track_states['video:4']:
+        raise ValueError('Title and video track 4 share one native Premiere lock state')
+    for key, state in track_states.items():
         try:
             kind, raw_track = key.split(':', 1)
             number = int(raw_track)
@@ -609,6 +623,31 @@ def save_project(data):
             for track_index, track in enumerate(tracks):
                 for clip_index, clip in enumerate(track.clips):
                     original_clips[(kind, track_index, clip_index)] = clip
+        original_by_object = {clip._element.get('ObjectID'): key for key, clip in original_clips.items()}
+        incoming_by_key = {(('audio' if item.get('type') == 'audio' else 'video'),
+                            item.get('premiereTrack'), item.get('premiereIndex')): item
+                           for item in data.get('clips', []) if 'premiereIndex' in item}
+        links = sequence._element.find('PersistentGroupContainer/LinkContainer/Links')
+        for link_ref in list(links) if links is not None else []:
+            link = project._document.resolve(link_ref)
+            keys = [original_by_object.get(ref.get('ObjectRef'))
+                    for ref in link.findall('TrackItemGroup/TrackItems/TrackItem')]
+            if any(key is None for key in keys):
+                continue
+            present = [incoming_by_key.get(key) for key in keys]
+            if not any(present):
+                remove_child(links, link_ref)
+                project._document.remove_object(link)
+                continue
+            if not all(present):
+                raise ValueError('Linked Premiere audio and video must be deleted together')
+            offsets = [(float(item['start']) - original_clips[key].start.seconds,
+                        float(item['duration']) - original_clips[key].duration.seconds,
+                        float(item['in']) - original_clips[key].in_point.seconds)
+                       for key, item in zip(keys, present)]
+            if any(any(abs(value - offsets[0][position]) > .001 for position, value in enumerate(values))
+                   for values in offsets[1:]):
+                raise ValueError('Linked Premiere audio and video must stay aligned')
     available = {}
     existing = {}
     existing_uid = {}
@@ -649,6 +688,26 @@ def save_project(data):
         available[item['id']] = project.import_files([path])[0]
         if item.get('bin'):
             available[item['id']].move_to(_ensure_bin(project, item['bin'], bin_cache))
+    new_link_groups = {}
+    for item in data.get('clips', []):
+        if item.get('linkGroup') and 'premiereIndex' not in item:
+            new_link_groups.setdefault(item['linkGroup'], []).append(item)
+    linked_placements = {}
+    for group in new_link_groups.values():
+        video = next((item for item in group if item.get('type') == 'video'), None)
+        audio = next((item for item in group if item.get('type') == 'audio'), None)
+        if len(group) != 2 or video is None or audio is None:
+            raise ValueError('A native linked placement needs one video and one audio clip')
+        source = available.get(video.get('mediaId'))
+        if source is None or source is not available.get(audio.get('mediaId')):
+            raise ValueError('Linked Premiere audio and video need the same source item')
+        if any(abs(float(video[key]) - float(audio[key])) > .001 for key in ('start', 'duration', 'in')):
+            raise ValueError('Linked Premiere audio and video must stay aligned')
+        video_track = int(video['track']) - 1
+        audio_track = -int(audio['track']) - 1
+        if not 0 <= video_track < len(sequence.video_tracks) or not 0 <= audio_track < len(sequence.audio_tracks):
+            raise ValueError('Native linked placement track is unavailable')
+    linked_groups_placed = set()
     # Put linked camera sound on a free audio track alongside the explicit mix.
     audio_regions = [[] for _ in sequence.audio_tracks]
     for region in data.get('clips', []):
@@ -658,7 +717,7 @@ def save_project(data):
                 raise ValueError('Unsupported audio track')
             audio_regions[track].append((region['start'], region['start'] + region['duration']))
     pending_transitions = []
-    for item in data.get('clips', []):
+    for item in sorted(data.get('clips', []), key=lambda clip: 'premiereIndex' not in clip):
         companion = None
         source = available.get(item.get('mediaId'))
         is_audio = item.get('type') == 'audio'
@@ -667,7 +726,20 @@ def save_project(data):
         index = -ui_track - 1 if is_audio else ui_track - 1
         if index < 0 or index >= len(tracks):
             raise ValueError('Unsupported track number')
-        if original and 'premiereIndex' in item:
+        group_key = item.get('linkGroup')
+        if group_key in new_link_groups and group_key not in linked_groups_placed:
+            pair = new_link_groups[group_key]
+            video = next(member for member in pair if member['type'] == 'video')
+            audio = next(member for member in pair if member['type'] == 'audio')
+            linked_video, linked_audio = sequence.add_linked_clip(
+                available[video['mediaId']], py_premiere.Time.from_seconds(float(video['start'])),
+                int(video['track']) - 1, -int(audio['track']) - 1)
+            linked_placements[video['id']] = linked_video
+            linked_placements[audio['id']] = linked_audio
+            linked_groups_placed.add(group_key)
+        if item.get('id') in linked_placements:
+            clip = linked_placements[item['id']]
+        elif original and 'premiereIndex' in item:
             original_track = int(item.get('premiereTrack', index))
             if original_track >= len(tracks):
                 raise ValueError('Premiere track is unavailable')

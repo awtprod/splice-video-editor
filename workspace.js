@@ -138,6 +138,13 @@
   };
   const mediaFor = (project, clip) =>
     project.media.find((m) => m.id === clip.mediaId);
+  function mediaLabel(media) {
+    if(Number.isInteger(media.nestedSequence))return media.proxyState==='preparing'?'Preparing nested preview':media.proxyState==='unavailable'?'Nested preview unavailable':'Nested sequence';
+    if(Number.isInteger(media.nativeGenerator))return [1112293707,1414680150].includes(media.nativeGenerator)?'Premiere generator':'Native generator · Premiere preview';
+    if(media.nativeUnsupported)return 'Native source · Premiere preview';
+    if(media.offline || !media.src)return 'Offline · Relink media';
+    return (media.type==='audio'?'Audio':'Video')+' · '+Math.round(media.duration||0)+'s'+(media.originalSrc && media.src!==media.originalSrc?' · Proxy':'');
+  }
   function renderLibrary(state) {
     const { project } = state;
     project.media.forEach(makeThumb);
@@ -152,7 +159,7 @@
         ...[...new Set(project.media.map(m=>m.bin).filter(Boolean))].sort().map(f=>new Option(f,f)));
       if ([...$('bin-filter').options].some(o=>o.value===previousBin)) $('bin-filter').value=previousBin;
       const bin=$('bin-filter').value;
-      body.innerHTML = `<div class="library-section">Imported media</div>${project.media.some((m) => m.offline || !m.src) ? '<button class="asset-add" id="relink-assets">↻ &nbsp; Relink offline media</button>' : ""}<div class="media-grid">${project.media.filter(media => { const term=$("media-search").value.trim().toLowerCase(); const filter=$("media-filter").value;return (!bin || (bin==="@root" ? !media.bin : media.bin===bin)) && (!term || (media.name+" "+(media.path||"")).toLowerCase().includes(term)) && (filter==="all"||filter===media.type||(filter==="offline"&&(media.offline||!media.src))); }).map((media) => `<button class="media-card" draggable="true" data-media="${esc(media.id)}" title="Double click to add to timeline"><div class="media-thumb ${media.type === "audio" ? "audio-thumb" : ""}">${media.type === "audio" ? "♫" : media.thumb ? `<img src="${esc(media.thumb)}" alt="">` : "▶"}<span class="media-icon">${media.type === "audio" ? "♫" : "▶"}</span><span class="media-duration">${fmt(media.duration, project.fps).slice(3, 8)}</span></div><span class="media-name">${esc(media.name)}</span><span class="media-meta">${media.offline || !media.src ? "Offline · Relink media" : `${media.type === "audio" ? "Audio" : "Video"} · ${Math.round(media.duration || 0)}s`}</span></button>`).join("")}</div><button class="asset-add" id="asset-add">＋ &nbsp; Import your own footage or audio</button>`;
+      body.innerHTML = `<div class="library-section">Imported media</div>${project.media.some(m=>m.offline) ? '<button class="asset-add" id="relink-assets">↻ &nbsp; Relink offline media</button><button class="asset-add" id="relink-folder">Relink from folder…</button>' : ""}<div class="media-grid">${project.media.filter(media => { const term=$("media-search").value.trim().toLowerCase(); const filter=$("media-filter").value;return (!bin || (bin==="@root" ? !media.bin : media.bin===bin)) && (!term || (media.name+" "+(media.path||"")).toLowerCase().includes(term)) && (filter==="all"||filter===media.type||(filter==="offline"&&media.offline)); }).map((media) => `<button class="media-card" draggable="true" data-media="${esc(media.id)}" title="Double click to add to timeline"><div class="media-thumb ${media.type === "audio" ? "audio-thumb" : ""}">${media.type === "audio" ? "♫" : media.thumb ? `<img src="${esc(media.thumb)}" alt="">` : "▶"}<span class="media-icon">${media.type === "audio" ? "♫" : "▶"}</span><span class="media-duration">${fmt(media.duration, project.fps).slice(3, 8)}</span></div><span class="media-name">${esc(media.name)}</span><span class="media-meta">${esc(mediaLabel(media))}</span></button>`).join("")}</div><button class="asset-add" id="asset-add">＋ &nbsp; Import your own footage or audio</button>`;
       body.querySelectorAll("[data-media]").forEach((el) => {
         if (project.media.find(m => m.id === el.dataset.media)?.offline) {
           el.onclick = () => { relinkTarget = el.dataset.media; $("specific-relink-input").click(); };
@@ -165,6 +172,7 @@
           e.dataTransfer.setData("text/plain", el.dataset.media);
       });
       $("asset-add").onclick = () => $("media-input").click();
+      if ($("relink-folder")) $("relink-folder").onclick=()=>$("folder-relink-input").click();
       if ($("relink-assets"))
         $("relink-assets").onclick = () => $("relink-input").click();
     } else if (tab === "effects")
@@ -183,8 +191,20 @@
   }
   const group = new Set();
   let clipboard=[];
+  const withLinked = clips => {
+    const all=editor.get().project.clips;
+    const ids=new Set(clips.map(clip=>clip.id));
+    for(const clip of clips)if(clip.linkGroup)
+      for(const member of all.filter(item=>item.linkGroup===clip.linkGroup))ids.add(member.id);
+    return all.filter(clip=>ids.has(clip.id));
+  };
   let snapEnabled = true;
   let rippleEnabled = false;
+  function toggleRipple() {
+    rippleEnabled=!rippleEnabled;
+    $("ripple-toggle").classList.toggle("active",rippleEnabled);
+    $("delete-selected").title=rippleEnabled?"Ripple delete selected clip":"Delete selected clip";
+  }
   function snapTime(value, ignoredId) {
     const time = Math.max(0, value);
     if (!snapEnabled) return time;
@@ -275,9 +295,10 @@
     const canvas = $("preview-canvas"), state = monitorState;
     if (!state) { requestAnimationFrame(paintPreview); return; }
     const video = state.video;
-    const paintKey = [state.revision, state.time, state.selectedId, video?.currentSrc,
-      video?.readyState, video?.currentTime, video?.seeking, canvas.width, canvas.height].join(":");
-    if (state.playing || paintKey !== lastPaint) {
+    const frame=Math.floor(state.time*state.project.fps);
+    const paintKey = [state.revision, frame, state.selectedId, video?.currentSrc,video?.readyState,
+      state.playing?'rolling':video?.currentTime, video?.seeking,canvas.width,canvas.height].join(':');
+    if (paintKey !== lastPaint) {
       editor.drawFrame(canvas);
       lastPaint = paintKey;
     }
@@ -436,6 +457,10 @@
   );
   $("import-media").onclick = $("library-import").onclick = () =>
     $("media-input").click();
+  $("folder-relink-input").onchange=e=>{
+    const files=Array.from(e.target.files);e.target.value="";
+    if(files.length)busy(()=>editor.relinkFolder(files),"Matching sources relinked");
+  };
   $("relink-input").onchange = (e) => {
     const files = Array.from(e.target.files);
     if (files.length) busy(() => editor.relinkMedia(files), "Media relinked");
@@ -483,7 +508,7 @@
   $("step-forward").onclick = () =>
     editor.seek(editor.get().time + 1 / editor.get().project.fps);
   $("split").onclick = () => safeEdit(() => editor.split());
-  $("delete-selected").onclick = () => safeEdit(() => editor.deleteSelected());
+  $("delete-selected").onclick = () => safeEdit(() => editor.deleteSelected({ripple:rippleEnabled}));
   $("undo").onclick = () => editor.undo();
   $("redo").onclick = () => editor.redo();
   $("reset-clip").onclick = () => {
@@ -533,7 +558,7 @@
     }
     const edge=e.target.closest(".trim-handle");
     if (!group.has(clip.id) || edge || e.altKey) group.clear();
-    const originals=editor.get().project.clips.filter(c=>group.has(c.id)).map(c=>({id:c.id,start:c.start,track:c.track,type:c.type}));
+    const originals=withLinked(editor.get().project.clips.filter(c=>group.has(c.id))).map(c=>({id:c.id,start:c.start,track:c.track,type:c.type}));
     if ([clip,...originals].some(item=>editor.isTrackLocked(item.track,item.type))) {
       notify('Unlock the track before editing.'); return;
     }
@@ -594,7 +619,7 @@
       editor.moveClip(editor.get().selectedId,editor.get().time,Number(lane.dataset.track));});
   });
   $("snap-toggle").onclick=()=>{snapEnabled=!snapEnabled;$("snap-toggle").classList.toggle("active",snapEnabled)};
-  $("ripple-toggle").onclick=()=>{rippleEnabled=!rippleEnabled;$("ripple-toggle").classList.toggle("active",rippleEnabled)};
+  $("ripple-toggle").onclick=toggleRipple;
   $("compatibility").onclick=()=>SpliceDialogs.projectReport();
   $("versions").onclick=()=>busy(()=>SpliceSession.history());
   $("save-as").onclick=()=>busy(()=>SpliceSession.saveAs("prproj"));
@@ -620,12 +645,15 @@
     if (/INPUT|TEXTAREA|SELECT/.test(document.activeElement?.tagName)) return;
     const selected = editor.get().project.clips.filter(c=>group.size?group.has(c.id):c.id===editor.get().selectedId);
     const key=e.key.toLowerCase();
-    if((e.metaKey||e.ctrlKey)&&key==="c"){e.preventDefault();clipboard=structuredClone(selected);return;}
+    if((e.metaKey||e.ctrlKey)&&key==="c"){e.preventDefault();clipboard=structuredClone(withLinked(selected));return;}
     if((e.metaKey||e.ctrlKey)&&key==="v"&&clipboard.length){e.preventDefault();const t=editor.get().time, first=Math.min(...clipboard.map(c=>c.start));safeEdit(()=>editor.editProject(p=>{
+      const links=new Map();
       for(const original of clipboard){if(original.mediaId&&!p.media.some(m=>m.id===original.mediaId))throw Error("Paste into a project containing the source media.");
-        const c=structuredClone(original);c.start=t+c.start-first;c.id=crypto.randomUUID();delete c.premiereIndex;delete c.premiereTrack;p.clips.push(c);}
+        const c=structuredClone(original);c.start=t+c.start-first;c.id=crypto.randomUUID();delete c.premiereIndex;delete c.premiereTrack;
+        if(c.linkGroup){if(!links.has(c.linkGroup))links.set(c.linkGroup,crypto.randomUUID());c.linkGroup=links.get(c.linkGroup);}
+        p.clips.push(c);}
     }));return;}
-    if(e.key==="Delete"&&group.size){safeEdit(()=>editor.editProject(p=>{p.clips=p.clips.filter(c=>!group.has(c.id))}));group.clear();return;}
+    if(e.key==="Delete"&&group.size){safeEdit(()=>editor.deleteClips([...group],{ripple:rippleEnabled}));group.clear();return;}
     if(key==="m"&&!e.ctrlKey&&!e.metaKey){e.preventDefault();editMarker();return;}
     if(e.key==="["||e.key==="]"){e.preventDefault();const s=editor.get();const times=(s.project.markers||[]).map(m=>m.time);editor.seek(e.key==="]"?Math.min(s.duration,...times.filter(x=>x>s.time+.001)):Math.max(0,...times.filter(x=>x<s.time-.001)));return;}
     if(e.key==="ArrowLeft"||e.key==="ArrowRight"){e.preventDefault();editor.seek(editor.get().time+(e.key==="ArrowRight"?1:-1)/editor.get().project.fps);return;}
@@ -633,7 +661,7 @@
     if (e.key.toLowerCase()==="k"){e.preventDefault();editor.setRate?.(0);return;}
     if (e.key.toLowerCase()==="l"){e.preventDefault();editor.setRate?.(1);return;}
     if (e.key.toLowerCase()==="n"){e.preventDefault();snapEnabled=!snapEnabled;$("snap-toggle").classList.toggle("active",snapEnabled);return;}
-    if (e.key.toLowerCase()==="r"){e.preventDefault();rippleEnabled=!rippleEnabled;$("ripple-toggle").classList.toggle("active",rippleEnabled);return;}
+    if (e.key.toLowerCase()==="r"){e.preventDefault();toggleRipple();return;}
     if (e.code === "Space") {
       e.preventDefault();
       editor.togglePlay();
@@ -646,6 +674,6 @@
       e.preventDefault();
       e.shiftKey ? editor.redo() : editor.undo();
     }
-    if (e.key === "Delete") safeEdit(()=>editor.deleteSelected());
+    if (e.key === "Delete") safeEdit(()=>editor.deleteSelected({ripple:rippleEnabled}));
   });
 })();

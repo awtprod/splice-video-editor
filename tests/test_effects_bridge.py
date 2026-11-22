@@ -61,6 +61,14 @@ class ExtendedEffectsRoundTrip(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'audio pan'):
                 premiere_effects.apply_extended(clip, {'pan':35})
 
+    def test_lut_never_disappears_silently_on_native_save(self):
+        app = py_premiere.new()
+        sequence = app.project.add_sequence('LUT', '1080p25')
+        item = app.project.import_files(['assets/ridge.mp4'])[0]
+        clip = sequence.video_tracks[0].add_clip(item, py_premiere.Time.from_seconds(0))
+        with self.assertRaisesRegex(ValueError, '3D LUT'):
+            premiere_effects.apply(clip, {'lut':{'size':2,'data':[0]*24}},100)
+
 
 if __name__ == '__main__':
     unittest.main()
@@ -124,6 +132,14 @@ class NativeMotionAndFade(unittest.TestCase):
             self.assertEqual(premiere_effects.read_extended(reopened)['transform'],
                 {'x':13,'y':-9,'scale':120,'rotation':7})
 
+    def test_materialized_motion_stays_neutral_when_only_rotated(self):
+        app = py_premiere.new()
+        sequence = app.project.add_sequence('Rotate', '1080p25')
+        item = app.project.import_files(['assets/ridge.mp4'])[0]
+        clip = sequence.video_tracks[0].add_clip(item, py_premiere.Time.from_seconds(0))
+        premiere_effects.apply_extended(clip, {'transform':{'rotation':10}})
+        self.assertEqual(premiere_effects.read_extended(clip)['transform']['scale'],100)
+
     def test_new_audio_fades_roundtrip(self):
         app = py_premiere.new()
         sequence = app.project.add_sequence('Sound', '1080p25')
@@ -137,3 +153,32 @@ class NativeMotionAndFade(unittest.TestCase):
             reopened = py_premiere.parse(output).project.sequences[0].audio_tracks[0].clips[0]
             self.assertEqual(premiere_effects.read_extended(reopened),
                 {'volume':70,'fadeIn':.4,'fadeOut':.5})
+
+    def test_audio_gain_automation_roundtrip(self):
+        app = py_premiere.new()
+        sequence = app.project.add_sequence('Gain', '1080p25')
+        item = app.project.import_files(['assets/score.wav'])[0]
+        clip = sequence.audio_tracks[0].add_clip(item, py_premiere.Time.from_seconds(1))
+        clip.end = py_premiere.Time.from_seconds(5)
+        points=[{'time':0,'value':0},{'time':1.5,'value':100},{'time':4,'value':60}]
+        premiere_effects.apply_extended(clip, {'volume':100,'keyframes':{'volume':points}})
+        with tempfile.TemporaryDirectory() as directory:
+            output = str(Path(directory) / 'gain.prproj')
+            app.project.save(output)
+            reopened = py_premiere.parse(output).project.sequences[0].audio_tracks[0].clips[0]
+            effects = premiere_effects.read_extended(reopened)
+            self.assertEqual(effects['keyframes']['volume'],points)
+            self.assertEqual(effects['volume'],100)
+
+    def test_adobe_audio_keys_outside_trimmed_source_are_preserved(self):
+        fixture = Path(__file__).resolve().parent / 'fixtures' / '63_audio_keyframes.prproj'
+        app = py_premiere.parse(str(fixture))
+        clip = app.project.sequences[0].audio_tracks[0].clips[0]
+        level = next(param for component in clip.components for param in component.properties
+                     if param.display_name=='Level')
+        before = level._element.findtext('Keyframes')
+        self.assertEqual(premiere_effects.read_extended(clip),{})
+        _,volume=premiere_effects.read(clip)
+        premiere_effects.apply(clip,{},volume)
+        premiere_effects.apply_extended(clip,{})
+        self.assertEqual(level._element.findtext('Keyframes'),before)

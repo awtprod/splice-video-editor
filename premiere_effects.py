@@ -11,7 +11,7 @@ from py_premiere.enums.general import KeyframeInterpolation
 from py_premiere.models.caption import (
     read_style_color, read_style_float, write_style_color, write_style_float,
     write_payload_element, _add_table_field, _field_offset, _style_table,
-    _write_table_flag,
+    _write_table_flag, _document_table,
 )
 from py_premiere.models.color import Color
 
@@ -59,14 +59,29 @@ def _write_graphic_color(payload, slot, color):
     return bytes(with_field)
 
 
+def _text_run_count(payload):
+    document=_document_table(payload)
+    field=_field_offset(payload,document,0)
+    if field is None: return 0
+    vector=field+struct.unpack_from('<I',payload,field)[0]
+    return struct.unpack_from('<I',payload,vector)[0]
+
+
 def _read_keys(param, clip, convert=lambda value: value):
     if param is None or not param.is_time_varying:
         return []
-    return [{'time': round(key.seconds - clip.start.seconds, 5),
+    audio=clip._element.tag == 'AudioClipTrackItem'
+    base=clip.in_point.seconds if audio else clip.start.seconds
+    rate=clip.speed if audio else 1
+    points=[{'time': round((key.seconds - base)/rate, 5),
              'value': round(convert(param.get_value_at_key(key)), 5)} for key in param.keys]
+    if any(point['time'] < -.001 or point['time'] > clip.duration.seconds+.001 for point in points):
+        return []
+    return points
 
 
-def _apply_scalar_keys(param, clip, points, decode=lambda value: value, encode=lambda value: value):
+def _apply_scalar_keys(param, clip, points, decode=lambda value: value, encode=lambda value: value,
+                       low=-100000, high=100000):
     if not isinstance(points, list) or not 1 <= len(points) <= 200:
         raise ValueError('Invalid Premiere keyframe count')
     prepared=[]
@@ -75,14 +90,17 @@ def _apply_scalar_keys(param, clip, points, decode=lambda value: value, encode=l
             raise ValueError('Invalid Premiere keyframe')
         time=float(point.get('time', float('nan')))
         value=float(point.get('value', float('nan')))
-        if not math.isfinite(time) or not math.isfinite(value) or not 0 <= time <= clip.duration.seconds + .001:
+        if not math.isfinite(time) or not math.isfinite(value) or not 0 <= time <= clip.duration.seconds + .001 or not low <= value <= high:
             raise ValueError('Invalid Premiere keyframe time or value')
         prepared.append((round(time,5),round(value,5)))
     if len({time for time,_ in prepared}) != len(prepared):
         raise ValueError('Duplicate Premiere keyframe time')
     if _read_keys(param,clip,decode) == [{'time':t,'value':v} for t,v in prepared]:
         return
-    param.set_keyframes([(Time.from_seconds(clip.start.seconds+t),encode(v),KeyframeInterpolation.LINEAR)
+    audio=clip._element.tag == 'AudioClipTrackItem'
+    base=clip.in_point.seconds if audio else clip.start.seconds
+    rate=clip.speed if audio else 1
+    param.set_keyframes([(Time.from_seconds(base+t*rate),encode(v),KeyframeInterpolation.LINEAR)
                          for t,v in prepared])
 
 
@@ -150,6 +168,8 @@ def _attach(clip, name):
     for ref in element.findall('.//Params/Param'):
         component._properties.append(ComponentParam(doc.resolve(ref), doc, component))
     clip._components.append(component)
+    if name == 'motion':
+        _parameter(component, 'Scale').value = 100.0
     return component
 
 
@@ -236,14 +256,24 @@ def read_extended(clip):
     level = _parameter(volume_component, 'Level')
     if level is not None and level.is_time_varying:
         keys = [(time.seconds, level.get_value_at_key(time)) for time in level.keys]
+        source_end=clip.in_point.seconds + clip.duration.seconds*clip.speed
+        if not keys or any(t < clip.in_point.seconds-.001 or t > source_end+.001 for t,_ in keys):
+            return result
         if 2 <= len(keys) <= 4 and all(isinstance(value, (int, float)) for _, value in keys):
-            start, end = clip.start.seconds, clip.end.seconds
+            start, end = clip.in_point.seconds, source_end
             first, last = keys[0], keys[-1]
             if abs(first[0] - start) < .05 and abs(last[0] - end) < .05:
-                result['volume'] = round(100 * max(value for _, value in keys), 4)
-                result['fadeIn'] = round(keys[1][0] - start, 4) if first[1] == 0 and len(keys) > 2 else 0
-                result['fadeOut'] = round(end - keys[-2][0], 4) if last[1] == 0 and len(keys) > 2 else 0
-                if result['fadeIn'] or result['fadeOut']:
+                peak=max(value for _,value in keys)
+                close=lambda a,b:abs(a-b)<.00001
+                fade_in=len(keys) in (3,4) and close(first[1],0) and close(keys[1][1],peak)
+                fade_out=len(keys) in (3,4) and close(last[1],0) and close(keys[-2][1],peak)
+                if ((fade_in or fade_out) and
+                    (not fade_in or fade_out or close(last[1],peak)) and
+                    (not fade_out or fade_in or close(first[1],peak)) and
+                    all(close(value,peak) for _,value in keys[1:-1])):
+                    result['volume'] = round(100*peak,4)
+                    result['fadeIn'] = round((keys[1][0] - start)/clip.speed,4) if fade_in else 0
+                    result['fadeOut'] = round((end - keys[-2][0])/clip.speed,4) if fade_out else 0
                     return result
         result['keyframes'] = {**result.get('keyframes',{}), 'volume':_read_keys(level,clip,lambda value:value*100)}
         result['volume'] = round(100 * max(value for _,value in keys),4)
@@ -289,14 +319,21 @@ def apply_extended(clip, item):
                 if not isinstance(value, str) or len(value) != 7 or value[0] != '#' or any(c not in '0123456789abcdefABCDEF' for c in value[1:]):
                     raise ValueError('Invalid title '+key)
                 channels = [int(value[i:i+2], 16) for i in (1, 3, 5)]
-                payload = _write_graphic_color(payload, slot, Color(*channels)); changed = True
+                wanted=Color(*channels)
+                if read_style_color(payload,slot)==wanted: continue
+                if _text_run_count(payload)>1:
+                    raise ValueError('Premiere export cannot recolor a title with multiple text styles. Save a Splice working copy to keep this edit.')
+                payload = _write_graphic_color(payload, slot, wanted); changed = True
                 if slot == 4:
                     payload = _write_table_flag(payload, _style_table, 5)
             if 'strokeWidth' in style:
                 width = float(style['strokeWidth'])
                 if not math.isfinite(width) or not 0 <= width <= 8:
                     raise ValueError('Invalid title outline width')
-                if width or read_style_float(payload, 6) is not None:
+                prior=read_style_float(payload,6)
+                if (width or prior is not None) and (prior is None or abs(width-prior)>.0001):
+                    if _text_run_count(payload)>1:
+                        raise ValueError('Premiere export cannot change outlines on a title with multiple text styles. Save a Splice working copy to keep this edit.')
                     payload = write_style_float(payload, 6, width)
                     if width: payload = _write_table_flag(payload, _style_table, 5)
                     changed = True
@@ -332,7 +369,8 @@ def apply_extended(clip, item):
             base=float(transform.get(key,100 if key=='scale' else 0))
             if not param.is_time_varying and abs(float(param.value or 0)-base)>.0001:
                 param.value=base
-            _apply_scalar_keys(param,clip,automation[key])
+            _apply_scalar_keys(param,clip,automation[key],low=10 if key=='scale' else -180,
+                               high=400 if key=='scale' else 180)
     opacity = float(item.get('opacity',100))
     if not math.isfinite(opacity) or not 0 <= opacity <= 100:
         raise ValueError('Invalid clip opacity')
@@ -342,7 +380,7 @@ def apply_extended(clip, item):
         if automation.get('opacity'):
             if not param.is_time_varying and abs(float(param.value or 0)-opacity)>.0001:
                 param.value=opacity
-            _apply_scalar_keys(param,clip,automation['opacity'])
+            _apply_scalar_keys(param,clip,automation['opacity'],low=0,high=100)
         elif abs(float(param.value or 0)-opacity)>.0001:
             if param.is_time_varying:
                 raise ValueError('An existing Premiere opacity animation needs manual review before replacing it.')
@@ -357,7 +395,7 @@ def apply_extended(clip, item):
             raise ValueError('Premiere export cannot preserve camera sound gain keyframes on a video-only clip.')
         component = next((c for c in clip.components if c.match_name.startswith('Internal Volume')), None) or _attach(clip,'volume')
         _apply_scalar_keys(_parameter(component,'Level'),clip,automation['volume'],
-                           decode=lambda value:value*100,encode=lambda value:value/100)
+                           decode=lambda value:value*100,encode=lambda value:value/100,low=0,high=200)
     if fade_in or fade_out:
         if clip._element.tag != 'AudioClipTrackItem':
             raise ValueError('Premiere export cannot preserve camera sound fades on a video-only clip.')
@@ -367,15 +405,16 @@ def apply_extended(clip, item):
         level = _parameter(component, 'Level')
         if level.is_time_varying:
             raise ValueError('An existing Premiere audio envelope needs manual review before replacing it.')
-        start = clip.start.seconds
+        start = clip.in_point.seconds
         duration = clip.duration.seconds
+        rate = clip.speed
         volume = float(item.get('volume', 100)) / 100
         points = [(start, 0 if fade_in else volume)]
         if fade_in:
-            points.append((start + min(fade_in, duration/2), volume))
+            points.append((start + min(fade_in, duration/2)*rate, volume))
         if fade_out:
-            points.append((start + duration - min(fade_out, duration/2), volume))
-            points.append((start + duration, 0))
+            points.append((start + (duration - min(fade_out, duration/2))*rate, volume))
+            points.append((start + duration*rate, 0))
         else:
-            points.append((start + duration, volume))
+            points.append((start + duration*rate, volume))
         level.set_keyframes([(Time.from_seconds(t), v, KeyframeInterpolation.LINEAR) for t, v in points])

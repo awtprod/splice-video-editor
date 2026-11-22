@@ -9,7 +9,7 @@ def cube_text(lut, intensity=100):
     data = lut.get('data')
     if isinstance(size, bool) or not isinstance(size, int) or not 2 <= size <= 33 or not isinstance(data, list) or len(data) != size**3*3:
         raise ValueError('Invalid 3D LUT shape')
-    if any(not isinstance(value,(float,int)) or not math.isfinite(value) or not 0 <= value <= 1 for value in data):
+    if any(isinstance(value,bool) or not isinstance(value,(float,int)) or not math.isfinite(value) or not -4 <= value <= 4 for value in data):
         raise ValueError('Invalid 3D LUT sample')
     domain_min = lut.get('domainMin', [0,0,0])
     domain_max = lut.get('domainMax', [1,1,1])

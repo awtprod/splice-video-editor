@@ -46,7 +46,26 @@ window.SpliceMedia = (() => {
       )
     );
   }
-  async function put(record) {
+  function matchFolder(items, files) {
+    const parts = path => String(path||'').toLowerCase().split(/[\\/]/).filter(Boolean);
+    const ordered = [];
+    const consumed = new Set();
+    for(const item of items.filter(m=>m.offline)){
+      const source=parts(item.path||item.name);
+      const options=files.filter(f=>basename(f.name)===source.at(-1)).map(file=>{
+        const candidate=parts(file.webkitRelativePath||file.name);
+        let count=0;
+        while(count<Math.min(source.length,candidate.length) && source.at(-1-count)===candidate.at(-1-count))count++;
+        return {file,count};
+      }).sort((a,b)=>b.count-a.count);
+      if(!options.length)continue;
+      if(options[0].count===options[1]?.count || consumed.has(options[0].file))
+        throw Error('Ambiguous copies of '+item.name+'. Relink this source individually.');
+      consumed.add(options[0].file);ordered.push({item,file:options[0].file});
+    }
+    return ordered;
+  }
+  async function putRecords(records) {
     const db = await open();
     const transaction = db.transaction("files", "readwrite");
     const committed = new Promise((resolve, reject) => {
@@ -56,7 +75,8 @@ window.SpliceMedia = (() => {
           transaction.error || new Error("Could not store this media file."),
         );
     });
-    transaction.objectStore("files").put(record);
+    const store=transaction.objectStore("files");
+    for(const record of records)store.put(record);
     await committed;
   }
   async function upload(file) {
@@ -90,14 +110,41 @@ window.SpliceMedia = (() => {
     const src=info.proxyRecommended?await makeProxy(originalSrc):originalSrc;
     return {...info,src,originalSrc,name:file.name,path:file.name,offline:false};
   }
+  const nestedRequests=new WeakMap();
+  function prepareNested(item,retry=false) {
+    if(!item?.nestedProject || item.src) return;
+    if(nestedRequests.has(item) && !retry)return nestedRequests.get(item);
+    const task=(async()=>{
+      try {
+        item.proxyState='preparing';
+        const project=await forPremiere(item.nestedProject);
+        const response=await fetch('/api/media/nested-preview',{method:'POST',headers:{'Content-Type':'application/json'},
+                                 body:JSON.stringify({project}),signal:AbortSignal.timeout(3600000)});
+        const body=await response.json();
+        if(!response.ok||!localMedia(body.src))throw Error(body.error||'Nested preview failed');
+        item.src=body.src;item.proxyState='ready';item.offline=false;
+      }catch(e){item.proxyState='unavailable';item.proxyError=e.message;}
+      window.Editor?.refreshMedia?.();
+    })();
+    nestedRequests.set(item,task);return task;
+  }
   async function remember(item) {
-    await put({id:key(item),path:item.path,serverSrc:item.originalSrc,previewSrc:item.src});
+    return rememberMany([item]);
+  }
+  function rememberMany(items) {
+    return putRecords(items.map(item=>({id:key(item),path:item.path,serverSrc:item.originalSrc,previewSrc:item.src})));
   }
   async function restore(project) {
     const db = await open();
     for (const item of project.media) {
+      if (Number.isInteger(item.nativeGenerator) || item.nativeUnsupported) {
+        item.offline=false;
+        continue;
+      }
       if (Number.isInteger(item.nestedSequence)) {
         if(item.nestedProject) await restore(item.nestedProject);
+        if(item.src && (!localMedia(item.src)||!await exists(item.src)))item.src='';
+        item.offline=false;
         continue;
       }
       if ((bundled(item.src) || localMedia(item.src)) && await exists(item.src)) {
@@ -179,11 +226,11 @@ window.SpliceMedia = (() => {
         if (!response.ok || !localMedia(result.src))
           throw new Error(result.error || "Could not store " + item.name);
         record.serverSrc = result.src;
-        await put(record);
+        await putRecords([record]);
       }
       item.src = record.serverSrc;
     }
     return copy;
   }
-  return { importFile, remember, restore, matches, forPremiere };
+  return { importFile, remember, rememberMany, prepareNested, restore, matches, matchFolder, forPremiere };
 })();

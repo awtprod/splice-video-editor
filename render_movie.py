@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from premiere import MEDIA_ROOT, _media_path
+from premiere import MEDIA_ROOT, STILL_IMAGES, _media_path
 
 
 
@@ -17,14 +17,30 @@ def _number(value, label, low=0, high=7200):
 
 
 def _probe(path):
-    result = subprocess.run(['ffprobe', '-v', 'error', '-protocol_whitelist', 'file', '-show_entries', 'stream=codec_type:format=duration', '-of', 'json', str(path)],
+    result = subprocess.run(['ffprobe', '-v', 'error', '-protocol_whitelist', 'file', '-show_entries', 'stream=codec_type,channels:format=duration', '-of', 'json', str(path)],
                             capture_output=True, text=True, timeout=15, check=True)
     data = json.loads(result.stdout)
-    return {stream['codec_type'] for stream in data.get('streams', [])}, float(data.get('format', {}).get('duration', 0))
+    streams=data.get('streams', [])
+    channels=next((stream.get('channels',2) for stream in streams if stream['codec_type']=='audio'),0)
+    return {stream['codec_type'] for stream in streams}, float(data.get('format', {}).get('duration', 0)), channels
+
+
+def _stereo_pan(pan, channels):
+    # Mirror the Web Audio StereoPannerNode used for playback.
+    if channels == 1:
+        angle = (pan + 1) * math.pi / 4
+        return f'pan=stereo|c0={math.cos(angle):.8f}*c0|c1={math.sin(angle):.8f}*c0'
+    if pan <= 0:
+        angle = (pan + 1) * math.pi / 2
+        matrix = f'c0=c0+{math.cos(angle):.8f}*c1|c1={math.sin(angle):.8f}*c1'
+    else:
+        angle = pan * math.pi / 2
+        matrix = f'c0={math.cos(angle):.8f}*c0|c1=c1+{math.sin(angle):.8f}*c0'
+    return 'aformat=channel_layouts=stereo,pan=stereo|' + matrix
 
 
 def _font_path(family):
-    bundled={'DM Sans':'dm-sans.ttf','IBM Plex Mono':'plex-mono.ttf','DejaVu Sans':'dm-sans.ttf'}
+    bundled={'DM Sans':'dm-sans.ttf','IBM Plex Mono':'plex-mono.ttf'}
     if not isinstance(family,str) or not family or len(family)>100 or any(c in family for c in '\r\n\x00'):
         raise ValueError('Invalid title typeface')
     if family in bundled:
@@ -181,7 +197,6 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
     if not isinstance(render_options, dict) or not isinstance(render_options.get('mutedTracks', {}), dict):
         raise ValueError('Invalid render options')
     muted = render_options.get('mutedTracks', {})
-    inputs = []
     paths = {}
     kinds = {}
     for clip in clips:
@@ -202,15 +217,24 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
         item = media_by_id.get(clip.get('mediaId'))
         if not item:
             raise ValueError('A clip references missing media')
-        if item.get('nativeGenerator') is not None or item.get('nativeUnsupported'):
+        generator=item.get('nativeGenerator')
+        if generator not in (None,1112293707,1414680150) or item.get('nativeUnsupported'):
             raise ValueError(f"Premiere generator {item.get('name','')} is not supported for export")
         if item.get('nestedSequence') is not None or clip.get('nestedSequence') is not None:
             raise ValueError('Nested Premiere sequences are not yet supported for export')
+        if generator in (1112293707,1414680150):
+            kinds[item['id']]={'video'}
+            _number(item.get('duration'),'generator duration',0,7200)
+            item['_actualDuration']=7200.0
+            if clip['type']!='video': raise ValueError('Premiere generator has no audio stream')
+            continue
         if item['id'] not in paths:
             path = _media_path(item.get('src', ''))
             paths[item['id']] = path
-            kinds[item['id']], item['_actualDuration'] = _probe(path)
-            inputs.extend(['-threads', '2', '-protocol_whitelist', 'file', '-i', str(path)])
+            if path.suffix.lower() in STILL_IMAGES:
+                kinds[item['id']], item['_actualDuration'], item['_audioChannels'] = {'video'}, 7200, 0
+            else:
+                kinds[item['id']], item['_actualDuration'], item['_audioChannels'] = _probe(path)
         speed=_number(clip.get('speed',1),'speed',.1,16)
         before=float(clip.get('transitionBefore',0) or 0)
         if before and not clip.get('reverse') and float(clip.get('in',0))-before*speed<-.01:
@@ -221,6 +245,17 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
         if clip['type'] not in kinds[item['id']]:
             raise ValueError(f"{item.get('name', 'Media')} lacks a {clip['type']} stream")
     indexes = {identity: index for index, identity in enumerate(paths)}
+    source_offsets={identity:min((float(c.get('in',0))-
+        (float(c.get('transitionBefore',0) or 0)*_number(c.get('speed',1),'speed',.1,16) if not c.get('reverse') else 0)
+        for c in clips if c.get('mediaId')==identity),default=0) for identity in paths}
+    inputs=[]
+    for identity,path in paths.items():
+        offset=max(0,source_offsets[identity]);source_offsets[identity]=offset
+        if path.suffix.lower() in STILL_IMAGES:
+            inputs.extend(['-protocol_whitelist','file','-f','image2','-loop','1','-framerate',str(fps),'-i',str(path)])
+            source_offsets[identity] = 0
+        else:
+            inputs.extend(['-ss',f'{offset:.6f}','-threads','2','-protocol_whitelist','file','-i',str(path)])
     command = ['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-filter_complex_threads', '3', '-y', *inputs,
                '-f', 'lavfi', '-i', f'color=c=black:s={width}x{height}:r={fps}:d={duration:.6f}']
     base_index = len(indexes)
@@ -230,7 +265,8 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
     if not muted.get('video'):
         for number, clip in enumerate(video_clips):
             item = media_by_id[clip['mediaId']]
-            index = indexes[item['id']]
+            if item.get('nativeGenerator')==1414680150: continue
+            index = indexes.get(item['id'])
             start = float(clip['start']); length = float(clip['duration']); source_in = float(clip.get('in', 0))
             speed=_number(clip.get('speed',1),'speed',.1,16)
             reverse=',reverse' if clip.get('reverse') else ''
@@ -238,7 +274,7 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
             transition_duration=min(float(clip.get('transitionDuration',.5)),length+before)
             render_start=start-before
             render_length=length+before
-            render_source=source_in if clip.get('reverse') else source_in-before*speed
+            render_source=(source_in if clip.get('reverse') else source_in-before*speed)-source_offsets.get(item['id'],0)
             color = clip.get('color') or {}
             transform,position=_transform(clip,width,height,before)
             lut_filter=''
@@ -249,14 +285,17 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
                 lut_filter=f',lut3d=file={file}:interp=trilinear,format=yuva420p'
             opacity=_number(clip.get('opacity',100),'opacity',0,100)/100
             opacity_keys=(clip.get('keyframes') or {}).get('opacity')
-            chain = f'[{index}:v]trim=start={render_source:.6f}:duration={render_length*speed:.6f}{reverse},setpts=(PTS-STARTPTS)/{speed:.6f},fps={fps},scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,{_css_color_filter(color)}{lut_filter}{transform},format=yuva420p,colorchannelmixer=aa={1 if opacity_keys else opacity:.6f}'
+            prefix=(f'color=c=black:s={width}x{height}:r={fps}:d={render_length:.6f},setpts=PTS-STARTPTS' if index is None else
+                    f'[{index}:v]trim=start={render_source:.6f}:duration={render_length*speed:.6f}{reverse},setpts=(PTS-STARTPTS)/{speed:.6f},fps={fps}')
+            chain = f'{prefix},scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,{_css_color_filter(color)}{lut_filter}{transform},format=yuva420p,colorchannelmixer=aa={1 if opacity_keys else opacity:.6f}'
             if opacity_keys:
                 opacity_expr=_keyframe_expr(clip,'opacity',opacity*100,0,100,f'(T-{before:.6f})')
                 chain += f",format=yuva444p,geq=lum='p(X,Y)':cb='p(X,Y)':cr='p(X,Y)':a='p(X,Y)*({opacity_expr})/100',format=yuva420p"
-            previous = next((c for c in reversed(video_clips[:number]) if c.get('track') == clip.get('track') and c['start'] + c['duration'] >= start - .05), None)
+            previous = next((c for c in reversed(video_clips[:number]) if c.get('track') == clip.get('track') and
+                             media_by_id[c['mediaId']].get('nativeGenerator') != 1414680150 and c['start'] + c['duration'] >= start - .05), None)
             overlap_transition = previous is not None and clip.get('transition') in ('dissolve','wipe')
             if overlap_transition:
-                prior_index = indexes[previous['mediaId']]
+                prior_index = indexes.get(previous['mediaId'])
                 prior_speed=_number(previous.get('speed',1),'speed',.1,16)
                 prior_available=(float(previous.get('in',0))/prior_speed if previous.get('reverse') else
                                  (media_by_id[previous['mediaId']]['_actualDuration']-(float(previous.get('in',0))+float(previous['duration'])*prior_speed))/prior_speed)
@@ -264,6 +303,7 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
                 if tail < 1 / float(fps) and transition_duration-before >= 1/float(fps):
                     raise ValueError('Cross dissolve needs more footage after the outgoing clip')
                 prior_source = float(previous.get('in',0))-tail*prior_speed if previous.get('reverse') else float(previous.get('in',0))+float(previous['duration'])*prior_speed
+                prior_source-=source_offsets.get(previous['mediaId'],0)
                 prior_reverse=',reverse' if previous.get('reverse') else ''
                 prior_tail={**previous,'keyframes':{},'transform':dict(previous.get('transform') or {})}
                 for key in ('x','y','scale','rotation','opacity'):
@@ -282,7 +322,9 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
                     prior_lut=f',lut3d=file={prior_file}:interp=trilinear,format=yuva420p'
                 prior_opacity=_number(prior_tail.get('opacity',100),'opacity',0,100)/100
                 if tail >= 1/float(fps):
-                    filters.append(f'[{prior_index}:v]trim=start={prior_source:.6f}:duration={tail*prior_speed:.6f}{prior_reverse},setpts=(PTS-STARTPTS)/{prior_speed:.6f},fps={fps},scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,{_css_color_filter(prior_color)}{prior_lut}{prior_transform},format=yuva420p,colorchannelmixer=aa={prior_opacity:.6f},setpts=PTS+{start:.6f}/TB[tail{number}]')
+                    prior_prefix=(f'color=c=black:s={width}x{height}:r={fps}:d={tail:.6f},setpts=PTS-STARTPTS' if prior_index is None else
+                                  f'[{prior_index}:v]trim=start={prior_source:.6f}:duration={tail*prior_speed:.6f}{prior_reverse},setpts=(PTS-STARTPTS)/{prior_speed:.6f},fps={fps}')
+                    filters.append(f'{prior_prefix},scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,{_css_color_filter(prior_color)}{prior_lut}{prior_transform},format=yuva420p,colorchannelmixer=aa={prior_opacity:.6f},setpts=PTS+{start:.6f}/TB[tail{number}]')
                     filters.append(f'[{active}][tail{number}]overlay={prior_position}:eof_action=pass:shortest=0[under{number}]')
                     active = f'under{number}'
                 if clip.get('transition') == 'dissolve':
@@ -327,6 +369,7 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
         if not muted.get('audio') and not video_only:
             for number, clip in enumerate(c for c in clips if c['type'] in ('audio', 'video')):
                 item = media_by_id[clip['mediaId']]
+                if item.get('nativeGenerator') in (1112293707,1414680150): continue
                 mix = track_mix.get(str(clip.get('track', -1))) or {}
                 if mix.get('mute') or (solo and not mix.get('solo')): continue
                 if 'audio' not in kinds[item['id']] or (clip['type'] == 'video' and clip.get('embeddedAudio') is False):
@@ -335,15 +378,15 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
                 source_in = float(clip.get('in', 0)); length = float(clip['duration']); start=float(clip['start'])
                 speed=_number(clip.get('speed',1),'speed',.1,16)
                 before=_number(clip.get('transitionBefore',0),'transition lead',0,2)
-                render_source=source_in if clip.get('reverse') else source_in-before*speed
+                render_source=(source_in if clip.get('reverse') else source_in-before*speed)-source_offsets.get(item['id'],0)
                 render_length=length+before
                 delay=round((start-before)*1000)
                 volume_keys=(clip.get('keyframes') or {}).get('volume')
                 gain = (100 if volume_keys else _number(clip.get('volume',100),'volume',0,200)) * _number(mix.get('gain',100),'track gain',0,200) / 10000
                 pan = max(-1,min(1,(_number(clip.get('pan', 0), 'pan', -100, 100) + _number(mix.get('pan',0),'track pan',-100,100))/100))
-                left = min(1,1-pan); right=min(1,1+pan)
-                fade_in = min(length/2,_number(clip.get('fadeIn',0),'fade in',0,7200))
-                fade_out = min(length/2,_number(clip.get('fadeOut',0),'fade out',0,7200))
+                panner = _stereo_pan(pan,item['_audioChannels'])
+                fade_in = min(length,_number(clip.get('fadeIn',0),'fade in',0,7200))
+                fade_out = min(length,_number(clip.get('fadeOut',0),'fade out',0,7200))
                 chain = f'[{index}:a]atrim=start={render_source:.6f}:duration={render_length*speed:.6f}'
                 if clip.get('reverse'): chain += ',areverse'
                 chain += ',asetpts=PTS-STARTPTS'
@@ -352,7 +395,7 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
                     chain += ',atempo=2';remaining/=2
                 while remaining<.5:
                     chain += ',atempo=0.5';remaining*=2
-                chain += f',atempo={remaining:.6f},volume={gain:.4f},aformat=channel_layouts=stereo,pan=stereo|c0={left:.3f}*c0|c1={right:.3f}*c1'
+                chain += f',atempo={remaining:.6f},volume={gain:.4f},{panner}'
                 if volume_keys:
                     volume_expr=_keyframe_expr(clip,'volume',float(clip.get('volume',100)),0,200,f'(t-{before:.6f})')
                     chain += f",volume='({volume_expr})/100':eval=frame"
@@ -374,13 +417,14 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
                         available=(source_in/speed if clip.get('reverse') else (item['_actualDuration']-source_in-length*speed)/speed)
                         if available+1e-3<after: raise ValueError('Audio crossfade needs more outgoing source footage')
                         tail_source=source_in-after*speed if clip.get('reverse') else source_in+length*speed
+                        tail_source-=source_offsets.get(item['id'],0)
                         tail_chain=f'[{index}:a]atrim=start={tail_source:.6f}:duration={after*speed:.6f}'
                         if clip.get('reverse'): tail_chain+=',areverse'
                         tail_chain+=',asetpts=PTS-STARTPTS'
                         remaining=speed
                         while remaining>2: tail_chain+=',atempo=2';remaining/=2
                         while remaining<.5: tail_chain+=',atempo=0.5';remaining*=2
-                        tail_chain+=f",atempo={remaining:.6f},volume={gain:.4f},aformat=channel_layouts=stereo,pan=stereo|c0={left:.3f}*c0|c1={right:.3f}*c1"
+                        tail_chain+=f",atempo={remaining:.6f},volume={gain:.4f},{panner}"
                         if volume_keys:
                             terminal=sorted(volume_keys,key=lambda point:point['time'])[-1]['value']
                             tail_chain+=f",volume={_number(terminal,'volume keyframe',0,200)/100:.6f}"
@@ -388,7 +432,7 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
                         filters.append(tail_chain)
                         audio_labels.append(f'[tailaudio{number}]')
         if audio_labels:
-            filters.append(f"{''.join(audio_labels)}amix=inputs={len(audio_labels)}:duration=longest:normalize=0,alimiter=limit=0.95,apad,atrim=duration={duration:.6f}[aout]")
+            filters.append(f"{''.join(audio_labels)}amix=inputs={len(audio_labels)}:duration=longest:normalize=0,alimiter=limit=0.95:level=0:latency=1,apad,atrim=duration={duration:.6f}[aout]")
         elif not video_only:
             command.extend(['-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo'])
             filters.append(f'[{base_index+1}:a]atrim=duration={duration:.6f}[aout]')

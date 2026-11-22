@@ -20,7 +20,7 @@
       } else {
         if (!size) throw new Error('The 3D LUT size must appear before its samples.');
         const values = parts.map(Number);
-        if (values.length !== 3 || values.some(v=>!Number.isFinite(v)||v<0||v>1)) throw new Error('Invalid LUT color sample.');
+        if (values.length !== 3 || values.some(v=>!Number.isFinite(v)||v < -4||v > 4)) throw new Error('Invalid LUT color sample.');
         rows.push(...values);
         if (rows.length > MAX_SIZE**3*3) throw new Error('The LUT has too many samples.');
       }

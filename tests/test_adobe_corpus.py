@@ -21,7 +21,7 @@ NAMES = ('07_transitions', '10_audio_volume', '13_track_mute', '17_audio_mute',
          '20_track_lock', '21_audio_track_lock', '25_time_remap', '29_captions',
          '32_sync_lock', '34_generators', '39_transition_wipe',
          '63_audio_keyframes', '64_caption_style', '66_eg_text',
-         '68_rate_override', '74_subsequence', '78_multicam_3angle',
+         '68_rate_override', '71_av_subclip', '74_subsequence', '78_multicam_3angle',
          '82_caption_style_sweep')
 
 
@@ -32,6 +32,51 @@ def objects(data):
 
 
 class AdobeCorpus(unittest.TestCase):
+    def test_native_link_graph_stays_aligned_on_edits(self):
+        source = (CORPUS / '71_av_subclip.prproj').read_bytes()
+        project = open_project(source, 1)
+        linked = [clip for clip in project['clips'] if clip.get('linkGroup')]
+        self.assertEqual(len(linked), 2)
+        self.assertEqual(linked[0]['linkGroup'], linked[1]['linkGroup'])
+        linked[0]['start'] += 1
+        with self.assertRaisesRegex(ValueError, 'stay aligned'):
+            save_project(project)
+        linked[1]['start'] += 1
+        moved = open_project(save_project(project), 1)
+        self.assertEqual([clip['start'] for clip in moved['clips']], [1, 1])
+        project['clips'] = [clip for clip in project['clips'] if clip['id'] != linked[1]['id']]
+        with self.assertRaisesRegex(ValueError, 'deleted together'):
+            save_project(project)
+        project['clips'] = []
+        removed = open_project(save_project(project), 1)
+        self.assertFalse(removed['clips'])
+
+    def test_native_linked_split_creates_second_real_link_group(self):
+        project = open_project((CORPUS / '71_av_subclip.prproj').read_bytes(), 1)
+        for clip in list(project['clips']):
+            right = {**clip, 'id': clip['id'] + '-right', 'start': 2,
+                     'in': clip['in'] + 2, 'duration': clip['duration'] - 2,
+                     'linkGroup': 'new-linked-pair'}
+            right.pop('premiereIndex')
+            right.pop('premiereTrack')
+            project['clips'].append(right)
+            clip['duration'] = 2
+        reopened = open_project(save_project(project), 1)
+        groups = {}
+        for clip in reopened['clips']:
+            groups.setdefault(clip.get('linkGroup'), []).append(clip)
+        self.assertEqual(sorted(len(members) for members in groups.values()), [2, 2])
+        self.assertEqual(sorted(clip['start'] for clip in reopened['clips']), [0, 0, 2, 2])
+
+    def test_native_save_rejects_new_same_track_overlap(self):
+        project = open_project((CORPUS / '10_audio_volume.prproj').read_bytes())
+        video = next(clip for clip in project['clips'] if clip['type'] == 'video')
+        duplicate = {**video, 'id': 'overlap', 'start': video['start'] + 1}
+        duplicate.pop('premiereIndex')
+        project['clips'].append(duplicate)
+        with self.assertRaisesRegex(ValueError, 'overlapping clips'):
+            save_project(project)
+
     def test_native_track_lock_and_sync_lock_fixture_roundtrip(self):
         cases = (('20_track_lock', 'video:1', 'locked'),
                  ('21_audio_track_lock', 'audio:-1', 'locked'),
@@ -168,6 +213,8 @@ class AdobeCorpus(unittest.TestCase):
 
     def test_targeted_timing_edit_preserves_unrelated_objects(self):
         for name in NAMES:
+            if name == '71_av_subclip':
+                continue  # Link integrity is exercised in its dedicated test.
             with self.subTest(name=name):
                 source = (CORPUS / (name + '.prproj')).read_bytes()
                 project = open_project(source)

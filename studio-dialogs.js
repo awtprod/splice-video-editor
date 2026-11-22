@@ -32,6 +32,16 @@ window.SpliceDialogs = (() => {
     const state=Editor.get(), form=document.createElement('form');
     form.innerHTML='<p class="export-spec"></p><label>Format<select name="codec"><option value="h264">H.264 / AAC · MP4</option><option value="prores">ProRes 422 HQ / PCM · MOV</option><option value="wav">Audio mix · WAV</option></select></label><label>Quality<select name="quality"><option value="16">Master · CRF 16</option><option value="20" selected>Delivery · CRF 20</option><option value="26">Review copy · CRF 26</option></select></label><label>Audio bitrate<select name="bitrate"><option>128</option><option selected>192</option><option>320</option></select></label><progress max="1" value="0" hidden></progress><p role="status" class="render-state"></p><footer><button type="button" data-cancel>Close</button><button type="submit" class="primary">Render MP4</button></footer>';
     form.querySelector('.export-spec').textContent=state.project.name+' · '+state.project.width+' × '+state.project.height+' · '+Number(state.project.fps.toFixed(3))+' fps';
+    const nativeBlocks=state.project.clips.filter(c=>c.transition==='native'||c.nativeTimeRemap||c.nativeUnsupported);
+    if(nativeBlocks.length) {
+      const preview=document.createElement('p');preview.className='render-blocked';
+      preview.textContent=nativeBlocks.map(c=>{
+        const m=state.project.media.find(item=>item.id===c.mediaId);
+        const problem=c.transition==='native'? c.transitionMatchName||'native transition' : c.nativeTimeRemap?'time-remapping curve':c.nativeUnsupported;
+        return (m?.name||c.title||'Clip')+' at '+c.start.toFixed(2)+' s uses '+problem;
+      }).join('. ')+'. Replace the unsupported item to render this sequence.';
+      form.querySelector('.export-spec').after(preview);
+    }
     const render=form.querySelector('[type=submit]'), cancel=form.querySelector('[data-cancel]'), progress=form.querySelector('progress'), status=form.querySelector('[role=status]');
     let controller, renderWarnings=[];
     const syncFormat=()=>{
