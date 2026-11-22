@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#141714" />
+    <title>Splice — Video editor</title>
+    <link rel="icon" href="assets/icon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="assets/fonts/fonts.css" />
+    <link rel="stylesheet" href="studio.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="app-header">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"
+            ><i></i><i></i><i></i></span
+          ><span>splice<span class="brand-period">.</span></span>
+        </div>
+        <div class="header-divider"></div>
+        <div class="project-heading">
+          <span class="project-overline">CURRENT PROJECT</span
+          ><button id="project-name" title="Rename project">
+            Alpine Passage <span class="chevron">⌄</span>
+          </button>
+        </div>
+        <div class="header-spacer"></div>
+        <nav class="workspace-nav" aria-label="Workspace">
+          <button class="active" data-workspace="edit">Edit</button
+          ><button data-workspace="color">Color</button
+          ><button data-workspace="audio">Audio</button>
+        </nav>
+        <div class="header-spacer"></div>
+        <span id="save-status" class="save-status">Ready</span>
+        <button
+          class="quiet header-icon"
+          id="open-project"
+          title="Open project"
+        >
+          ↥ <span>Open</span>
+        </button>
+        <button
+          class="quiet header-icon"
+          id="save-project"
+          title="Save Premiere project (Ctrl+S). Save Splice project with Ctrl+Shift+S."
+        >
+          ▣ <span>Save</span>
+        </button>
+        <button class="export-button" id="export-video">
+          <span>↗</span> Export video
+        </button>
+      </header>
+      <div class="utility-bar">
+        <div class="utility-left">
+          <button id="new-project" class="menu-button">New project</button
+          ><button id="import-media" class="menu-button">
+            Import media <span>+</span></button
+          ><span class="utility-sep"></span
+          ><span class="sequence-label">SEQUENCE 01</span
+          ><span class="sequence-name">Alpine Passage — Main Edit</span>
+        </div>
+        <div class="utility-right">
+          <span class="format-pill">1920 × 1080</span
+          ><span class="format-pill" id="fps-label">24 FPS</span
+          ><span class="utility-sep"></span
+          ><span class="timecode" id="header-time">00:00:00:00</span>
+        </div>
+      </div>
+      <main class="workspace">
+        <aside class="library panel">
+          <div class="panel-top">
+            <div class="panel-title">
+              Project assets <span class="asset-count" id="asset-count">0</span>
+            </div>
+            <button
+              class="icon-button"
+              id="library-import"
+              aria-label="Import media"
+              title="Import media"
+            >
+              +
+            </button>
+          </div>
+          <div class="library-tabs">
+            <button class="active" data-library="media">Media</button
+            ><button data-library="effects">Effects</button
+            ><button data-library="titles">Titles</button>
+          </div>
+          <div class="library-body" id="library-body"></div>
+          <div class="library-footer">
+            <span class="status-dot"></span
+            ><span id="asset-footer">Project ready</span>
+          </div>
+        </aside>
+        <section class="viewer panel" aria-label="Preview monitor">
+          <div class="panel-top viewer-head">
+            <div class="panel-title">
+              Program monitor
+              <span class="monitor-subtitle">/ Sequence 01</span>
+            </div>
+            <div class="viewer-actions">
+              <span id="monitor-resolution">Fit</span
+              ><button
+                class="icon-button"
+                id="fullscreen-monitor"
+                title="Fullscreen preview"
+              >
+                ⛶
+              </button>
+            </div>
+          </div>
+          <div class="monitor-area">
+            <div class="monitor-frame" id="monitor-frame">
+              <canvas
+                id="preview-canvas"
+                width="1280"
+                height="720"
+                aria-label="Video preview"
+              ></canvas>
+              <div id="preview-title" class="preview-title"></div>
+              <div id="preview-empty" class="preview-empty">
+                <span class="empty-glyph">▶</span
+                ><strong>Your canvas is ready</strong
+                ><span>Add a clip from your assets to begin editing</span>
+              </div>
+            </div>
+          </div>
+          <div class="viewer-bottom">
+            <div class="viewer-info">
+              <span class="viewer-timecode" id="viewer-time">00:00:00:00</span
+              ><span class="viewer-duration" id="viewer-duration"
+                >/ 00:00:00:00</span
+              >
+            </div>
+            <div class="transport">
+              <button id="jump-start" title="Go to start">Ⅰ◀</button
+              ><button id="step-back" title="Back one frame">◀</button
+              ><button
+                id="play-toggle"
+                class="play-button"
+                title="Play or pause"
+              >
+                ▶</button
+              ><button id="step-forward" title="Forward one frame">▶</button
+              ><button id="jump-end" title="Go to end">▶Ⅰ</button>
+            </div>
+            <div class="viewer-scale">Fit</div>
+          </div>
+        </section>
+        <aside class="inspector panel">
+          <div class="panel-top">
+            <div class="panel-title">Inspector</div>
+            <button
+              class="icon-button"
+              id="reset-clip"
+              title="Reset selected clip adjustments"
+            >
+              ↺
+            </button>
+          </div>
+          <div class="inspector-content" id="inspector-content"></div>
+        </aside>
+      </main>
+      <section class="timeline panel" aria-label="Timeline">
+        <div class="timeline-header">
+          <div class="timeline-title">
+            <span class="timeline-icon">▤</span><strong>Timeline</strong
+            ><span class="timeline-project">Alpine Passage — Main Edit</span
+            ><span class="sequence-badge">SEQUENCE 01</span>
+          </div>
+          <div class="timeline-tools">
+            <button id="undo" title="Undo (Ctrl+Z)">↶</button
+            ><button id="redo" title="Redo (Ctrl+Shift+Z)">↷</button
+            ><span class="tool-sep"></span
+            ><button id="split" title="Split at playhead (S)">
+              ⌁ <span>Split</span></button
+            ><button id="delete-selected" title="Delete selected clip">
+              ⌫ <span>Delete</span></button
+            ><span class="tool-sep"></span
+            ><button id="zoom-out" title="Zoom out">−</button
+            ><span id="zoom-label">55%</span
+            ><button id="zoom-in" title="Zoom in">+</button>
+          </div>
+        </div>
+        <div class="timeline-body" id="timeline-body">
+          <div class="track-heads">
+            <div class="ruler-head">TIMECODE</div>
+            <div class="track-head" data-track="title">
+              <span class="track-icon">T</span><span>Titles</span
+              ><button
+                class="track-mute"
+                data-track="title"
+                title="Toggle track"
+              >
+                ◉
+              </button>
+            </div>
+            <div class="track-head" data-track="video">
+              <span class="track-icon">▣</span><span>Video 1</span
+              ><button
+                class="track-mute"
+                data-track="video"
+                title="Toggle track"
+              >
+                ◉
+              </button>
+            </div>
+            <div class="track-head" data-track="audio">
+              <span class="track-icon">♫</span><span>Audio 1</span
+              ><button
+                class="track-mute"
+                data-track="audio"
+                title="Toggle track"
+              >
+                ◉
+              </button>
+            </div>
+          </div>
+          <div class="track-scroll" id="track-scroll">
+            <div class="timeline-surface" id="timeline-surface">
+              <div class="time-ruler" id="time-ruler"></div>
+              <div
+                class="track-lane title-lane"
+                id="title-lane"
+                data-track="title"
+              ></div>
+              <div
+                class="track-lane video-lane"
+                id="video-lane"
+                data-track="video"
+              ></div>
+              <div
+                class="track-lane audio-lane"
+                id="audio-lane"
+                data-track="audio"
+              ></div>
+              <div class="playhead" id="playhead"><i></i></div>
+            </div>
+          </div>
+        </div>
+        <div class="timeline-footer">
+          <div>
+            <span class="status-dot"></span
+            ><span id="timeline-status">Ready to edit</span>
+          </div>
+          <span>Drag assets to the timeline · Space to play · S to split</span>
+        </div>
+      </section>
+    </div>
+    <input
+      type="file"
+      id="media-input"
+      accept="video/*,audio/*"
+      multiple
+      hidden
+    />
+    <input
+      type="file"
+      id="relink-input"
+      accept="video/*,audio/*"
+      multiple
+      hidden
+    />
+    <input
+      type="file"
+      id="project-input"
+      accept=".prproj,.splice,.json,application/json"
+      hidden
+    />
+    <script src="media-store.js"></script>
+    <script src="engine.js"></script>
+    <script src="workspace.js"></script>
+  </body>
+</html>
