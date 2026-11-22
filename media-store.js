@@ -61,7 +61,7 @@ window.SpliceMedia = (() => {
       if(!options.length)continue;
       if(options[0].count===options[1]?.count || consumed.has(options[0].file))
         throw Error('Ambiguous copies of '+item.name+'. Relink this source individually.');
-      consumed.add(options[0].file);ordered.push({item,file:options[0].file});
+      consumed.add(options[0].file);ordered.push({item,file:options[0].file,nameOnly:options[0].count===1});
     }
     return ordered;
   }
@@ -134,6 +134,11 @@ window.SpliceMedia = (() => {
   function rememberMany(items) {
     return putRecords(items.map(item=>({id:key(item),path:item.path,serverSrc:item.originalSrc,previewSrc:item.src})));
   }
+  async function restoreSource(item, original) {
+    const metadata=await probe(original);
+    const src=metadata.proxyRecommended?await makeProxy(original):original;
+    Object.assign(item,metadata,{src,originalSrc:original});
+  }
   async function restore(project) {
     const db = await open();
     for (const item of project.media) {
@@ -148,13 +153,9 @@ window.SpliceMedia = (() => {
         continue;
       }
       if ((bundled(item.src) || localMedia(item.src)) && await exists(item.src)) {
-        if (!item.originalSrc && localMedia(item.src)) {
-          const original=item.src, metadata=await probe(original);
-          if(metadata.proxyRecommended) {
-            item.src=await makeProxy(original);
-            Object.assign(item,metadata,{originalSrc:original});
-          }
-        }
+        const original=item.originalSrc||item.src;
+        if (localMedia(item.src) && (!item.originalSrc || !Number.isInteger(item.audioStreams)) &&
+            (original===item.src || await exists(original))) await restoreSource(item,original);
         item.offline = false;
         continue;
       }
@@ -179,8 +180,8 @@ window.SpliceMedia = (() => {
       if (record?.serverSrc && await exists(record.serverSrc)) {
         item.originalSrc=record.serverSrc;
         item.src=record.previewSrc && await exists(record.previewSrc) ? record.previewSrc : record.serverSrc;
-        if(item.src===record.serverSrc && (await probe(record.serverSrc)).proxyRecommended)
-          item.src=await makeProxy(record.serverSrc);
+        if(item.src===record.serverSrc || !Number.isInteger(item.audioStreams))
+          await restoreSource(item,record.serverSrc);
         item.storageKey=record.id; item.offline=false;
       } else if (record?.file) {
         if (!urls.has(record.id))

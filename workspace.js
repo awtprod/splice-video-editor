@@ -545,7 +545,8 @@
     }
     const edge=e.target.closest(".trim-handle");
     if (!group.has(clip.id) || edge || e.altKey) group.clear();
-    const originals=withLinked(editor.get().project.clips.filter(c=>group.has(c.id))).map(c=>({id:c.id,start:c.start,track:c.track,type:c.type}));
+    const originals=withLinked(editor.get().project.clips.filter(c=>group.has(c.id)||c.id===clip.id))
+      .map(c=>({id:c.id,start:c.start,track:c.track,type:c.type}));
     if ([clip,...originals].some(item=>editor.isTrackLocked(item.track,item.type))) {
       notify('Unlock the track before editing.'); return;
     }
@@ -566,17 +567,17 @@
     if(gesture.mode==="move"){
       const lane=document.elementFromPoint(e.clientX,e.clientY)?.closest(".track-lane");
       const track=lane && lane.dataset.kind===clip.type?Number(lane.dataset.track):gesture.track;
-      const members=gesture.originals.length?gesture.originals:[gesture.original];
+      const members=gesture.originals;
       const offset=Math.max(snapTime(start+delta,clip.id)-start,-Math.min(...members.map(c=>c.start)));
-      for(const original of members){
+      gesture.placements=members.map(original=>{
         const dest=original.type!==clip.type||clip.type==='title'?original.track:
             original.type==='audio'?Math.min(-1,original.track+track-gesture.track):Math.max(1,original.track+track-gesture.track);
-        if (editor.isTrackLocked(dest,original.type)) continue;
-        safeEdit(()=>editor.moveClip(original.id,original.start+offset,dest));
-        const actual=editor.get().project.clips.find(c=>c.id===original.id);
-        const node=lanes.querySelector('[data-clip="'+CSS.escape(original.id)+'"]');
-        const target=lanes.querySelector('[data-kind="'+original.type+'"][data-track="'+dest+'"]');
-        if(node){node.style.left=px(actual.start)+'px';if(target&&node.parentElement!==target)target.append(node);}
+        return {...original,start:original.start+offset,track:dest};
+      });
+      for(const placement of gesture.placements){
+        const node=lanes.querySelector('[data-clip="'+CSS.escape(placement.id)+'"]');
+        const target=lanes.querySelector('[data-kind="'+placement.type+'"][data-track="'+placement.track+'"]');
+        if(node){node.style.left=px(placement.start)+'px';if(target&&node.parentElement!==target)target.append(node);}
       }
     } else if(gesture.mode==="slip") { safeEdit(()=>editor.slipClip?.(clip.id,delta-(gesture.lastDelta||0))); gesture.lastDelta=delta; }
     else {
@@ -592,7 +593,11 @@
       if(node){node.style.left=px(clip.start)+"px";node.style.width=Math.max(22,px(clip.duration)-2)+"px";}
     }
   });
-  window.addEventListener("pointerup",()=>{if(gesture){editor.endGesture?.();gesture=null;lastProject="";refresh(editor.get());}});
+  window.addEventListener("pointerup",()=>{
+    if(!gesture)return;
+    if(gesture.placements)safeEdit(()=>editor.moveClips(gesture.placements));
+    editor.endGesture?.();gesture=null;lastProject="";refresh(editor.get());
+  });
   window.addEventListener("pointercancel",()=>{editor.endGesture?.();gesture=null;lastProject="";refresh(editor.get());});
   lanes.addEventListener("click",e=>{if(e.target.classList.contains("track-lane"))editor.seek(positionTime(e,e.target));});
   lanes.addEventListener("dragover",e=>{if(e.target.closest(".track-lane"))e.preventDefault();});

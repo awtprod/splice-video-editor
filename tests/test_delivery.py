@@ -209,6 +209,51 @@ class MovieDelivery(unittest.TestCase):
             self.project['trackMix']={'1':{'mute':True}}
             muted=open_project(save_project(self.project))
             self.assertLess(rms(muted),.0001)
+            self.project['trackMix']={}
+            incoming['start']=1.04
+            self.assertLess(rms(self.project),.0001)
+
+    def test_prores_preserves_ungraded_ten_bit_luma(self):
+        from premiere import MEDIA_ROOT
+        MEDIA_ROOT.mkdir(parents=True,exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=MEDIA_ROOT) as directory:
+            source=Path(directory)/'gradient.mov'
+            subprocess.run(['ffmpeg','-nostdin','-v','error','-f','lavfi','-i',
+                'nullsrc=s=256x64:r=25,format=yuv422p10le,geq=lum=100+3*X:cb=512:cr=512',
+                '-t','1','-c:v','prores_ks','-profile:v','3','-threads','1',str(source)],check=True,timeout=10)
+            self.project.update(width=256,height=64,media=[dict(id='ramp',src='/media/'+str(source.relative_to(MEDIA_ROOT)))],
+                clips=[dict(type='video',mediaId='ramp',track=1,start=0,duration=1)])
+            output=Path(directory)/'master.mov'
+            render_to_file(self.project,output,options={'codec':'prores'})
+            for file in (source,output):
+                raw=subprocess.check_output(['ffmpeg','-nostdin','-v','error','-i',str(file),'-frames:v','1',
+                    '-pix_fmt','yuv422p10le','-f','rawvideo','pipe:1'],timeout=10)
+                row=raw[32*256*2:33*256*2]
+                self.assertEqual(len({row[i:i+2] for i in range(0,len(row),2)}),256)
+
+    def test_mix_includes_second_discrete_camera_stream(self):
+        from array import array
+        from premiere import MEDIA_ROOT, save_project
+        from media_proxy import describe
+        MEDIA_ROOT.mkdir(parents=True,exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=MEDIA_ROOT) as directory:
+            source=Path(directory)/'camera.mov'
+            subprocess.run(['ffmpeg','-nostdin','-v','error','-f','lavfi','-i','color=red:s=160x90:r=25:d=1',
+                '-f','lavfi','-i','anullsrc=r=48000:cl=mono:d=1','-f','lavfi','-i','sine=1000:sample_rate=48000:duration=1',
+                '-map','0:v','-map','1:a','-map','2:a','-c:v','prores_ks','-threads','1','-c:a','pcm_s24le',str(source)],
+                check=True,timeout=10)
+            src='/media/'+str(source.relative_to(MEDIA_ROOT))
+            metadata=describe(src)
+            self.assertEqual(metadata['audioStreams'],2)
+            self.project['media']=[dict(id='av',src=src,**metadata)]
+            self.project['clips']=[dict(type='video',mediaId='av',track=1,start=0,duration=1)]
+            output=Path(directory)/'mix.wav'
+            render_to_file(self.project,output,options={'codec':'wav'})
+            samples=array('f',subprocess.check_output(['ffmpeg','-nostdin','-v','error','-ss','0.2',
+                '-i',str(output),'-t','0.5','-f','f32le','pipe:1'],timeout=10))
+            self.assertGreater((sum(sample*sample for sample in samples)/len(samples))**.5,.05)
+            with self.assertRaisesRegex(ValueError,'multiple source audio streams'):
+                save_project(self.project)
 
     def test_fractional_video_origin_and_delayed_audio(self):
         from array import array

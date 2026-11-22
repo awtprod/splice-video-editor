@@ -87,6 +87,7 @@
     }
     if (clip.type === 'audio' || clip.type === 'video' && clip.embeddedAudio !== false) {
       html += section('Audio',
+        (source?.audioStreams>1 ? `<p class="splice-handle">${source.audioStreams} source streams mixed to stereo.</p>` : '') +
         label('Gain', 'volume', number(clip.volume, 100), 0, 200, 1, '%') +
         (clip.keyframes?.volume?.length ? '<p class="splice-handle">Gain keyframes control the level. Edit them below.</p>' : '') +
         label('Pan', 'pan', number(clip.pan, 0), -100, 100, 1, '', '') +
@@ -126,6 +127,8 @@
     if (clip.keyframes?.volume?.length && (number(clip.fadeIn,0)||number(clip.fadeOut,0))) nativeLimits.push('combined gain keyframes and fades');
     if (text.align && text.align!=='center') nativeLimits.push('left/right title alignment');
     if (number(clip.pan,0)) nativeLimits.push('clip audio pan');
+    if (source?.audioStreams>1 && clip.premiereIndex===undefined && (clip.type==='audio'||clip.embeddedAudio!==false))
+      nativeLimits.push('multiple source audio streams');
     const videoMix = clip.type === 'video' && state.project.trackMix?.[clip.track];
     if (videoMix?.pan || videoMix?.solo) nativeLimits.push('embedded video-track pan or solo');
     if (nativeLimits.length) html += section('Premiere compatibility',

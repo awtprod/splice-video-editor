@@ -455,7 +455,12 @@ def save_project(data):
     if not isinstance(data, dict):
         raise ValueError('Invalid project')
     lanes = {}
+    multistream = {item.get('id') for item in data.get('media',[])
+                   if isinstance(item.get('audioStreams'),int) and item['audioStreams']>1}
     for item in data.get('clips', []):
+        if (item.get('mediaId') in multistream and 'premiereIndex' not in item and
+                (item.get('type')=='audio' or item.get('embeddedAudio') is not False)):
+            raise ValueError('Premiere save cannot assign multiple source audio streams for a new placement. Save a Splice working copy to keep the stereo mix.')
         lane = ('audio' if item.get('type') == 'audio' else 'video', int(item.get('track', 1)))
         lanes.setdefault(lane, []).append(item)
     for lane, clips in lanes.items():

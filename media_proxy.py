@@ -14,6 +14,15 @@ from premiere import MEDIA_ROOT, STILL_IMAGES, _media_path, _playback_url
 
 _encoders = threading.BoundedSemaphore(2)
 _locks = tuple(threading.Lock() for _ in range(32))
+MAX_AUDIO_STREAMS = 16
+
+
+def stereo_mix_filters(sources, output):
+    labels = [f'{output}stream{index}' for index in range(len(sources))]
+    filters = [f'{source},aformat=channel_layouts=stereo[{label}]' for source,label in zip(sources,labels)]
+    inputs = ''.join(f'[{label}]' for label in labels)
+    filters.append(f'{inputs}amix=inputs={len(labels)}:duration=longest:normalize=0,aformat=channel_layouts=stereo[{output}]')
+    return filters
 
 
 def describe(src):
@@ -26,7 +35,10 @@ def describe(src):
     data = json.loads(probe.stdout)
     streams = data.get('streams', [])
     video = next((s for s in streams if s['codec_type']=='video' and not s.get('disposition',{}).get('attached_pic')), {})
-    audio = next((s for s in streams if s['codec_type']=='audio'), {})
+    audio_streams = [s for s in streams if s['codec_type']=='audio']
+    if len(audio_streams)>MAX_AUDIO_STREAMS:
+        raise ValueError(f'Media has more than {MAX_AUDIO_STREAMS} audio streams')
+    audio = audio_streams[0] if audio_streams else {}
     if not video and not audio:
         raise ValueError('The source contains no editable audio or video stream')
     still = path.suffix.lower() in STILL_IMAGES
@@ -42,14 +54,16 @@ def describe(src):
     native_audio = not audio or acodec in ('aac','mp3','opus','vorbis','flac','pcm_s16le','pcm_s24le','pcm_f32le')
     native_container = path.suffix.lower() in ('.mp4','.m4v','.m4a','.webm','.wav','.mp3','.ogg','.flac','.aac')
     return dict(type='video' if video else 'audio', duration=duration, width=video.get('width'), height=video.get('height'),
-                fps=fps, videoCodec=vcodec, audioCodec=acodec, audioChannels=audio.get('channels',0), still=still, proxyRecommended=not (native_video and native_audio and native_container))
+                fps=fps, videoCodec=vcodec, audioCodec=acodec, audioChannels=2 if len(audio_streams)>1 else audio.get('channels',0),
+                audioStreams=len(audio_streams), still=still,
+                proxyRecommended=len(audio_streams)>1 or not (native_video and native_audio and native_container))
 
 
 def proxy(src):
     original = _media_path(src)
     info = describe(src)
     stat = original.stat()
-    key = hashlib.sha256(f'proxy-v2:{original}:{stat.st_size}:{stat.st_mtime_ns}'.encode()).hexdigest()
+    key = hashlib.sha256(f'proxy-v3:{original}:{stat.st_size}:{stat.st_mtime_ns}'.encode()).hexdigest()
     directory = MEDIA_ROOT / key[:32]
     video = info['type']=='video'
     target = directory / ('edit.mp4' if video else 'edit.m4a')
@@ -65,14 +79,19 @@ def proxy(src):
             if shutil.disk_usage(directory).free < 512 * 1024**2 + info['duration'] * (525000 if video else 24000):
                 raise ValueError('Insufficient free space for an edit proxy')
             with tempfile.NamedTemporaryFile(dir=directory,suffix=target.suffix) as out:
-                cmd = ['ffmpeg','-nostdin','-v','error','-y','-threads','2','-filter_threads','1','-protocol_whitelist','file']
+                cmd = ['ffmpeg','-nostdin','-v','error','-y','-threads','2','-filter_threads','1','-filter_complex_threads','2','-protocol_whitelist','file']
                 if info['still']:
                     cmd += ['-f','image2','-loop','1','-framerate','25']
                 cmd += ['-i',str(original)]
                 if video:
-                    cmd += ['-map','0:V:0','-map','0:a:0?', '-vf',"scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1",'-c:v','libx264','-threads','2','-preset','veryfast','-crf','19','-maxrate','4M','-bufsize','8M','-g','24','-pix_fmt','yuv420p']
+                    cmd += ['-map','0:V:0','-vf',"scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1",'-c:v','libx264','-threads','2','-preset','veryfast','-crf','19','-maxrate','4M','-bufsize','8M','-g','24','-pix_fmt','yuv420p']
                 else:
-                    cmd += ['-map','0:a:0','-vn']
+                    cmd += ['-vn']
+                if info['audioStreams']>1:
+                    sources = [f'[0:a:{i}]aresample=48000:first_pts=0' for i in range(info['audioStreams'])]
+                    cmd += ['-filter_complex',';'.join(stereo_mix_filters(sources,'mixed')),'-map','[mixed]']
+                else:
+                    cmd += ['-map','0:a:0?']
                 cmd += ['-t',str(info['duration']),'-c:a','aac','-b:a','160k','-ac',str(min(2,max(1,info['audioChannels']))),'-movflags','+faststart',out.name]
                 completed = subprocess.run(cmd,capture_output=True,timeout=min(3600,max(60,info['duration']*3)))
                 if completed.returncode:

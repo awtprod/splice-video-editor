@@ -18,15 +18,18 @@ def _number(value, label, low=0, high=7200):
 
 def _probe(path):
     from fractions import Fraction
+    from media_proxy import MAX_AUDIO_STREAMS
     result = subprocess.run(['ffprobe', '-v', 'error', '-protocol_whitelist', 'file', '-show_entries', 'stream=codec_type,channels,avg_frame_rate,r_frame_rate:format=duration', '-of', 'json', str(path)],
                             capture_output=True, text=True, timeout=15, check=True)
     data = json.loads(result.stdout)
     streams=data.get('streams', [])
-    channels=next((stream.get('channels',2) for stream in streams if stream['codec_type']=='audio'),0)
+    audio=[stream.get('channels',2) for stream in streams if stream['codec_type']=='audio']
+    if len(audio)>MAX_AUDIO_STREAMS:
+        raise ValueError(f'Media has more than {MAX_AUDIO_STREAMS} audio streams')
     video = next((stream for stream in streams if stream['codec_type']=='video'),{})
     average = video.get('avg_frame_rate')
     rate = float(Fraction(average)) if average and average == video.get('r_frame_rate') and average != '0/0' else 0
-    return {stream['codec_type'] for stream in streams}, float(data.get('format', {}).get('duration', 0)), channels, rate
+    return {stream['codec_type'] for stream in streams}, float(data.get('format', {}).get('duration', 0)), audio, rate
 
 
 def _stereo_pan(pan, channels):
@@ -60,28 +63,36 @@ def _font_path(family):
     return resolved
 
 
-def _css_color_filter(color):
+def _css_color_filter(color, high_depth):
     brightness=_number(color.get('brightness',100),'brightness',0,300)/100
     contrast=_number(color.get('contrast',100),'contrast',0,300)/100
     saturation=_number(color.get('saturation',100),'saturation',0,300)/100
     exposure=_number(color.get('exposure',0),'exposure',-4,4)
     temperature=_number(color.get('temperature',0),'temperature',-100,100)/100
     tint=_number(color.get('tint',0),'tint',-100,100)/100
+    if (brightness,contrast,saturation,exposure,temperature,tint)==(1,1,1,0,0,0):
+        return ''
     gain=2**exposure
     gains=(gain*(1+.35*temperature-.1*tint),gain*(1+.2*tint),gain*(1-.35*temperature-.1*tint))
     light=(.213,.715,.072)
     matrix=[[saturation*(r==c)+(1-saturation)*light[c] for c in range(3)] for r in range(3)]
     channels='rgb'
     brightness_filter=':'.join(f"{c}=val*{brightness:.6f}" for c in channels)
-    contrast_filter=':'.join(f"{c}=(val-127.5)*{contrast:.6f}+127.5" for c in channels)
+    contrast_filter=':'.join(f"{c}=(val-maxval/2)*{contrast:.6f}+maxval/2" for c in channels)
     mixer=':'.join(f"{channels[r]}{channels[c]}={matrix[r][c]:.6f}" for r in range(3) for c in range(3))
     grade_filter=':'.join(f'{c}=val*{g:.7f}' for c,g in zip(channels,gains))
-    return f'format=rgb24,lutrgb={brightness_filter},lutrgb={contrast_filter},colorchannelmixer={mixer},lutrgb={grade_filter},format=yuva420p'
+    rgb = 'gbrp10le' if high_depth else 'rgb24'
+    return f',format={rgb},lutrgb={brightness_filter},lutrgb={contrast_filter},colorchannelmixer={mixer},lutrgb={grade_filter}'
 
 
-def _fit_picture(width, height, color, lut):
-    return (f'scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2,'
-            f'{_css_color_filter(color)}{lut},pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black@0')
+def _fit_picture(width, height, color, lut, alpha_format, high_depth):
+    return (f'scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2'
+            f'{_css_color_filter(color,high_depth)}{lut},format={alpha_format},'
+            f'pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black@0')
+
+
+def _mask_alpha(expression, alpha_format, full_alpha):
+    return f",format={full_alpha},geq=lum='p(X,Y)':cb='p(X,Y)':cr='p(X,Y)':a='p(X,Y)*({expression})',format={alpha_format}"
 
 
 def _video_sample_time(point, item, fps):
@@ -91,11 +102,18 @@ def _video_sample_time(point, item, fps):
     return point
 
 
-def _trim_audio(index, start, length, reverse):
+def _trim_audio(filters, label, index, streams, start, length, reverse):
     # A stream can start later than the video's source clock. Preserve the gap.
     clock = f'PTS-({start:.9f})/TB'
-    result = f'[{index}:a]atrim=start={start:.9f}:end={start+length:.9f},asetpts={clock},aresample=48000:first_pts=0'
-    return result + (',areverse' if reverse else '')
+    trim = f'atrim=start={start:.9f}:end={start+length:.9f},asetpts={clock},aresample=48000:first_pts=0'
+    if len(streams)>1:
+        from media_proxy import stereo_mix_filters
+        sources = [f'[{index}:a:{number}]{trim}' for number in range(len(streams))]
+        filters.extend(stereo_mix_filters(sources,label))
+        result = f'[{label}]'
+    else:
+        result = f'[{index}:a:0]{trim},'
+    return result + ('areverse,' if reverse else '')
 
 
 def _run_controlled(command, cancelled, timeout):
@@ -236,6 +254,12 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
     video_only = (options or {}).get('_videoOnly',False)
     codec=(options or {}).get('codec','h264')
     if codec not in ('h264','prores'): raise ValueError('Unsupported export codec')
+    high_depth = codec=='prores'
+    base_format = 'yuv422p10le' if high_depth else 'yuv420p'
+    alpha_format = 'yuva422p10le' if high_depth else 'yuva420p'
+    full_alpha = 'yuva444p10le' if high_depth else 'yuva444p'
+    dip_rgb = 'gbrap10le' if high_depth else 'gbrap'
+    overlay = 'eof_action=pass:shortest=0:format=' + ('yuv422p10' if high_depth else 'yuv420')
     if not isinstance(render_options, dict) or not isinstance(render_options.get('mutedTracks', {}), dict):
         raise ValueError('Invalid render options')
     muted = render_options.get('mutedTracks', {})
@@ -274,9 +298,9 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
             path = _media_path(item.get('src', ''))
             paths[item['id']] = path
             if path.suffix.lower() in STILL_IMAGES:
-                kinds[item['id']], item['_actualDuration'], item['_audioChannels'] = {'video'}, 7200, 0
+                kinds[item['id']], item['_actualDuration'], item['_audioStreams'] = {'video'}, 7200, []
             else:
-                kinds[item['id']], item['_actualDuration'], item['_audioChannels'], item['_videoFPS'] = _probe(path)
+                kinds[item['id']], item['_actualDuration'], item['_audioStreams'], item['_videoFPS'] = _probe(path)
         speed=_number(clip.get('speed',1),'speed',.1,16)
         before=float(clip.get('transitionBefore',0) or 0)
         if before and not clip.get('reverse') and float(clip.get('in',0))-before*speed<-.01:
@@ -303,7 +327,7 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
     command = ['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-filter_complex_threads', '3', '-y', *inputs,
                '-f', 'lavfi', '-i', f'color=c=black:s={width}x{height}:r={fps}:d={duration:.6f}']
     base_index = len(indexes)
-    filters = [f'[{base_index}:v]format=yuv420p[base0]']
+    filters = [f'[{base_index}:v]format={base_format}[base0]']
     active = 'base0'
     video_clips = sorted((c for c in clips if c['type'] == 'video'), key=lambda c: (c.get('track', 0), c['start']))
     if not muted.get('video'):
@@ -344,16 +368,18 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
                 from lut import cube_text
                 file=Path(lut_directory)/f'clip-{number}.cube'
                 file.write_text(cube_text(color['lut'], color.get('lutIntensity',100)))
-                lut_filter=f',lut3d=file={file}:interp=trilinear,format=yuva420p'
+                lut_filter=f',lut3d=file={file}:interp=trilinear'
             opacity=_number(clip.get('opacity',100),'opacity',0,100)/100
             opacity_keys=(clip.get('keyframes') or {}).get('opacity')
             prefix=(f'color=c=black:s={width}x{height}:r={fps}:d={render_length:.6f},setpts=PTS-STARTPTS' if index is None else
                     f'[{index}:v]trim=start={render_source:.6f}:duration={render_length*speed:.6f}{reverse},setpts=(PTS-STARTPTS)/{speed:.6f},fps={fps}')
-            fit = _fit_picture(width,height,color,lut_filter)
-            chain = f'{prefix},{fit}{transform},format=yuva420p,colorchannelmixer=aa={1 if opacity_keys else opacity:.6f}'
+            fit = _fit_picture(width,height,color,lut_filter,alpha_format,high_depth)
+            chain = f'{prefix},{fit}{transform}'
             if opacity_keys:
                 opacity_expr=_keyframe_expr(clip,'opacity',opacity*100,0,100,f'(T-{before:.6f})')
-                chain += f",format=yuva444p,geq=lum='p(X,Y)':cb='p(X,Y)':cr='p(X,Y)':a='p(X,Y)*({opacity_expr})/100',format=yuva420p"
+                chain += _mask_alpha(f'({opacity_expr})/100',alpha_format,full_alpha)
+            elif opacity!=1:
+                chain += _mask_alpha(f'{opacity:.6f}',alpha_format,full_alpha)
             prior_number = predecessors.get(number)
             previous = video_clips[prior_number] if prior_number is not None else None
             next_number = followers.get(number)
@@ -363,11 +389,11 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
                 filters.append(f'[{active}]split[with{number}][without{next_number}]')
                 active = f'with{number}'
             if dip_head>0:
-                chain += f',format=gbrap,fade=t=in:st=0:d={dip_head:.6f}'
+                chain += f',format={dip_rgb},fade=t=in:st=0:d={dip_head:.6f}'
             if following and following.get('transition') == 'fade':
                 dip_tail = float(following.get('transitionBefore',0) or 0)
                 if dip_tail>0:
-                    chain += f',format=gbrap,fade=t=out:st={max(0,render_length-dip_tail):.6f}:d={dip_tail:.6f}'
+                    chain += f',format={dip_rgb},fade=t=out:st={max(0,render_length-dip_tail):.6f}:d={dip_tail:.6f}'
             overlap_transition = previous is not None and clip.get('transition') in ('dissolve','wipe')
             if overlap_transition:
                 prior_index = indexes.get(previous['mediaId'])
@@ -397,33 +423,34 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
                     from lut import cube_text
                     prior_file=Path(lut_directory)/f'tail-{number}.cube'
                     prior_file.write_text(cube_text(prior_color['lut'],prior_color.get('lutIntensity',100)))
-                    prior_lut=f',lut3d=file={prior_file}:interp=trilinear,format=yuva420p'
+                    prior_lut=f',lut3d=file={prior_file}:interp=trilinear'
                 prior_opacity=_number(prior_tail.get('opacity',100),'opacity',0,100)/100
                 if tail + 1e-6 >= frame_duration:
                     prior_prefix=(f'color=c=black:s={width}x{height}:r={fps}:d={tail:.6f},setpts=PTS-STARTPTS' if prior_index is None else
                                   f'[{prior_index}:v]trim=start={prior_source:.6f}:duration={tail*prior_speed:.6f}{prior_reverse},setpts=(PTS-STARTPTS)/{prior_speed:.6f},fps={fps}')
-                    prior_fit = _fit_picture(width,height,prior_color,prior_lut)
+                    prior_fit = _fit_picture(width,height,prior_color,prior_lut,alpha_format,high_depth)
+                    prior_alpha = _mask_alpha(f'{prior_opacity:.6f}',alpha_format,full_alpha) if prior_opacity!=1 else ''
                     cut_frame = math.ceil(start*fps-1e-6)
-                    filters.append(f'{prior_prefix},{prior_fit}{prior_transform},format=yuva420p,colorchannelmixer=aa={prior_opacity:.6f},setpts=PTS+{cut_frame}[tail{number}]')
-                    filters.append(f'[{active}][tail{number}]overlay={prior_position}:eof_action=pass:shortest=0[under{number}]')
+                    filters.append(f'{prior_prefix},{prior_fit}{prior_transform}{prior_alpha},setpts=PTS+{cut_frame}[tail{number}]')
+                    filters.append(f'[{active}][tail{number}]overlay={prior_position}:{overlay}[under{number}]')
                     active = f'under{number}'
             elif clip.get('transition') == 'dissolve':
                 chain += f',fade=t=in:st=0:d={transition_duration:.6f}:alpha=1'
             if clip.get('transition') == 'wipe':
                 left = _horizontal_position(clip,width,'W',f'(T-{before:.6f})')
                 mask = f'if(gte(T,{transition_duration:.6f}),1,lt(X+({left}),{width}*T/{transition_duration:.6f}))'
-                chain += f",format=yuva444p,geq=lum='p(X,Y)':cb='p(X,Y)':cr='p(X,Y)':a='p(X,Y)*({mask})',format=yuva420p"
+                chain += _mask_alpha(mask,alpha_format,full_alpha)
             first_frame = math.ceil(render_start*fps-1e-6)
             chain += f',setpts=PTS+{first_frame}[clip{number}]'
             filters.append(chain)
             if overlap_transition and clip.get('transition') == 'dissolve':
-                filters.append(f'[without{number}][clip{number}]overlay={position}:eof_action=pass:shortest=0[incoming{number}]')
+                filters.append(f'[without{number}][clip{number}]overlay={position}:{overlay}[incoming{number}]')
                 end = render_start+transition_duration
                 progress = f'(T-{render_start:.9f})/{transition_duration:.9f}'
                 blend = f'if(lte(T,{render_start:.9f}),A,if(gte(T,{end:.9f}),B,A*(1-{progress})+B*{progress}))'
                 filters.append(f"[{active}][incoming{number}]blend=all_expr='{blend}'[base{number+1}]")
             else:
-                filters.append(f'[{active}][clip{number}]overlay={position}:eof_action=pass:shortest=0[base{number+1}]')
+                filters.append(f'[{active}][clip{number}]overlay={position}:{overlay}[base{number+1}]')
             active = f'base{number+1}'
     with tempfile.TemporaryDirectory(prefix='splice-render-') as work:
         for number, clip in enumerate(c for c in clips if c['type'] == 'title' and c.get('title') and not muted.get('title')):
@@ -483,19 +510,20 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
                 volume_keys=(clip.get('keyframes') or {}).get('volume')
                 gain = (100 if volume_keys else _number(clip.get('volume',100),'volume',0,200)) * _number(mix.get('gain',100),'track gain',0,200) / 10000
                 pan = max(-1,min(1,(_number(clip.get('pan', 0), 'pan', -100, 100) + _number(mix.get('pan',0),'track pan',-100,100))/100))
-                panner = _stereo_pan(pan,item['_audioChannels'])
+                streams = item['_audioStreams']
+                panner = _stereo_pan(pan,2 if len(streams)>1 else streams[0])
                 fade_in = min(length,_number(clip.get('fadeIn',0),'fade in',0,7200))
                 fade_out = min(length,_number(clip.get('fadeOut',0),'fade out',0,7200))
-                chain = _trim_audio(index,render_source,render_length*speed,clip.get('reverse'))
+                chain = _trim_audio(filters,f'mix{number}',index,streams,render_source,render_length*speed,clip.get('reverse'))
                 tempo = ''
                 remaining=speed
                 while remaining>2:
-                    tempo += ',atempo=2';remaining/=2
+                    tempo += 'atempo=2,';remaining/=2
                 while remaining<.5:
-                    tempo += ',atempo=0.5';remaining*=2
+                    tempo += 'atempo=0.5,';remaining*=2
                 if abs(remaining-1)>1e-6:
-                    tempo += f',atempo={remaining:.6f}'
-                processing=f'{tempo},volume={gain:.4f},{panner}'
+                    tempo += f'atempo={remaining:.6f},'
+                processing=f'{tempo}volume={gain:.4f},{panner}'
                 chain += processing
                 envelope=[]
                 if volume_keys:
@@ -504,7 +532,7 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
                 if clip.get('transition') in ('dissolve','wipe','fade'):
                     incoming=min(_number(clip.get('transitionDuration',.5),'transition duration',1/float(fps),2),render_length)
                     envelope.append(f'min(1,t/{incoming:.9f})')
-                next_clip=next((candidate for candidate in clips if candidate is not clip and candidate.get('type')==clip['type'] and candidate.get('track')==clip.get('track') and candidate.get('transition') in ('dissolve','wipe') and abs(float(candidate['start'])-(start+length))<.05),None)
+                next_clip=next((candidate for candidate in clips if candidate is not clip and candidate.get('type')==clip['type'] and candidate.get('track')==clip.get('track') and candidate.get('transition') in ('dissolve','wipe') and round(float(candidate['start'])*fps)==round((start+length)*fps)),None)
                 if next_clip:
                     next_before=_number(next_clip.get('transitionBefore',0),'transition lead',0,2)
                     next_duration=_number(next_clip.get('transitionDuration',.5),'transition duration',1/float(fps),2)
@@ -527,7 +555,7 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
                         if available+1e-3<after: raise ValueError('Audio crossfade needs more outgoing source footage')
                         tail_source=source_in-after*speed if clip.get('reverse') else source_in+length*speed
                         tail_source-=source_offsets.get(item['id'],0)
-                        tail_chain=_trim_audio(index,tail_source,after*speed,clip.get('reverse'))
+                        tail_chain=_trim_audio(filters,f'tailmix{number}',index,streams,tail_source,after*speed,clip.get('reverse'))
                         tail_chain+=processing
                         if volume_keys:
                             terminal=sorted(volume_keys,key=lambda point:point['time'])[-1]['value']

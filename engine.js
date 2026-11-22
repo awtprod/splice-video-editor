@@ -299,7 +299,7 @@
             source.media.find(m=>m.id===c.mediaId)?.nativeGenerator !== 1414680150 &&
             c.track === clip.track &&
             c.start < clip.start &&
-            c.start + c.duration >= clip.start - 0.05,
+            Math.round((c.start+c.duration)*source.fps)===Math.round(clip.start*source.fps),
         )
         .sort((a, b) => b.start - a.start)[0] || null
     );
@@ -685,7 +685,7 @@
         video?.readyState < 2 && previewProjects.get(canvas) === project) return;
     previewProjects.set(canvas, project);
     const ctx = canvas.getContext("2d");
-    ctx.fillStyle = "#080a0a";
+    ctx.fillStyle = '#000';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     if (!mutedTracks.video) {
       const visible=project.clips.filter(c=>c.type==='video' && c.start-transitionBefore(c)<=time && time<c.start+c.duration)
@@ -785,6 +785,8 @@
       (item.audioChannels>0 && c.embeddedAudio!==false));
     if (needsAudio && !(replacement.audioChannels>0))
       throw Error(replacement.name+' has no audio stream. Choose a replacement that includes the original sound.');
+    if (needsAudio && item.audioStreams>1 && replacement.audioStreams<item.audioStreams)
+      throw Error(replacement.name+' has fewer audio streams than the original source.');
     const end=Math.max(0,...clips.map(c=>{
       const next=followingTransition(c);
       const handle=c.reverse?transitionBefore(c):next?transitionLength(next)-transitionBefore(next):0;
@@ -1028,6 +1030,13 @@
       const sequence=project;
       const matches=SpliceMedia.matchFolder(sequence.media,Array.from(files));
       if(!matches.length)throw Error('The folder contains no matching offline media.');
+      const nameOnly=matches.filter(match=>match.nameOnly);
+      if(nameOnly.length){
+        const examples=nameOnly.slice(0,5).map(({item,file})=>`${item.path||item.name} → ${file.webkitRelativePath||file.name}`);
+        const remaining=nameOnly.length-examples.length;
+        if(remaining) examples.push(`and ${remaining} more`);
+        if(!window.confirm('Review these relinks. Only the filenames match:\n\n'+examples.join('\n')+'\n\nUse these files?'))return false;
+      }
       const rows=[];
       for(const {item,file} of matches){
         const decoded=await fileToMedia(file);checkReplacement(item,decoded);
@@ -1252,6 +1261,17 @@
     },
     moveClip(id, start, track) {
       Editor.updateClip(id, { start, track });
+    },
+    moveClips(placements) {
+      const byId=new Map(placements.map(item=>[item.id,item]));
+      Editor.editProject(next=>{
+        for(const clip of next.clips){
+          const placement=byId.get(clip.id);
+          if(!placement)continue;
+          clip.start=snap(placement.start);
+          clip.track=placement.track;
+        }
+      });
     },
     addTitle() {
       if (trackLocked("title", 4)) throw new Error("Unlock the title track before editing.");
