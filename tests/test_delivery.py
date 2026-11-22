@@ -93,6 +93,11 @@ class MovieDelivery(unittest.TestCase):
         self.assertTrue(coords)
         self.assertAlmostEqual(statistics.mean(coords),320,delta=6)
         self.assertLess(max(self.frame(1.0)),16)
+        self.project['clips'][0]['keyframes']={'opacity':[{'time':0,'value':0},{'time':.8,'value':100}]}
+        render_to_file(self.project,self.destination)
+        self.assertLess(max(self.frame(0)),16)
+        self.assertAlmostEqual(max(self.frame(.4)),128,delta=18)
+        self.assertGreater(max(self.frame(.8)),235)
 
     def test_growing_rotated_clip_keeps_picture_at_the_edges(self):
         self.project['media']=[dict(id='still',src='/assets/ridge.jpg')]
@@ -117,7 +122,7 @@ class MovieDelivery(unittest.TestCase):
             for color, size in [('red','160x90'),('blue','120x90')]:
                 file=Path(directory)/f'{color}.mp4'
                 subprocess.run(['ffmpeg','-nostdin','-v','error','-f','lavfi','-i',
-                    f'color={color}:s={size}:r=25:d=1','-c:v','libx264','-threads','1',str(file)],
+                    f'color={color}:s={size}:r=25:d=3','-c:v','libx264','-threads','1',str(file)],
                     timeout=10,check=True)
                 self.project['media'].append(dict(id=color,src='/media/'+str(file.relative_to(MEDIA_ROOT))))
             self.project['clips'] = [dict(type='video',mediaId='red',track=1,start=0,duration=1),
@@ -130,10 +135,21 @@ class MovieDelivery(unittest.TestCase):
             self.project['clips'][1].update(transition='fade',transitionDuration=.48,transform={'scale':35})
             render_to_file(self.project,self.destination)
             halfway=self.frame(.24)
-            self.assertLess(max(halfway[edge:edge+3]),8)
+            self.assertGreater(halfway[edge],235)
             self.assertLess(halfway[center],8)
             self.assertAlmostEqual(halfway[center+2],125,delta=8)
             self.assertGreater(self.frame(.48)[edge],235)
+            self.project['clips'][1].update(track=1,start=1,transition='dissolve')
+            render_to_file(self.project,self.destination)
+            self.assertAlmostEqual(self.frame(1.24)[edge],125,delta=8)
+            self.assertLess(self.frame(1.44)[edge],35)
+            self.assertLess(self.frame(1.48)[edge],8)
+            self.project['clips'][1].update(transition='fade',transitionDuration=.8,transitionBefore=.4,
+                                            transform={}, **{'in':.4})
+            render_to_file(self.project,self.destination)
+            self.assertAlmostEqual(self.frame(.8)[center],125,delta=8)
+            self.assertLess(max(self.frame(1)[center:center+3]),8)
+            self.assertAlmostEqual(self.frame(1.2)[center+2],125,delta=8)
 
     def test_export_pan_routes_both_stereo_channels(self):
         from array import array
@@ -187,6 +203,44 @@ class MovieDelivery(unittest.TestCase):
             native=open_project(save_project(self.project))
             self.assertEqual([c['transition'] for c in native['clips'] if c['type']=='audio'],['none','dissolve'])
             self.assertAlmostEqual(rms(native),before,places=4)
+            render_to_file(self.project,self.destination)
+            stream=next(stream for stream in self.streams() if stream['codec_type']=='audio')
+            self.assertEqual((stream['codec_name'],stream['channel_layout']),('aac','stereo'))
+            self.project['trackMix']={'1':{'mute':True}}
+            muted=open_project(save_project(self.project))
+            self.assertLess(rms(muted),.0001)
+
+    def test_fractional_video_origin_and_delayed_audio(self):
+        from array import array
+        from premiere import MEDIA_ROOT
+        MEDIA_ROOT.mkdir(parents=True,exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=MEDIA_ROOT) as directory:
+            source=Path(directory)/'fractional.mov'
+            subprocess.run(['ffmpeg','-nostdin','-v','error','-f','lavfi','-i',
+                "color=black:s=160x90:r=24000/1001:d=5,geq=lum='if(eq(mod(N,24),0),235,16)':cb=128:cr=128",
+                '-itsoffset','0.5','-f','lavfi','-i','sine=frequency=440:sample_rate=48000:duration=4.5',
+                '-c:v','libx264','-threads','1','-c:a','pcm_s16le',str(source)],check=True,timeout=10)
+            fps=24000/1001
+            self.project.update(fps=fps,media=[dict(id='av',src='/media/'+str(source.relative_to(MEDIA_ROOT)))])
+            self.project['clips']=[dict(type='video',mediaId='av',track=1,start=7/fps,duration=60/fps,**{'in':43/fps})]
+            render_to_file(self.project,self.destination)
+            received=[]
+            for frame in (11,12,13):
+                received.append(statistics.mean(self.frame(frame/fps)))
+            self.assertLess(received[0],16)
+            self.assertGreater(received[1],220)
+            self.assertLess(received[2],16)
+            self.project['clips'][0]['in']=43.5/fps
+            render_to_file(self.project,self.destination)
+            self.assertLess(statistics.mean(self.frame(11/fps)),16)
+            self.assertGreater(statistics.mean(self.frame(12/fps)),220)
+            self.project['clips'][0].update(start=0,duration=2,**{'in':0})
+            movie=Path(directory)/'delayed.mov'
+            render_to_file(self.project,movie,options={'codec':'prores'})
+            pcm=array('f',subprocess.check_output(['ffmpeg','-nostdin','-v','error','-ss','0.15',
+                '-i',str(movie),'-t','0.60','-vn','-ac','1','-f','f32le','pipe:1'],timeout=10))
+            self.assertLess(max(abs(sample) for sample in pcm[:9600]),.0001)
+            self.assertGreater(max(abs(sample) for sample in pcm[-4800:]),.04)
 
     def test_250_cuts_frame_count_and_selectable_subtitles(self):
         self.project['clips']=[self.clip(str(i),'ridge',i/25,.04) for i in range(250)]

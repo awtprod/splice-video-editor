@@ -602,8 +602,8 @@
     const item=editor.get().project.media.find(m=>m.id===id);
     if(!item||item.type!==lane.dataset.kind)return notify("Choose a "+lane.dataset.kind+" lane.");
     if (editor.isTrackLocked(Number(lane.dataset.track),lane.dataset.kind)) return notify('Unlock the track before editing.');
-    safeEdit(()=>{editor.seek(snapTime(positionTime(e,lane)));editor.addToTimeline(id);
-      editor.moveClip(editor.get().selectedId,editor.get().time,Number(lane.dataset.track));});
+    const start=positionTime(e,lane);
+    safeEdit(()=>editor.addToTimeline(id,{start:snapTime(start),track:Number(lane.dataset.track)}));
   });
   $("snap-toggle").onclick=()=>{snapEnabled=!snapEnabled;$("snap-toggle").classList.toggle("active",snapEnabled)};
   $("ripple-toggle").onclick=toggleRipple;
@@ -644,9 +644,9 @@
     if(key==="m"&&!e.ctrlKey&&!e.metaKey){e.preventDefault();editMarker();return;}
     if(e.key==="["||e.key==="]"){e.preventDefault();const s=editor.get();const times=(s.project.markers||[]).map(m=>m.time);editor.seek(e.key==="]"?Math.min(s.duration,...times.filter(x=>x>s.time+.001)):Math.max(0,...times.filter(x=>x<s.time-.001)));return;}
     if(e.key==="ArrowLeft"||e.key==="ArrowRight"){e.preventDefault();editor.seek(editor.get().time+(e.key==="ArrowRight"?1:-1)/editor.get().project.fps);return;}
-    if (e.key.toLowerCase()==="j"){e.preventDefault();editor.setRate?.(-1);return;}
+    if (e.key.toLowerCase()==="j"){e.preventDefault();editor.shuttle(-1);return;}
     if (e.key.toLowerCase()==="k"){e.preventDefault();editor.setRate?.(0);return;}
-    if (e.key.toLowerCase()==="l"){e.preventDefault();editor.setRate?.(1);return;}
+    if (e.key.toLowerCase()==="l"){e.preventDefault();editor.shuttle(1);return;}
     if (e.key.toLowerCase()==="n"){e.preventDefault();snapEnabled=!snapEnabled;$("snap-toggle").classList.toggle("active",snapEnabled);return;}
     if (e.key.toLowerCase()==="r"){e.preventDefault();toggleRipple();return;}
     if (e.code === "Space") {

@@ -30,11 +30,12 @@
     if(direction>0){player.playbackRate=rate;player.play().catch(error=>show(error.message));return;}
     shuttleTimer=setInterval(()=>{
       if(!dialog?.open || current()<=0){stopShuttle();return;}
+      if(player.seeking)return;
       player.currentTime=Math.max(0,current()-rate/fps);
     },1000/fps);
   }
-  function newClip(start,track) {
-    return {id:crypto.randomUUID(),mediaId:media.id,start:snap(start),duration:snap(markOut-markIn),in:snap(markIn),track,type:media.type,title:'',color:{brightness:100,contrast:100,saturation:100},volume:100,transition:'none'};
+  function newClip(start,track,duration) {
+    return {id:crypto.randomUUID(),mediaId:media.id,start,duration,in:markIn,track,type:media.type,title:'',color:{brightness:100,contrast:100,saturation:100},volume:100,transition:'none'};
   }
   function place(mode) {
     show('');
@@ -42,9 +43,12 @@
     const track=Number(dialog.querySelector('.source-track').value);
     if (Editor.isTrackLocked(track, media.type)) return show(`Unlock ${media.type} track ${Math.abs(track)} before editing.`);
     const state=Editor.get(), time=mode==='append' ? Math.max(0,...state.project.clips.filter(c=>c.type===media.type && c.track===track).map(c=>c.start+c.duration)) : state.time;
-    const start=snap(time), length=snap(markOut-markIn), end=start+length;
+    const sequenceFps=state.project.fps;
+    const frames=Math.min(Math.round((markOut-markIn)*sequenceFps),Math.floor((media.duration-markIn)*sequenceFps+1e-6));
+    if (frames<1) return show('Mark a range at least one sequence frame long.');
+    const start=Math.round(time*sequenceFps)/sequenceFps, length=frames/sequenceFps, end=start+length;
     if (typeof Editor.editProject !== 'function') return show('Timeline edit service is unavailable.');
-    const clip=newClip(start,track);
+    const clip=newClip(start,track,length);
     try { Editor.editProject(project => {
       const additions=[];
       const rightGroups=new Map();
@@ -112,7 +116,7 @@
     if(!item){window.alert('Media is unavailable.');return;}
     if(!item.src || item.offline){window.alert('Relink '+item.name+' before opening it.');return;}
     media={...item,duration:Number.isFinite(Number(item.duration)) && Number(item.duration)>0 ? Number(item.duration) : 0};
-    fps=Editor.get().project.fps || 25;
+    fps=Number.isFinite(media.fps) && media.fps>0 ? media.fps : Editor.get().project.fps;
     const state=Editor.get().project;
     const trackCount=Math.min(64,Math.max(state.trackCounts?.[media.type] || 3,
       ...state.clips.filter(clip=>clip.type===media.type).map(clip=>Math.abs(clip.track)),2)+1);

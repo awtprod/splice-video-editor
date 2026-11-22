@@ -525,15 +525,21 @@ def save_project(data):
             track.is_locked = bool(state['locked'])
         if bool(state.get('syncLocked', True)) != track.is_sync_locked:
             track.is_sync_locked = bool(state['syncLocked'])
+    camera_mix = {}
     for key, mix in (data.get('trackMix') or {}).items():
         number = int(key)
-        if number >= 0 or -number > len(sequence.audio_tracks):
+        if not number or number > len(sequence.video_tracks) or -number > len(sequence.audio_tracks):
             raise ValueError('Premiere audio track mixer target is unavailable')
-        track = sequence.audio_tracks[-number - 1]
         gain = float(mix.get('gain', 100))
         pan = float(mix.get('pan', 0))
         if not math.isfinite(gain) or not 0 <= gain <= 200 or not math.isfinite(pan) or not -100 <= pan <= 100:
             raise ValueError('Premiere audio mixer value is out of range')
+        if number > 0:
+            if pan:
+                raise ValueError('Premiere export cannot preserve embedded camera track pan. Save a Splice working copy to keep it.')
+            camera_mix[number] = 0 if mix.get('mute') else gain / 100
+            continue
+        track = sequence.audio_tracks[-number - 1]
         current_gain = _static_audio_value(_audio_track_param(track, 'Volume'), 1) * 100
         current_pan = (_static_audio_value(_audio_track_param(track, 'Balance'), .5) - .5) * 200
         if abs(gain - current_gain) > .0001:
@@ -841,10 +847,15 @@ def save_project(data):
             companion.in_point = clip.in_point
             companion.out_point = clip.out_point
             companion.end = clip.end
-            premiere_effects.apply(companion, {}, float(item.get('volume', 100)))
             audio_item = {key: item[key] for key in ('volume','fadeIn','fadeOut','pan') if key in item}
+            mix_gain = camera_mix.get(ui_track,1)
+            audio_item['volume'] = float(item.get('volume',100))*mix_gain
             if (item.get('keyframes') or {}).get('volume'):
-                audio_item['keyframes'] = {'volume': item['keyframes']['volume']}
+                audio_item['keyframes'] = {'volume': [{**point,'value':point['value']*mix_gain}
+                                                      for point in item['keyframes']['volume']]}
+            if audio_item['volume']>200:
+                raise ValueError('Premiere export cannot combine this camera clip and track gain above 200%.')
+            premiere_effects.apply(companion, {}, audio_item['volume'])
             premiere_effects.apply_extended(companion, audio_item)
             item = {**item, 'fadeIn': 0, 'fadeOut': 0, 'pan': 0,
                     'keyframes': {key: points for key, points in (item.get('keyframes') or {}).items() if key != 'volume'}}

@@ -76,6 +76,7 @@
         `<label class="splice-text"><span>Text</span><textarea aria-label="Title text" data-field="title" rows="2" maxlength="500">${escape(clip.title)}</textarea></label>` +
         `<label class="splice-number"><span>Typeface</span><select aria-label="Title typeface" data-field="fontFamily" data-group="titleStyle">${fonts.map(name => option(name,name,text.fontFamily || 'DM Sans')).join('')}</select></label>` +
         label('Size', 'fontSize', number(text.fontSize, 8), 2, 20, .5, '%', 'titleStyle') +
+        label('Opacity', 'opacity', number(clip.opacity, 100), 0, 100, 1, '%') +
         label('Horizontal', 'x', number(text.x, 50), 0, 100, 1, '%', 'titleStyle') +
         label('Vertical', 'y', number(text.y, 78), 0, 100, 1, '%', 'titleStyle') +
         `<label class="splice-number"><span>Alignment</span><select aria-label="Title alignment" data-field="align" data-group="titleStyle">${['left','center','right'].map(name => option(name,name,text.align || 'center')).join('')}</select></label>` +
@@ -92,8 +93,14 @@
         field('Fade in', 'fadeIn', number(clip.fadeIn, 0).toFixed(2), 0, clip.duration, .04) +
         field('Fade out', 'fadeOut', number(clip.fadeOut, 0).toFixed(2), 0, clip.duration, .04));
     }
-    if (clip.type === 'video' || clip.type === 'audio') {
-      const available=clip.type==='audio' ? ['volume'] : ['opacity','x','y','scale','rotation',...(clip.embeddedAudio===false?[]:['volume'])];
+    if (clip.type === 'audio') {
+      html += section('Incoming transition',
+        `<label class="splice-number"><span>Style</span><select aria-label="Audio transition style" data-field="transition">${clip.transition==='native'?option('native','Imported: '+(clip.transitionMatchName||'Premiere effect'),'native'):''}${option('none','Cut',clip.transition || 'none')}${option('dissolve','Crossfade',clip.transition || 'none')}</select></label>` +
+        field('Length','transitionDuration',number(clip.transitionDuration,.5).toFixed(2),1/fps,2,1/fps));
+    }
+    if (['video','audio','title'].includes(clip.type)) {
+      const available=clip.type==='audio' ? ['volume'] : clip.type==='title' ? ['opacity'] :
+        ['opacity','x','y','scale','rotation',...(clip.embeddedAudio===false?[]:['volume'])];
       if(!available.includes(automationProperty))automationProperty=available[0];
       const spec=automation[automationProperty], local=Math.max(0,Math.min(clip.duration,number(state.time,clip.start)-clip.start));
       const points=(clip.keyframes?.[automationProperty] || []).slice().sort((a,b)=>a.time-b.time);
@@ -120,7 +127,7 @@
     if (text.align && text.align!=='center') nativeLimits.push('left/right title alignment');
     if (number(clip.pan,0)) nativeLimits.push('clip audio pan');
     const videoMix = clip.type === 'video' && state.project.trackMix?.[clip.track];
-    if (videoMix && (videoMix.gain!==100 || videoMix.pan || videoMix.mute || videoMix.solo)) nativeLimits.push('embedded video-track mix');
+    if (videoMix?.pan || videoMix?.solo) nativeLimits.push('embedded video-track pan or solo');
     if (nativeLimits.length) html += section('Premiere compatibility',
       `<p class="splice-compat">${escape(nativeLimits.join(', '))} will not save to Premiere. Save a Splice working copy to keep this edit.</p>`);
     if(clip.transition==='native') html += section('Render compatibility',
