@@ -353,12 +353,15 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
                     chain += f',fade=t=in:st=0:d={transition_duration:.6f}:alpha=1'
                 else:
                     chain += f",format=yuva444p,geq=lum='p(X,Y)':cb='p(X,Y)':cr='p(X,Y)':a='p(X,Y)*if(lt(X,W*min(1,T/{transition_duration:.6f})),1,0)',format=yuva420p"
-            elif clip.get('transition') == 'dissolve':
+            elif clip.get('transition') in ('dissolve','fade'):
                 chain += f',fade=t=in:st=0:d={transition_duration:.6f}:alpha=1'
             elif clip.get('transition') == 'wipe':
                 chain += f",format=yuva444p,geq=lum='p(X,Y)':cb='p(X,Y)':cr='p(X,Y)':a='p(X,Y)*if(lt(X,W*min(1,T/{transition_duration:.6f})),1,0)',format=yuva420p"
             if clip.get('transition') == 'fade':
-                chain += f',fade=t=in:st=0:d={transition_duration:.6f}'
+                first = math.ceil(render_start*fps-1e-6)
+                after = math.ceil((render_start+transition_duration)*fps-1e-6)
+                filters.append(f"[{active}]drawbox=color=black:t=fill:enable='gte(n,{first})*lt(n,{after})'[black{number}]")
+                active = f'black{number}'
             chain += f',setpts=PTS+{render_start:.6f}/TB[clip{number}]'
             filters.append(chain)
             filters.append(f'[{active}][clip{number}]overlay={position}:eof_action=pass:shortest=0[base{number+1}]')

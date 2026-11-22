@@ -127,6 +127,13 @@ class MovieDelivery(unittest.TestCase):
             edge,center=(45*160+5)*3,(45*160+80)*3
             self.assertGreater(frame[edge],235)
             self.assertGreater(frame[center+2],235)
+            self.project['clips'][1].update(transition='fade',transitionDuration=.48,transform={'scale':35})
+            render_to_file(self.project,self.destination)
+            halfway=self.frame(.24)
+            self.assertLess(max(halfway[edge:edge+3]),8)
+            self.assertLess(halfway[center],8)
+            self.assertAlmostEqual(halfway[center+2],125,delta=8)
+            self.assertGreater(self.frame(.48)[edge],235)
 
     def test_export_pan_routes_both_stereo_channels(self):
         from array import array
