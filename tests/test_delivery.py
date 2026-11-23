@@ -125,6 +125,32 @@ class MovieDelivery(unittest.TestCase):
                     frequency=2*sum(a<0<=b for a,b in zip(part,part[1:]))
                     self.assertAlmostEqual(frequency,750,delta=6)
 
+    def test_hdr_master_white_title_matches_graphics_reference_white(self):
+        from premiere import MEDIA_ROOT
+        MEDIA_ROOT.mkdir(parents=True,exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=MEDIA_ROOT) as directory:
+            for transfer, expected in [('smpte2084',573), ('arib-std-b67',721)]:
+                with self.subTest(transfer=transfer):
+                    source = Path(directory) / (transfer+'.mov')
+                    fixture = ('color=black:s=160x90:r=25:d=1,'
+                               f'setparams=color_primaries=bt2020:color_trc={transfer}:colorspace=bt2020nc:range=tv')
+                    subprocess.run(['ffmpeg','-nostdin','-v','error','-f','lavfi','-i',fixture,
+                                    '-c:v','prores_ks','-profile:v','3','-threads','1','-pix_fmt','yuv422p10le',
+                                    '-movflags','+write_colr',str(source)],check=True,timeout=10)
+                    self.project['media'] = [{'id':'hdr','src':'/media/'+str(source.relative_to(MEDIA_ROOT))}]
+                    self.project['clips'] = [{**self.clip('hdr','hdr',0,1),'in':0},
+                                             {'type':'title','track':2,'start':0,'duration':1,'title':'HDR',
+                                              'titleStyle':{'x':50,'y':50,'color':'#ffffff','fontSize':30}}]
+                    self.destination = Path(directory)/('master-'+transfer+'.mov')
+                    render_to_file(self.project,self.destination,options={'codec':'prores'})
+                    video = next(s for s in self.streams() if s['codec_type']=='video')
+                    self.assertEqual((video['color_transfer'],video['pix_fmt']),(transfer,'yuv422p10le'))
+                    data = subprocess.check_output(['ffmpeg','-nostdin','-v','error','-ss','0.4','-i',str(self.destination),
+                                                    '-frames:v','1','-pix_fmt','yuv422p10le','-f','rawvideo','pipe:1'],timeout=10)
+                    luminance = memoryview(data).cast('H')[:160*90]
+                    self.assertGreater(sum(abs(value-expected)<=4 for value in luminance),20)
+                    self.assertLess(max(luminance),expected+12)
+
     def test_title_lines_center_independently_and_end_on_out_frame(self):
         self.project.update(width=640,height=360,clips=[
             {'type':'title','start':0,'duration':1,'title':'WIDE FIRST LINE\nI',

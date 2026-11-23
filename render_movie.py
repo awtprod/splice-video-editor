@@ -2,6 +2,7 @@
 import json
 import math
 from fractions import Fraction
+from functools import lru_cache
 import subprocess
 import tempfile
 from pathlib import Path
@@ -230,7 +231,24 @@ def _slice_keyframes(keyframes, offset, length):
     return result
 
 
-def _draw_title(filters, active, number, clip, height, fps, directory):
+@lru_cache(maxsize=256)
+def _hdr_graphic_color(color, primaries, transfer):
+    if color == '000000':
+        return color
+    # Convert the authored RGB swatch to the master color space before
+    # drawtext blends its glyph mask. BT.2408 places graphics white at 203 nits.
+    swatch = (f'color=0x{color}:s=2x2,format=gbrp,'
+              'setparams=color_primaries=bt709:color_trc=bt709:colorspace=gbr:range=pc,'
+              f'zscale=t=linear:npl=100,format=gbrpf32le,zscale=p={primaries},'
+              f'zscale=t={transfer}:m=gbr:r=full:npl=203,format=gbrp')
+    result = subprocess.check_output(['ffmpeg','-nostdin','-v','error','-f','lavfi','-i',swatch,
+                                      '-frames:v','1','-pix_fmt','rgb24','-f','rawvideo','pipe:1'],timeout=5)
+    if len(result) != 12:
+        raise ValueError('Could not convert the HDR title color')
+    return result[:3].hex()
+
+
+def _draw_title(filters, active, number, clip, height, fps, directory, hdr_profile):
     begin = float(clip['start']); end = begin + float(clip['duration'])
     first_frame = math.ceil(begin * fps - 1e-6)
     out_frame = math.ceil(end * fps - 1e-6)
@@ -251,6 +269,12 @@ def _draw_title(filters, active, number, clip, height, fps, directory):
     if len(stroke)!=7 or not stroke.startswith('#') or any(c not in '0123456789abcdefABCDEF' for c in stroke[1:]):
         raise ValueError('Invalid title outline color')
     border=int(_number(style.get('strokeWidth',0),'title outline',0,8)*height/180)
+    fill, outline = color[1:], stroke[1:]
+    if hdr_profile:
+        primaries, transfer, _ = hdr_profile
+        fill = _hdr_graphic_color(fill,primaries,transfer)
+        if border:
+            outline = _hdr_graphic_color(outline,primaries,transfer)
     lines = str(clip['title'])[:500].split('\n')[:20]
     for row, line in enumerate(lines):
         if not line.strip():
@@ -261,7 +285,7 @@ def _draw_title(filters, active, number, clip, height, fps, directory):
         label = f'title{number}line{row}'
         filters.append(
             f'[{active}]drawtext=fontfile={font_path}:textfile={text_file}:expansion=none:'
-            f'fontsize={fontsize}:fontcolor=0x{color[1:]}:borderw={border}:bordercolor=0x{stroke[1:]}:'
+            f'fontsize={fontsize}:fontcolor=0x{fill}:borderw={border}:bordercolor=0x{outline}:'
             f'shadowcolor=black:shadowx=3:shadowy=3:x={xpos}:y=h*{y:.5f}+({offset:.3f})-text_h/2:'
             f"alpha='({alpha})/100':"
             f'enable=gte(n\\,{first_frame})*lt(n\\,{out_frame})[{label}]')
@@ -373,7 +397,11 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
     command = ['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-filter_complex_threads', '3', '-y', *inputs,
                '-f', 'lavfi', '-i', f'color=c=black:s={width}x{height}:r={fps}:d={duration:.6f}']
     base_index = len(indexes)
-    filters = [f'[{base_index}:v]format={base_format}[base0]']
+    profile = (options or {}).get('_color_profile')
+    hdr_profile = profile if high_depth and profile and profile[1] in HDR_TRANSFERS else None
+    picture_params = (f',setparams=color_primaries={profile[0]}:color_trc={profile[1]}:colorspace={profile[2]}:range=tv'
+                      if hdr_profile else '')
+    filters = [f'[{base_index}:v]format={base_format}{picture_params}[base0]']
     active = 'base0'
     video_clips = [] if muted.get('video') else sorted((c for c in clips if c['type']=='video'),
                                                        key=lambda c: (c.get('track',0),c['start']))
@@ -395,7 +423,7 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
             by_end[track,round((clip['start']+clip['duration'])*fps)] = number
         for _, is_title, number, clip in picture_layers:
             if is_title:
-                active = _draw_title(filters,active,number,clip,height,fps,lut_directory)
+                active = _draw_title(filters,active,number,clip,height,fps,lut_directory,hdr_profile)
                 continue
             item = media_by_id[clip['mediaId']]
             if item.get('nativeGenerator')==1414680150: continue
