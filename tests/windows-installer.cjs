@@ -70,6 +70,15 @@ async function main() {
     assert.equal(await page.evaluate(() => Editor.get().project.clips.find(clip => clip.type === 'title').title), 'Splice on Windows')
     await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].setSize(1120, 780))
     await page.locator('#export-video').click()
+    console.log('Starting the first export after Premiere reopen.')
+    await page.locator('.studio-dialog [type=submit]').click()
+    await page.waitForFunction(() => !document.querySelector('.studio-dialog [type=submit]').disabled,
+      null, { timeout: 25000 })
+    const firstStatus = await page.locator('.render-state').textContent()
+    assert.ok(firstStatus.startsWith('MP4 exported'), firstStatus)
+    await waitForFile(rendered)
+    require('node:fs').unlinkSync(rendered)
+    console.log('First export passed. Checking cancel and retry.')
     await page.locator('.studio-dialog [type=submit]').click()
     await page.waitForFunction(() => document.querySelector('.studio-dialog [data-cancel]')?.textContent === 'Cancel render')
     await page.locator('.studio-dialog [data-cancel]').click()
@@ -92,6 +101,15 @@ async function main() {
   } catch (error) {
     await page.screenshot({ path: path.join(proof, 'Windows-error.png') }).catch(() => {})
     console.error(await page.locator('.render-state').allTextContents())
+    try {
+      const powershell = path.join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+      console.error(execFileSync(powershell, [
+        '-NoProfile', '-NonInteractive', '-Command',
+        `Get-CimInstance Win32_Process | Where-Object { $_.Name -in 'python.exe','ffmpeg.exe','ffprobe.exe' } | Select-Object Name,ProcessId,ParentProcessId,CommandLine | ConvertTo-Json -Compress`
+      ], { timeout: 8000, encoding: 'utf8' }))
+    } catch (diagnosticError) {
+      console.error(diagnosticError.message)
+    }
     throw error
   } finally {
     await app.close()
