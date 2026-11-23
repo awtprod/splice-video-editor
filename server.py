@@ -11,6 +11,8 @@ import mimetypes
 import uuid
 import tempfile
 import subprocess
+import sys
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit, parse_qs, quote
@@ -283,10 +285,18 @@ def _exit_on_terminate(signum, frame):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8765)
+    parser.add_argument('--exit-with-stdin', action='store_true',
+                        help='Stop the server when the desktop launcher closes its input pipe.')
     args = parser.parse_args()
     server = create_server(args.port)
     with server:
         signal.signal(signal.SIGTERM,_exit_on_terminate)
+        if args.exit_with_stdin:
+            def stop_on_parent_exit():
+                sys.stdin.buffer.read(1)
+                server.shutdown()
+
+            threading.Thread(target=stop_on_parent_exit, daemon=True).start()
         print(f'http://127.0.0.1:{server.server_port}', flush=True)
         try:
             server.serve_forever()

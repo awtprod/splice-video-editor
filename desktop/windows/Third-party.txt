@@ -1,0 +1,14 @@
+Splice runs FFmpeg and ffprobe as separate command-line programs.
+This distribution contains unmodified binaries from the Gyan Windows
+FFmpeg 9.1 Essentials build, distributed under the GNU GPL version 3.
+See LICENSE alongside the executables.
+
+Binary release and source revision
+https://github.com/GyanD/codexffmpeg/releases/tag/9.1
+
+FFmpeg corresponding project source
+https://github.com/FFmpeg/FFmpeg/commit/74e4393595
+
+Build configuration
+Run ffmpeg.exe -buildconf to view the exact configuration used by Gyan.
+https://www.gyan.dev/ffmpeg/builds/#libraries

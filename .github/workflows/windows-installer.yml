@@ -1,0 +1,58 @@
+name: Windows installer
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  installer:
+    runs-on: windows-2025
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea5e5dc5ba9c38 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22'
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $nsis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
+          if (!(Test-Path $nsis)) {
+            choco install nsis --version=3.11 --yes --no-progress
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
+          python desktop/windows/build.py artifacts/installer --nsis "$nsis"
+      - name: Install and verify Splice
+        shell: pwsh
+        run: |
+          $setup = Resolve-Path artifacts/installer/Splice-Setup-x64.exe
+          $result = Start-Process $setup -ArgumentList '/S' -Wait -PassThru
+          if ($result.ExitCode) { exit $result.ExitCode }
+          npm ci
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          node tests/windows-installer.cjs
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $root = Join-Path $env:LOCALAPPDATA 'Programs\Splice'
+          $result = Start-Process (Join-Path $root 'Uninstall.exe') -ArgumentList '/S' -Wait -PassThru
+          if ($result.ExitCode) { exit $result.ExitCode }
+          if (Test-Path (Join-Path $root 'Application\Splice.exe')) { throw 'Uninstall left Splice.exe behind.' }
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: Splice-Windows-x64
+          path: artifacts/installer/Splice-Setup-x64.exe
+          if-no-files-found: error
+          compression-level: 0
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        if: always()
+        with:
+          name: Windows-installer-verification
+          path: artifacts/installer-proof
+          if-no-files-found: ignore
