@@ -135,7 +135,6 @@
     if (color.lut) nativeLimits.push('3D LUT');
     if (['x','y'].some(key=>Array.isArray(clip.keyframes?.[key])&&clip.keyframes[key].length)) nativeLimits.push('position keyframes');
     if (clip.keyframes?.volume?.length && (number(clip.fadeIn,0)||number(clip.fadeOut,0))) nativeLimits.push('combined gain keyframes and fades');
-    if (text.align && text.align!=='center') nativeLimits.push('left/right title alignment');
     if (number(clip.pan,0)) nativeLimits.push('clip audio pan');
     const videoMix = clip.type === 'video' && state.project.trackMix?.[clip.track];
     if (videoMix?.pan || videoMix?.solo) nativeLimits.push('embedded video-track pan or solo');
