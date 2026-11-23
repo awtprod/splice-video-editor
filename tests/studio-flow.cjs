@@ -147,6 +147,17 @@ async function main() {
         assert.ok(reopened.path.endsWith('.mov'));assert.ok(reopened.src.endsWith('.mp4'));
       }
       if(pass===1) {
+        const malformed={name:'Malformed title project',width:1280,height:720,fps:25,media:[],
+          clips:[{id:'bad-title',type:'title',title:123,track:1,start:0,in:0,duration:2}]};
+        await page.locator('#project-input').setInputFiles({
+          name:'malformed-title.splice.json',mimeType:'application/json',buffer:Buffer.from(JSON.stringify(malformed)),
+        });
+        await waitState(()=>document.querySelector('.toast')?.textContent==='A title in this project has invalid text.');
+        assert.equal(await saveButton.isEnabled(),true);
+        assert.equal(await page.evaluate(()=>Editor.get().project.name),name);
+        if(screenshots)await page.screenshot({path:path.join(screenshots,'Splice-malformed-project-refused.png')});
+        await page.reload();await page.evaluate(()=>SpliceSession.ready);
+        assert.equal(await page.evaluate(()=>Editor.get().project.clips.find(c=>c.type==='title').title),'Opening '+pass);
         await click('#export-video'); await click('.studio-dialog [type=submit]');
         await waitState(()=>document.querySelector('.studio-dialog [data-cancel]')?.textContent==='Cancel render');
         await click('.studio-dialog [data-cancel]');

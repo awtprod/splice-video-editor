@@ -1009,7 +1009,8 @@
     anchor.click();
     setTimeout(() => URL.revokeObjectURL(url), 60000);
   }
-  function validateProject(value) {
+  function validateProject(value, depth = 0) {
+    if (depth >= 4) throw new Error("This project nests sequences more than four levels deep.");
     if (
       !value ||
       typeof value !== "object" ||
@@ -1041,6 +1042,20 @@
         value.trackCounts.video < 1 || value.trackCounts.video > 64 ||
         value.trackCounts.audio < 1 || value.trackCounts.audio > 64))
       throw new Error("This project file has invalid track counts.");
+    if (value.trackMix != null && (typeof value.trackMix !== "object" ||
+        Array.isArray(value.trackMix) || Object.values(value.trackMix).some(mix => !mix || typeof mix !== "object" || Array.isArray(mix))))
+      throw new Error("This project file has invalid audio mixer settings.");
+    if (value.markers != null && (!Array.isArray(value.markers) ||
+        value.markers.some(marker => !marker || typeof marker.name !== "string" || !Number.isFinite(marker.time))))
+      throw new Error("This project file has invalid markers.");
+    if (value.captions != null && (!Array.isArray(value.captions) ||
+        value.captions.some(cue => !cue || typeof cue.text !== "string" || !Number.isFinite(cue.start) || !Number.isFinite(cue.duration))))
+      throw new Error("This project file has invalid captions.");
+    for (const field of ["premiereSequences", "compatibilityWarnings"]) {
+      const entries = value[field];
+      if (entries != null && (!Array.isArray(entries) || entries.some(entry => typeof entry !== "string")))
+        throw new Error("This project file has invalid Premiere metadata.");
+    }
     const mediaIds = new Set();
     for (const item of value.media) {
       if (
@@ -1054,6 +1069,8 @@
         mediaIds.has(item.id)
       )
         throw new Error("This project file has invalid media.");
+      if (Number.isInteger(item.nestedSequence) && item.nestedProject != null)
+        validateProject(item.nestedProject, depth + 1);
       mediaIds.add(item.id);
     }
     const clipIds = new Set();
@@ -1074,6 +1091,13 @@
         || (clip.linkGroup !== undefined && (typeof clip.linkGroup !== "string" || clip.linkGroup.length > 128))
       )
         throw new Error("This project file has an invalid clip.");
+      if (clip.type === "title" && clip.title != null && typeof clip.title !== "string")
+        throw new Error("A title in this project has invalid text.");
+      if (clip.keyframes != null && (typeof clip.keyframes !== "object" || Array.isArray(clip.keyframes) ||
+          Object.values(clip.keyframes).some(points => !Array.isArray(points) ||
+            points.some(point => !point || !Number.isFinite(point.time) || !Number.isFinite(point.value)))))
+        throw new Error("This project file has invalid keyframes.");
+      if (clip.color?.lut) window.SpliceLUT.validate(clip.color.lut);
       clipIds.add(clip.id);
     }
   }

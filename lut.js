@@ -29,16 +29,23 @@
     if (!size || rows.length !== size**3*3) throw new Error('The LUT sample count does not match its size.');
     return {size,data:rows,domainMin,domainMax,title:String(title).slice(0,120)};
   }
-  function applyImageData(imageData,lut,intensity=100) {
+  function validate(lut) {
     const {size,data,domainMin=[0,0,0],domainMax=[1,1,1]}=lut;
     if (!Number.isInteger(size)||size<2||size>MAX_SIZE||!Array.isArray(data)||data.length!==size**3*3) throw new Error('Invalid project LUT.');
+    for (let channel=0;channel<3;channel++) {
+      const min=domainMin?.[channel],max=domainMax?.[channel];
+      if (!Number.isFinite(min)||!Number.isFinite(max)||min>=max) throw new Error('Invalid project LUT domain.');
+    }
+  }
+  function applyImageData(imageData,lut,intensity=100) {
+    validate(lut);
+    const {size,data,domainMin=[0,0,0],domainMax=[1,1,1]}=lut;
     const pixels=imageData.data, mix=Math.max(0,Math.min(1,Number(intensity)/100));
     if (mix===0) return imageData;
     const low=[],high=[],fraction=[];
     for(let channel=0;channel<3;channel++) {
       const lo=new Uint8Array(256),hi=new Uint8Array(256),weight=new Float32Array(256);
       const min=domainMin[channel],max=domainMax[channel];
-      if (!Number.isFinite(min)||!Number.isFinite(max)||min>=max) throw new Error('Invalid project LUT domain.');
       for(let value=0;value<256;value++) {
         const position=Math.max(0,Math.min(size-1,(value/255-min)/(max-min)*(size-1)));
         lo[value]=Math.floor(position);hi[value]=Math.min(size-1,lo[value]+1);weight[value]=position-lo[value];
@@ -68,5 +75,5 @@
     }
     return imageData;
   }
-  window.SpliceLUT={parseCube,applyImageData};
+  window.SpliceLUT={parseCube,validate,applyImageData};
 })();
