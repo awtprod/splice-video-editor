@@ -321,24 +321,28 @@ def _audio_transition_gain(clip, expression):
 
 def _run_controlled(command, cancelled, timeout):
     import time
-    process=subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, creationflags=HIDE_CONSOLE)
-    try:
-        deadline=time.monotonic()+timeout
-        while process.poll() is None:
-            if cancelled and cancelled.is_set():
-                process.terminate()
-                raise InterruptedError('Export cancelled')
-            if time.monotonic()>deadline:
+    # FFmpeg can fill a Windows stderr pipe before it exits. Keep the child
+    # writable while polling it and read only the diagnostic tail on failure.
+    with tempfile.TemporaryFile() as stderr:
+        process=subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=stderr, creationflags=HIDE_CONSOLE)
+        try:
+            deadline=time.monotonic()+timeout
+            while process.poll() is None:
+                if cancelled and cancelled.is_set():
+                    process.terminate()
+                    raise InterruptedError('Export cancelled')
+                if time.monotonic()>deadline:
+                    process.kill()
+                    raise TimeoutError('Export timed out')
+                time.sleep(.2)
+            if process.returncode:
+                size=stderr.seek(0,2)
+                stderr.seek(max(0,size-1500))
+                raise ValueError('FFmpeg render failed: '+stderr.read(1500).decode('utf-8','replace'))
+        finally:
+            if process.poll() is None:
                 process.kill()
-                raise TimeoutError('Export timed out')
-            time.sleep(.2)
-        error=process.stderr.read().decode('utf-8','replace')
-        if process.returncode: raise ValueError('FFmpeg render failed: '+error[-1500:])
-    finally:
-        if process.poll() is None:
-            process.kill()
-        process.wait()
-        process.stderr.close()
+            process.wait()
 
 
 def _horizontal_position(clip, width, overlay_width, clock):
