@@ -8,6 +8,7 @@ import sys
 import tempfile
 from pathlib import Path, PureWindowsPath
 from urllib.parse import urlparse, unquote, quote
+from splice_platform import data_directory
 
 sys.path.insert(0, str(Path(__file__).parent / 'vendor'))
 import py_premiere
@@ -27,7 +28,7 @@ AUDIO_CROSSFADE_NAMES = {AUDIO_CROSSFADE,'Constant Power'}
 
 STILL_IMAGES = frozenset({".png", ".bmp", ".jpg", ".jpeg"})
 ROOT = Path(__file__).resolve().parent
-MEDIA_ROOT = Path.home() / '.local' / 'share' / 'splice' / 'media'
+MEDIA_ROOT = data_directory() / 'media'
 
 
 def _media_path(src):
@@ -52,7 +53,7 @@ def _playback_url(path):
     resolved = path.resolve()
     for prefix, base in (('/assets/', ROOT / 'assets'), ('/media/', MEDIA_ROOT)):
         if resolved.is_relative_to(base) and resolved.is_file():
-            return prefix + quote(str(resolved.relative_to(base)))
+            return prefix + quote(resolved.relative_to(base).as_posix())
     return ''
 
 
@@ -247,10 +248,10 @@ def open_project(data, index=0, _seen=()):
         raise ValueError('Premiere sequence nesting cycle is unsupported')
     if len(_seen) >= 4:
         raise ValueError('Premiere sequence nesting exceeds four levels')
-    with tempfile.NamedTemporaryFile(suffix='.prproj') as source:
-        source.write(data)
-        source.flush()
-        project = py_premiere.parse(source.name).project
+    with tempfile.TemporaryDirectory(prefix='splice-open-') as directory:
+        source = Path(directory) / 'source.prproj'
+        source.write_bytes(data)
+        project = py_premiere.parse(source).project
         if not isinstance(index, int) or index < 0 or (project.sequences and index >= len(project.sequences)):
             raise ValueError('Choose a sequence in this Premiere project')
         if not project.sequences:
@@ -490,10 +491,10 @@ def save_project(data):
     if original:
         raw = base64.b64decode(original, validate=True)
         _check_size(raw)
-        with tempfile.NamedTemporaryFile(suffix='.prproj') as source:
-            source.write(raw)
-            source.flush()
-            app = py_premiere.parse(source.name)
+        with tempfile.TemporaryDirectory(prefix='splice-handoff-') as directory:
+            source = Path(directory) / 'source.prproj'
+            source.write_bytes(raw)
+            app = py_premiere.parse(source)
     else:
         app = py_premiere.new()
     project = app.project
@@ -622,7 +623,7 @@ def save_project(data):
         folder.mkdir(parents=True, exist_ok=True)
         source_path = folder / (hashlib.sha256(content.encode('utf-8')).hexdigest() + '.srt')
         if not source_path.exists():
-            source_path.write_text(content)
+            source_path.write_text(content, encoding='utf-8')
         imported = project.import_files([source_path])[0]
         caption_track = sequence.create_caption_track(imported)
         for item, caption in zip(sorted(new_captions, key=lambda value: float(value.get('start', 0))), caption_track.captions):

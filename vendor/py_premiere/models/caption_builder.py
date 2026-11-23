@@ -31,7 +31,7 @@ from ..data.caption_template import (
     TEMPLATE_STYLE,
 )
 from ..xml.mutations import remove_child
-from .media_import import _BMP_IMPLEMENTATION_ID, _MEDIA_CLASS_ID, _leaf, _top
+from .media_import import _BMP_IMPLEMENTATION_ID, _MEDIA_CLASS_ID, _leaf, _relative_media_path, _top
 from .time import TICKS_PER_SECOND
 
 if TYPE_CHECKING:
@@ -195,7 +195,7 @@ def new_data_media(
     )
     state.text = blob + "\n\t\t"
     state.tail = "\n\t\t"
-    _leaf(element, "RelativePath", os.path.relpath(file_path, project_dir), "\n\t\t")
+    _leaf(element, "RelativePath", _relative_media_path(file_path, project_dir), "\n\t\t")
     _leaf(element, "FilePath", file_path, "\n\t\t")
     _leaf(element, "ImplementationID", _BMP_IMPLEMENTATION_ID, "\n\t\t")
     _leaf(element, "Title", os.path.basename(file_path), "\n\t\t")

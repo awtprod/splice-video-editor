@@ -18,13 +18,12 @@ from __future__ import annotations
 
 import base64
 import json
-import os
 import uuid
 import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
 
-from .media_import import TIMECODE_FORMATS, _leaf, _top
+from .media_import import TIMECODE_FORMATS, _leaf, _relative_media_path, _top
 from .time import TICKS_PER_SECOND
 
 _MEDIA_CLASS_ID = "7a5c103e-f3ac-4391-b6b4-7cc3d2f9a7ff"
@@ -391,7 +390,7 @@ def build_mgt_media(
     _leaf(
         element,
         "RelativePath",
-        os.path.relpath(file_path, project_dir),
+        _relative_media_path(file_path, project_dir),
         "\n\t\t",
     )
     _leaf(element, "TimeDisplay", str(template.time_display), "\n\t\t")

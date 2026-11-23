@@ -1,4 +1,4 @@
-"""Loopback server for the Linux editing workspace."""
+"""Loopback server for the Splice editing workspace."""
 import argparse
 import os
 import re
@@ -179,9 +179,9 @@ class Handler(BaseHTTPRequestHandler):
                 if shutil.disk_usage(MEDIA_ROOT).free < length + 512 * 1024 ** 2:
                     raise ValueError('There is insufficient local space to import this file')
                 digest = hashlib.sha256()
-                with tempfile.NamedTemporaryFile(dir=MEDIA_ROOT, delete=False) as sink:
-                    temporary = Path(sink.name)
-                    try:
+                with tempfile.TemporaryDirectory(dir=MEDIA_ROOT, prefix='.import-') as staging:
+                    temporary = Path(staging) / 'upload'
+                    with temporary.open('wb') as sink:
                         remaining = length
                         while remaining:
                             chunk = self.rfile.read(min(1024 * 1024, remaining))
@@ -190,16 +190,13 @@ class Handler(BaseHTTPRequestHandler):
                             digest.update(chunk)
                             sink.write(chunk)
                             remaining -= len(chunk)
-                        sink.flush()
-                        directory = MEDIA_ROOT / digest.hexdigest()[:32]
-                        directory.mkdir(mode=0o700, exist_ok=True)
-                        destination = directory / name
-                        try:
-                            os.link(temporary, destination)
-                        except FileExistsError:
-                            pass  # Identical bytes and filename already imported.
-                    finally:
-                        temporary.unlink(missing_ok=True)
+                    directory = MEDIA_ROOT / digest.hexdigest()[:32]
+                    directory.mkdir(mode=0o700, exist_ok=True)
+                    destination = directory / name
+                    try:
+                        os.link(temporary, destination)
+                    except FileExistsError:
+                        pass  # Identical bytes and filename already imported.
                 self._json(200, {'src':'/media/' + directory.name + '/' + quote(name,safe=''),
                                  'path':str(destination)})
                 return

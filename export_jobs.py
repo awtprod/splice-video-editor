@@ -3,6 +3,7 @@ import multiprocessing
 import os
 from pathlib import Path
 import signal
+import subprocess
 import tempfile
 import threading
 import time
@@ -16,8 +17,9 @@ FORMATS = {'h264':('mp4','video/mp4',True), 'prores':('mov','video/quicktime',Fa
 
 def _worker(project, options, output, progress, cancelled, connection):
     # A cancelled render must stop its FFmpeg children as well as Python.
-    os.setsid()
-    connection.send(('ready', None))
+    if os.name != 'nt':
+        os.setsid()
+    connection.send(('ready', os.name != 'nt'))
     try:
         from render_movie import render_to_file
 
@@ -85,7 +87,7 @@ class ExportJobs:
                     except EOFError:
                         break
                     if kind == 'ready':
-                        grouped = True
+                        grouped = message
                     elif kind == 'done':
                         done = True
                         job['warnings'] = message or []
@@ -95,7 +97,19 @@ class ExportJobs:
                     if not job['cancelled'].is_set():
                         error = 'Export exceeded its time limit'
                     try:
-                        if grouped:
+                        if os.name == 'nt':
+                            # Let the renderer terminate FFmpeg first. If it is
+                            # blocked in a probe, stop this exact process tree.
+                            if job['cancelled'].is_set():
+                                process.join(.6)
+                            if process.is_alive():
+                                taskkill = Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32' / 'taskkill.exe'
+                                try:
+                                    subprocess.run([str(taskkill), '/PID', str(process.pid), '/T', '/F'],
+                                                   capture_output=True, timeout=4, check=True)
+                                except (OSError, subprocess.SubprocessError):
+                                    process.kill()
+                        elif grouped:
                             os.killpg(process.pid, signal.SIGKILL)
                         else:
                             process.kill()
@@ -104,6 +118,11 @@ class ExportJobs:
                     break
                 if not process.is_alive() and not reader.poll():
                     break
+        except BrokenPipeError:
+            # Windows can report a closed worker pipe while polling. The
+            # exit code and completion message still determine the outcome.
+            if not done and not error and not job['cancelled'].is_set():
+                error = 'Export stopped before completion'
         finally:
             reader.close()
             process.join()
@@ -120,7 +139,10 @@ class ExportJobs:
     def reap(self):
         for identifier, job in list(self.jobs.items()):
             if job['finished'] and time.monotonic() - job['finished'] > 3600:
-                job['directory'].cleanup()
+                try:
+                    job['directory'].cleanup()
+                except PermissionError:
+                    continue  # Windows still has this export open for streaming.
                 del self.jobs[identifier]
 
     def status(self, identifier, cancel=False):
@@ -141,7 +163,6 @@ class ExportJobs:
             job = self.jobs[identifier]
             if job['state'] != 'complete':
                 raise ValueError('Export is not ready')
-            # Linux keeps an open file readable when its directory is reaped.
             return job['output'].open('rb')
 
     def shutdown(self):

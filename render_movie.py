@@ -10,6 +10,7 @@ from pathlib import Path
 
 from premiere import MEDIA_ROOT, STILL_IMAGES, _media_path
 from media_proxy import AVC_REC709, HDR_LINEAR_REC709, HDR_TONE_MAP, HDR_TRANSFERS, HDR_TO_REC709, REC709, tempo_filters
+from splice_platform import font_roots, installed_font
 
 
 PQ = ('bt2020','smpte2084','bt2020nc')
@@ -67,15 +68,30 @@ def _font_path(family):
         raise ValueError('Invalid title typeface')
     if family in bundled:
         return Path(__file__).resolve().parent/'assets'/'fonts'/bundled[family]
-    match=subprocess.run(['fc-match','-f','%{family}|%{file}',family],capture_output=True,text=True,timeout=5,check=True).stdout
-    resolved_family,separator,path=match.partition('|')
-    resolved=Path(path).resolve()
-    if not separator or not resolved.is_file() or not resolved.is_relative_to('/usr/share/fonts'):
-        raise ValueError('Unable to resolve title typeface')
+    candidate=installed_font(family)
+    if candidate:
+        return candidate[1]
+    from shutil import which
+    resolved_family, resolved = 'DM Sans', Path(__file__).resolve().parent/'assets'/'fonts'/'dm-sans.ttf'
+    fontconfig = which('fc-match')
+    if fontconfig:
+        match=subprocess.run([fontconfig,'-f','%{family}|%{file}',family],capture_output=True,text=True,timeout=5,check=True).stdout
+        name,separator,path=match.partition('|')
+        if separator:
+            path=Path(path).resolve()
+            if path.is_file() and any(path.is_relative_to(root.resolve()) for root in font_roots()):
+                resolved_family,resolved=name,path
     if family.casefold() not in resolved_family.casefold():
         import warnings
         warnings.warn(f'Title font {family!r} is unavailable; using {resolved_family!r}',stacklevel=2)
     return resolved
+
+
+def _filter_path(path):
+    # FFmpeg parses option values, then the filter graph itself.
+    value=path.as_posix()
+    option=''.join('\\'+char if char in "\\':" else char for char in value)
+    return ''.join('\\'+char if char in "\\'[],;" else char for char in option)
 
 
 def _grade_values(color):
@@ -244,7 +260,7 @@ def _lut_filter(color, destination, *, preserve_headroom=False):
     custom_domain = domain_min != [0,0,0] or domain_max != [1,1,1]
     mix_after_lookup = custom_domain or preserve_headroom
     destination.write_text(cube_text(lut,100 if mix_after_lookup else intensity,normalized_domain=custom_domain))
-    apply_lut = f'lut3d=file={destination}:interp=trilinear'
+    apply_lut = f'lut3d=file={_filter_path(destination)}:interp=trilinear'
     if not mix_after_lookup:
         return ','+apply_lut
     # Apply the input offset and scale explicitly. FFmpeg's .cube reader
@@ -489,7 +505,7 @@ def _draw_title(filters, active, number, clip, height, fps, directory, hdr_profi
         offset = (row - (len(lines) - 1) / 2) * fontsize * 1.2
         label = f'title{number}line{row}'
         filters.append(
-            f'[{active}]drawtext=fontfile={font_path}:textfile={text_file}:expansion=none:'
+            f'[{active}]drawtext=fontfile={_filter_path(font_path)}:textfile={_filter_path(text_file)}:expansion=none:'
             f'fontsize={fontsize}:fontcolor=0x{fill}:borderw={border}:bordercolor=0x{outline}:'
             f'shadowcolor=black:shadowx=3:shadowy=3:x={xpos}:y=h*{y:.5f}+({offset:.3f})-text_h/2:'
             f"alpha='({alpha})/100':"
@@ -1031,7 +1047,7 @@ def _render_prepared(project, output_path, *, options=None, progress=None, cance
             segments.append(target)
             if progress: progress((index+1)/len(windows)*.95)
         manifest=Path(directory)/'segments.txt'
-        manifest.write_text(''.join(f"file '{segment}'\n" for segment in segments))
+        manifest.write_text(''.join(f"file '{segment.name}'\n" for segment in segments),encoding='utf-8')
         video=Path(directory)/f'video{suffix}'
         command=['ffmpeg','-nostdin','-hide_banner','-loglevel','error','-y','-f','concat','-safe','0','-i',str(manifest),'-an','-c:v','copy',str(video)]
         _run_controlled(command,cancelled,120)
@@ -1044,7 +1060,7 @@ def _render_prepared(project, output_path, *, options=None, progress=None, cance
         command=['ffmpeg','-nostdin','-hide_banner','-loglevel','error','-y','-i',str(video),'-i',str(audio)]
         if validated_captions and (options or {}).get('captions',True):
             subtitle=Path(directory)/'captions.srt'
-            subtitle.write_text(''.join(f'{index}\n{srt_time(start)} --> {srt_time(end)}\n{text.replace(chr(13)," ").replace("-->","→").strip()}\n\n' for index,(start,end,text) in enumerate(validated_captions,1)))
+            subtitle.write_text(''.join(f'{index}\n{srt_time(start)} --> {srt_time(end)}\n{text.replace(chr(13)," ").replace("-->","→").strip()}\n\n' for index,(start,end,text) in enumerate(validated_captions,1)),encoding='utf-8')
             command.extend(['-i',str(subtitle)])
         command.extend(['-map','0:v:0','-map','1:a:0'])
         if validated_captions and (options or {}).get('captions',True): command.extend(['-map','2:s:0'])

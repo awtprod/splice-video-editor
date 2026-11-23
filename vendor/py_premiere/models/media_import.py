@@ -29,6 +29,14 @@ from typing import TYPE_CHECKING, NamedTuple
 if TYPE_CHECKING:
     from typing import Iterator
 
+
+def _relative_media_path(file_path, project_dir):
+    try:
+        return os.path.relpath(file_path, project_dir)
+    except ValueError:
+        # Windows cannot form a relative path between drives.
+        return os.path.abspath(file_path)
+
 _ITEM_CLASS_ID = "cb4e0ed7-aca1-4171-8525-e3658dec06dd"
 _MASTER_CLASS_ID = "fb11c33a-b0a9-4465-aa94-b6d5db2628cf"
 _LOGGING_CLASS_ID = "77ab7fdd-dcdf-465d-9906-7a330ca1e738"
@@ -1302,7 +1310,7 @@ def new_movie_media(
     _leaf(
         element,
         "RelativePath",
-        os.path.relpath(file_path, project_dir),
+        _relative_media_path(file_path, project_dir),
         "\n\t\t",
     )
     _leaf(element, "FilePath", file_path, "\n\t\t")
@@ -1393,7 +1401,7 @@ def new_audio_media(
     _leaf(
         element,
         "RelativePath",
-        os.path.relpath(file_path, project_dir),
+        _relative_media_path(file_path, project_dir),
         "\n\t\t",
     )
     _leaf(element, "FilePath", file_path, "\n\t\t")
@@ -1526,7 +1534,7 @@ def new_media(
     _leaf(
         element,
         "RelativePath",
-        os.path.relpath(file_path, project_dir),
+        _relative_media_path(file_path, project_dir),
         "\n\t\t",
     )
     _leaf(element, "FilePath", file_path, "\n\t\t")

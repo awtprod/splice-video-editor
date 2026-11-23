@@ -1,0 +1,28 @@
+#!/bin/sh
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+app_dir=$(CDPATH= cd -- "$(dirname -- "$0")/../Resources" && pwd) || exit 1
+
+failure() {
+    printf '%s\n' "$1" >&2
+    if ! [ -t 2 ]; then
+        /usr/bin/osascript - "$1" <<'APPLESCRIPT'
+on run argv
+    display alert "Splice could not start" message (item 1 of argv)
+end run
+APPLESCRIPT
+    fi
+    exit 1
+}
+
+python=$(command -v python3)
+if ! [ -n "$python" ] || ! "$python" -c 'import sys; sys.exit(sys.version_info < (3, 10))' 2>/dev/null; then
+    failure "Install Python 3.10 or newer with Homebrew or from python.org, then reopen Splice."
+fi
+if [ -t 2 ] || [ "${SPLICE_NO_DIALOG:-}" = 1 ]; then
+    exec "$python" -B "$app_dir/splice_app.py" "$@"
+fi
+
+log=$(mktemp -t splice-launch) || exit 1
+trap 'rm -f "$log"' EXIT
+"$python" -B "$app_dir/splice_app.py" "$@" >"$log" 2>&1 ||
+    failure "$(tail -8 "$log")"

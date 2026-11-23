@@ -181,7 +181,8 @@ def proxy(src, seek_optimized=False, audio_stream=None, grading_data=False):
             directory.mkdir(mode=0o700, parents=True, exist_ok=True)
             if shutil.disk_usage(directory).free < 512 * 1024**2 + info['duration'] * (525000 if video else 24000):
                 raise ValueError('Insufficient free space for an edit proxy')
-            with tempfile.NamedTemporaryFile(dir=directory,suffix=target.suffix) as out:
+            with tempfile.TemporaryDirectory(dir=directory,prefix='.proxy-') as staging:
+                out = Path(staging) / target.name
                 cmd = ['ffmpeg','-nostdin','-v','error','-y','-threads','2','-filter_threads','1','-filter_complex_threads','2','-protocol_whitelist','file']
                 if info['still']:
                     cmd += ['-f','image2','-loop','1','-framerate','25']
@@ -209,11 +210,11 @@ def proxy(src, seek_optimized=False, audio_stream=None, grading_data=False):
                     cmd += ['-an']
                 else:
                     cmd += audio_map + ['-c:a','aac','-b:a','160k','-ac',str(min(2,max(1,info['audioChannels']))),'-movflags','+faststart']
-                cmd.append(out.name)
+                cmd.append(str(out))
                 completed = subprocess.run(cmd,capture_output=True,timeout=min(3600,max(60,info['duration']*3)))
                 if completed.returncode:
                     raise ValueError('Proxy creation failed for '+original.name+': '+completed.stderr.decode(errors='replace')[-400:])
-                os.link(out.name,target)
+                os.link(out,target)
             return _playback_url(target)
     finally:
         _encoders.release()
@@ -240,14 +241,15 @@ def premiere_audio(src, audio_stream=None):
             filters = (stereo_mix_filters(sources,'mixed',[info['audioStreamChannels'][i] for i in chosen],duration)
                        if len(chosen)>1 else [sources[0]+'[mixed]'])
             filters.append(f'[mixed]apad=whole_dur={duration:.9f}[audio]')
-            with tempfile.NamedTemporaryFile(dir=target.parent,suffix='.wav') as output:
+            with tempfile.TemporaryDirectory(dir=target.parent,prefix='.audio-') as staging:
+                output = Path(staging) / target.name
                 cmd=['ffmpeg','-nostdin','-v','error','-y','-threads','2','-filter_complex_threads','2',
                      '-protocol_whitelist','file','-i',str(original),'-filter_complex',';'.join(filters),
-                     '-map','[audio]','-c:a','pcm_s24le','-t',str(duration),output.name]
+                     '-map','[audio]','-c:a','pcm_s24le','-t',str(duration),str(output)]
                 result=subprocess.run(cmd,capture_output=True,timeout=min(3600,max(60,duration*3)))
                 if result.returncode:
                     raise ValueError('Could not write Premiere audio: '+result.stderr.decode(errors='replace')[-400:])
-                os.link(output.name,target)
+                os.link(output,target)
             return target
     finally:
         _encoders.release()
@@ -294,9 +296,10 @@ def nested_preview(project):
             ratio=min(1,1280/width,720/height)
             prepared={**project,'width':max(16,2*round(width*ratio/2)),'height':max(16,2*round(height*ratio/2))}
             directory.mkdir(mode=0o700,parents=True,exist_ok=True)
-            with tempfile.NamedTemporaryFile(dir=directory,suffix='.mp4') as output:
-                render_to_file(prepared,output.name,options={'codec':'h264','crf':19})
-                os.link(output.name,target)
+            with tempfile.TemporaryDirectory(dir=directory,prefix='.nested-') as staging:
+                output = Path(staging) / target.name
+                render_to_file(prepared,output,options={'codec':'h264','crf':19})
+                os.link(output,target)
             return _playback_url(target)
     finally:
         _encoders.release()

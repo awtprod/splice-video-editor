@@ -1,16 +1,20 @@
 # Splice
 
-Splice is a local video editor for Linux. It opens with **Alpine Passage**, a 32-second sequence with four moving landscape shots, an opening title, dissolves, and an ambient score.
+Splice is a local video editor for Linux, Windows, and macOS. It opens with **Alpine Passage**, a 32-second sequence with four moving landscape shots, an opening title, dissolves, and an ambient score.
 
 ## Launch
 
-Use Python 3.10 or newer, Chromium or Google Chrome, and FFmpeg with ffprobe, H.264, AAC, and the drawtext filter. HDR-to-SDR conversion uses FFmpeg's zscale and tonemap filters. Extract the entire Linux archive and run this command inside its Splice directory.
+Use [Python 3.10 or newer](https://www.python.org/downloads/), Chromium, Google Chrome, or Microsoft Edge, and [FFmpeg](https://ffmpeg.org/download.html) with ffprobe, H.264, AAC, and the drawtext filter. HDR-to-SDR conversion uses FFmpeg's zscale and tonemap filters. Keep the whole extracted application together.
+
+- **Windows:** Extract `Splice-Windows.zip` and double-click `Splice.cmd` inside the Splice folder. Install Python with the launcher or add Python to PATH. Add the directory containing `ffmpeg.exe` and `ffprobe.exe` to PATH.
+- **macOS:** Extract `Splice-macOS.zip` and open `Splice.app`. The app detects Homebrew Python and FFmpeg in `/opt/homebrew/bin` or `/usr/local/bin`. This portable build is unsigned.
+- **Linux:** Run the command below from the extracted Splice directory.
 
 ```sh
 ./splice
 ```
 
-The launcher opens a dedicated application window and stops its loopback server when the window closes. All fonts, sample media, and project-format code are included. To use a regular browser, run `python3 server.py` and open the local address it prints. The desktop and browser modes have separate browser storage.
+The launcher opens a dedicated application window and stops its loopback server when the window closes. Bundled fonts, sample media, and project-format code are included. To use a regular browser, run `python3 server.py` (`py -3 server.py` on Windows) and open the local address it prints. The desktop and browser modes have separate browser storage.
 
 ## Edit
 
@@ -38,4 +42,6 @@ DM Sans and IBM Plex Mono are distributed under the SIL Open Font License. Licen
 
 ## Verify locally
 
-From the extracted application directory, run the Python suite with `python3 -m unittest discover -s tests`. For the two-pass browser and render verification, install Node 20 or later and run `npm ci && npm test`. Set `SPLICE_CHROME` if Chromium is installed outside the standard paths. The test uses an isolated local media store, imports real footage, trims a clip, styles a title, reloads the session, saves and reopens a native project, and checks the exported video and audio streams. It also tests linked edits, locks, folder and camera-original relinking, short-source rejection, and recovery after both a Chromium renderer crash and a full browser and server restart during a save.
+From a source checkout, run the Python suite with `python3 -m unittest discover -s tests`. To run the full browser and render suite on Linux, install Node 20 or later and run `npm ci && npm test`. Set `SPLICE_CHROME` if Chromium is installed outside the standard paths. The suite imports media, edits a sequence, saves and reopens a native project, checks exported streams, and verifies recovery after browser and server crashes.
+
+Run `python3 package_desktop.py artifacts` from a source checkout to build the Windows and macOS archives.
