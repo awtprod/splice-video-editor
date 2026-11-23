@@ -1009,6 +1009,21 @@
     anchor.click();
     setTimeout(() => URL.revokeObjectURL(url), 60000);
   }
+  function validateTrackMix(key, mix) {
+    // Premiere and working projects can have different track layouts.
+    // Keep settings for empty working tracks within the editor's track limit.
+    const track=Number(key);
+    if (!Number.isInteger(track) || String(track)!==key || !track || Math.abs(track)>64)
+      throw new Error("This project file has an invalid audio mixer track.");
+    if (!mix || typeof mix !== "object" || Array.isArray(mix) ||
+        (mix.gain !== undefined && !Number.isFinite(mix.gain)) ||
+        (mix.pan !== undefined && !Number.isFinite(mix.pan)) ||
+        (mix.mute !== undefined && typeof mix.mute !== "boolean") ||
+        (mix.solo !== undefined && typeof mix.solo !== "boolean"))
+      throw new Error("This project file has invalid audio mixer settings.");
+    if (mix.gain < 0 || mix.gain > 200) throw new Error("Track gain must be between 0% and 200%.");
+    if (mix.pan < -100 || mix.pan > 100) throw new Error("Track pan must be between -100 and 100.");
+  }
   function validateProject(value, depth = 0) {
     if (depth >= 4) throw new Error("This project nests sequences more than four levels deep.");
     if (
@@ -1045,14 +1060,7 @@
     if (value.trackMix != null) {
       if (typeof value.trackMix !== "object" || Array.isArray(value.trackMix))
         throw new Error("This project file has invalid audio mixer settings.");
-      for (const mix of Object.values(value.trackMix)) {
-        if (!mix || typeof mix !== "object" || Array.isArray(mix) ||
-            (mix.gain !== undefined && !Number.isFinite(mix.gain)) ||
-            (mix.pan !== undefined && !Number.isFinite(mix.pan)) ||
-            (mix.mute !== undefined && typeof mix.mute !== "boolean") ||
-            (mix.solo !== undefined && typeof mix.solo !== "boolean"))
-          throw new Error("This project file has invalid audio mixer settings.");
-      }
+      for (const [key,mix] of Object.entries(value.trackMix)) validateTrackMix(key,mix);
     }
     if (value.markers != null && (!Array.isArray(value.markers) ||
         value.markers.some(marker => !marker || typeof marker.name !== "string" || !Number.isFinite(marker.time))))
@@ -1162,6 +1170,7 @@
     updateTrackMix(track, patch) {
       const key=String(track);
       const next={ gain:100, pan:0, mute:false, solo:false, ...project.trackMix?.[key], ...patch };
+      validateTrackMix(key,next);
       if (JSON.stringify(next)===JSON.stringify(project.trackMix?.[key])) return;
       snapshot();
       project.trackMix ||= {};

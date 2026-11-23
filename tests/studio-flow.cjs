@@ -168,13 +168,21 @@ async function main() {
         await waitState(()=>document.querySelector('.toast')?.textContent==='Invalid 3D LUT sample.');
         assert.equal(await saveButton.isEnabled(),true);
         assert.equal(await page.evaluate(()=>Editor.get().project.name),name);
-        const badMix={...malformed,name:'Malformed mixer',clips:[],trackMix:{'-1':{gain:'loud',pan:'x',mute:'no'}}};
-        await page.locator('#project-input').setInputFiles({
-          name:'malformed-mixer.splice.json',mimeType:'application/json',buffer:Buffer.from(JSON.stringify(badMix)),
-        });
-        await waitState(()=>document.querySelector('.toast')?.textContent==='This project file has invalid audio mixer settings.');
-        assert.equal(await saveButton.isEnabled(),true);
-        assert.equal(await page.evaluate(()=>Editor.get().project.name),name);
+        const badMixes=[
+          [{'-1':{gain:'loud',pan:'x',mute:'no'}},'This project file has invalid audio mixer settings.'],
+          [{'-1':{gain:500}},'Track gain must be between 0% and 200%.'],
+          [{'-1':{pan:1000}},'Track pan must be between -100 and 100.'],
+          [{'-99':{gain:80}},'This project file has an invalid audio mixer track.'],
+        ];
+        for(const [trackMix,message] of badMixes){
+          const badMix={...malformed,name:'Malformed mixer',clips:[],trackMix};
+          await page.locator('#project-input').setInputFiles({
+            name:'malformed-mixer.splice.json',mimeType:'application/json',buffer:Buffer.from(JSON.stringify(badMix)),
+          });
+          await waitState(message=>document.querySelector('.toast')?.textContent===message,message);
+          assert.equal(await saveButton.isEnabled(),true);
+          assert.equal(await page.evaluate(()=>Editor.get().project.name),name);
+        }
         await page.reload();await page.evaluate(()=>SpliceSession.ready);
         assert.equal(await page.evaluate(()=>Editor.get().project.clips.find(c=>c.type==='title').title),'Opening '+pass);
         await click('#export-video'); await click('.studio-dialog [type=submit]');
