@@ -219,8 +219,12 @@
     const {project,duration,selectedId}=state;
     const highestVideo = Math.max(1, ...project.clips.filter(c=>c.type==="video").map(c=>c.track));
     const lowestAudio = Math.min(-1, ...project.clips.filter(c=>c.type==="audio").map(c=>c.track));
-    const visibleLanes=[{kind:'title',track:4,name:'Titles'},
-      ...Array.from({length:Math.min(64,Math.max(2,project.trackCounts?.video||3,highestVideo+1))},(_,n)=>({kind:'video',track:n+1,name:'Video '+(n+1)})).reverse(),
+    const defaultTitle=editor.titleTrack();
+    const titleTracks=new Set([defaultTitle,...project.clips.filter(c=>c.type==='title').map(c=>c.track)]);
+    const pictureLanes=[...Array.from(titleTracks,track=>({kind:'title',track,name:track===defaultTitle?'Titles':'Titles · V'+track})),
+      ...Array.from({length:Math.min(64,Math.max(2,project.trackCounts?.video||3,highestVideo+1))},(_,n)=>({kind:'video',track:n+1,name:'Video '+(n+1)}))];
+    pictureLanes.sort((a,b)=>b.track-a.track);
+    const visibleLanes=[...pictureLanes,
       ...Array.from({length:Math.min(64,Math.max(2,project.trackCounts?.audio||3,-lowestAudio+1))},(_,n)=>({kind:'audio',track:-n-1,name:'Audio '+(n+1)}))];
     const scroll=$("track-scroll"), screen=Math.max(300,scroll.clientWidth);
     const width=Math.max(screen,px(Math.max(38,duration+4)));
@@ -251,7 +255,7 @@
       surface.dataset.track=lane.track;surface.dataset.kind=lane.kind;
       surface.classList.toggle('is-locked', editor.isTrackLocked(lane.track,lane.kind));
       lanes.append(surface);
-      for(const clip of project.clips.filter(c=>(c.track===lane.track || lane.kind==="title") && c.type===lane.kind && visible(c.start,c.start+c.duration))){
+      for(const clip of project.clips.filter(c=>c.track===lane.track && c.type===lane.kind && visible(c.start,c.start+c.duration))){
         const media=mediaFor(project,clip),node=document.createElement("button");
         node.className="timeline-clip "+lane.kind+(clip.id===selectedId?" selected":"")+(group.has(clip.id)?" group-selected":"");
         node.style.left=px(clip.start)+"px";node.style.width=Math.max(22,px(clip.duration)-2)+"px";

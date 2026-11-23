@@ -134,6 +134,10 @@ class MovieDelivery(unittest.TestCase):
                                                                  'range':{'start':.8,'end':1.2}})
             video = next(stream for stream in self.streams() if stream['codec_type']=='video')
             self.assertEqual((video['nb_frames'],video['color_transfer'],video['pix_fmt']),('10','bt709','yuv422p10le'))
+            render_to_file(self.project,self.destination,options={'codec':'prores','colorSpace':'pq',
+                                                                 'range':{'start':.8,'end':1.2}})
+            video = next(stream for stream in self.streams() if stream['codec_type']=='video')
+            self.assertEqual((video['nb_frames'],video['color_transfer'],video['pix_fmt']),('10','smpte2084','yuv422p10le'))
 
     def test_slow_audio_preview_keeps_pitch_and_samples_across_windows(self):
         from media_proxy import audition_audio

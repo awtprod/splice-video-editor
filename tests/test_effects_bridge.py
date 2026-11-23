@@ -42,6 +42,20 @@ class ExtendedEffectsRoundTrip(unittest.TestCase):
             self.assertEqual((style['color'],style['strokeColor'],style['strokeWidth']),
                              ('#e43522','#1546dd',3))
 
+    def test_multiline_paragraph_alignment_roundtrip(self):
+        project = {'name':'Align', 'fps':25, 'media':[], 'clips':[{
+            'type':'title','track':4,'title':'Wide first line\nShort','start':0,'duration':2,
+            'titleStyle':{'align':'right','x':72,'y':60,'color':'#e43522'},
+        }]}
+        for align in ('right','left','center','right'):
+            project['clips'][0]['titleStyle']['align'] = align
+            project = open_project(save_project(project))
+            title = project['clips'][0]
+            self.assertEqual(title['title'],'Wide first line\nShort')
+            self.assertEqual(title['titleStyle']['align'],align)
+            self.assertEqual((title['titleStyle']['x'],title['titleStyle']['y'],title['titleStyle']['color']),
+                             (72,60,'#e43522'))
+
     def test_title_style_uses_native_premiere_parameters(self):
         project = {'name':'Title', 'fps':25, 'media':[], 'clips':[{
             'type':'title','track':2,'title':'Card','start':0,'duration':2,

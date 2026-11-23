@@ -33,7 +33,7 @@ window.SpliceDialogs = (() => {
     form.innerHTML='<p class="export-spec"></p><label>Format<select name="codec"><option value="h264">H.264 / AAC · MP4</option><option value="prores">ProRes 422 HQ / PCM · MOV</option><option value="wav">Audio mix · WAV</option></select></label><label>Range<select name="rangeMode"><option value="all">Entire sequence</option><option value="custom">Custom range</option></select></label><label hidden>Start (seconds)<input name="rangeStart" type="number" min="0" step="any"></label><label hidden>End (seconds)<input name="rangeEnd" type="number" min="0" step="any"></label><label>Quality<select name="quality"><option value="16">Master · CRF 16</option><option value="20" selected>Delivery · CRF 20</option><option value="26">Review copy · CRF 26</option></select></label><label>Audio bitrate<select name="bitrate"><option>128</option><option selected>192</option><option>320</option></select></label><progress max="1" value="0" hidden></progress><p role="status" class="render-state"></p><footer><button type="button" data-cancel>Close</button><button type="submit" class="primary">Render MP4</button></footer>';
     const rangeFields=[form.elements.rangeStart,form.elements.rangeEnd];
     form.elements.codec.closest('label').insertAdjacentHTML('afterend',
-      '<label hidden>Color space<select name="colorSpace"><option value="source">Preserve source color space</option><option value="rec709">Rec. 709 SDR</option></select></label>');
+      '<label hidden>Color space<select name="colorSpace"><option value="source">Preserve source color space</option><option value="rec709">Rec. 709 SDR</option><option value="pq">Rec. 2100 PQ HDR</option></select></label>');
     rangeFields[0].value=String(Math.min(state.time,Math.max(0,state.duration-1/state.project.fps)).toFixed(6));
     rangeFields[1].value=String((Math.ceil((state.duration-1e-9)*state.project.fps)/state.project.fps).toFixed(6));
     form.elements.rangeMode.onchange=()=>{
@@ -61,16 +61,18 @@ window.SpliceDialogs = (() => {
     const colorNotice=document.createElement('p');
     const hdrSources=new Set(state.project.media.filter(m=>m.hdr).map(m=>m.id));
     const hdr=state.project.clips.some(c=>c.type==='video' && hdrSources.has(c.mediaId));
-    colorNotice.textContent='This export tone-maps HDR footage to Rec. 709.';
     form.querySelector('.export-spec').after(colorNotice);
     let controller, renderWarnings=[];
     const syncFormat=()=>{
       const h264=form.elements.codec.value==='h264';
       const prores=form.elements.codec.value==='prores';
+      const pq=prores&&form.elements.colorSpace.value==='pq';
       form.elements.quality.closest('label').hidden=!h264;
       form.elements.bitrate.closest('label').hidden=!h264;
       form.elements.colorSpace.closest('label').hidden=!prores;
-      colorNotice.hidden=!hdr||!(h264||prores&&form.elements.colorSpace.value==='rec709');
+      colorNotice.hidden=!pq&&(!hdr||!(h264||prores&&form.elements.colorSpace.value==='rec709'));
+      colorNotice.textContent=pq?'Maps SDR reference white to 203 nits and converts HDR footage to PQ.':
+        'This export tone-maps HDR footage to Rec. 709.';
       render.textContent='Render '+({h264:'MP4',prores:'MOV',wav:'WAV'}[form.elements.codec.value]);
     };
     form.elements.codec.onchange=form.elements.colorSpace.onchange=syncFormat;syncFormat();

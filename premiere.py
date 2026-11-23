@@ -23,6 +23,7 @@ TRANSITIONS = {
 }
 TRANSITION_BY_MATCH = {match:style for style,(match,_) in TRANSITIONS.items()}
 AUDIO_CROSSFADE = 'Constant Gain'
+AUDIO_CROSSFADE_NAMES = {AUDIO_CROSSFADE,'Constant Power'}
 
 STILL_IMAGES = frozenset({".png", ".bmp", ".jpg", ".jpeg"})
 ROOT = Path(__file__).resolve().parent
@@ -232,7 +233,7 @@ def _read_transition(track, item, clip_data):
     if matching is None:
         return
     if clip_data['type'] == 'audio':
-        clip_data['transition'] = 'dissolve' if matching.match_name == AUDIO_CROSSFADE else 'native'
+        clip_data['transition'] = 'dissolve' if matching.match_name in AUDIO_CROSSFADE_NAMES else 'native'
     else:
         clip_data['transition'] = TRANSITION_BY_MATCH.get(matching.match_name, 'native')
     clip_data['transitionBefore'] = matching.cut_point_offset.seconds
@@ -518,11 +519,12 @@ def save_project(data):
             raise ValueError('Changing an existing Premiere sequence format is unsupported')
     else:
         base = FORMATS['1080p25']
-        custom = base._replace(frame_rate=chosen[0], width=width, height=height, time_display=chosen[1], video_tracks=4)
+        highest_video = max(4, max((int(clip['track']) for clip in data['clips'] if clip.get('type') in ('video','title')), default=4))
+        if highest_video > 64:
+            raise ValueError('Unsupported video track number')
+        custom = base._replace(frame_rate=chosen[0], width=width, height=height, time_display=chosen[1], video_tracks=highest_video)
         sequence = project.add_sequence(str(data.get('name') or 'Untitled')[:120], sequence_format=custom)
     track_states = data.get('trackState') or {}
-    if 'title:4' in track_states and 'video:4' in track_states and track_states['title:4'] != track_states['video:4']:
-        raise ValueError('Title and video track 4 share one native Premiere lock state')
     for key, state in track_states.items():
         try:
             kind, raw_track = key.split(':', 1)
@@ -530,6 +532,8 @@ def save_project(data):
         except (ValueError, AttributeError) as exc:
             raise ValueError('Invalid Premiere track state target') from exc
         tracks = sequence.audio_tracks if kind == 'audio' else sequence.video_tracks if kind in ('video', 'title') else None
+        if kind == 'title' and f'video:{number}' in track_states and track_states[f'video:{number}'] != state:
+            raise ValueError(f'Title and video track {number} share one native Premiere lock state')
         if tracks is None:
             raise ValueError('Invalid Premiere track state target')
         index = -number - 1 if kind == 'audio' else number - 1
@@ -837,7 +841,7 @@ def save_project(data):
                 # face only for new Splice titles; retain native title fonts.
                 item = {**item, 'titleStyle': {
                     'fontFamily': 'DM Sans', 'x': 50, 'y': 78, 'fontSize': 8,
-                    'strokeWidth': 0, **(item.get('titleStyle') or {}),
+                    'strokeWidth': 0, 'align': 'center', **(item.get('titleStyle') or {}),
                 }}
             else:
                 if source is None:
@@ -904,7 +908,10 @@ def save_project(data):
         if item.get('transition') in TRANSITIONS and not is_audio:
             pending_transitions.append((clip, item, *TRANSITIONS[item['transition']]))
         elif is_audio and item.get('transition') == 'dissolve':
-            pending_transitions.append((clip, item, AUDIO_CROSSFADE, AUDIO_CROSSFADE))
+            match = item.get('transitionMatchName')
+            if match not in AUDIO_CROSSFADE_NAMES:
+                match = AUDIO_CROSSFADE
+            pending_transitions.append((clip, item, match, match))
     if original:
         retained = {(('video' if c.get('type') == 'title' else c.get('type')), c.get('premiereTrack'), c.get('premiereIndex')) for c in data.get('clips', []) if 'premiereIndex' in c}
         for key, clip in original_clips.items():

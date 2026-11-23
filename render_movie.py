@@ -12,6 +12,16 @@ from premiere import MEDIA_ROOT, STILL_IMAGES, _media_path
 from media_proxy import AVC_REC709, HDR_LINEAR_REC709, HDR_TONE_MAP, HDR_TRANSFERS, HDR_TO_REC709, REC709, tempo_filters
 
 
+PQ = ('bt2020','smpte2084','bt2020nc')
+
+
+def _render_source(item):
+    src = item.get('src')
+    if not src:
+        raise ValueError(f"Relink {item.get('name') or 'the offline source'} before exporting.")
+    return _media_path(src)
+
+
 
 def _number(value, label, low=0, high=7200):
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not low <= value <= high:
@@ -129,10 +139,13 @@ def _brightness_contrast(brightness, contrast, pivot=.5):
     return _linear_gain((slope,)*3)+f',exposure=exposure={-math.log2(1-offset):.12f}:black={-offset:.12f}'
 
 
-def _hdr_grade(color, lut, high_depth, profile):
+def _hdr_grade(color, lut, high_depth, profile, target=None):
     brightness,contrast,saturation,gains=_grade_values(color)
     if (brightness,contrast,saturation,gains)==(1,1,1,(1,1,1)) and (not lut or not high_depth):
-        return '' if high_depth else ','+HDR_TO_REC709+lut
+        if not high_depth:
+            return ','+HDR_TO_REC709+lut
+        if not target or target==profile:
+            return ''
     display_grade=(brightness,contrast,saturation)!=(1,1,1)
     scale=1
     if display_grade and high_depth and not lut:
@@ -160,7 +173,7 @@ def _hdr_grade(color, lut, high_depth, profile):
         return chain+','+HDR_TONE_MAP+lut
     if lut:
         chain+=',zscale=t=bt709,format=gbrpf32le'+lut+',zscale=t=linear,format=gbrpf32le'
-    primaries,transfer,matrix=profile
+    primaries,transfer,matrix=target or profile
     return chain+f',zscale=p={primaries},zscale=t={transfer}:m={matrix}:r=limited:npl={peak:.9f},format=yuv444p10le'
 
 
@@ -187,9 +200,9 @@ def _hdr_still_filter(profile):
 
 
 def _fit_picture(width, height, color, lut, alpha_format, high_depth, profile=None, rec709=False,
-                 *, still_frames=0, hdr_profile=None):
+                 *, still_frames=0, hdr_profile=None, conform_pq=False):
     if profile and profile[1] in HDR_TRANSFERS:
-        grade = _hdr_grade(color,lut,high_depth and not rec709,profile)
+        grade = _hdr_grade(color,lut,high_depth and not rec709,profile,PQ if conform_pq else None)
     else:
         convert = (',zscale=p=bt709:t=bt709:m=bt709:r=limited,format=yuv444p10le'
                    if rec709 and profile and profile!=REC709
@@ -197,6 +210,11 @@ def _fit_picture(width, height, color, lut, alpha_format, high_depth, profile=No
         grade = convert+_css_color_filter(color,high_depth,bool(still_frames))+lut
         if still_frames and hdr_profile:
             grade += _hdr_still_filter(hdr_profile)
+        elif conform_pq and profile:
+            primaries,transfer,matrix=(value if value not in (None,'unknown','unspecified') else default
+                                      for value,default in zip(profile,REC709))
+            grade += (f',zscale=pin={primaries}:tin={transfer}:min={matrix}:p=bt2020:t=linear,format=gbrpf32le,'
+                      'zscale=t=smpte2084:m=bt2020nc:r=limited:npl=203,format=yuv444p10le')
     repeat = f',loop=loop={still_frames-1}:size=1:start=0,setpts=N' if still_frames>1 else ''
     return (f'scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2'
             f'{grade},format={alpha_format},'
@@ -246,6 +264,10 @@ def _trim_audio(filters, label, index, streams, start, length, reverse):
     else:
         result = f'[{index}:a:{next(iter(streams))}]{trim},'
     return result + ('areverse,' if reverse else '')
+
+
+def _audio_transition_gain(clip, expression):
+    return f'sin(PI*({expression})/2)' if clip.get('transitionMatchName')=='Constant Power' else expression
 
 
 def _run_controlled(command, cancelled, timeout):
@@ -507,6 +529,7 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
     if codec not in ('h264','prores'): raise ValueError('Unsupported export codec')
     high_depth = codec=='prores'
     rec709 = (options or {}).get('colorSpace')=='rec709'
+    conform_pq = (options or {}).get('colorSpace')=='pq'
     base_format = 'yuv422p10le' if high_depth else 'yuv420p'
     alpha_format = 'yuva422p10le' if high_depth else 'yuva420p'
     full_alpha = 'yuva444p10le' if high_depth else 'yuva444p'
@@ -548,7 +571,7 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
             if clip['type']!='video': raise ValueError('Premiere generator has no audio stream')
             continue
         if item['id'] not in paths:
-            path = _media_path(item.get('src', ''))
+            path = _render_source(item)
             paths[item['id']] = path
             if path.suffix.lower() in STILL_IMAGES:
                 kinds[item['id']], item['_actualDuration'], item['_audioStreams'] = {'video'}, math.inf, []
@@ -627,7 +650,7 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
             still_frames = max(1,math.ceil(render_length*fps-1e-6)) if item.get('_renderStill') else 0
             prefix = _picture_input(index,render_source,render_length,speed,width,height,fps,reverse,still_frames)
             fit = _fit_picture(width,height,color,lut_filter,alpha_format,high_depth,item.get('_sourceProfile'),rec709,
-                               still_frames=still_frames,hdr_profile=hdr_profile)
+                               still_frames=still_frames,hdr_profile=hdr_profile,conform_pq=conform_pq)
             chain = f'{prefix},{fit}{transform}'
             if opacity_keys:
                 opacity_expr=_keyframe_expr(clip,'opacity',opacity*100,0,100,f'(T-{before:.6f})')
@@ -679,7 +702,8 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
                     still_tail = max(1,math.ceil(tail*fps-1e-6)) if prior_item.get('_renderStill') else 0
                     prior_prefix = _picture_input(prior_index,prior_source,tail,prior_speed,width,height,fps,prior_reverse,still_tail)
                     prior_fit = _fit_picture(width,height,prior_color,prior_lut,alpha_format,high_depth,
-                                             prior_item.get('_sourceProfile'),rec709,still_frames=still_tail,hdr_profile=hdr_profile)
+                                             prior_item.get('_sourceProfile'),rec709,still_frames=still_tail,
+                                             hdr_profile=hdr_profile,conform_pq=conform_pq)
                     prior_alpha = _mask_alpha(f'{prior_opacity:.6f}',alpha_format,full_alpha) if prior_opacity!=1 else ''
                     cut_frame = math.ceil(start*fps-1e-6)
                     filters.append(f'{prior_prefix},{prior_fit}{prior_transform}{prior_alpha},setpts=PTS+{cut_frame}[tail{number}]')
@@ -742,14 +766,14 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
                 envelope.append(f'({volume_expr})/100')
             if clip.get('transition') in ('dissolve','wipe','fade'):
                 incoming=min(_number(clip.get('transitionDuration',.5),'transition duration',1/float(fps)),render_length)
-                envelope.append(f'min(1,t/{incoming:.9f})')
+                envelope.append(_audio_transition_gain(clip,f'min(1,t/{incoming:.9f})'))
             next_clip=next((candidate for candidate in clips if candidate is not clip and candidate.get('type')==clip['type'] and candidate.get('track')==clip.get('track') and candidate.get('transition') in ('dissolve','wipe') and round(float(candidate['start'])*fps)==round((start+length)*fps)),None)
             if next_clip:
                 next_before=_number(next_clip.get('transitionBefore',0),'transition lead')
                 next_duration=_number(next_clip.get('transitionDuration',.5),'transition duration',1/float(fps))
                 next_duration=min(next_duration,next_before+float(next_clip['duration']))
                 fade_start=before+length-next_before
-                envelope.append(f'max(0,min(1,1-(t-{fade_start:.9f})/{next_duration:.9f}))')
+                envelope.append(_audio_transition_gain(next_clip,f'max(0,min(1,1-(t-{fade_start:.9f})/{next_duration:.9f}))'))
             if fade_in or fade_out:
                 head = f'max(0,(t-{before:.9f})/{fade_in:.9f})' if fade_in else '1'
                 tail = f'max(0,({render_length:.9f}-t)/{fade_out:.9f})' if fade_out else '1'
@@ -771,7 +795,7 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
                     if volume_keys:
                         terminal=sorted(volume_keys,key=lambda point:point['time'])[-1]['value']
                         tail_chain+=f",volume={_number(terminal,'volume keyframe',0,200)/100:.6f}"
-                    tail_gain=f'max(0,1-({next_before:.9f}+t)/{next_duration:.9f})'
+                    tail_gain=_audio_transition_gain(next_clip,f'max(0,1-({next_before:.9f}+t)/{next_duration:.9f})')
                     tail_delay=round((start+length)*48000)
                     tail_chain+=f",aeval=exprs='val(ch)*{tail_gain}':channel_layout=stereo,adelay={tail_delay}S:all=1[tailaudio{number}]"
                     filters.append(tail_chain)
@@ -851,7 +875,7 @@ def _render_prepared(project, output_path, *, options=None, progress=None, cance
     codec=options.get('codec','h264')
     if codec not in ('h264','prores','wav'): raise ValueError('Unsupported export codec')
     color_space=options.get('colorSpace','source')
-    if color_space!='source' and (codec!='prores' or color_space!='rec709'):
+    if color_space!='source' and (codec!='prores' or color_space not in ('rec709','pq')):
         raise ValueError('Invalid export color space')
     suffix='.mov' if codec=='prores' else '.mp4'
     total_frames = round(total*fps)
@@ -873,16 +897,17 @@ def _render_prepared(project, output_path, *, options=None, progress=None, cance
         vid_ids = _picture_range_media(video_clips,by_id,fps,first,stop)
         for item in project['media']:
             if item.get('id') not in vid_ids or item.get('nativeGenerator') is not None:continue
-            path = _media_path(item.get('src',''))
+            path = _render_source(item)
             if path.suffix.lower() not in STILL_IMAGES:
                 if path not in probes:probes[path]=_probe(path)
                 profiles.add(probes[path][-1])
     hdr = any(profile[1] in HDR_TRANSFERS for profile in profiles)
     if hdr and codec=='prores' and len(profiles)!=1 and color_space=='source':
-        raise ValueError('A ProRes HDR master needs one HDR color space. Select Rec. 709 to combine HDR and SDR sources.')
+        raise ValueError('A ProRes HDR master needs one HDR color space. Select Rec. 2100 PQ or Rec. 709 to combine HDR and SDR sources.')
     profile = next(iter(profiles)) if len(profiles)==1 else None
     if profile and not all(value and value not in ('unknown','unspecified') for value in profile):profile=None
     if color_space=='rec709' or hdr and codec=='h264': profile=REC709
+    if color_space=='pq': profile=PQ
     options.update(_probes=probes,_color_profile=profile)
     audio_options={**options,'_output_frames':(first,stop) if (first,stop)!=(0,total_frames) else None}
     captions=project.get('captions') or []

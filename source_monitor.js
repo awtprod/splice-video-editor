@@ -34,9 +34,9 @@
       player.currentTime=Math.max(0,current()-rate/fps);
     },1000/fps);
   }
-  function newClip(start,track,duration) {
-    return {id:crypto.randomUUID(),mediaId:media.id,start,duration,in:markIn,track,type:media.type,title:'',color:{brightness:100,contrast:100,saturation:100},volume:100,transition:'none',
-      ...(media.audioStreams>1?{audioStream:media.audioStream??null}:{})};
+  function newClip(start,track,selection) {
+    return {id:crypto.randomUUID(),mediaId:media.id,start,track,type:media.type,title:'',
+      color:{brightness:100,contrast:100,saturation:100},volume:100,transition:'none',...selection};
   }
   function mark(edge) {
     const point=Math.min(media.duration,snap(current()));
@@ -52,16 +52,15 @@
   function place(mode) {
     if (dialog.dataset.preparing) return;
     show('');
-    if (markOut-markIn < 1/fps) return show('Mark a range at least one frame long.');
     const track=Number(dialog.querySelector('.source-track').value);
     if (Editor.isTrackLocked(track, media.type)) return show(`Unlock ${media.type} track ${Math.abs(track)} before editing.`);
     const state=Editor.get(), time=mode==='append' ? Math.max(0,...state.project.clips.filter(c=>c.type===media.type && c.track===track).map(c=>c.start+c.duration)) : state.time;
     const sequenceFps=state.project.fps;
-    const frames=Math.min(Math.round((markOut-markIn)*sequenceFps),Math.floor((media.duration-markIn)*sequenceFps+1e-6));
-    if (frames<1) return show('Mark a range at least one sequence frame long.');
-    const start=Math.round(time*sequenceFps)/sequenceFps, length=frames/sequenceFps, end=start+length;
-    if (typeof Editor.editProject !== 'function') return show('Timeline edit service is unavailable.');
-    const clip=newClip(start,track,length);
+    let selection;
+    try { selection=Editor.sourceSelection(media,{in:markIn,out:markOut},media.audioStream??null); }
+    catch(error) { return show(error.message); }
+    const start=Math.round(time*sequenceFps)/sequenceFps, length=selection.duration, end=start+length;
+    const clip=newClip(start,track,selection);
     try { Editor.editProject(project => {
       const additions=[];
       const rightGroups=new Map();

@@ -40,6 +40,7 @@
     if(locked) html += '<p class="splice-compat">This track is locked. Unlock it in the timeline to edit this clip.</p>';
     html += section('Timing',
       field('Timeline start', 'start', number(clip.start, 0).toFixed(2), 0, 7200, 1/fps) +
+      (clip.type==='title' ? field('Video track','track',clip.track,1,64,1) : '') +
       (clip.type === 'title' || source?.still ? '' : field('Source in', 'in', number(clip.in, 0).toFixed(2), 0, source?.duration || 7200, 1/fps)) +
       field('Duration', 'duration', number(clip.duration, 1).toFixed(2), 1/fps, maximumDuration, 1/fps));
     if (clip.type!=='title' && !source?.still && !clip.nativeTimeRemap) html += section('Speed',
@@ -179,7 +180,7 @@
             render(editor.get(),element,editor);
           } else {
             editor.updateClip(active.id, group ? {[group]: {...(active[group] || {}), [key]: value}} : {[key]: value});
-            if(['align','pan','fadeIn','fadeOut','transition','transitionDuration'].includes(key)) render(editor.get(),element,editor);
+            if(['align','track','pan','fadeIn','fadeOut','transition','transitionDuration'].includes(key)) render(editor.get(),element,editor);
           }
         } catch(error) {
           window.alert(error.message || 'This clip cannot be changed.');

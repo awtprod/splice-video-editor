@@ -20,6 +20,29 @@ TEMPLATES = Path(__file__).resolve().parent / 'vendor' / 'splice-effects'
 NEUTRAL = {'brightness': 100, 'contrast': 100, 'saturation': 100, 'temperature': 0, 'tint': 0}
 BRIGHTNESS_NAME = 'Splice Brightness'
 BRIGHTNESS_LAYERS = {BRIGHTNESS_NAME, 'Splice HDR Brightness'}
+# FormattedTextData document slot 4. Premiere 27 writes 1 for Right;
+# Premiere caption files use 2 for Center and omit the default Left value.
+TITLE_ALIGNMENTS = ('left','right','center')
+TITLE_ALIGNMENT_SLOT = 4
+
+
+def _title_alignment(payload):
+    field = _field_offset(payload,_document_table(payload),TITLE_ALIGNMENT_SLOT)
+    value = 0 if field is None else struct.unpack_from('<I',payload,field)[0]
+    return TITLE_ALIGNMENTS[value] if value<len(TITLE_ALIGNMENTS) else None
+
+
+def _write_title_alignment(payload, align):
+    if align not in TITLE_ALIGNMENTS:
+        raise ValueError('Choose Left, Center, or Right title alignment.')
+    if _title_alignment(payload)==align:
+        return payload
+    encoded = struct.pack('<I',TITLE_ALIGNMENTS.index(align))
+    document = _document_table(payload)
+    field = _field_offset(payload,document,TITLE_ALIGNMENT_SLOT)
+    if field is None:
+        return _add_table_field(payload,document,TITLE_ALIGNMENT_SLOT,encoded)
+    return payload[:field]+encoded+payload[field+4:]
 
 
 def _component(clip, name):
@@ -259,6 +282,10 @@ def read_extended(clip):
             'strokeColor': '#%02x%02x%02x' % stroke[:3] if stroke else '#000000',
             'strokeWidth': round(stroke_width, 4) if stroke_width else 0,
         }
+        payload = source._payload() if source else None
+        align = _title_alignment(payload) if payload else None
+        if align:
+            result['titleStyle']['align'] = align
     motion = _component(clip, 'AE.ADBE Motion')
     if motion is not None:
         position_param = _parameter(motion, 'Position')
@@ -315,8 +342,6 @@ def apply_extended(clip, item):
     if any(automation.get(key) for key in ('x','y')):
         raise ValueError('Premiere export cannot preserve animated position yet. Save a Splice working copy to keep it.')
     style = item.get('titleStyle') or {}
-    if style.get('align', 'center') != 'center':
-        raise ValueError('Premiere export cannot preserve left or right title alignment yet. Save a Splice working copy to keep it.')
     text_component = _component(clip, 'AE.ADBE Text')
     if text_component is not None:
         pos = _parameter(text_component, 'Position')
@@ -339,6 +364,12 @@ def apply_extended(clip, item):
         if source is not None:
             payload = source._payload()
             changed = False
+            if 'align' in style:
+                if not payload:
+                    raise ValueError('This Premiere title has no editable paragraph data.')
+                aligned = _write_title_alignment(payload,style['align'])
+                changed = aligned!=payload
+                payload = aligned
             for key, slot, default in (('color', 2, '#ffffff'), ('strokeColor', 4, '#000000')):
                 value = style.get(key)
                 if value is None or str(value).lower() == default and read_style_color(payload, slot) is None:

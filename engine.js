@@ -277,6 +277,24 @@
     future = [];
   };
   const mediaOf = (clip) => project.media.find((m) => m.id === clip.mediaId);
+  const titleTrack = () => Math.min(64,Math.max(4,...project.clips.filter(c=>c.type==='video').map(c=>c.track+1)));
+  function sourceSelection(item, marks=item.sourceMarks, stream=item.sourceAudioStream) {
+    const usedLength=project.clips.find(c=>c.mediaId===item.id)?.duration;
+    const available=item.duration||usedLength||5;
+    const selection={in:0,duration:available};
+    if(Number.isFinite(marks?.in) && Number.isFinite(marks?.out)) {
+      const from=clamp(marks.in,0,available);
+      const to=clamp(marks.out,from,available);
+      const frames=Math.min(Math.round((to-from)*project.fps),Math.floor((available-from)*project.fps+1e-6));
+      if(frames<1) throw Error('Mark a range at least one sequence frame long.');
+      Object.assign(selection,{in:from,duration:frames/project.fps});
+    }
+    if(item.audioStreams>1) {
+      const valid=stream===null||Number.isInteger(stream)&&stream>=0&&stream<item.audioStreams;
+      selection.audioStream=valid?stream:item.audioStream??null;
+    }
+    return selection;
+  }
   const trackKey = (kind, track) => `${kind}:${track}`;
   const trackState = (kind, track, source = project) =>
     source.trackState?.[trackKey(kind, track)] ||
@@ -368,6 +386,10 @@
       if(next && next.id!==clip.id) (next.transition==='fade'?videoDipFollowers:transitionFollowers).set(clip.id,next);
     }
   }
+  const audioTransitionGain = (clip, progress) => {
+    const value=clamp(progress,0,1);
+    return clip.transitionMatchName==='Constant Power' ? Math.sin(value*Math.PI/2) : value;
+  };
   const audibility = clip => {
     const mix = trackSettings(clip.track);
     if (mutedTracks.audio || mix.mute || (soloActive() && !mix.solo)) return 0;
@@ -375,9 +397,9 @@
     const fadeIn = clamp(Number(clip.fadeIn)||0,0,clip.duration);
     const fadeOut = clamp(Number(clip.fadeOut)||0,0,clip.duration);
     let fade = Math.min(1, fadeIn ? local/fadeIn : 1, fadeOut ? (clip.duration-local)/fadeOut : 1);
-    if(['dissolve','wipe','fade'].includes(clip.transition)) fade*=clamp((time-clip.start+transitionBefore(clip))/transitionLength(clip),0,1);
+    if(['dissolve','wipe','fade'].includes(clip.transition)) fade*=audioTransitionGain(clip,(time-clip.start+transitionBefore(clip))/transitionLength(clip));
     const next=followingTransition(clip);
-    if(next) fade*=clamp(1-(time-next.start+transitionBefore(next))/transitionLength(next),0,1);
+    if(next) fade*=audioTransitionGain(next,1-(time-next.start+transitionBefore(next))/transitionLength(next));
     return clamp(animated(clip,'volume',Number(clip.volume??100))/100,0,2) * clamp((mix.gain??100)/100,0,2) * clamp(fade,0,1);
   };
   const filterFor = (clip) => {
@@ -1176,6 +1198,8 @@
       revision++;
       notify();
     },
+    sourceSelection,
+    titleTrack,
     async prepareSourceProxy(id) {
       const sequence=project, media=sequence.media.find(item=>item.id===id);
       if(!media || media.offline || !media.src)throw Error('Relink the source before building its seek proxy.');
@@ -1266,13 +1290,11 @@
                 .filter((c) => c.type === "video")
                 .map((c) => c.start + c.duration),
             ));
-      const knownLength = project.clips.find((c) => c.mediaId === id)?.duration;
       const clip = {
         id: uid(),
         mediaId: id,
         start,
-        duration: item.duration || knownLength || 5,
-        in: 0,
+        ...sourceSelection(item),
         track: placement?.track ?? (item.type === "audio" ? -1 : 1),
         type: item.type,
         title: "",
@@ -1287,6 +1309,8 @@
     updateClip(id, patch) {
       const clip = project.clips.find((c) => c.id === id);
       if (!clip) return;
+      if ('track' in patch && (!Number.isInteger(patch.track) || Math.abs(patch.track)>64 ||
+          (clip.type==='audio' ? patch.track>=0 : patch.track<=0))) throw Error('Choose a valid timeline track.');
       ensureEditable(clip, "track" in patch ? Number(patch.track) : clip.track);
       if (Object.entries(patch).every(([key,value]) => JSON.stringify(clip[key])===JSON.stringify(value))) return;
       const linkedFields=["start","duration","in","speed","reverse"];
@@ -1499,14 +1523,15 @@
       });
     },
     addTitle() {
-      if (trackLocked("title", 4)) throw new Error("Unlock the title track before editing.");
+      const track=titleTrack();
+      if (trackLocked("title", track)) throw new Error("Unlock the title track before editing.");
       const clip = {
         id: uid(),
         mediaId: null,
         start: time,
         duration: 4,
         in: 0,
-        track: 4,
+        track,
         type: "title",
         title: "Your title",
         color: { brightness: 100, contrast: 100, saturation: 100 },

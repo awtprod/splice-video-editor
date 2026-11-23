@@ -1,7 +1,7 @@
 (() => {
   const key = lane => `${lane.kind}:${lane.track}`;
   function renderHeader(head, lane, project, editor) {
-    const state = project.trackState?.[key(lane)] || (lane.kind === 'title' ? project.trackState?.['video:4'] : null) || {};
+    const state = project.trackState?.[key(lane)] || (lane.kind === 'title' ? project.trackState?.['video:'+lane.track] : null) || {};
     const mix = project.trackMix?.[String(lane.track)] || {};
     const locked = !!state.locked;
     const synced = state.syncLocked !== false;
