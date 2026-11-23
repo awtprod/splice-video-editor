@@ -9,6 +9,7 @@ import sys
 import threading
 
 from premiere import _media_path
+from splice_platform import HIDE_CONSOLE
 
 _workers = ThreadPoolExecutor(max_workers=2, thread_name_prefix='waveform')
 _pending = {}
@@ -19,7 +20,7 @@ _lock = threading.Lock()
 def _compute(path, size, modified):
     info = subprocess.run(['ffprobe','-v','error','-protocol_whitelist','file','-select_streams','a:0',
                            '-show_entries','stream=codec_type:format=duration','-of','json',path],
-                          capture_output=True,timeout=15,check=True)
+                          capture_output=True,timeout=15,check=True,creationflags=HIDE_CONSOLE)
     data = json.loads(info.stdout)
     if not data.get('streams'):
         return []
@@ -31,7 +32,7 @@ def _compute(path, size, modified):
     cmd = ['ffmpeg','-nostdin','-loglevel','error','-threads','1','-protocol_whitelist','file',
            '-i',path,'-map','0:a:0','-vn','-ac','1','-ar','4000','-t',str(duration),
            '-f','s16le','pipe:1']
-    with subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL) as process:
+    with subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,creationflags=HIDE_CONSOLE) as process:
         timer = threading.Timer(180,process.kill)
         timer.start()
         try:

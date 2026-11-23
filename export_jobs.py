@@ -10,6 +10,8 @@ import time
 import uuid
 import warnings
 
+from splice_platform import HIDE_CONSOLE
+
 
 FORMATS = {'h264':('mp4','video/mp4',True), 'prores':('mov','video/quicktime',False),
            'wav':('wav','audio/wav',True)}
@@ -106,7 +108,7 @@ class ExportJobs:
                                 taskkill = Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32' / 'taskkill.exe'
                                 try:
                                     subprocess.run([str(taskkill), '/PID', str(process.pid), '/T', '/F'],
-                                                   capture_output=True, timeout=4, check=True)
+                                                   capture_output=True, timeout=4, check=True, creationflags=HIDE_CONSOLE)
                                 except (OSError, subprocess.SubprocessError):
                                     process.kill()
                         elif grouped:

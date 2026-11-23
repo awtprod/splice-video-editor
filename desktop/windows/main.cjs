@@ -5,6 +5,7 @@ const { join } = require('node:path')
 const origin = 'http://127.0.0.1:47834'
 let editor
 let backend
+let shuttingDown = false
 
 function startBackend() {
   const root = process.resourcesPath
@@ -47,12 +48,11 @@ function startBackend() {
       reject(error)
     })
     child.once('exit', (code, signal) => {
-      const unexpected = backend === child
       backend = null
       clearTimeout(timeout)
       if (!ready) {
         reject(new Error(stderr.trim() || `The editor server exited (${code ?? signal}).`))
-      } else if (unexpected) {
+      } else if (!shuttingDown) {
         dialog.showErrorBox('Splice stopped', stderr.trim() || 'The editor server closed unexpectedly.')
         app.quit()
       }
@@ -72,8 +72,9 @@ if (!app.requestSingleInstanceLock()) {
   app.on('before-quit', event => {
     if (!backend) return
     event.preventDefault()
+    if (shuttingDown) return
+    shuttingDown = true
     const child = backend
-    backend = null
     const deadline = setTimeout(() => child.kill(), 8000)
     child.once('close', () => {
       clearTimeout(deadline)

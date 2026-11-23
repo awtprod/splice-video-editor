@@ -11,6 +11,7 @@ import tempfile
 import threading
 
 from premiere import MEDIA_ROOT, STILL_IMAGES, _media_path, _playback_url
+from splice_platform import HIDE_CONSOLE
 
 _encoders = threading.BoundedSemaphore(2)
 _locks = tuple(threading.Lock() for _ in range(32))
@@ -75,7 +76,7 @@ def audition_audio(src, index, rate=1, reverse=False):
             '-ss', f'{seek:.9f}', '-i', str(path), '-map', '0:a:0',
             '-af', ','.join(filters), '-ac', '2', '-c:a', 'pcm_s16le',
             '-t', str(AUDITION_SECONDS+overlap), '-f', 'wav', 'pipe:1',
-        ], capture_output=True, timeout=8)
+        ], capture_output=True, timeout=8, creationflags=HIDE_CONSOLE)
         if result.returncode:
             raise ValueError('Could not decode audio for preview')
         return result.stdout
@@ -102,7 +103,7 @@ def describe(src):
     path = _media_path(src)
     probe = subprocess.run(['ffprobe', '-v', 'error', '-protocol_whitelist', 'file',
                             '-show_entries', 'format=duration:stream=codec_type,codec_name,width,height,avg_frame_rate,duration,channels,color_transfer:stream_disposition=attached_pic',
-                            '-of', 'json', str(path)], capture_output=True, timeout=25)
+                            '-of', 'json', str(path)], capture_output=True, timeout=25, creationflags=HIDE_CONSOLE)
     if probe.returncode:
         raise ValueError('Could not read media streams in ' + path.name)
     data = json.loads(probe.stdout)
@@ -211,7 +212,8 @@ def proxy(src, seek_optimized=False, audio_stream=None, grading_data=False):
                 else:
                     cmd += audio_map + ['-c:a','aac','-b:a','160k','-ac',str(min(2,max(1,info['audioChannels']))),'-movflags','+faststart']
                 cmd.append(str(out))
-                completed = subprocess.run(cmd,capture_output=True,timeout=min(3600,max(60,info['duration']*3)))
+                completed = subprocess.run(cmd,capture_output=True,timeout=min(3600,max(60,info['duration']*3)),
+                                           creationflags=HIDE_CONSOLE)
                 if completed.returncode:
                     raise ValueError('Proxy creation failed for '+original.name+': '+completed.stderr.decode(errors='replace')[-400:])
                 os.link(out,target)
@@ -246,7 +248,8 @@ def premiere_audio(src, audio_stream=None):
                 cmd=['ffmpeg','-nostdin','-v','error','-y','-threads','2','-filter_complex_threads','2',
                      '-protocol_whitelist','file','-i',str(original),'-filter_complex',';'.join(filters),
                      '-map','[audio]','-c:a','pcm_s24le','-t',str(duration),str(output)]
-                result=subprocess.run(cmd,capture_output=True,timeout=min(3600,max(60,duration*3)))
+                result=subprocess.run(cmd,capture_output=True,timeout=min(3600,max(60,duration*3)),
+                                      creationflags=HIDE_CONSOLE)
                 if result.returncode:
                     raise ValueError('Could not write Premiere audio: '+result.stderr.decode(errors='replace')[-400:])
                 os.link(output,target)

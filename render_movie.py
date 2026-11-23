@@ -10,7 +10,7 @@ from pathlib import Path
 
 from premiere import MEDIA_ROOT, STILL_IMAGES, _media_path
 from media_proxy import AVC_REC709, HDR_LINEAR_REC709, HDR_TONE_MAP, HDR_TRANSFERS, HDR_TO_REC709, REC709, tempo_filters
-from splice_platform import font_roots, installed_font
+from splice_platform import HIDE_CONSOLE, font_roots, installed_font
 
 
 PQ = ('bt2020','smpte2084','bt2020nc')
@@ -35,7 +35,7 @@ def _probe(path):
     from media_proxy import MAX_AUDIO_STREAMS
     result = subprocess.run(['ffprobe', '-v', 'error', '-protocol_whitelist', 'file', '-show_entries',
                             'stream=codec_type,channels,avg_frame_rate,r_frame_rate,color_primaries,color_transfer,color_space:format=duration', '-of', 'json', str(path)],
-                            capture_output=True, text=True, timeout=15, check=True)
+                            capture_output=True, text=True, timeout=15, check=True, creationflags=HIDE_CONSOLE)
     data = json.loads(result.stdout)
     streams=data.get('streams', [])
     audio=[stream.get('channels',2) for stream in streams if stream['codec_type']=='audio']
@@ -321,7 +321,7 @@ def _audio_transition_gain(clip, expression):
 
 def _run_controlled(command, cancelled, timeout):
     import time
-    process=subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    process=subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, creationflags=HIDE_CONSOLE)
     try:
         deadline=time.monotonic()+timeout
         while process.poll() is None:
@@ -443,7 +443,8 @@ def _hdr_graphic_color(color, primaries, transfer):
         swatch += f',zscale=t={transfer}:m=gbr:r=full:npl=203,format=gbrp'
     pixel_format = 'gbrpf32le' if hlg else 'rgb24'
     result = subprocess.check_output(['ffmpeg','-nostdin','-v','error','-f','lavfi','-i',swatch,
-                                      '-frames:v','1','-pix_fmt',pixel_format,'-f','rawvideo','pipe:1'],timeout=5)
+                                      '-frames:v','1','-pix_fmt',pixel_format,'-f','rawvideo','pipe:1'],
+                                     timeout=5,creationflags=HIDE_CONSOLE)
     if len(result) != (48 if hlg else 12):
         raise ValueError('Could not convert the HDR title color')
     if hlg:

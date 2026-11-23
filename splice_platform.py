@@ -2,7 +2,11 @@
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
+
+
+HIDE_CONSOLE = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 def data_directory(*, browser=False):
