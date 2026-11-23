@@ -24,7 +24,10 @@ function startBackend() {
   let stderr = ''
   let ready = false
   child.stdin.on('error', error => console.error(error.message))
-  child.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-1800) })
+  child.stderr.on('data', chunk => {
+    stderr = (stderr + chunk).slice(-1800)
+    if (process.env.SPLICE_TEST_TRACE) console.error(chunk.toString().trimEnd())
+  })
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error('The editor server did not start within 15 seconds.')), 15000)
     let startup = ''

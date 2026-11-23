@@ -18,9 +18,11 @@ async function windowForEditor() {
   const app = await electron.launch({
     executablePath: path.join(installed, 'Splice.exe'),
     args: [`--user-data-dir=${path.join(workspace, 'profile')}`],
-    env: { ...env, Path: path.join(process.env.SystemRoot, 'System32'), SPLICE_DATA_DIR: path.join(workspace, 'media') },
+    env: { ...env, Path: path.join(process.env.SystemRoot, 'System32'),
+      SPLICE_DATA_DIR: path.join(workspace, 'media'), SPLICE_TEST_TRACE: '1' },
     timeout: 30000
   })
+  app.on('console', message => { if (message.type() === 'error') console.error(message.text()) })
   const page = await app.firstWindow()
   page.setDefaultTimeout(20000)
   await page.waitForFunction(() => !!window.SpliceSession)

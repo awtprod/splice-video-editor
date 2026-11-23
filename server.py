@@ -292,8 +292,19 @@ if __name__ == '__main__':
     with server:
         signal.signal(signal.SIGTERM,_exit_on_terminate)
         if args.exit_with_stdin:
+            # Watch the launcher pipe without exposing it as the standard
+            # input of child processes created by the render server.
+            parent_pipe = os.dup(sys.stdin.fileno())
+            with open(os.devnull, "rb") as null:
+                os.dup2(null.fileno(), sys.stdin.fileno())
+            if os.name == "nt":
+                import ctypes
+                import msvcrt
+                ctypes.windll.kernel32.SetStdHandle(-10, ctypes.c_void_p(msvcrt.get_osfhandle(sys.stdin.fileno())))
+
             def stop_on_parent_exit():
-                sys.stdin.buffer.read(1)
+                with os.fdopen(parent_pipe, "rb", buffering=0) as pipe:
+                    pipe.read(1)
                 server.shutdown()
 
             threading.Thread(target=stop_on_parent_exit, daemon=True).start()

@@ -18,6 +18,9 @@ FORMATS = {'h264':('mp4','video/mp4',True), 'prores':('mov','video/quicktime',Fa
 
 
 def _worker(project, options, output, progress, cancelled, connection):
+    if os.environ.get('SPLICE_TEST_TRACE'):
+        import faulthandler
+        faulthandler.dump_traceback_later(10)
     # A cancelled render must stop its FFmpeg children as well as Python.
     if os.name != 'nt':
         os.setsid()
