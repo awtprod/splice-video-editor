@@ -119,6 +119,14 @@ class MovieDelivery(unittest.TestCase):
         self.assertAlmostEqual(max(self.frame(.4)),128,delta=18)
         self.assertGreater(max(self.frame(.8)),235)
 
+    def test_overlapping_titles_render_in_track_order(self):
+        front = {'type':'title','track':4,'start':0,'duration':1,'title':'TITLE',
+                 'titleStyle':{'fontSize':18,'color':'#ffffff'}}
+        behind = {**front,'track':3,'titleStyle':{**front['titleStyle'],'color':'#2040df'}}
+        self.project['clips'] = [front, behind]
+        render_to_file(self.project, self.destination)
+        self.assertGreater(max(self.frame(.4)[0::3]),230)
+
     def test_growing_rotated_clip_keeps_picture_at_the_edges(self):
         self.project['media']=[dict(id='still',src='/assets/ridge.jpg')]
         self.project['clips']=[self.clip('still','still',0,1.2,keyframes={

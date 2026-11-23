@@ -10,6 +10,19 @@ from premiere import open_project, save_project
 
 
 class ExtendedEffectsRoundTrip(unittest.TestCase):
+    def test_removing_opacity_keys_survives_native_reopen(self):
+        project = {'name':'Title','fps':25,'media':[],'clips':[{
+            'type':'title','track':4,'title':'Card','start':0,'duration':2,'opacity':100,
+            'keyframes':{'opacity':[{'time':0,'value':0},{'time':1,'value':100}]},
+        }]}
+        reopened = open_project(save_project(project))
+        self.assertEqual(len(reopened['clips'][0]['keyframes']['opacity']),2)
+        reopened['clips'][0]['keyframes']['opacity'] = []
+        reopened['clips'][0]['opacity'] = 65
+        title = open_project(save_project(reopened))['clips'][0]
+        self.assertEqual(title['opacity'],65)
+        self.assertFalse(title.get('keyframes',{}).get('opacity'))
+
     def test_custom_title_fill_and_stroke_roundtrip(self):
         project = {'name':'Title', 'fps':25, 'media':[], 'clips':[{
             'type':'title','track':2,'title':'Card','start':0,'duration':2,

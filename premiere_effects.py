@@ -14,6 +14,7 @@ from py_premiere.models.caption import (
     _write_table_flag, _document_table,
 )
 from py_premiere.models.color import Color
+from py_premiere.xml.mutations import remove_child
 
 TEMPLATES = Path(__file__).resolve().parent / 'vendor' / 'splice-effects'
 NEUTRAL = {'brightness': 100, 'contrast': 100, 'saturation': 100, 'temperature': 0, 'tint': 0}
@@ -383,6 +384,12 @@ def apply_extended(clip, item):
             if not param.is_time_varying and abs(float(param.value or 0)-opacity)>.0001:
                 param.value=opacity
             _apply_scalar_keys(param,clip,automation['opacity'],low=0,high=100)
+        elif automation.get('opacity') == [] and param.is_time_varying:
+            for tag in ('Keyframes','IsTimeVarying'):
+                field = param._element.find(tag)
+                if field is not None:
+                    remove_child(param._element,field)
+            param.value=opacity
         elif abs(float(param.value or 0)-opacity)>.0001:
             if param.is_time_varying:
                 raise ValueError('An existing Premiere opacity animation needs manual review before replacing it.')

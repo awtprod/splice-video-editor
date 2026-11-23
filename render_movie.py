@@ -461,7 +461,9 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
                 filters.append(f'[{active}][clip{number}]overlay={position}:{overlay}[base{number+1}]')
             active = f'base{number+1}'
     with tempfile.TemporaryDirectory(prefix='splice-render-') as work:
-        for number, clip in enumerate(c for c in clips if c['type'] == 'title' and c.get('title') and not muted.get('title')):
+        titles = sorted((c for c in clips if c['type']=='title' and c.get('title') and not muted.get('title')),
+                        key=lambda c: (c.get('track',4),c['start']))
+        for number, clip in enumerate(titles):
             begin = float(clip['start']); end = begin + float(clip['duration'])
             first_frame = math.ceil(begin * fps - 1e-6)
             out_frame = math.ceil(end * fps - 1e-6)
