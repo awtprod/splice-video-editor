@@ -61,6 +61,6 @@ async function stop(child){if(child.exitCode!==null||child.signalCode)return;con
  } finally {
   const stopped=await Promise.allSettled([...children].map(stop));
   for(const s of stopped)if(s.status==='rejected')console.error(s.reason);
-  fs.rmSync(profile,{recursive:true,force:true});
+  fs.rmSync(profile,{recursive:true,force:true,maxRetries:5,retryDelay:100});
  }
 })().catch(e=>{console.error(e);process.exitCode=1});

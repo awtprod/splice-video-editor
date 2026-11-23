@@ -65,6 +65,17 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, OSError, TimeoutError, RuntimeError, subprocess.SubprocessError) as error:
                 self._json(422, {'error':str(error)})
             return
+        if path == '/api/media/audition':
+            from media_proxy import audition_audio
+            query = parse_qs(urlsplit(self.path).query)
+            try:
+                audio = audition_audio(query.get('src',[''])[0], int(query.get('index',['-1'])[0]))
+                self._reply(200, audio, 'audio/wav')
+            except (BrokenPipeError, ConnectionResetError):
+                return
+            except (ValueError, OSError, subprocess.SubprocessError) as error:
+                self._json(422, {'error':str(error)})
+            return
         job = re.fullmatch(r'/api/exports/([a-f0-9]{32})(/file|/preview)?', path)
         if job:
             try:

@@ -4,7 +4,7 @@ Splice is a local video editor for Linux. It opens with **Alpine Passage**, a 32
 
 ## Launch
 
-Use Python 3.10 or newer, Chromium or Google Chrome, and FFmpeg with ffprobe, H.264, AAC, and the drawtext filter. Extract the entire Linux archive and run this command inside its Splice directory.
+Use Python 3.10 or newer, Chromium or Google Chrome, and FFmpeg with ffprobe, H.264, AAC, and the drawtext filter. HDR-to-SDR conversion uses FFmpeg's zscale and tonemap filters. Extract the entire Linux archive and run this command inside its Splice directory.
 
 ```sh
 ./splice
@@ -14,7 +14,7 @@ The launcher opens a dedicated application window and stops its loopback server 
 
 ## Edit
 
-Use **File → New project** to choose a name, frame size, and frame rate. The media pool accepts files from **Import media**. Splice probes camera originals with FFmpeg and builds local proxies for formats such as ProRes MOV. Choose **Build seek proxy** in the source monitor for faster scrubbing and reverse playback of long-GOP footage. Premiere save and final export use the original. In the source monitor, set In and Out and insert, overwrite, or append to a target track. A bin path organizes the pool. Click an offline item to relink it individually. **Relink from folder** matches moved sources by directory suffix and asks you to confirm filename-only matches.
+Use **File → New project** to choose a name, frame size, and frame rate. The media pool accepts files from **Import media**. Splice probes camera originals with FFmpeg and builds local proxies for formats such as ProRes MOV. Choose **Build seek proxy** in the source monitor for faster scrubbing and reverse playback of long-GOP footage. Premiere save and final export use the original. In the source monitor, set In and Out and insert, overwrite, or append to a target track. A bin path organizes the pool. Click an offline item to relink it individually. **Relink from folder** matches moved sources by directory suffix and asks for confirmation when the path matches only a filename or a single folder and filename.
 
 Drag a clip body to move it, drag an edge to trim, Shift-drag a shared edge to roll, or Alt-drag the body to slip. The **Snap** and **Ripple** switches control trims and ripple deletes. Track headers control locking and ripple synchronization. Linked camera audio follows the picture through supported timeline edits. Use **S** to split at the playhead. Ctrl-click selects multiple clips. The ruler supports scrubbing and markers. The File menu includes the keyboard reference.
 
@@ -22,7 +22,7 @@ Select a clip to adjust its speed, playback direction, transform, color, transit
 
 **Save** writes an editable Premiere project. The native file picker can update a file you select. Browsers without filesystem access download a copy. For newly placed media with discrete audio streams, choose a stream or default stereo routing in the Source Monitor. Premiere save retains the camera picture and creates linked 24-bit PCM audio. Include that generated audio with the originals when moving the project. **File → Save working project** retains Splice-specific state. Edits are also checkpointed to a local session. **File → Recent projects & recovery** opens earlier projects and versions.
 
-**Export video** offers H.264/AAC MP4, ProRes 422 HQ with 24-bit PCM in MOV, and a separate 48 kHz 24-bit WAV mix. Choose the entire sequence or a custom range. MP4 delivery includes selectable video quality and audio bitrate. Export supports progress, cancellation, and in-app MP4 and WAV review. The Captions panel imports, edits, and exports SRT. MP4/MOV can carry a selectable subtitle stream. The renderer processes video in segments to bound memory. The sequence frame size and frame rate determine output dimensions and timing.
+**Export video** offers H.264/AAC MP4, ProRes 422 HQ with 24-bit PCM in MOV, and a separate 48 kHz 24-bit WAV mix. Choose the entire sequence or a custom range. MP4 delivery includes selectable video quality and audio bitrate. Splice previews newly imported HLG and PQ on an SDR monitor and tone-maps those sources to Rec. 709 for MP4 delivery. ProRes can retain one HDR color space across the sequence. Export supports progress, cancellation, and in-app MP4 and WAV review. The Captions panel imports, edits, and exports SRT. MP4/MOV can carry a selectable subtitle stream. The renderer processes video in segments to bound memory. The sequence frame size and frame rate determine output dimensions and timing.
 
 ## Premiere compatibility
 

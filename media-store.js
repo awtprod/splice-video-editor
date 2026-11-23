@@ -62,7 +62,8 @@ window.SpliceMedia = (() => {
       if(options[0].count===options[1]?.count || consumed.has(options[0].file))
         throw Error('Ambiguous copies of '+item.name+'. Relink this source individually.');
       const {file,count,depth}=options[0];
-      consumed.add(file);ordered.push({item,file,matched:count,needsConfirmation:count===1||count<depth});
+      // A chosen card folder can share its name and filenames with another camera.
+      consumed.add(file);ordered.push({item,file,matched:count,needsConfirmation:count<3||count<depth});
     }
     return ordered;
   }

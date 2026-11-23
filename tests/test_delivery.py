@@ -81,6 +81,26 @@ class MovieDelivery(unittest.TestCase):
         self.assertEqual(next(s['nb_frames'] for s in self.streams() if s['codec_type']=='video'),'25')
         self.assertGreater(statistics.mean(self.frame(.8)),30)
 
+    def test_hdr_mp4_tone_maps_and_sets_rec709_signaling(self):
+        from premiere import MEDIA_ROOT
+        MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=MEDIA_ROOT) as directory:
+            source = Path(directory) / 'hlg.mov'
+            fixture = ('color=gray:s=160x90:r=25:d=1,'
+                       'setparams=color_primaries=bt2020:color_trc=arib-std-b67:colorspace=bt2020nc')
+            subprocess.run(['ffmpeg','-nostdin','-v','error','-f','lavfi','-i',fixture,
+                            '-c:v','prores_ks','-profile:v','3','-threads','1','-pix_fmt','yuv422p10le',
+                            '-color_primaries','bt2020','-color_trc','arib-std-b67','-colorspace','bt2020nc',
+                            '-movflags','+write_colr',str(source)], check=True, timeout=15)
+            self.project['media'] = [{'id':'hdr','src':'/media/'+str(source.relative_to(MEDIA_ROOT))}]
+            self.project['clips'] = [{**self.clip('hdr','hdr',0,1), 'in':0}]
+            render_to_file(self.project, self.destination)
+            video = next(stream for stream in self.streams() if stream['codec_type']=='video')
+            self.assertEqual(tuple(video[field] for field in ('color_primaries','color_transfer','color_space')),
+                             ('bt709','bt709','bt709'))
+            self.assertEqual(video['nb_frames'], '25')
+            self.assertGreater(statistics.mean(self.frame(.4)), 15)
+
     def test_title_lines_center_independently_and_end_on_out_frame(self):
         self.project.update(width=640,height=360,clips=[
             {'type':'title','start':0,'duration':1,'title':'WIDE FIRST LINE\nI',

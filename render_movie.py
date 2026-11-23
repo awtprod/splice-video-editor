@@ -7,6 +7,7 @@ import tempfile
 from pathlib import Path
 
 from premiere import MEDIA_ROOT, STILL_IMAGES, _media_path
+from media_proxy import AVC_REC709, HDR_TRANSFERS, HDR_TO_REC709, REC709
 
 
 
@@ -87,8 +88,9 @@ def _css_color_filter(color, high_depth):
     return f',format={rgb},lutrgb={brightness_filter},lutrgb={contrast_filter},colorchannelmixer={mixer},lutrgb={grade_filter}'
 
 
-def _fit_picture(width, height, color, lut, alpha_format, high_depth):
-    return (f'scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2'
+def _fit_picture(width, height, color, lut, alpha_format, high_depth, tone_map=False):
+    tone_filter = HDR_TO_REC709+',' if tone_map else ''
+    return (f'{tone_filter}scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2'
             f'{_css_color_filter(color,high_depth)}{lut},format={alpha_format},'
             f'pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black@0')
 
@@ -304,7 +306,8 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
                 kinds[item['id']], item['_actualDuration'], item['_audioStreams'] = {'video'}, 7200, []
             else:
                 probe = probes.get(path) or _probe(path)
-                kinds[item['id']], item['_actualDuration'], item['_audioStreams'], item['_videoFPS'], _ = probe
+                kinds[item['id']], item['_actualDuration'], item['_audioStreams'], item['_videoFPS'], profile = probe
+                item['_toneMap'] = not high_depth and profile[1] in HDR_TRANSFERS
         speed=_number(clip.get('speed',1),'speed',.1,16)
         before=float(clip.get('transitionBefore',0) or 0)
         if before and not clip.get('reverse') and float(clip.get('in',0))-before*speed<-.01:
@@ -377,7 +380,7 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
             opacity_keys=(clip.get('keyframes') or {}).get('opacity')
             prefix=(f'color=c=black:s={width}x{height}:r={fps}:d={render_length:.6f},setpts=PTS-STARTPTS' if index is None else
                     f'[{index}:v]trim=start={render_source:.6f}:duration={render_length*speed:.6f}{reverse},setpts=(PTS-STARTPTS)/{speed:.6f},fps={fps}')
-            fit = _fit_picture(width,height,color,lut_filter,alpha_format,high_depth)
+            fit = _fit_picture(width,height,color,lut_filter,alpha_format,high_depth,item.get('_toneMap',False))
             chain = f'{prefix},{fit}{transform}'
             if opacity_keys:
                 opacity_expr=_keyframe_expr(clip,'opacity',opacity*100,0,100,f'(T-{before:.6f})')
@@ -432,7 +435,8 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
                 if tail + 1e-6 >= frame_duration:
                     prior_prefix=(f'color=c=black:s={width}x{height}:r={fps}:d={tail:.6f},setpts=PTS-STARTPTS' if prior_index is None else
                                   f'[{prior_index}:v]trim=start={prior_source:.6f}:duration={tail*prior_speed:.6f}{prior_reverse},setpts=(PTS-STARTPTS)/{prior_speed:.6f},fps={fps}')
-                    prior_fit = _fit_picture(width,height,prior_color,prior_lut,alpha_format,high_depth)
+                    prior_fit = _fit_picture(width,height,prior_color,prior_lut,alpha_format,high_depth,
+                                             media_by_id[previous['mediaId']].get('_toneMap',False))
                     prior_alpha = _mask_alpha(f'{prior_opacity:.6f}',alpha_format,full_alpha) if prior_opacity!=1 else ''
                     cut_frame = math.ceil(start*fps-1e-6)
                     filters.append(f'{prior_prefix},{prior_fit}{prior_transform}{prior_alpha},setpts=PTS+{cut_frame}[tail{number}]')
@@ -602,7 +606,7 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
         profile = (options or {}).get('_color_profile')
         if profile:
             command.extend(['-color_primaries',profile[0],'-color_trc',profile[1],'-colorspace',profile[2]])
-            if high_depth and profile[1] in ('arib-std-b67','smpte2084'):
+            if high_depth and profile[1] in HDR_TRANSFERS:
                 command.extend(['-bsf:v',f'prores_metadata=color_primaries={profile[0]}:color_trc={profile[1]}:colorspace={profile[2]}'])
         command.extend(['-movflags','+faststart+write_colr' if profile else '+faststart',str(output)])
         _run_controlled(command,cancelled,min(3600,max(120,duration*8)))
@@ -671,11 +675,12 @@ def _render_prepared(project, output_path, *, options=None, progress=None, cance
                 profiles.add(probes[path][-1])
             else:
                 profiles.add((None,None,None))
-    hdr = any(profile[1] in ('arib-std-b67','smpte2084') for profile in profiles)
-    if hdr and (len(profiles)!=1 or codec!='prores'):
-        raise ValueError('Use ProRes HQ and one HDR color space to preserve HLG or PQ signaling.')
+    hdr = any(profile[1] in HDR_TRANSFERS for profile in profiles)
+    if hdr and codec=='prores' and len(profiles)!=1:
+        raise ValueError('A ProRes HDR master needs one HDR color space. Export a Rec. 709 MP4 to combine HDR and SDR sources.')
     profile = next(iter(profiles)) if len(profiles)==1 else None
     if profile and not all(value and value not in ('unknown','unspecified') for value in profile):profile=None
+    if hdr and codec=='h264': profile=REC709
     options.update(_probes=probes,_color_profile=profile)
     audio_options={**options,'_output_frames':(first,stop) if (first,stop)!=(0,total_frames) else None}
     captions=project.get('captions') or []
@@ -786,6 +791,8 @@ def _render_prepared(project, output_path, *, options=None, progress=None, cance
             command.extend(['-c:s','mov_text','-metadata:s:s:0','language=eng','-disposition:s:0','default'])
         if profile:
             command.extend(['-color_primaries',profile[0],'-color_trc',profile[1],'-colorspace',profile[2]])
+            if codec=='h264' and profile==REC709:
+                command.extend(['-bsf:v',AVC_REC709])
         command.extend(['-t',f'{out_duration:.6f}','-movflags','+faststart+write_colr' if profile else '+faststart',str(output_path)])
         _run_controlled(command,cancelled,120)
         if cancelled and cancelled.is_set(): raise InterruptedError('Export cancelled')

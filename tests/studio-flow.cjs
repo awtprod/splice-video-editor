@@ -204,6 +204,30 @@ async function main() {
     await waitState(()=>Editor.get().audioMeters[1]>.02&&Editor.get().audioMeters[2]<.002);
     await click('#play-toggle');
     console.log('The V2 mixer mutes embedded sound on V2 while V1 remains audible.');
+    await page.evaluate(()=>{
+      Editor.editProject(project=>{project.clips=project.clips.filter(clip=>clip.id==='video-1');});
+      Editor.seek(.4);
+    });
+    await page.locator('[data-clip=video-1] .clip-name').click();
+    const reverse=page.locator('#inspector-content [data-field=reverse]');
+    await reverse.check();
+    await waitState(()=>Editor.get().video.readyState>=2&&!Editor.get().video.seeking&&Editor.get().audioMeters[1]<.002);
+    await click('#play-toggle');
+    await waitState(()=>Editor.get().time>.65&&Editor.get().audioMeters[1]>.02);
+    await click('#play-toggle');
+    await reverse.uncheck();
+    const speed=page.locator('#inspector-content [data-field=speedPercent]');
+    await speed.fill('10');
+    await speed.dispatchEvent('change');
+    await page.evaluate(()=>Editor.seek(.4));
+    await waitState(()=>Editor.get().video.readyState>=2&&!Editor.get().video.seeking);
+    await click('#play-toggle');
+    await waitState(()=>Editor.get().time>=1.2);
+    const slow=await page.evaluate(()=>({timeline:Editor.get().time,source:Editor.get().video.currentTime,rate:Editor.get().video.playbackRate}));
+    assert.equal(slow.rate,.1);
+    assert.ok(Math.abs(slow.source-.1*slow.timeline)<.05,JSON.stringify(slow));
+    await click('#play-toggle');
+    console.log('Reversed clips retain monitor audio, and 10% speed advances the source at 10%.');
     await page.evaluate(()=>SpliceSession.newProject({name:'Picture in picture',width:640,height:360,fps:25}));
     for(const color of ['red','lime']) execFileSync('ffmpeg',['-nostdin','-v','error','-f','lavfi','-i',
       'color='+color+':s=320x180:r=25:d=3','-c:v','libx264','-threads','1',path.join(temp,color+'.mp4')]);

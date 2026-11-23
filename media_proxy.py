@@ -15,6 +15,34 @@ from premiere import MEDIA_ROOT, STILL_IMAGES, _media_path, _playback_url
 _encoders = threading.BoundedSemaphore(2)
 _locks = tuple(threading.Lock() for _ in range(32))
 MAX_AUDIO_STREAMS = 16
+HDR_TRANSFERS = frozenset({'arib-std-b67', 'smpte2084'})
+REC709 = ('bt709', 'bt709', 'bt709')
+AVC_REC709 = 'h264_metadata=colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1'
+HDR_TO_REC709 = ('zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,'
+                'tonemap=mobius:desat=2:peak=10,zscale=t=bt709:m=bt709:r=limited,format=yuv444p10le')
+AUDITION_SECONDS = 4
+_audition_decoders = threading.BoundedSemaphore(4)
+
+
+def audition_audio(src, index):
+    """Read a bounded span of the same audio the normal monitor plays."""
+    if not 0 <= index < 86400 // AUDITION_SECONDS:
+        raise ValueError('Invalid audio preview position')
+    path = _media_path(src)
+    if not _audition_decoders.acquire(timeout=2):
+        raise ValueError('Audio preview is busy')
+    try:
+        result = subprocess.run([
+            'ffmpeg', '-nostdin', '-v', 'error', '-protocol_whitelist', 'file', '-threads', '1',
+            '-ss', str(index * AUDITION_SECONDS), '-i', str(path), '-map', '0:a:0',
+            '-af', 'aresample=48000:first_pts=0,apad', '-ac', '2', '-c:a', 'pcm_s16le',
+            '-t', str(AUDITION_SECONDS), '-f', 'wav', 'pipe:1',
+        ], capture_output=True, timeout=8)
+        if result.returncode:
+            raise ValueError('Could not decode audio for preview')
+        return result.stdout
+    finally:
+        _audition_decoders.release()
 
 
 def stereo_mix_filters(sources, output, channels, duration):
@@ -35,7 +63,7 @@ def stereo_mix_filters(sources, output, channels, duration):
 def describe(src):
     path = _media_path(src)
     probe = subprocess.run(['ffprobe', '-v', 'error', '-protocol_whitelist', 'file',
-                            '-show_entries', 'format=duration:stream=codec_type,codec_name,width,height,avg_frame_rate,duration,channels:stream_disposition=attached_pic',
+                            '-show_entries', 'format=duration:stream=codec_type,codec_name,width,height,avg_frame_rate,duration,channels,color_transfer:stream_disposition=attached_pic',
                             '-of', 'json', str(path)], capture_output=True, timeout=25)
     if probe.returncode:
         raise ValueError('Could not read media streams in ' + path.name)
@@ -60,10 +88,11 @@ def describe(src):
     native_video = not video or vcodec in ('h264','vp8','vp9','av1')
     native_audio = not audio or acodec in ('aac','mp3','opus','vorbis','flac','pcm_s16le','pcm_s24le','pcm_f32le')
     native_container = path.suffix.lower() in ('.mp4','.m4v','.m4a','.webm','.wav','.mp3','.ogg','.flac','.aac')
-    return dict(type='video' if video else 'audio', duration=duration, width=video.get('width'), height=video.get('height'),
+    hdr = video.get('color_transfer') in HDR_TRANSFERS
+    return dict(type='video' if video else 'audio', duration=duration, width=video.get('width'), height=video.get('height'), hdr=hdr,
                 fps=fps, videoCodec=vcodec, audioCodec=acodec, audioChannels=2 if len(audio_streams)>1 else audio.get('channels',0),
                 audioStreams=len(audio_streams), audioStreamChannels=[stream.get('channels',1) for stream in audio_streams], still=still,
-                proxyRecommended=len(audio_streams)>1 or not (native_video and native_audio and native_container))
+                proxyRecommended=hdr or len(audio_streams)>1 or not (native_video and native_audio and native_container))
 
 
 def _select_stream(channels, selection):
@@ -87,6 +116,8 @@ def proxy(src, seek_optimized=False, audio_stream=None):
         raise ValueError('A seek proxy requires moving video')
     stat = original.stat()
     profile = 'proxy-seek-v1' if seek_optimized else 'proxy-v3'
+    if info['hdr']:
+        profile += ':hdr-rec709-v1'
     audio_map = _source_audio_map(info['audioStreamChannels'],audio_stream,info['duration'])
     if info['audioStreams']>1:
         profile += f':audio-v2:{audio_stream}'
@@ -113,9 +144,12 @@ def proxy(src, seek_optimized=False, audio_stream=None):
                 if video:
                     width,height = (960,540) if seek_optimized else (1280,720)
                     fit = f"scale=w='min({width},iw)':h='min({height},ih)':force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1"
-                    cmd += ['-map','0:V:0','-vf',fit,'-c:v','libx264','-threads','2','-preset','veryfast',
+                    picture = HDR_TO_REC709+','+fit if info['hdr'] else fit
+                    cmd += ['-map','0:V:0','-vf',picture,'-c:v','libx264','-threads','2','-preset','veryfast',
                             '-crf','22' if seek_optimized else '19','-maxrate','4M','-bufsize','8M',
                             '-g','1' if seek_optimized else '24','-pix_fmt','yuv420p']
+                    if info['hdr']:
+                        cmd += ['-bsf:v',AVC_REC709,'-color_primaries','bt709','-color_trc','bt709','-colorspace','bt709']
                 else:
                     cmd += ['-vn']
                 cmd += audio_map

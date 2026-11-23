@@ -56,11 +56,17 @@ window.SpliceDialogs = (() => {
       form.querySelector('.export-spec').after(notice);
     }
     const render=form.querySelector('[type=submit]'), cancel=form.querySelector('[data-cancel]'), progress=form.querySelector('progress'), status=form.querySelector('[role=status]');
+    const colorNotice=document.createElement('p');
+    const hdrSources=new Set(state.project.media.filter(m=>m.hdr).map(m=>m.id));
+    const hdr=state.project.clips.some(c=>c.type==='video' && hdrSources.has(c.mediaId));
+    colorNotice.textContent='MP4 tone-maps HDR footage to Rec. 709.';
+    form.querySelector('.export-spec').after(colorNotice);
     let controller, renderWarnings=[];
     const syncFormat=()=>{
       const h264=form.elements.codec.value==='h264';
       form.elements.quality.closest('label').hidden=!h264;
       form.elements.bitrate.closest('label').hidden=!h264;
+      colorNotice.hidden=!hdr||!h264;
       render.textContent='Render '+({h264:'MP4',prores:'MOV',wav:'WAV'}[form.elements.codec.value]);
     };
     form.elements.codec.onchange=syncFormat;syncFormat();

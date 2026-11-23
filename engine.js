@@ -86,6 +86,92 @@
   let gestureBefore = null;
   let audioContext;
   const audioNodes = new WeakMap();
+  const auditionSpan = 4;
+  const auditionBuffers = new Map();
+  const auditions = new Map();
+  function auditionBuffer(src, index, reversed) {
+    const key=JSON.stringify([src,index,reversed]);
+    let entry=auditionBuffers.get(key);
+    if (entry?.retryAfter && performance.now()>=entry.retryAfter) {
+      auditionBuffers.delete(key);
+      entry=null;
+    }
+    if (entry) {
+      auditionBuffers.delete(key);
+      auditionBuffers.set(key,entry);
+      return entry.buffer;
+    }
+    const controller=new AbortController();
+    entry={controller};
+    auditionBuffers.set(key,entry);
+    if (auditionBuffers.size>24) {
+      const oldest=auditionBuffers.keys().next().value;
+      auditionBuffers.get(oldest).controller.abort();
+      auditionBuffers.delete(oldest);
+    }
+    fetch('/api/media/audition?'+new URLSearchParams({src,index}),{
+      signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)]),
+    }).then(async response=>{
+      if (!response.ok) throw Error(await response.text());
+      const buffer=await audioContext.decodeAudioData(await response.arrayBuffer());
+      if (reversed) for(let channel=0;channel<buffer.numberOfChannels;channel++) buffer.getChannelData(channel).reverse();
+      entry.buffer=buffer;
+    }).catch(error=>{
+      if (!controller.signal.aborted) {
+        entry.retryAfter=performance.now()+5000;
+        console.warn('Audio preview unavailable',error);
+      }
+    });
+  }
+  function stopAudition(state) {
+    for(const voice of state.voices) { voice.stop();voice.disconnect(); }
+    state.voices.clear();
+  }
+  function auditionAudio(element,clip,target,rate,forceSeek) {
+    const item=mediaOf(clip);
+    if (!item?.src || item.audioChannels===0 || item.still || clip.embeddedAudio===false || target<0) return;
+    const index=Math.floor(target/auditionSpan), step=clip.reverse?-1:1;
+    const initial=auditionBuffer(item.src,index,clip.reverse);
+    const next=index+step;
+    if (next>=0 && next*auditionSpan<item.duration && (clip.reverse?target-index*auditionSpan:(index+1)*auditionSpan-target)<rate*.75)
+      auditionBuffer(item.src,next,clip.reverse);
+    if (!playing || playbackRate<0 || audioContext.state!=='running') return;
+    let state=auditions.get(element);
+    const now=audioContext.currentTime;
+    if (forceSeek || state?.src!==item.src || state?.rate!==rate || state?.step!==step || state?.id!==clip.id ||
+        (state.clock!==null && Math.abs(state.target+step*rate*(now-state.clock)-target)>rate*.15)) {
+      if (state) stopAudition(state);
+      state={src:item.src,id:clip.id,rate,step,clock:null,voices:new Set()};
+      auditions.set(element,state);
+    }
+    state.active=true;
+    if (!initial) return;
+    let buffer, offset, start, chunk;
+    if (state.clock===null || state.end<=now) {
+      stopAudition(state);
+      start=now;
+      chunk=index;
+      offset=clip.reverse ? auditionSpan-(target-index*auditionSpan) : target-index*auditionSpan;
+      buffer=initial;
+      state.clock=now;
+      state.target=target;
+    } else if (state.end-now<.12 && state.next>=0 && state.next*auditionSpan<item.duration) {
+      chunk=state.next;
+      buffer=auditionBuffer(item.src,chunk,clip.reverse);
+      start=state.end;
+      offset=0;
+    }
+    if (!buffer || offset>=buffer.duration) return;
+    const voice=audioContext.createBufferSource();
+    voice.buffer=buffer;
+    voice.playbackRate.value=rate;
+    voice.connect(routeAudio(element).gain);
+    voice.onended=()=>{voice.disconnect();state.voices.delete(voice);};
+    voice.start(start,offset);
+    state.voices.add(voice);
+    state.next=chunk+step;
+    state.end=start+(buffer.duration-offset)/rate;
+  }
   function routeAudio(element) {
     if (!audioContext) audioContext = new AudioContext();
     let route = audioNodes.get(element);
@@ -144,6 +230,17 @@
     if (shouldPlay && element.paused) element.play().catch(() => {});
     else if (!shouldPlay && !element.paused) element.pause();
   }
+  const clipPlaybackRate = clip => clamp((Number(clip.speed)||1)*Math.abs(playbackRate),.0625,16);
+  function syncClipPlayback(element, clip, target, forceSeek, audible=true) {
+    const rate=clipPlaybackRate(clip);
+    element.playbackRate=rate;
+    setMediaPlaying(element,playing && playbackRate>0 && !clip.reverse && rate>=.25);
+    element.muted=!audible || clip.reverse || rate<.25;
+    if (!audible) return;
+    setAudio(element,clip);
+    if (clip.reverse || rate<.25) auditionAudio(element,clip,target,rate,forceSeek);
+  }
+  const seekTolerance = clip => Math.max(1/project.fps,Math.min(1,Number(clip.speed)||1)*.3);
   let history = [];
   let future = [];
   const subscribers = new Set();
@@ -348,7 +445,8 @@
   }
   const presentedSeekTimes = new WeakMap();
   function seekVideo(element, clip, target, forceSeek) {
-    const framewise=playing && (playbackRate<0 || clip.reverse);
+    const slow=clipPlaybackRate(clip)<.25;
+    const framewise=playing && (playbackRate<0 || clip.reverse || slow);
     if (!forceSeek && framewise) {
       if (element.seeking || element.readyState<2) return;
       if (presentedSeekTimes.get(element)!==element.currentTime) {
@@ -357,7 +455,10 @@
         return;
       }
     }
-    if (!forceSeek && Math.abs(element.currentTime-target)<=(framewise?.5/project.fps:.3)) return;
+    if (!forceSeek && framewise && slow) {
+      const fps=mediaOf(clip)?.fps||project.fps;
+      if (Math.floor(element.currentTime*fps+1e-6)===Math.floor(target*fps+1e-6)) return;
+    } else if (!forceSeek && Math.abs(element.currentTime-target)<=(framewise?.5/project.fps:seekTolerance(clip))) return;
     try { element.currentTime = Math.max(0,target); }
     catch (error) {
       if (error.name!=='InvalidStateError') throw error;
@@ -365,6 +466,7 @@
   }
   function syncMedia(forceSeek = false) {
     ensureElements();
+    for(const state of auditions.values()) state.active=false;
     indexTransitions();
     if (window.SpliceMedia?.prepareNested) for (const clip of project.clips) {
       if (clip.type==='title' || clip.start-transitionBefore(clip)>time+1.5 || clip.start+clip.duration<time) continue;
@@ -415,11 +517,9 @@
       }
     }
     if (clip && mediaItem) {
-      video.muted=false;
       const target = sourceTime(clip,time);
       seekVideo(video,clip,target,forceSeek);
-      video.playbackRate=clamp((Number(clip.speed)||1)*Math.max(.25,Math.abs(playbackRate)),.25,16);
-      setMediaPlaying(video,playing && playbackRate>0 && !clip.reverse);
+      syncClipPlayback(video,clip,target,forceSeek);
     }
     const previous = clip ? transitionTail(clip,time) : null;
     const previousMedia = previous && mediaOf(previous);
@@ -439,10 +539,7 @@
     if (previous) {
       const target = sourceTime(previous,previous.start+previous.duration+time-clip.start);
       seekVideo(transitionVideo,previous,target,forceSeek);
-      transitionVideo.playbackRate=clamp((Number(previous.speed)||1)*Math.max(.25,Math.abs(playbackRate)),.25,16);
-      setMediaPlaying(transitionVideo,playing && playbackRate>0 && !previous.reverse);
-      transitionVideo.muted=false;
-      setAudio(transitionVideo,previous);
+      syncClipPlayback(transitionVideo,previous,target,forceSeek);
     } else transitionVideo.pause();
     if (playing && playbackRate > 0 && clip && !previous) {
       const upcoming = project.clips
@@ -468,12 +565,8 @@
       }
       if(upcoming && preloadClipId===upcoming.id && time>=upcoming.start-transitionBefore(upcoming)) {
         const target=sourceTime(upcoming,time);
-        if(forceSeek||Math.abs(transitionVideo.currentTime-target)>.3) try{transitionVideo.currentTime=target}catch(_){}
-        setMediaPlaying(transitionVideo,!upcoming.reverse);
-        if(transitionBefore(upcoming)>0) {
-          transitionVideo.muted=false;
-          setAudio(transitionVideo,upcoming);
-        }
+        seekVideo(transitionVideo,upcoming,target,forceSeek);
+        syncClipPlayback(transitionVideo,upcoming,target,forceSeek,transitionBefore(upcoming)>0);
       }
     }
     const visible = project.clips.filter(c=>c.type==='video' && c.start-transitionBefore(c)<=time && time<c.start+c.duration);
@@ -514,10 +607,10 @@
       const preload = preloading.has(layer.id);
       const target=sourceTime(layer,preload?layer.start-transitionBefore(layer):time);
       seekVideo(element,layer,target,forceSeek);
-      element.playbackRate=clamp((Number(layer.speed)||1)*Math.max(.25,Math.abs(playbackRate)),.25,16);
-      setMediaPlaying(element,!preload && playing && playbackRate>0 && !layer.reverse);
-      element.muted=preload;
-      if (!preload) setAudio(element,layer);
+      if (preload) {
+        element.muted=true;
+        setMediaPlaying(element,false);
+      } else syncClipPlayback(element,layer,target,forceSeek);
     }
     const currentIds = new Set(audioClips.map((c) => c.id));
     for (const [id, element] of audioElements)
@@ -543,18 +636,19 @@
       }
       if (element.getAttribute("src") !== item.src) element.src = item.src;
       const target = sourceTime(audioClip,time);
-      if (forceSeek || Math.abs(element.currentTime - target) > 0.3)
+      if (forceSeek || Math.abs(element.currentTime - target) > seekTolerance(audioClip))
         try {
           element.currentTime = target;
         } catch (_) {
           /* Metadata may still be loading. */
         }
-      element.playbackRate=clamp((Number(audioClip.speed)||1)*Math.max(.25,Math.abs(playbackRate)),.25,16);
-      setMediaPlaying(element,playing && playbackRate>0 && !audioClip.reverse);
-      setAudio(element,audioClip);
+      syncClipPlayback(element,audioClip,target,forceSeek);
     }
     audio = audioClips.length ? audioElements.get(audioClips[0].id) : null;
-    if (clip) setAudio(video,clip);
+    for(const [element,state] of auditions) if (!state.active) {
+      stopAudition(state);
+      auditions.delete(element);
+    }
   }
   function curveValue(points,local,base) {
     if (!points.length) return base;
@@ -948,7 +1042,6 @@
       if(time>=duration()&&playbackRate>0) time=0;
       if(time<=0&&playbackRate<0) time=duration();
       playing=true;
-      for (const element of [video,transitionVideo,...audioElements.values(),...layerVideos.values()]) if(element) element.playbackRate=Math.max(.25,Math.abs(playbackRate));
       if(playbackRate>0) audioContext?.resume().catch(()=>{});
       syncMedia(true);notify();
     },
@@ -1050,7 +1143,7 @@
         const examples=unverified.slice(0,5).map(({item,file})=>`${item.path||item.name} → ${file.webkitRelativePath||file.name}`);
         const remaining=unverified.length-examples.length;
         if(remaining) examples.push(`and ${remaining} more`);
-        const reason=unverified.every(match=>match.matched===1)?'Only the filenames match':'The selected folders differ from the original paths';
+        const reason=unverified.every(match=>match.matched===1)?'Only the filenames match':'The selected folders do not identify the original camera or path';
         if(!window.confirm(`Review these relinks. ${reason}:\n\n${examples.join('\n')}\n\nUse these files?`))return false;
       }
       const rows=[];
