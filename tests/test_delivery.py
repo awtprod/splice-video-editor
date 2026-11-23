@@ -122,6 +122,10 @@ class MovieDelivery(unittest.TestCase):
             for start,end in ((.8,.96),(1,1.2)):
                 with self.assertRaisesRegex(ValueError,'one HDR color space'):
                     render_to_file(self.project,self.destination,options={'codec':'prores','range':{'start':start,'end':end}})
+            render_to_file(self.project,self.destination,options={'codec':'prores','colorSpace':'rec709',
+                                                                 'range':{'start':.8,'end':1.2}})
+            video = next(stream for stream in self.streams() if stream['codec_type']=='video')
+            self.assertEqual((video['nb_frames'],video['color_transfer'],video['pix_fmt']),('10','bt709','yuv422p10le'))
 
     def test_slow_audio_preview_keeps_pitch_and_samples_across_windows(self):
         from media_proxy import audition_audio
@@ -453,6 +457,22 @@ class MovieDelivery(unittest.TestCase):
             native=Path(directory)/'native.wav'
             render_to_file(reopened,native,options={'codec':'wav'})
             self.assertEqual(native.read_bytes(),output.read_bytes())
+            self.project['clips']=[
+                dict(type='video',mediaId='av',track=1,start=0,duration=.4,audioStream=0),
+                dict(type='video',mediaId='av',track=1,start=.4,duration=.4,audioStream=1),
+            ]
+            render_to_file(self.project,output,options={'codec':'wav'})
+            with wave.open(str(output)) as mix:
+                self.assertFalse(any(mix.readframes(19200)))
+                self.assertTrue(any(mix.readframes(19200)))
+            reopened=open_project(save_project(self.project))
+            render_to_file(reopened,native,options={'codec':'wav'})
+            with wave.open(str(output)) as direct, wave.open(str(native)) as transferred:
+                self.assertEqual(transferred.getnframes(),direct.getnframes())
+                for frame in (4800,24000):
+                    direct.setpos(frame)
+                    transferred.setpos(frame)
+                    self.assertEqual(transferred.readframes(4800),direct.readframes(4800))
 
     def test_export_range_retains_frames_inside_long_dissolve(self):
         self.project['clips'] = [self.clip('a','ridge',0,4),

@@ -3,6 +3,7 @@ import argparse
 import os
 import re
 import shutil
+import signal
 from export_jobs import ExportJobs
 import json
 import hashlib
@@ -279,11 +280,18 @@ class StudioServer(ThreadingHTTPServer):
 def create_server(port=0):
     return StudioServer(('127.0.0.1', port), Handler)
 
+def _exit_on_terminate(signum, frame):
+    raise KeyboardInterrupt
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8765)
     args = parser.parse_args()
     server = create_server(args.port)
-    print(f'http://127.0.0.1:{server.server_port}', flush=True)
     with server:
-        server.serve_forever()
+        signal.signal(signal.SIGTERM,_exit_on_terminate)
+        print(f'http://127.0.0.1:{server.server_port}', flush=True)
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass

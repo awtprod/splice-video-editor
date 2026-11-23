@@ -164,8 +164,14 @@ def _hdr_grade(color, lut, high_depth, profile):
     return chain+f',zscale=p={primaries},zscale=t={transfer}:m={matrix}:r=limited:npl={peak:.9f},format=yuv444p10le'
 
 
-def _fit_picture(width, height, color, lut, alpha_format, high_depth, hdr_profile=None):
-    grade = _hdr_grade(color,lut,high_depth,hdr_profile) if hdr_profile else _css_color_filter(color,high_depth)+lut
+def _fit_picture(width, height, color, lut, alpha_format, high_depth, profile=None, rec709=False):
+    if profile and profile[1] in HDR_TRANSFERS:
+        grade = _hdr_grade(color,lut,high_depth and not rec709,profile)
+    else:
+        convert = (',zscale=p=bt709:t=bt709:m=bt709:r=limited,format=yuv444p10le'
+                   if rec709 and profile and profile!=REC709
+                   and all(value not in (None,'unknown','unspecified') for value in profile) else '')
+        grade = convert+_css_color_filter(color,high_depth)+lut
     return (f'scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2'
             f'{grade},format={alpha_format},'
             f'pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black@0')
@@ -465,6 +471,7 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
     codec=(options or {}).get('codec','h264')
     if codec not in ('h264','prores'): raise ValueError('Unsupported export codec')
     high_depth = codec=='prores'
+    rec709 = (options or {}).get('colorSpace')=='rec709'
     base_format = 'yuv422p10le' if high_depth else 'yuv420p'
     alpha_format = 'yuva422p10le' if high_depth else 'yuva420p'
     full_alpha = 'yuva444p10le' if high_depth else 'yuva444p'
@@ -513,7 +520,7 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
             else:
                 probe = probes.get(path) or _probe(path)
                 kinds[item['id']], item['_actualDuration'], item['_audioStreams'], item['_videoFPS'], profile = probe
-                item['_hdrProfile'] = profile if profile[1] in HDR_TRANSFERS else None
+                item['_sourceProfile'] = profile
         speed=_number(clip.get('speed',1),'speed',.1,16)
         before=float(clip.get('transitionBefore',0) or 0)
         if before and not clip.get('reverse') and float(clip.get('in',0))-before*speed<-.01:
@@ -583,7 +590,7 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
             opacity_keys=(clip.get('keyframes') or {}).get('opacity')
             prefix=(f'color=c=black:s={width}x{height}:r={fps}:d={render_length:.6f},setpts=PTS-STARTPTS' if index is None else
                     f'[{index}:v]trim=start={render_source:.6f}:duration={render_length*speed:.6f}{reverse},setpts=(PTS-STARTPTS)/{speed:.6f},fps={fps}')
-            fit = _fit_picture(width,height,color,lut_filter,alpha_format,high_depth,item.get('_hdrProfile'))
+            fit = _fit_picture(width,height,color,lut_filter,alpha_format,high_depth,item.get('_sourceProfile'),rec709)
             chain = f'{prefix},{fit}{transform}'
             if opacity_keys:
                 opacity_expr=_keyframe_expr(clip,'opacity',opacity*100,0,100,f'(T-{before:.6f})')
@@ -634,7 +641,7 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
                     prior_prefix=(f'color=c=black:s={width}x{height}:r={fps}:d={tail:.6f},setpts=PTS-STARTPTS' if prior_index is None else
                                   f'[{prior_index}:v]trim=start={prior_source:.6f}:duration={tail*prior_speed:.6f}{prior_reverse},setpts=(PTS-STARTPTS)/{prior_speed:.6f},fps={fps}')
                     prior_fit = _fit_picture(width,height,prior_color,prior_lut,alpha_format,high_depth,
-                                             media_by_id[previous['mediaId']].get('_hdrProfile'))
+                                             media_by_id[previous['mediaId']].get('_sourceProfile'),rec709)
                     prior_alpha = _mask_alpha(f'{prior_opacity:.6f}',alpha_format,full_alpha) if prior_opacity!=1 else ''
                     cut_frame = math.ceil(start*fps-1e-6)
                     filters.append(f'{prior_prefix},{prior_fit}{prior_transform}{prior_alpha},setpts=PTS+{cut_frame}[tail{number}]')
@@ -680,7 +687,7 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
             gain = (100 if volume_keys else _number(clip.get('volume',100),'volume',0,200)) * _number(mix.get('gain',100),'track gain',0,200) / 10000
             pan = max(-1,min(1,(_number(clip.get('pan', 0), 'pan', -100, 100) + _number(mix.get('pan',0),'track pan',-100,100))/100))
             streams = dict(enumerate(item['_audioStreams']))
-            selection = item.get('audioStream')
+            selection = clip.get('audioStream',item.get('audioStream'))
             if selection is not None:
                 if type(selection) is not int or selection not in streams:
                     raise ValueError('The selected source audio stream is unavailable')
@@ -805,6 +812,9 @@ def _render_prepared(project, output_path, *, options=None, progress=None, cance
     options={**(options or {}),'_output_frames':None}
     codec=options.get('codec','h264')
     if codec not in ('h264','prores','wav'): raise ValueError('Unsupported export codec')
+    color_space=options.get('colorSpace','source')
+    if color_space!='source' and (codec!='prores' or color_space!='rec709'):
+        raise ValueError('Invalid export color space')
     suffix='.mov' if codec=='prores' else '.mp4'
     total_frames = round(total*fps)
     first,stop = 0,total_frames
@@ -832,11 +842,11 @@ def _render_prepared(project, output_path, *, options=None, progress=None, cance
             else:
                 profiles.add((None,None,None))
     hdr = any(profile[1] in HDR_TRANSFERS for profile in profiles)
-    if hdr and codec=='prores' and len(profiles)!=1:
-        raise ValueError('A ProRes HDR master needs one HDR color space. Export a Rec. 709 MP4 to combine HDR and SDR sources.')
+    if hdr and codec=='prores' and len(profiles)!=1 and color_space=='source':
+        raise ValueError('A ProRes HDR master needs one HDR color space. Select Rec. 709 to combine HDR and SDR sources.')
     profile = next(iter(profiles)) if len(profiles)==1 else None
     if profile and not all(value and value not in ('unknown','unspecified') for value in profile):profile=None
-    if hdr and codec=='h264': profile=REC709
+    if color_space=='rec709' or hdr and codec=='h264': profile=REC709
     options.update(_probes=probes,_color_profile=profile)
     audio_options={**options,'_output_frames':(first,stop) if (first,stop)!=(0,total_frames) else None}
     captions=project.get('captions') or []

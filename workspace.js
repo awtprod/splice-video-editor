@@ -36,7 +36,15 @@
   }
   async function paintWave(canvas, media, clip) {
     if (!media?.src) return;
-    const samples = await waveform(media.src);
+    let src=media.src;
+    const stream='audioStream' in clip?clip.audioStream:media.audioStream??null;
+    if(stream!==(media.audioStream??null)) {
+      const preview=SpliceMedia.preparePreview(media,stream);
+      await preview?.done;
+      src=preview?.src;
+    }
+    if (!src || !canvas.isConnected) return;
+    const samples = await waveform(src);
     if (!samples?.length || !canvas.isConnected) return;
     const width = Math.max(1, Math.round(canvas.getBoundingClientRect().width));
     canvas.width = Math.min(8192,width * 2);
@@ -300,7 +308,9 @@
   let lastPlay, lastFrame, lastOverallKey;
   function refresh(state) {
     monitorState = state;
-    const hdrStatus=window.SpliceMedia?.hdrPreviewStatus(mediaFor(state.project,state.activeClip||{}));
+    const picture=state.activeClip;
+    const hdrStatus=window.SpliceMedia?.hdrPreviewStatus(mediaFor(state.project,picture||{}),
+      picture && 'audioStream' in picture ? picture.audioStream : undefined);
     const previewStatus=$('hdr-preview-status');
     previewStatus.hidden=!(hdrStatus?.pending || hdrStatus?.error);
     previewStatus.textContent=hdrStatus?.pending ? 'Preparing HDR preview…' : hdrStatus?.error ? 'HDR preview proxy unavailable' : '';

@@ -35,9 +35,22 @@
     },1000/fps);
   }
   function newClip(start,track,duration) {
-    return {id:crypto.randomUUID(),mediaId:media.id,start,duration,in:markIn,track,type:media.type,title:'',color:{brightness:100,contrast:100,saturation:100},volume:100,transition:'none'};
+    return {id:crypto.randomUUID(),mediaId:media.id,start,duration,in:markIn,track,type:media.type,title:'',color:{brightness:100,contrast:100,saturation:100},volume:100,transition:'none',
+      ...(media.audioStreams>1?{audioStream:media.audioStream??null}:{})};
+  }
+  function mark(edge) {
+    const point=Math.min(media.duration,snap(current()));
+    if (edge==='in') {
+      markIn=Math.min(point,Math.max(0,media.duration-1/fps));
+      markOut=Math.max(markOut,Math.min(media.duration,markIn+1/fps));
+    } else {
+      markOut=Math.max(point,Math.min(media.duration,1/fps));
+      markIn=Math.min(markIn,Math.max(0,markOut-1/fps));
+    }
+    Editor.setSourceMarks(media.id,markIn,markOut);
   }
   function place(mode) {
+    if (dialog.dataset.preparing) return;
     show('');
     if (markOut-markIn < 1/fps) return show('Mark a range at least one frame long.');
     const track=Number(dialog.querySelector('.source-track').value);
@@ -100,8 +113,7 @@
     if (!dialog?.open || /INPUT|SELECT|TEXTAREA/.test(document.activeElement?.tagName) && document.activeElement?.type!=='range') return;
     const key=event.key.toLowerCase();
     if(key==='escape'){event.preventDefault();close();}
-    if(key==='i'){event.preventDefault();markIn=snap(current());if(markIn>=markOut)markOut=Math.min(media.duration,markIn+1/fps);}
-    if(key==='o'){event.preventDefault();markOut=snap(current());if(markOut<=markIn)markIn=Math.max(0,markOut-1/fps);}
+    if(key==='i'||key==='o'){event.preventDefault();mark(key==='i'?'in':'out');}
     if(key===' '){event.preventDefault();shuttleRate?stopShuttle():shuttle(1);}
     if(key==='j'){event.preventDefault();shuttle(-1);}
     if(key==='k'){event.preventDefault();stopShuttle();}
@@ -120,7 +132,10 @@
     const state=Editor.get().project;
     const trackCount=Math.min(64,Math.max(state.trackCounts?.[media.type] || 3,
       ...state.clips.filter(clip=>clip.type===media.type).map(clip=>Math.abs(clip.track)),2)+1);
-    markIn=0;markOut=media.duration;
+    const saved=item.sourceMarks;
+    markOut=Number.isFinite(saved?.out)?Math.max(0,Math.min(media.duration,saved.out)):media.duration;
+    markIn=Number.isFinite(saved?.in)?Math.max(0,Math.min(markOut,saved.in)):0;
+    if(markOut<=markIn) {markIn=0;markOut=media.duration;}
     dialog=document.createElement('dialog');dialog.className='source-dialog';
     dialog.innerHTML=`<div class="source-head"><div><small>SOURCE MONITOR</small><strong>${esc(media.name)}</strong></div><button class="source-close" aria-label="Close source monitor">×</button></div><div class="source-stage"><${media.type==='audio'?'audio':'video'} controls playsinline preload="auto"></${media.type==='audio'?'audio':'video'}></div><div class="source-controls"><input class="source-scrub" type="range" min="0" max="${media.duration}" step="${1/fps}" value="0" aria-label="Source playhead"><span class="source-time"></span><div class="source-buttons"><button data-action="back">−1 frame</button><button data-action="play">Play / Pause</button><button data-action="forward">+1 frame</button><button data-action="in">Mark In (I)</button><button data-action="out">Mark Out (O)</button></div><span class="source-range"></span><small class="source-shortcuts">J reverse · K stop · L forward</small><label class="source-bin">Bin path <input type="text" value="${esc(media.bin || '')}" placeholder="e.g. Interview / Camera A" aria-label="Media bin path"></label><label class="source-track-label">Timeline track <select class="source-track">${Array.from({length:trackCount},(_,i)=>media.type==='video'?i+1:-i-1).map(n=>`<option value="${n}">${media.type==='video'?'Video':'Audio'} ${Math.abs(n)}${Math.abs(n)>(state.trackCounts?.[media.type]||3)?' · working project only':''}</option>`).join('')}</select></label><div class="source-actions"><button data-action="append">Append</button><button data-action="overwrite">Overwrite</button><button class="source-primary" data-action="insert">Insert at playhead</button></div><p class="source-status" role="status"></p></div>`;
     document.body.append(dialog);player=dialog.querySelector('video,audio');player.src=media.src;player.onerror=()=>show('The source file could not be decoded.');player.onended=stopShuttle;
@@ -136,13 +151,32 @@
     async function setPreviewSource(settings) {
       const active=dialog, position=current();
       stopShuttle();show('Building a playback proxy…',false);
-      const replacement=await Editor.prepareSourceProxy(media.id,settings);
-      if(dialog!==active)return false;
-      media={...media,...replacement};
-      player.addEventListener('loadedmetadata',()=>{if(dialog===active)player.currentTime=position;},{once:true});
-      player.src=media.src;
-      show('Playback proxy updated.',false);
-      return true;
+      const actions=[...dialog.querySelectorAll('.source-actions [data-action]')];
+      active.dataset.preparing='true';
+      for(const button of actions)button.disabled=true;
+      try {
+        const stream='audioStream' in settings?settings.audioStream:media.audioStream??null;
+        const id=media.id;
+        const item=settings.seekOptimized ? await Editor.prepareSourceProxy(id) :
+          Editor.get().project.media.find(entry=>entry.id===id);
+        if (dialog!==active) return false;
+        let src=item.src;
+        if(stream!==(item.audioStream??null)) {
+          const job=SpliceMedia.preparePreview(item,stream);
+          await job?.done;
+          if (dialog!==active) return false;
+          if (!job?.src) throw Error(job?.error||'Could not prepare this audio stream.');
+          src=job.src;
+        }
+        media={...media,...item,src,audioStream:stream};
+        player.addEventListener('loadedmetadata',()=>{if(dialog===active)player.currentTime=position;},{once:true});
+        player.src=src;
+        show('Playback proxy updated.',false);
+        return true;
+      } finally {
+        delete active.dataset.preparing;
+        for(const button of actions)button.disabled=false;
+      }
     }
     const proxyButton=document.createElement('button');
     const trackPicker=document.createElement('select');
@@ -166,7 +200,7 @@
     }
     if(media.audioStreams>1) {
       const label=document.createElement('label');label.className='source-track-label';
-      label.append('Source audio ',trackPicker);
+      label.append('Audio for new edits ',trackPicker);
       trackPicker.append(new Option('Default stereo routing',''));
       for(let i=0;i<media.audioStreams;i++)trackPicker.append(new Option(`Stream ${i+1}`,String(i)));
       trackPicker.value=media.audioStream??'';
@@ -190,8 +224,8 @@
         case 'back':stopShuttle();player.currentTime=Math.max(0,current()-1/fps);break;
         case 'forward':stopShuttle();player.currentTime=Math.min(media.duration,current()+1/fps);break;
         case 'play':shuttleRate?stopShuttle():shuttle(1);break;
-        case 'in':markIn=snap(current());if(markIn>=markOut)markOut=Math.min(media.duration,markIn+1/fps);break;
-        case 'out':markOut=snap(current());if(markOut<=markIn)markIn=Math.max(0,markOut-1/fps);break;
+        case 'in':mark('in');break;
+        case 'out':mark('out');break;
         default:place(button.dataset.action);
       }
     };

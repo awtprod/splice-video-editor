@@ -94,8 +94,9 @@
         `<label class="splice-safe-toggle"><input type="checkbox" data-safe-area ${showSafeArea ? 'checked' : ''}> Show title and action safe areas</label>`);
     }
     if (clip.type === 'audio' || clip.type === 'video' && clip.embeddedAudio !== false) {
+      const stream='audioStream' in clip?clip.audioStream:source?.audioStream;
       html += section('Audio',
-        (source?.audioStreams>1 ? `<p class="splice-handle">${source.audioStream==null?`${source.audioStreams} source streams in stereo`:`Source stream ${source.audioStream+1}`} · Change routing in the Source Monitor.</p>` : '') +
+        (source?.audioStreams>1 ? `<p class="splice-handle">${stream==null?`${source.audioStreams} source streams in stereo`:`Source stream ${stream+1}`}</p>` : '') +
         label('Gain', 'volume', number(clip.volume, 100), 0, 200, 1, '%') +
         (clip.keyframes?.volume?.length ? '<p class="splice-handle">Gain keyframes control the level. Edit them below.</p>' : '') +
         label('Pan', 'pan', number(clip.pan, 0), -100, 100, 1, '', '') +

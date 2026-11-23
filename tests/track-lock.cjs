@@ -70,6 +70,11 @@ async function main() {
     assert.equal(await lock.getAttribute('aria-pressed'), 'true');
     await page.evaluate(() => SpliceSource.open('video'));
     await page.locator('.source-track').selectOption('2');
+    await page.locator('.source-scrub').evaluate(input=>{
+      input.value=.4;
+      input.dispatchEvent(new Event('input'));
+    });
+    await page.waitForFunction(()=>Math.abs(document.querySelector('.source-stage video').currentTime-.4)<.02);
     await page.locator('[data-action=in]').click();
     await page.locator('[data-action=insert]').click();
     assert.match(await page.locator('.source-status').textContent(), /Unlock video track 2/);
@@ -78,6 +83,7 @@ async function main() {
     await lock.click();
     assert.equal(await page.getByRole('button', {name: 'Lock Video 2'}).getAttribute('aria-pressed'), 'false');
     await page.evaluate(() => SpliceSource.open('video'));
+    await page.waitForFunction(()=>document.querySelector('.source-range').textContent.startsWith('00:00:00:10'));
     await page.locator('.source-track').selectOption('2');
     await page.locator('[data-action=insert]').click();
     await page.waitForFunction(() => Editor.get().project.clips.length === 4);
@@ -86,6 +92,7 @@ async function main() {
     await page.waitForFunction(() => document.querySelector('#session-status')?.textContent === 'Draft saved locally');
     await page.reload();
     await page.evaluate(() => SpliceSession.ready);
+    assert.equal(await page.evaluate(()=>Editor.get().project.media.find(item=>item.id==='video').sourceMarks.in),.4);
     assert.equal(await page.getByRole('button', {name: 'Unlock Video 2'}).getAttribute('aria-pressed'), 'true');
     await page.setViewportSize({width: 1024, height: 760});
     const screenshot = path.join(root, 'artifacts', 'track-controls.png');

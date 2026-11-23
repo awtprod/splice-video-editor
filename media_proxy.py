@@ -18,11 +18,11 @@ MAX_AUDIO_STREAMS = 16
 HDR_TRANSFERS = frozenset({'arib-std-b67', 'smpte2084'})
 REC709 = ('bt709', 'bt709', 'bt709')
 AVC_REC709 = 'h264_metadata=colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1'
-HDR_PREVIEW_VERSION = 2
-# BT.2408 reference white is 203 cd/m². Reserve the upper tenth of the SDR
-# linear range for highlights from a nominal 1,000 cd/m² HDR master.
+HDR_PREVIEW_VERSION = 3
+# BT.2408 reference white is 203 cd/m². Leave enough room in the SDR
+# highlight shoulder to distinguish bright patches on an 8-bit display.
 HDR_LINEAR_REC709 = 'zscale=t=linear:npl={peak:.9f},format=gbrpf32le,zscale=p=bt709'
-HDR_TONE_MAP = 'tonemap=mobius:param=0.9:desat=0:peak=4.926108,zscale=t=bt709:m=bt709:r=limited,format=yuv444p10le'
+HDR_TONE_MAP = 'tonemap=mobius:param=0.78:desat=0:peak=4.926108,zscale=t=bt709:m=bt709:r=limited,format=yuv444p10le'
 HDR_TO_REC709 = HDR_LINEAR_REC709.format(peak=203) + ',' + HDR_TONE_MAP
 # Pack wide-gamut PQ channel values into a browser-decodable proxy. Its
 # Rec.709 tags prevent the browser from tone-mapping these data samples.

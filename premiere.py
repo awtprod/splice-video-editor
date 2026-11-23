@@ -717,19 +717,24 @@ def save_project(data):
     media_by_id = {item.get('id'): item for item in data.get('media',[])}
     generated_audio = {}
 
-    def source_audio(identity):
+    def source_audio(clip):
+        identity = clip.get('mediaId')
         item = media_by_id.get(identity,{})
-        if item.get('audioStream') is None and (not isinstance(item.get('audioStreams'),int) or item['audioStreams']<=1):
+        stream = clip.get('audioStream',item.get('audioStream'))
+        if stream is not None and type(stream) is not int:
+            raise ValueError('The selected source audio stream is unavailable')
+        if stream is None and (not isinstance(item.get('audioStreams'),int) or item['audioStreams']<=1):
             return available.get(identity)
-        if identity not in generated_audio:
+        key = (identity,stream)
+        if key not in generated_audio:
             from media_proxy import premiere_audio
-            handoff = premiere_audio(item.get('src',''),item.get('audioStream'))
-            generated_audio[identity] = project.import_files([handoff])[0]
-        return generated_audio[identity]
+            handoff = premiere_audio(item.get('src',''),stream)
+            generated_audio[key] = project.import_files([handoff])[0]
+        return generated_audio[key]
 
-    def place_linked(identity, position, video_track, audio_track, audio_identity=None):
-        video_source = available[identity]
-        audio_source = source_audio(audio_identity if audio_identity is not None else identity)
+    def place_linked(picture_clip, position, video_track, audio_track, sound_clip=None):
+        video_source = available[picture_clip['mediaId']]
+        audio_source = source_audio(sound_clip if sound_clip is not None else picture_clip)
         if audio_source is video_source:
             return sequence.add_linked_clip(video_source,position,video_track,audio_track)
         picture = sequence.video_tracks[video_track].add_clip(video_source,position)
@@ -785,8 +790,8 @@ def save_project(data):
             video = next(member for member in pair if member['type'] == 'video')
             audio = next(member for member in pair if member['type'] == 'audio')
             linked_video, linked_audio = place_linked(
-                video['mediaId'], py_premiere.Time.from_seconds(float(video['start'])),
-                int(video['track']) - 1, -int(audio['track']) - 1,audio['mediaId'])
+                video, py_premiere.Time.from_seconds(float(video['start'])),
+                int(video['track']) - 1, -int(audio['track']) - 1,audio)
             linked_placements[video['id']] = linked_video
             linked_placements[audio['id']] = linked_audio
             linked_groups_placed.add(group_key)
@@ -847,13 +852,13 @@ def save_project(data):
                         if paired:
                             raise ValueError('Linked camera sound needs one free audio track across the crossfade')
                         raise ValueError('No free audio track for linked camera sound')
-                    clip, companion = place_linked(item['mediaId'], placement, index, free)
+                    clip, companion = place_linked(item, placement, index, free)
                     audio_regions[free].append((begin, end))
                     camera_audio[id(item)] = (companion, free)
                     if paired or (previous is None and item.get('transition') in ('dissolve','wipe','fade')):
                         pending_transitions.append((companion, item, AUDIO_CROSSFADE, AUDIO_CROSSFADE))
                 else:
-                    clip = tracks[index].add_clip(source_audio(item['mediaId']) if is_audio else source, placement)
+                    clip = tracks[index].add_clip(source_audio(item) if is_audio else source, placement)
         speed = float(item.get('speed', clip.speed))
         if item.get('type') != 'title' and abs(speed - clip.speed) > .000001:
             if clip._clip_element.find('Clip/TimeRemapping') is not None:

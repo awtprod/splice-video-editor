@@ -106,23 +106,23 @@ window.SpliceMedia = (() => {
     if(!response.ok || !localMedia(data.src)) throw Error(data.error||'Could not create edit proxy');
     return data.src;
   }
-  const hdrPreviewJobs = new Map();
-  const hdrPreviewKey = item => JSON.stringify([item.originalSrc,item.seekOptimized,item.audioStream]);
-  function hdrPreviewStatus(item) {
-    return item?.originalSrc ? hdrPreviewJobs.get(hdrPreviewKey(item)) : undefined;
+  const previewJobs = new Map();
+  const previewKey = (item,stream,grading) => JSON.stringify([item.originalSrc||item.src,!!item.seekOptimized,stream,grading]);
+  function hdrPreviewStatus(item, stream=item?.audioStream??null) {
+    return item?.src ? previewJobs.get(previewKey(item,stream,true)) : undefined;
   }
-  function prepareHdrPreview(item) {
-    if (!item.originalSrc || item.offline) return;
-    const key=hdrPreviewKey(item);
-    let job=hdrPreviewJobs.get(key);
-    if (job) return job.src;
+  function preparePreview(item, stream, grading=false) {
+    if (!item.src || item.offline) return;
+    const key=previewKey(item,stream,grading);
+    let job=previewJobs.get(key);
+    if (job) return job;
     job={pending:true};
-    hdrPreviewJobs.set(key,job);
-    if (hdrPreviewJobs.size>500) {
-      const expired=[...hdrPreviewJobs].find(([,entry])=>!entry.pending);
-      if (expired) hdrPreviewJobs.delete(expired[0]);
+    previewJobs.set(key,job);
+    if (previewJobs.size>500) {
+      const expired=[...previewJobs].find(([,entry])=>!entry.pending);
+      if (expired) previewJobs.delete(expired[0]);
     }
-    makeProxy(item.originalSrc,item.seekOptimized===true,item.audioStream??null,true).then(src=>{
+    job.done=makeProxy(item.originalSrc||item.src,item.seekOptimized===true,stream,grading).then(src=>{
       job.src=src;
     }).catch(error=>{
       job.error=error.message;
@@ -130,6 +130,7 @@ window.SpliceMedia = (() => {
       job.pending=false;
       window.Editor?.refreshMedia?.();
     });
+    return job;
   }
   async function importFile(file) {
     const originalSrc=await upload(file);
@@ -168,7 +169,7 @@ window.SpliceMedia = (() => {
   }
   function needsSourceProbe(item) {
     return !Number.isInteger(item.audioStreams) || (item.audioStreams>1 && !Array.isArray(item.audioStreamChannels)) ||
-      (item.hdr && item.hdrPreviewVersion!==2);
+      (item.hdr && item.hdrPreviewVersion!==3);
   }
   async function restore(project) {
     const db = await open();
@@ -264,5 +265,5 @@ window.SpliceMedia = (() => {
     }
     return copy;
   }
-  return { importFile, remember, rememberMany, makeProxy, prepareNested, prepareHdrPreview, hdrPreviewStatus, restore, matches, matchFolder, forPremiere };
+  return { importFile, remember, rememberMany, makeProxy, prepareNested, preparePreview, hdrPreviewStatus, restore, matches, matchFolder, forPremiere };
 })();

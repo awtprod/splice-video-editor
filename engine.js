@@ -127,20 +127,21 @@
   }
   function auditionAudio(element,clip,target,rate,forceSeek) {
     const item=mediaOf(clip);
-    if (!item?.src || item.audioChannels===0 || item.still || clip.embeddedAudio===false || target<0) return;
+    const src=element.getAttribute('src');
+    if (!src || !item || item.audioChannels===0 || item.still || clip.embeddedAudio===false || target<0) return;
     const sourceSpan = auditionSpan*rate;
     const index=Math.floor(target/sourceSpan), step=clip.reverse?-1:1;
-    const initial=auditionBuffer(item.src,index,rate,clip.reverse);
+    const initial=auditionBuffer(src,index,rate,clip.reverse);
     const next=index+step;
     if (next>=0 && next*sourceSpan<item.duration && (clip.reverse?target-index*sourceSpan:(index+1)*sourceSpan-target)<rate*.75)
-      auditionBuffer(item.src,next,rate,clip.reverse);
+      auditionBuffer(src,next,rate,clip.reverse);
     if (!playing || playbackRate<0 || audioContext.state!=='running') return;
     let state=auditions.get(element);
     const now=audioContext.currentTime;
-    if (forceSeek || state?.src!==item.src || state?.rate!==rate || state?.step!==step || state?.id!==clip.id ||
+    if (forceSeek || state?.src!==src || state?.rate!==rate || state?.step!==step || state?.id!==clip.id ||
         (state.clock!==null && Math.abs(state.target+step*rate*(now-state.clock)-target)>rate*.15)) {
       if (state) stopAudition(state);
-      state={src:item.src,id:clip.id,rate,step,clock:null,voices:new Set()};
+      state={src,id:clip.id,rate,step,clock:null,voices:new Set()};
       auditions.set(element,state);
     }
     state.active=true;
@@ -157,7 +158,7 @@
       state.target=target;
     } else if (state.end-now<.12 && state.next>=0 && state.next*sourceSpan<item.duration) {
       chunk=state.next;
-      buffer=auditionBuffer(item.src,chunk,rate,clip.reverse);
+      buffer=auditionBuffer(src,chunk,rate,clip.reverse);
       start=state.end;
       offset=0;
     }
@@ -243,6 +244,8 @@
   const clipPlaybackRate = clip => clamp((Number(clip.speed)||1)*Math.abs(playbackRate),.0625,16);
   function syncClipPlayback(element, clip, target, forceSeek, audible=true) {
     const rate=clipPlaybackRate(clip);
+    const item=mediaOf(clip), stream=clipAudioStream(clip,item);
+    if (stream!==(item?.audioStream??null) && element.getAttribute('src')===item?.src) audible=false;
     element.playbackRate=rate;
     setMediaPlaying(element,playing && playbackRate>0 && !clip.reverse && rate>=.25);
     element.muted=!audible || clip.reverse || rate<.25;
@@ -391,13 +394,20 @@
     return ['brightness','contrast','saturation'].some(key=>(color[key]??100)!==100) ||
       ['exposure','temperature','tint'].some(key=>Number(color[key])||0);
   }
+  const clipAudioStream=(clip,item)=>'audioStream' in clip?clip.audioStream:item?.audioStream??null;
   function programSource(clip) {
     const item=clip && mediaOf(clip);
-    if (item?.hdr && hasHdrGrade(clip.color||{}))
-      return window.SpliceMedia?.prepareHdrPreview(item)||item.src;
-    return item?.src;
+    if (!item?.src) return;
+    const stream=clipAudioStream(clip,item);
+    if (item.hdr && hasHdrGrade(clip.color||{})) {
+      const graded=window.SpliceMedia?.preparePreview(item,stream,true)?.src;
+      if (graded) return graded;
+    }
+    if (stream!==(item.audioStream??null))
+      return window.SpliceMedia?.preparePreview(item,stream)?.src||item.src;
+    return item.src;
   }
-  const hdrShoulder=.9, hdrPeak=1000/203;
+  const hdrShoulder=.78, hdrPeak=1000/203;
   // Match the HDR preview proxy's Mobius shoulder. Undo it before grading.
   const shoulderA=-(hdrShoulder**2)*(hdrPeak-1)/(hdrShoulder**2-2*hdrShoulder+hdrPeak);
   const shoulderB=(hdrShoulder**2-2*hdrShoulder*hdrPeak+hdrPeak)/(hdrPeak-1);
@@ -689,18 +699,18 @@
         audioElements.delete(id);
       }
     for (const audioClip of audioClips) {
-      const item = mediaOf(audioClip);
-      if (!item?.src) continue;
+      const source=programSource(audioClip);
+      if (!source) continue;
       let element = audioElements.get(audioClip.id);
       if (!element) {
         element = document.createElement("audio");
-        element.src = item.src;
+        element.src = source;
         element.preload = "auto";
         element.style.display = "none";
         document.body.append(element);
         audioElements.set(audioClip.id, element);
       }
-      if (element.getAttribute("src") !== item.src) element.src = item.src;
+      if (element.getAttribute("src") !== source) element.src = source;
       const target = sourceTime(audioClip,time);
       if (forceSeek || Math.abs(element.currentTime - target) > seekTolerance(audioClip))
         try {
@@ -793,7 +803,7 @@
     const gains=gradeGains(color);
     const graded=gains.some(g=>Math.abs(g-1)>.0001);
     const item=mediaOf(clip);
-    const gradingSource=item?.hdr && window.SpliceMedia?.hdrPreviewStatus(item)?.src;
+    const gradingSource=item?.hdr && window.SpliceMedia?.hdrPreviewStatus(item,clipAudioStream(clip,item))?.src;
     const gradingData=!!gradingSource && element.getAttribute('src')===gradingSource;
     const hdrGrade=item?.hdr && (gradingData || hasHdrGrade(color));
     const previewScale=(lut || hdrGrade) && playing ? .5 : 1;
@@ -1152,15 +1162,20 @@
       selectedId = id;
       notify();
     },
-    async prepareSourceProxy(id, settings) {
+    setSourceMarks(id, inPoint, outPoint) {
+      const item=project.media.find(entry=>entry.id===id);
+      if (!item) return;
+      item.sourceMarks={in:inPoint,out:outPoint};
+      revision++;
+      notify();
+    },
+    async prepareSourceProxy(id) {
       const sequence=project, media=sequence.media.find(item=>item.id===id);
       if(!media || media.offline || !media.src)throw Error('Relink the source before building its seek proxy.');
       const originalSrc=media.originalSrc||media.src;
-      const seekOptimized=settings.seekOptimized??media.seekOptimized??false;
-      const audioStream='audioStream' in settings?settings.audioStream:media.audioStream??null;
-      const src=await SpliceMedia.makeProxy(originalSrc,seekOptimized,audioStream);
+      const src=await SpliceMedia.makeProxy(originalSrc,true,media.audioStream??null);
       if(sequence!==project)throw Error('The project changed while the proxy was building. Choose the source again.');
-      const update={...media,originalSrc,src,seekOptimized,audioStream};
+      const update={...media,originalSrc,src,seekOptimized:true};
       await SpliceMedia.remember(update);
       if(sequence!==project)throw Error('The project changed while the proxy was building. Choose the source again.');
       Editor.editProject(next=>Object.assign(next.media.find(item=>item.id===id),update));
