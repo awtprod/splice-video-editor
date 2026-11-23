@@ -7,7 +7,7 @@ import tempfile
 from pathlib import Path
 
 from premiere import MEDIA_ROOT, STILL_IMAGES, _media_path
-from media_proxy import AVC_REC709, HDR_TRANSFERS, HDR_TO_REC709, REC709
+from media_proxy import AVC_REC709, HDR_TRANSFERS, HDR_TO_REC709, REC709, tempo_filters
 
 
 
@@ -530,15 +530,7 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
                 fade_in = min(length,_number(clip.get('fadeIn',0),'fade in',0,7200))
                 fade_out = min(length,_number(clip.get('fadeOut',0),'fade out',0,7200))
                 chain = _trim_audio(filters,f'mix{number}',index,streams,render_source,render_length*speed,clip.get('reverse'))
-                tempo = ''
-                remaining=speed
-                while remaining>2:
-                    tempo += 'atempo=2,';remaining/=2
-                while remaining<.5:
-                    tempo += 'atempo=0.5,';remaining*=2
-                if abs(remaining-1)>1e-6:
-                    tempo += f'atempo={remaining:.6f},'
-                processing=f'{tempo}volume={gain:.4f},{panner}'
+                processing=','.join([*tempo_filters(speed),f'volume={gain:.4f}',panner])
                 chain += processing
                 envelope=[]
                 if volume_keys:

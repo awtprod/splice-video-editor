@@ -24,19 +24,48 @@ AUDITION_SECONDS = 4
 _audition_decoders = threading.BoundedSemaphore(4)
 
 
-def audition_audio(src, index):
-    """Read a bounded span of the same audio the normal monitor plays."""
-    if not 0 <= index < 86400 // AUDITION_SECONDS:
+def tempo_filters(speed):
+    """Stay within the pitch-preserving range of each FFmpeg tempo stage."""
+    filters = []
+    while speed > 2:
+        filters.append('atempo=2')
+        speed /= 2
+    while speed < .5:
+        filters.append('atempo=0.5')
+        speed *= 2
+    if abs(speed-1) > 1e-6:
+        filters.append(f'atempo={speed:.6f}')
+    return filters
+
+
+def audition_audio(src, index, rate=1, reverse=False):
+    """Read a bounded span and apply the same tempo processing as delivery."""
+    if not math.isfinite(rate) or not .0625 <= rate <= 16:
+        raise ValueError('Invalid audio preview speed')
+    span = AUDITION_SECONDS * rate
+    if not 0 <= index < 86400 / span:
         raise ValueError('Invalid audio preview position')
+    start = index * span
+    # Give the tempo filter extra source after the requested window so its
+    # analysis latency cannot leave a silent tail on an ordinary boundary.
+    overlap = .02 if rate != 1 else 0
+    extra = .25 * max(1, rate) if overlap else 0
+    seek = max(0, start-extra) if reverse else start
+    length = start+span-seek + (0 if reverse else extra)
+    filters = ['aresample=48000:first_pts=0', f'apad=whole_dur={length:.9f}', f'atrim=duration={length:.9f}']
+    if reverse:
+        filters.append('areverse')
+    filters.extend(tempo_filters(rate))
+    filters.append('apad')
     path = _media_path(src)
     if not _audition_decoders.acquire(timeout=2):
         raise ValueError('Audio preview is busy')
     try:
         result = subprocess.run([
             'ffmpeg', '-nostdin', '-v', 'error', '-protocol_whitelist', 'file', '-threads', '1',
-            '-ss', str(index * AUDITION_SECONDS), '-i', str(path), '-map', '0:a:0',
-            '-af', 'aresample=48000:first_pts=0,apad', '-ac', '2', '-c:a', 'pcm_s16le',
-            '-t', str(AUDITION_SECONDS), '-f', 'wav', 'pipe:1',
+            '-ss', f'{seek:.9f}', '-i', str(path), '-map', '0:a:0',
+            '-af', ','.join(filters), '-ac', '2', '-c:a', 'pcm_s16le',
+            '-t', str(AUDITION_SECONDS+overlap), '-f', 'wav', 'pipe:1',
         ], capture_output=True, timeout=8)
         if result.returncode:
             raise ValueError('Could not decode audio for preview')

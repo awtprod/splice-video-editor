@@ -1,10 +1,12 @@
 """Regression checks over pixels and streams returned by the production renderer."""
 import json
+from io import BytesIO
 from pathlib import Path
 import statistics
 import subprocess
 import tempfile
 import unittest
+import wave
 
 from render_movie import render_to_file
 
@@ -100,6 +102,25 @@ class MovieDelivery(unittest.TestCase):
                              ('bt709','bt709','bt709'))
             self.assertEqual(video['nb_frames'], '25')
             self.assertGreater(statistics.mean(self.frame(.4)), 15)
+
+    def test_slow_audio_preview_keeps_pitch_and_samples_across_windows(self):
+        from media_proxy import audition_audio
+        from premiere import MEDIA_ROOT
+        MEDIA_ROOT.mkdir(parents=True,exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=MEDIA_ROOT) as directory:
+            source = Path(directory) / 'tone.wav'
+            subprocess.run(['ffmpeg','-nostdin','-v','error','-f','lavfi','-i',
+                            'sine=frequency=750:sample_rate=48000:duration=2',str(source)],check=True,timeout=10)
+            src = '/media/'+str(source.relative_to(MEDIA_ROOT))
+            for index in (0,1):
+                with wave.open(BytesIO(audition_audio(src,index,.1))) as audio:
+                    self.assertEqual((audio.getnchannels(),audio.getframerate()),(2,48000))
+                    samples = memoryview(audio.readframes(48000*5)).cast('h')[0::2]
+                self.assertEqual(len(samples),192960)
+                for start in (48000,len(samples)-24000):
+                    part=samples[start:start+24000]
+                    frequency=2*sum(a<0<=b for a,b in zip(part,part[1:]))
+                    self.assertAlmostEqual(frequency,750,delta=6)
 
     def test_title_lines_center_independently_and_end_on_out_frame(self):
         self.project.update(width=640,height=360,clips=[

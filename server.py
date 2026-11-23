@@ -69,7 +69,8 @@ class Handler(BaseHTTPRequestHandler):
             from media_proxy import audition_audio
             query = parse_qs(urlsplit(self.path).query)
             try:
-                audio = audition_audio(query.get('src',[''])[0], int(query.get('index',['-1'])[0]))
+                audio = audition_audio(query.get('src',[''])[0], int(query.get('index',['-1'])[0]),
+                                       float(query.get('rate',['1'])[0]), query.get('reverse',['0'])[0]=='1')
                 self._reply(200, audio, 'audio/wav')
             except (BrokenPipeError, ConnectionResetError):
                 return

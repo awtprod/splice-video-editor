@@ -89,8 +89,8 @@
   const auditionSpan = 4;
   const auditionBuffers = new Map();
   const auditions = new Map();
-  function auditionBuffer(src, index, reversed) {
-    const key=JSON.stringify([src,index,reversed]);
+  function auditionBuffer(src, index, rate, reversed) {
+    const key=JSON.stringify([src,index,rate,reversed]);
     let entry=auditionBuffers.get(key);
     if (entry?.retryAfter && performance.now()>=entry.retryAfter) {
       auditionBuffers.delete(key);
@@ -109,13 +109,11 @@
       auditionBuffers.get(oldest).controller.abort();
       auditionBuffers.delete(oldest);
     }
-    fetch('/api/media/audition?'+new URLSearchParams({src,index}),{
+    fetch('/api/media/audition?'+new URLSearchParams({src,index,rate,reverse:reversed?1:0}),{
       signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)]),
     }).then(async response=>{
       if (!response.ok) throw Error(await response.text());
-      const buffer=await audioContext.decodeAudioData(await response.arrayBuffer());
-      if (reversed) for(let channel=0;channel<buffer.numberOfChannels;channel++) buffer.getChannelData(channel).reverse();
-      entry.buffer=buffer;
+      entry.buffer=await audioContext.decodeAudioData(await response.arrayBuffer());
     }).catch(error=>{
       if (!controller.signal.aborted) {
         entry.retryAfter=performance.now()+5000;
@@ -130,11 +128,12 @@
   function auditionAudio(element,clip,target,rate,forceSeek) {
     const item=mediaOf(clip);
     if (!item?.src || item.audioChannels===0 || item.still || clip.embeddedAudio===false || target<0) return;
-    const index=Math.floor(target/auditionSpan), step=clip.reverse?-1:1;
-    const initial=auditionBuffer(item.src,index,clip.reverse);
+    const sourceSpan = auditionSpan*rate;
+    const index=Math.floor(target/sourceSpan), step=clip.reverse?-1:1;
+    const initial=auditionBuffer(item.src,index,rate,clip.reverse);
     const next=index+step;
-    if (next>=0 && next*auditionSpan<item.duration && (clip.reverse?target-index*auditionSpan:(index+1)*auditionSpan-target)<rate*.75)
-      auditionBuffer(item.src,next,clip.reverse);
+    if (next>=0 && next*sourceSpan<item.duration && (clip.reverse?target-index*sourceSpan:(index+1)*sourceSpan-target)<rate*.75)
+      auditionBuffer(item.src,next,rate,clip.reverse);
     if (!playing || playbackRate<0 || audioContext.state!=='running') return;
     let state=auditions.get(element);
     const now=audioContext.currentTime;
@@ -151,26 +150,37 @@
       stopAudition(state);
       start=now;
       chunk=index;
-      offset=clip.reverse ? auditionSpan-(target-index*auditionSpan) : target-index*auditionSpan;
+      const inWindow=(target-index*sourceSpan)/rate;
+      offset=clip.reverse ? auditionSpan-inWindow : inWindow;
       buffer=initial;
       state.clock=now;
       state.target=target;
-    } else if (state.end-now<.12 && state.next>=0 && state.next*auditionSpan<item.duration) {
+    } else if (state.end-now<.12 && state.next>=0 && state.next*sourceSpan<item.duration) {
       chunk=state.next;
-      buffer=auditionBuffer(item.src,chunk,clip.reverse);
+      buffer=auditionBuffer(item.src,chunk,rate,clip.reverse);
       start=state.end;
       offset=0;
     }
     if (!buffer || offset>=buffer.duration) return;
     const voice=audioContext.createBufferSource();
     voice.buffer=buffer;
-    voice.playbackRate.value=rate;
-    voice.connect(routeAudio(element).gain);
-    voice.onended=()=>{voice.disconnect();state.voices.delete(voice);};
+    const end=start+auditionSpan-offset;
+    const overlap=Math.max(0,buffer.duration-auditionSpan);
+    const envelope=audioContext.createGain();
+    if (overlap>0) {
+      if (start>now) {
+        envelope.gain.setValueAtTime(0,start);
+        envelope.gain.linearRampToValueAtTime(1,start+overlap);
+      }
+      envelope.gain.setValueAtTime(1,end);
+      envelope.gain.linearRampToValueAtTime(0,end+overlap);
+    }
+    voice.connect(envelope).connect(routeAudio(element).gain);
+    voice.onended=()=>{voice.disconnect();envelope.disconnect();state.voices.delete(voice);};
     voice.start(start,offset);
     state.voices.add(voice);
     state.next=chunk+step;
-    state.end=start+(buffer.duration-offset)/rate;
+    state.end=end;
   }
   function routeAudio(element) {
     if (!audioContext) audioContext = new AudioContext();
