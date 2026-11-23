@@ -380,6 +380,43 @@
     const tint=clamp(Number(c.tint)||0,-100,100)/100, gain=2**exposure;
     return [gain*(1+.35*temperature-.1*tint),gain*(1+.2*tint),gain*(1-.35*temperature-.1*tint)];
   };
+  const decode709 = value => Math.sign(value)*Math.abs(value)**2.4;
+  const encode709 = value => Math.sign(value)*Math.abs(value)**(1/2.4);
+  const decodePixels709 = Array.from({length:256},(_,level)=>decode709(level/255));
+  const hdrShoulder=.9, hdrPeak=1000/203;
+  // Match the HDR preview proxy's Mobius shoulder. Undo it before grading.
+  const shoulderA=-(hdrShoulder**2)*(hdrPeak-1)/(hdrShoulder**2-2*hdrShoulder+hdrPeak);
+  const shoulderB=(hdrShoulder**2-2*hdrShoulder*hdrPeak+hdrPeak)/(hdrPeak-1);
+  const shoulderScale=(shoulderB+hdrShoulder)**2/(shoulderB-shoulderA);
+  function gradeHdrPreview(pixels, color, gains) {
+    const brightness=(color.brightness??100)/100, contrast=(color.contrast??100)/100, saturation=(color.saturation??100)/100;
+    const displayGrade=brightness!==1 || contrast!==1 || saturation!==1;
+    for(let i=0;i<pixels.length;i+=4) {
+      if (!pixels[i+3]) continue;
+      let r=decodePixels709[pixels[i]],g=decodePixels709[pixels[i+1]],b=decodePixels709[pixels[i+2]];
+      const before=Math.max(r,g,b);
+      if (before>hdrShoulder) {
+        const inverse=(before*shoulderB-shoulderScale*shoulderA)/(shoulderScale-before);
+        const ratio=Math.min(hdrPeak,inverse)/before;
+        r*=ratio;g*=ratio;b*=ratio;
+      }
+      if (displayGrade) {
+        r=(encode709(r)*brightness-.5)*contrast+.5;
+        g=(encode709(g)*brightness-.5)*contrast+.5;
+        b=(encode709(b)*brightness-.5)*contrast+.5;
+        const luma=(.213*r+.715*g+.072*b)*(1-saturation);
+        r=decode709(r*saturation+luma);
+        g=decode709(g*saturation+luma);
+        b=decode709(b*saturation+luma);
+      }
+      r*=gains[0];g*=gains[1];b*=gains[2];
+      const after=Math.max(r,g,b);
+      const ratio=after<=hdrShoulder ? 1 : shoulderScale*(after+shoulderA)/(after+shoulderB)/after;
+      pixels[i]=255*encode709(r*ratio);
+      pixels[i+1]=255*encode709(g*ratio);
+      pixels[i+2]=255*encode709(b*ratio);
+    }
+  }
   function ensureElements() {
     if (!video) {
       video = document.createElement("video");
@@ -733,8 +770,11 @@
   blackGenerator.getContext('2d').fillRect(0,0,16,9);
   function paintVideo(ctx,element,clip,canvas,alpha=1,brightness=1) {
     if (!element || (element instanceof HTMLVideoElement && element.readyState < 2)) return;
-    const lut=clip.color?.lut;
-    const previewScale=lut && playing ? .5 : 1;
+    const color=clip.color||{}, lut=color.lut;
+    const gains=gradeGains(color);
+    const graded=gains.some(g=>Math.abs(g-1)>.0001);
+    const hdrGrade=mediaOf(clip)?.hdr && (graded || ['brightness','contrast','saturation'].some(key=>(color[key]??100)!==100));
+    const previewScale=(lut || hdrGrade) && playing ? .5 : 1;
     const drawWidth=Math.max(1,Math.round(canvas.width*previewScale));
     const drawHeight=Math.max(1,Math.round(canvas.height*previewScale));
     const sourceWidth=element.videoWidth||element.width||canvas.width;
@@ -745,9 +785,7 @@
     const y=clamp(animated(clip,"y",Number(clip.transform?.y??0)),-100,100)*drawHeight/100;
     const rotation=clamp(animated(clip,"rotation",Number(clip.transform?.rotation??0)),-180,180)*Math.PI/180;
     let target=ctx;
-    const gains=gradeGains(clip.color||{});
-    const graded=gains.some(g=>Math.abs(g-1)>.0001);
-    if ((lut && window.SpliceLUT) || graded) {
+    if ((lut && window.SpliceLUT) || graded || hdrGrade) {
       let layer=layerCanvases.get(clip.id);
       if (!layer) { layer=document.createElement('canvas'); layerCanvases.set(clip.id,layer); }
       if (layer.width!==drawWidth || layer.height!==drawHeight) {layer.width=drawWidth;layer.height=drawHeight;}
@@ -755,14 +793,15 @@
       target.clearRect(0,0,layer.width,layer.height);
     }
     alpha *= clamp(animated(clip,"opacity",Number(clip.opacity??100))/100,0,1);
-    target.save(); target.globalAlpha=target===ctx?alpha:1; target.filter=filterFor(clip);
+    target.save(); target.globalAlpha=target===ctx?alpha:1; target.filter=hdrGrade?'none':filterFor(clip);
     if (target===ctx && brightness<1) target.filter+=` brightness(${brightness})`;
     target.translate(drawWidth/2+x,drawHeight/2+y); target.rotate(rotation);
     target.drawImage(element,-sourceWidth*fit*scale/2,-sourceHeight*fit*scale/2,sourceWidth*fit*scale,sourceHeight*fit*scale);
     target.restore();
     if (target!==ctx) {
       const image=target.getImageData(0,0,drawWidth,drawHeight);
-      if (graded) {
+      if (hdrGrade) gradeHdrPreview(image.data,color,gains);
+      else if (graded) {
         const pixels=image.data;
         for(let i=0;i<pixels.length;i+=4) {
           pixels[i]=Math.min(255,pixels[i]*gains[0]);

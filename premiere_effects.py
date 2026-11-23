@@ -108,7 +108,7 @@ def _apply_scalar_keys(param, clip, points, decode=lambda value: value, encode=l
 def read(clip):
     lumetri = _component(clip, 'AE.ADBE Lumetri')
     volume = next((c for c in clip.components if c.match_name.startswith('Internal Volume')), None)
-    color = {'brightness': round(100 * 2 ** _value(lumetri, 'Exposure', 0), 5),
+    color = {'brightness': 100, 'exposure': _value(lumetri, 'Exposure', 0),
              'contrast': 100 + _value(lumetri, 'Contrast', 0),
              'saturation': _value(lumetri, 'Saturation', 100),
              'temperature': _value(lumetri, 'Temperature', 0),
@@ -174,14 +174,20 @@ def _attach(clip, name):
     return component
 
 
-def apply(clip, color, volume):
+def apply(clip, color, volume, *, hdr=False):
     current, old_volume = read(clip)
+    current['brightness'] = round(100 * 2 ** current.pop('exposure'),5)
     color = {**NEUTRAL, **(color or {})}
     if color.get('lut'):
         raise ValueError('Premiere export cannot preserve this 3D LUT. Save a Splice working copy to keep it.')
     exposure = float(color.get('exposure', 0))
     if not math.isfinite(exposure) or not -4 <= exposure <= 4:
         raise ValueError('Invalid exposure')
+    if hdr:
+        brightness = float(color['brightness'])
+        if not math.isfinite(brightness) or not 0 <= brightness <= 300:
+            raise ValueError('Invalid HDR brightness')
+        color['brightness'] = 100 * (brightness / 100) ** 2.4
     color['brightness'] *= 2 ** exposure
     color = {key: color[key] for key in NEUTRAL}
     if clip._element.tag == 'VideoClipTrackItem' and color != current:

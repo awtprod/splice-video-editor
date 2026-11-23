@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 
 from premiere import MEDIA_ROOT, STILL_IMAGES, _media_path
-from media_proxy import AVC_REC709, HDR_TRANSFERS, HDR_TO_REC709, REC709, tempo_filters
+from media_proxy import AVC_REC709, HDR_LINEAR_REC709, HDR_TONE_MAP, HDR_TRANSFERS, HDR_TO_REC709, REC709, tempo_filters
 
 
 
@@ -67,32 +67,84 @@ def _font_path(family):
     return resolved
 
 
-def _css_color_filter(color, high_depth):
+def _grade_values(color):
     brightness=_number(color.get('brightness',100),'brightness',0,300)/100
     contrast=_number(color.get('contrast',100),'contrast',0,300)/100
     saturation=_number(color.get('saturation',100),'saturation',0,300)/100
     exposure=_number(color.get('exposure',0),'exposure',-4,4)
     temperature=_number(color.get('temperature',0),'temperature',-100,100)/100
     tint=_number(color.get('tint',0),'tint',-100,100)/100
-    if (brightness,contrast,saturation,exposure,temperature,tint)==(1,1,1,0,0,0):
-        return ''
     gain=2**exposure
     gains=(gain*(1+.35*temperature-.1*tint),gain*(1+.2*tint),gain*(1-.35*temperature-.1*tint))
-    light=(.213,.715,.072)
-    matrix=[[saturation*(r==c)+(1-saturation)*light[c] for c in range(3)] for r in range(3)]
+    return brightness, contrast, saturation, gains
+
+
+def _saturation_matrix(saturation):
+    return [[saturation*(r==c)+(1-saturation)*weight for c,weight in enumerate((.213,.715,.072))] for r in range(3)]
+
+
+def _channel_mixer(matrix):
+    return 'colorchannelmixer='+':'.join(f'{r}{c}={matrix[i][j]:.6f}' for i,r in enumerate('rgb') for j,c in enumerate('rgb'))
+
+
+def _css_color_filter(color, high_depth):
+    brightness,contrast,saturation,gains=_grade_values(color)
+    if (brightness,contrast,saturation,gains)==(1,1,1,(1,1,1)):
+        return ''
     channels='rgb'
     brightness_filter=':'.join(f"{c}=val*{brightness:.6f}" for c in channels)
     contrast_filter=':'.join(f"{c}=(val-maxval/2)*{contrast:.6f}+maxval/2" for c in channels)
-    mixer=':'.join(f"{channels[r]}{channels[c]}={matrix[r][c]:.6f}" for r in range(3) for c in range(3))
+    mixer=_channel_mixer(_saturation_matrix(saturation))
     grade_filter=':'.join(f'{c}=val*{g:.7f}' for c,g in zip(channels,gains))
     rgb = 'gbrp10le' if high_depth else 'rgb24'
-    return f',format={rgb},lutrgb={brightness_filter},lutrgb={contrast_filter},colorchannelmixer={mixer},lutrgb={grade_filter}'
+    return f',format={rgb},lutrgb={brightness_filter},lutrgb={contrast_filter},{mixer},lutrgb={grade_filter}'
 
 
-def _fit_picture(width, height, color, lut, alpha_format, high_depth, tone_map=False):
-    tone_filter = HDR_TO_REC709+',' if tone_map else ''
-    return (f'{tone_filter}scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2'
-            f'{_css_color_filter(color,high_depth)}{lut},format={alpha_format},'
+def _rgb_filter(expression):
+    return ',geq=' + ':'.join(f"{channel}='{expression(channel,index)}'" for index,channel in enumerate('rgb'))
+
+
+def _linear_gain(gains):
+    if gains==(1,1,1):
+        return ''
+    if max(gains)<=2:
+        return ',colorchannelmixer='+':'.join(f'{c}{c}={value:.7f}' for c,value in zip('rgb',gains))
+    return _rgb_filter(lambda c,i: f'{c}(X,Y)*{gains[i]:.7f}')
+
+
+def _hdr_grade(color, lut, high_depth, profile):
+    brightness,contrast,saturation,gains=_grade_values(color)
+    if (brightness,contrast,saturation,gains)==(1,1,1,(1,1,1)) and (not lut or not high_depth):
+        return '' if high_depth else ','+HDR_TO_REC709+lut
+    chain=','+HDR_LINEAR_REC709
+    if (brightness,contrast,saturation)!=(1,1,1):
+        # Brightness, contrast, and saturation retain their display-referred
+        # controls. Exposure and white balance below use linear light.
+        chain+=',zscale=t=bt709,format=gbrpf32le'
+        if contrast==1:
+            chain+=_linear_gain((brightness,)*3)
+        else:
+            chain+=_rgb_filter(lambda c,i: f'({c}(X,Y)*{brightness:.6f}-0.5)*{contrast:.6f}+0.5')
+        if saturation!=1:
+            matrix=_saturation_matrix(saturation)
+            # colorchannelmixer limits a coefficient to ±2. Preserve the
+            # extra gain for imported projects with a stronger saturation.
+            peak=max(1,max(abs(value) for row in matrix for value in row)/2)
+            chain+=','+_channel_mixer([[value/peak for value in row] for row in matrix])+_linear_gain((peak,)*3)
+        chain+=',zscale=t=linear,format=gbrpf32le'
+    chain+=_linear_gain(gains)
+    if not high_depth:
+        return chain+','+HDR_TONE_MAP+lut
+    if lut:
+        chain+=',zscale=t=bt709,format=gbrpf32le'+lut+',zscale=t=linear,format=gbrpf32le'
+    primaries,transfer,matrix=profile
+    return chain+f',zscale=p={primaries},zscale=t={transfer}:m={matrix}:r=limited:npl=203,format=yuv444p10le'
+
+
+def _fit_picture(width, height, color, lut, alpha_format, high_depth, hdr_profile=None):
+    grade = _hdr_grade(color,lut,high_depth,hdr_profile) if hdr_profile else _css_color_filter(color,high_depth)+lut
+    return (f'scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2'
+            f'{grade},format={alpha_format},'
             f'pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black@0')
 
 
@@ -370,7 +422,7 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
             else:
                 probe = probes.get(path) or _probe(path)
                 kinds[item['id']], item['_actualDuration'], item['_audioStreams'], item['_videoFPS'], profile = probe
-                item['_toneMap'] = not high_depth and profile[1] in HDR_TRANSFERS
+                item['_hdrProfile'] = profile if profile[1] in HDR_TRANSFERS else None
         speed=_number(clip.get('speed',1),'speed',.1,16)
         before=float(clip.get('transitionBefore',0) or 0)
         if before and not clip.get('reverse') and float(clip.get('in',0))-before*speed<-.01:
@@ -455,7 +507,7 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
             opacity_keys=(clip.get('keyframes') or {}).get('opacity')
             prefix=(f'color=c=black:s={width}x{height}:r={fps}:d={render_length:.6f},setpts=PTS-STARTPTS' if index is None else
                     f'[{index}:v]trim=start={render_source:.6f}:duration={render_length*speed:.6f}{reverse},setpts=(PTS-STARTPTS)/{speed:.6f},fps={fps}')
-            fit = _fit_picture(width,height,color,lut_filter,alpha_format,high_depth,item.get('_toneMap',False))
+            fit = _fit_picture(width,height,color,lut_filter,alpha_format,high_depth,item.get('_hdrProfile'))
             chain = f'{prefix},{fit}{transform}'
             if opacity_keys:
                 opacity_expr=_keyframe_expr(clip,'opacity',opacity*100,0,100,f'(T-{before:.6f})')
@@ -511,7 +563,7 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
                     prior_prefix=(f'color=c=black:s={width}x{height}:r={fps}:d={tail:.6f},setpts=PTS-STARTPTS' if prior_index is None else
                                   f'[{prior_index}:v]trim=start={prior_source:.6f}:duration={tail*prior_speed:.6f}{prior_reverse},setpts=(PTS-STARTPTS)/{prior_speed:.6f},fps={fps}')
                     prior_fit = _fit_picture(width,height,prior_color,prior_lut,alpha_format,high_depth,
-                                             media_by_id[previous['mediaId']].get('_toneMap',False))
+                                             media_by_id[previous['mediaId']].get('_hdrProfile'))
                     prior_alpha = _mask_alpha(f'{prior_opacity:.6f}',alpha_format,full_alpha) if prior_opacity!=1 else ''
                     cut_frame = math.ceil(start*fps-1e-6)
                     filters.append(f'{prior_prefix},{prior_fit}{prior_transform}{prior_alpha},setpts=PTS+{cut_frame}[tail{number}]')

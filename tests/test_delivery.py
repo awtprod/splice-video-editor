@@ -151,6 +151,37 @@ class MovieDelivery(unittest.TestCase):
                     self.assertGreater(sum(abs(value-expected)<=4 for value in luminance),20)
                     self.assertLess(max(luminance),expected+12)
 
+    def test_pq_master_exposure_doubles_linear_light(self):
+        from premiere import MEDIA_ROOT, open_project, save_project
+        MEDIA_ROOT.mkdir(parents=True,exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=MEDIA_ROOT) as directory:
+            source = Path(directory) / 'pq.mov'
+            fixture = ('color=gray:s=160x90:r=25:d=1,'
+                       'setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv')
+            to_pq = ('zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt2020,'
+                     'zscale=t=smpte2084:m=bt2020nc:r=limited:npl=203,format=yuv422p10le')
+            subprocess.run(['ffmpeg','-nostdin','-v','error','-f','lavfi','-i',fixture,'-vf',to_pq,
+                            '-c:v','prores_ks','-profile:v','3','-threads','1','-movflags','+write_colr',str(source)],
+                           check=True,timeout=10)
+            self.project['media'] = [{'id':'hdr','src':'/media/'+str(source.relative_to(MEDIA_ROOT)), 'hdr':True}]
+            self.project['clips'] = [{**self.clip('hdr','hdr',0,1,color={'exposure':1}),'in':0}]
+            master = Path(directory) / 'master.mov'
+            render_to_file(self.project,master,options={'codec':'prores'})
+
+            def linear_patch(file):
+                raw = subprocess.check_output(['ffmpeg','-nostdin','-v','error','-i',str(file),'-frames:v','1',
+                                               '-vf','zscale=t=linear:npl=100,format=gbrpf32le',
+                                               '-f','rawvideo','pipe:1'],timeout=10)
+                return memoryview(raw).cast('f')[80+45*160]
+
+            original = linear_patch(source)
+            self.assertGreater(original,.2)
+            self.assertAlmostEqual(linear_patch(master),original*2,delta=.03)
+            reopened = open_project(save_project(self.project))
+            self.assertAlmostEqual(reopened['clips'][0]['color']['exposure'],1)
+            render_to_file(reopened,master,options={'codec':'prores'})
+            self.assertAlmostEqual(linear_patch(master),original*2,delta=.03)
+
     def test_title_lines_center_independently_and_end_on_out_frame(self):
         self.project.update(width=640,height=360,clips=[
             {'type':'title','start':0,'duration':1,'title':'WIDE FIRST LINE\nI',

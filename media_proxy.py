@@ -21,8 +21,9 @@ AVC_REC709 = 'h264_metadata=colour_primaries=1:transfer_characteristics=1:matrix
 HDR_PREVIEW_VERSION = 2
 # BT.2408 reference white is 203 cd/m². Reserve the upper tenth of the SDR
 # linear range for highlights from a nominal 1,000 cd/m² HDR master.
-HDR_TO_REC709 = ('zscale=t=linear:npl=203,format=gbrpf32le,zscale=p=bt709,'
-                'tonemap=mobius:param=0.9:desat=0:peak=4.926108,zscale=t=bt709:m=bt709:r=limited,format=yuv444p10le')
+HDR_LINEAR_REC709 = 'zscale=t=linear:npl=203,format=gbrpf32le,zscale=p=bt709'
+HDR_TONE_MAP = 'tonemap=mobius:param=0.9:desat=0:peak=4.926108,zscale=t=bt709:m=bt709:r=limited,format=yuv444p10le'
+HDR_TO_REC709 = HDR_LINEAR_REC709 + ',' + HDR_TONE_MAP
 AUDITION_SECONDS = 4
 _audition_decoders = threading.BoundedSemaphore(4)
 
