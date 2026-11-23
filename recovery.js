@@ -99,6 +99,28 @@ window.SpliceSession = (() => {
     try { await action(); revision = editor.get().revision; }
     finally { suppress = false; }
   }
+  async function switchProject(message, action) {
+    if (document.getElementById('project-loading')) throw Error('Wait for the project to finish opening.');
+    const dialog = document.createElement('dialog');
+    dialog.id = 'project-loading';
+    dialog.className = 'studio-dialog';
+    dialog.setAttribute('aria-labelledby','project-loading-title');
+    dialog.innerHTML='<h2 id="project-loading-title"></h2><progress aria-label="Loading project"></progress>';
+    dialog.querySelector('h2').textContent=message;
+    dialog.oncancel=event=>event.preventDefault();
+    document.body.append(dialog);
+    const save=document.getElementById('save-project');
+    save.disabled=true;
+    try {
+      dialog.showModal();
+      editor.setRate(0);
+      return await action();
+    } finally {
+      dialog.close();
+      dialog.remove();
+      save.disabled=false;
+    }
+  }
   async function restore(row, historical = false) {
     const project = {...row.data};
     if (row.originalKey) project.premiereOriginal = await get('originals',row.originalKey);
@@ -119,7 +141,7 @@ window.SpliceSession = (() => {
       const last = await get('metadata','lastSession') || localStorage.getItem('splice.lastSession');
       if (last) {
         const row = await get('sessions',last);
-        if (row) await restore(row);
+        if (row) await switchProject('Restoring project…',()=>restore(row));
       }
     } catch(e) { signal('Could not restore the last session: '+e.message); }
     revision = editor.get().revision;
@@ -162,7 +184,9 @@ window.SpliceSession = (() => {
     });
   }
   async function openFile(file,handle=null) {
-    await start(()=>editor.openProject(file),handle,/\.prproj$/i.test(file.name)?'prproj':'splice',handle?signature(file):undefined);
+    await ready;
+    await switchProject('Opening project…',()=>start(()=>editor.openProject(file),handle,
+      /\.prproj$/i.test(file.name)?'prproj':'splice',handle?signature(file):undefined));
   }
   function pickerTypes(format) {
     const entries = {
@@ -232,8 +256,10 @@ window.SpliceSession = (() => {
     ];
     const choice=await choose('Recent projects and versions',rows);
     if(choice) {
-      await restore(choice,!!choice.session);
-      if (!choice.session) await persist();
+      await switchProject('Restoring project…',async()=>{
+        await restore(choice,!!choice.session);
+        if (!choice.session) await persist();
+      });
     }
   }
   async function sequence(requestedIndex) {
@@ -241,12 +267,14 @@ window.SpliceSession = (() => {
     const p=editor.get().project;
     const index=requestedIndex??await choose('Edit sequence',(p.premiereSequences || []).map((label,value)=>({label,value})));
     if(index===undefined || index===p.premiereSequence) return;
-    const response=await fetch('/api/premiere/sequence',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({project:await SpliceMedia.forPremiere(p),index}),signal:AbortSignal.timeout(120000)});
-    if(!response.ok) throw Error((await response.json()).error);
-    const {project}=await response.json();
-    await activate(()=>editor.openProject(new File([JSON.stringify(project)],'sequence.splice.json')));
-    touched=true; await persist(true);
+    await switchProject('Opening sequence…',async()=>{
+      const response=await fetch('/api/premiere/sequence',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({project:await SpliceMedia.forPremiere(p),index}),signal:AbortSignal.timeout(120000)});
+      if(!response.ok) throw Error((await response.json()).error);
+      const {project}=await response.json();
+      await activate(()=>editor.openProject(new File([JSON.stringify(project)],'sequence.splice.json')));
+      touched=true; await persist(true);
+    });
   }
   window.addEventListener('beforeunload',e=>{if(persisting){e.preventDefault();e.returnValue='';}});
   return {ready,open,openFile,save,saveAs:format=>save(format,true),history,sequence,

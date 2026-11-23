@@ -86,9 +86,9 @@
         `<label class="splice-number"><span>Typeface</span><select aria-label="Title typeface" data-field="fontFamily" data-group="titleStyle">${fonts.map(name => option(name,name,text.fontFamily || 'DM Sans')).join('')}</select></label>` +
         label('Size', 'fontSize', number(text.fontSize, 8), 2, 100, .5, '%', 'titleStyle') +
         label('Opacity', 'opacity', number(clip.opacity, 100), 0, 100, 1, '%') +
-        label('Horizontal', 'x', number(text.x, 50), 0, 100, 1, '%', 'titleStyle') +
+        label('Horizontal anchor', 'x', number(text.x, 50), 0, 100, 1, '%', 'titleStyle') +
         label('Vertical', 'y', number(text.y, 78), 0, 100, 1, '%', 'titleStyle') +
-        `<label class="splice-number"><span>Alignment</span><select aria-label="Title alignment" data-field="align" data-group="titleStyle">${['left','center','right'].map(name => option(name,name,text.align || 'center')).join('')}</select></label>` +
+        `<label class="splice-number"><span>Text alignment</span><select aria-label="Title alignment" data-field="align" data-group="titleStyle">${['left','center','right'].map(name => option(name,name,text.align || 'center')).join('')}</select></label>` +
         label('Outline', 'strokeWidth', number(text.strokeWidth, 0), 0, 8, .5, ' px', 'titleStyle') +
         `<label class="splice-number"><span>Outline color</span><input aria-label="Title outline color" type="color" data-field="strokeColor" data-group="titleStyle" value="${escape(text.strokeColor || '#000000')}"></label>` +
         `<label class="splice-number"><span>Text color</span><input aria-label="Title text color" type="color" data-field="color" data-group="titleStyle" value="${escape(text.color || '#ffffff')}"></label>` +

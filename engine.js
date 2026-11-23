@@ -1601,6 +1601,7 @@
         const response = await fetch("/api/premiere/open", {
           method: "POST",
           body: form,
+          signal: AbortSignal.timeout(120000),
         });
         if (!response.ok) throw new Error(await response.text());
         imported = (await response.json()).project;

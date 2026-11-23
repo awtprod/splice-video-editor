@@ -115,8 +115,32 @@ async function main() {
       const exportPath=path.join(temp,'studio-'+pass+'.prproj');
       const [native]=await Promise.all([page.waitForEvent('download'),click('#save-project')]);await native.saveAs(exportPath);
       assert.equal(fs.readFileSync(exportPath).readUInt16BE(),0x1f8b);
-      await page.locator('#project-input').setInputFiles(exportPath);
-      await waitState(()=>Editor.get().project.premiereOriginal);
+      const openRoute='**/api/premiere/open';
+      let releaseOpen;
+      const heldOpen=new Promise(resolve=>{releaseOpen=resolve;});
+      await page.route(openRoute,async route=>{
+        await heldOpen;
+        await route.continue();
+      },{times:1});
+      const saveButton=page.locator('#save-project');
+      const saveBox=await saveButton.boundingBox();
+      const revision=await page.evaluate(()=>Editor.get().revision);
+      try {
+        await Promise.all([page.waitForRequest(openRoute),page.locator('#project-input').setInputFiles(exportPath)]);
+        await page.getByRole('dialog',{name:'Opening project…'}).waitFor();
+        assert.equal(await saveButton.isDisabled(),true);
+        await page.keyboard.press('Escape');
+        await page.keyboard.press('Delete');
+        await page.keyboard.press('Control+s');
+        await page.mouse.click(saveBox.x+saveBox.width/2,saveBox.y+saveBox.height/2);
+        assert.equal(await page.evaluate(()=>Editor.get().revision),revision);
+        assert.equal(await page.locator('#project-loading').isVisible(),true);
+        if(screenshots&&pass===1)await page.screenshot({path:path.join(screenshots,'Splice-opening-project.png')});
+      } finally {
+        releaseOpen();
+      }
+      await waitState(()=>Editor.get().project.premiereOriginal&&!document.getElementById('project-loading'));
+      assert.equal(await saveButton.isEnabled(),true);
       assert.deepEqual(await page.evaluate(()=>{const p=Editor.get().project,c=p.clips.find(v=>v.type==='video');return [c.track,c.in,c.duration,c.color.saturation,p.media[0].bin,p.clips.find(v=>v.type==='title').title];}),[2,1,2,75,'Documentary/A camera','Opening '+pass]);
       if(pass===2) {
         const reopened=await page.evaluate(()=>Editor.get().project.media[0]);

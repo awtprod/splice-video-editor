@@ -477,7 +477,9 @@
     e.target.value = "";
     if (files.length) busy(() => editor.addMedia(files), "Media imported");
   };
-  $("open-project").onclick = () => window.SpliceSession?.open?.() ?? $("project-input").click();
+  $("open-project").onclick = () => {
+    if (!gesture) busy(() => window.SpliceSession?.open?.() ?? $("project-input").click());
+  };
   $("project-input").onchange = (e) => {
     const file = e.target.files[0];
     if (file) busy(() => window.SpliceSession?.openFile?.(file) ?? editor.openProject(file), "Project opened");
