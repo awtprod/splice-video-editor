@@ -551,7 +551,7 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
             path = _media_path(item.get('src', ''))
             paths[item['id']] = path
             if path.suffix.lower() in STILL_IMAGES:
-                kinds[item['id']], item['_actualDuration'], item['_audioStreams'] = {'video'}, 7200, []
+                kinds[item['id']], item['_actualDuration'], item['_audioStreams'] = {'video'}, math.inf, []
                 item['_renderStill'] = True
             else:
                 probe = probes.get(path) or _probe(path)
@@ -559,7 +559,7 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
                 item['_sourceProfile'] = profile
         speed=_number(clip.get('speed',1),'speed',.1,16)
         before=float(clip.get('transitionBefore',0) or 0)
-        if before and not clip.get('reverse') and float(clip.get('in',0))-before*speed<-.01:
+        if before and not item.get('_renderStill') and not clip.get('reverse') and float(clip.get('in',0))-before*speed<-.01:
             raise ValueError('Incoming clip lacks pre-cut footage for its transition')
         required=float(clip.get('in',0))+(float(clip.get('duration',0))+(before if clip.get('reverse') else 0))*speed
         if required > item['_actualDuration'] + .05:

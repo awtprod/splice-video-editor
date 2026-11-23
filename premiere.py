@@ -403,6 +403,8 @@ def open_project(data, index=0, _seen=()):
                     include_unused(source_item)
             include_unused(project.root_item)
         for item in media:
+            if item.get('path') and Path(item['path']).suffix.lower() in STILL_IMAGES:
+                item['still'] = True
             if not item['duration']:
                 used = [clip['in'] + clip['duration'] for clip in clips if clip.get('mediaId') == item['id']]
                 item['duration'] = max(used, default=0)

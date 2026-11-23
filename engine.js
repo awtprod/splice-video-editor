@@ -245,6 +245,11 @@
   function syncClipPlayback(element, clip, target, forceSeek, audible=true) {
     const rate=clipPlaybackRate(clip);
     const item=mediaOf(clip), stream=clipAudioStream(clip,item);
+    if (item?.still) {
+      element.pause();
+      element.muted=true;
+      return;
+    }
     if (stream!==(item?.audioStream??null) && element.getAttribute('src')===item?.src) audible=false;
     element.playbackRate=rate;
     setMediaPlaying(element,playing && playbackRate>0 && !clip.reverse && rate>=.25);
@@ -345,6 +350,7 @@
   const transitionBefore = clip => clamp(Number(clip.transitionBefore)||0,0,requestedTransitionLength(clip));
   const transitionLength = clip => Math.min(requestedTransitionLength(clip),clip.duration+transitionBefore(clip));
   const sourceTime = (clip, atTime) => {
+    if (mediaOf(clip)?.still) return 0;
     const speed=clamp(Number(clip.speed)||1,.1,16), local=atTime-clip.start;
     return Number(clip.in||0)+(clip.reverse ? clip.duration-local : local)*speed-(clip.reverse?1e-6:0);
   };
@@ -521,6 +527,7 @@
   }
   const presentedSeekTimes = new WeakMap();
   function seekVideo(element, clip, target, forceSeek) {
+    if (element.currentTime===0 && mediaOf(clip)?.still) return;
     const slow=clipPlaybackRate(clip)<.25;
     const framewise=playing && (playbackRate<0 || clip.reverse || slow);
     if (!forceSeek && framewise) {
@@ -969,7 +976,7 @@
       const handle=c.reverse?transitionBefore(c):next?transitionLength(next)-transitionBefore(next):0;
       return c.in+(c.duration+handle)*(Number(c.speed)||1);
     }));
-    if(replacement.duration+1e-6<end) throw Error(replacement.name+' is shorter than the source used on this timeline.');
+    if(!replacement.still && replacement.duration+1e-6<end) throw Error(replacement.name+' is shorter than the source used on this timeline.');
   }
   function download(blob, name) {
     const url = URL.createObjectURL(blob);
@@ -1302,7 +1309,7 @@
             !Number.isFinite(Number(candidate.in)) || Number(candidate.in)<0 ||
             !Number.isFinite(Number(candidate.duration)) || Number(candidate.duration)<=0 ||
             !Number.isFinite(Number(candidate.speed ?? 1)) || Number(candidate.speed ?? 1)<.1 || Number(candidate.speed ?? 1)>16 ||
-            (source?.duration && Number(candidate.in)+Number(candidate.duration)*Number(candidate.speed ?? 1)>source.duration+.01))
+            (!source?.still && source?.duration && Number(candidate.in)+Number(candidate.duration)*Number(candidate.speed ?? 1)>source.duration+.01))
           throw new Error("Clip extends beyond available source footage.");
       }
       Editor.editProject(next=>{
@@ -1345,8 +1352,8 @@
       const speed=Number(clip.speed)||1;
       const mediaItem = mediaOf(clip);
       const sourceEnd = mediaItem?.duration || Infinity;
-      const earliest=clip.reverse ? oldStart-(sourceEnd-clip.in-clip.duration*speed)/speed : oldStart-clip.in/speed;
-      const latest=clip.reverse ? oldEnd+clip.in/speed : oldStart+(sourceEnd-clip.in)/speed;
+      const earliest=mediaItem?.still ? 0 : clip.reverse ? oldStart-(sourceEnd-clip.in-clip.duration*speed)/speed : oldStart-clip.in/speed;
+      const latest=mediaItem?.still ? Infinity : clip.reverse ? oldEnd+clip.in/speed : oldStart+(sourceEnd-clip.in)/speed;
       const newStart = edge === "start" ? clamp(boundary, Math.max(0, earliest), oldEnd - 1/project.fps) : oldStart;
       const newEnd = edge === "end" ? clamp(boundary, oldStart + 1/project.fps, latest) : oldEnd;
       const shift = (edge === "start" ? newStart - oldStart : newEnd - oldEnd);
@@ -1356,8 +1363,9 @@
       for(const member of project.clips.filter(c=>memberIds.has(c.id))){
         const nextIn=member.in+(edge==="start"&&!member.reverse?shift*(Number(member.speed)||1):edge==="end"&&member.reverse?-shift*(Number(member.speed)||1):0);
         const nextDuration=member.duration+(edge==="start"?-shift:shift);
-        const available=mediaOf(member)?.duration;
-        if(nextDuration<1/project.fps-.001 || nextIn<-.001 || (available && nextIn+nextDuration*(Number(member.speed)||1)>available+.01))
+        const source=mediaOf(member);
+        if(nextDuration<1/project.fps-.001 ||
+           (!source?.still && (nextIn<-.001 || (source?.duration && nextIn+nextDuration*(Number(member.speed)||1)>source.duration+.01))))
           throw new Error("Linked clip cannot be trimmed beyond its source.");
       }
       Editor.editProject(next=>{
@@ -1381,8 +1389,8 @@
       if (incoming.some(clip => leftIds.has(clip.id))) return;
       for (const clip of [...outgoing,...incoming]) ensureEditable(clip);
       const frame = 1/project.fps;
-      const head = clip => clip.in / (Number(clip.speed) || 1);
-      const tail = clip => ((mediaOf(clip)?.duration || Infinity) - clip.in) / (Number(clip.speed) || 1) - clip.duration;
+      const head = clip => mediaOf(clip)?.still ? Infinity : clip.in / (Number(clip.speed) || 1);
+      const tail = clip => mediaOf(clip)?.still ? Infinity : ((mediaOf(clip)?.duration || Infinity) - clip.in) / (Number(clip.speed) || 1) - clip.duration;
       const earliest = Math.max(...outgoing.map(clip => frame-clip.duration),
         ...incoming.map(clip => Math.max(-clip.start, -(clip.reverse ? tail(clip) : head(clip)))));
       const latest = Math.min(...outgoing.map(clip => clip.reverse ? head(clip) : tail(clip)),
@@ -1411,11 +1419,12 @@
       });
     },
     slipClip(id, delta) {
-      const clip = project.clips.find(c => c.id === id), source = clip && mediaOf(clip)?.duration;
-      if (!clip || !source) return;
+      const clip = project.clips.find(c => c.id === id), source = clip && mediaOf(clip);
+      if (!clip || !source?.duration || source.still) return;
       ensureLinkedEditable(clip);
       const members=[clip,...linkedClips(clip)];
       const bounds=members.map(member=>{
+        if(mediaOf(member)?.still) return [-Infinity,Infinity];
         const following=followingTransition(member);
         const before=transitionBefore(member);
         const after=following ? requestedTransitionLength(following)-transitionBefore(following) : 0;

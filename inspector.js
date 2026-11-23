@@ -35,14 +35,14 @@
     const text = clip.titleStyle || {};
     const fps = state.project.fps || 25;
     const locked=!!editor.isTrackLocked?.(clip.track,clip.type);
-    const maximumDuration = source?.duration ? Math.max(1/fps, (source.duration - (clip.in || 0))/number(clip.speed,1)) : 7200;
+    const maximumDuration = !source?.still && source?.duration ? Math.max(1/fps, (source.duration - (clip.in || 0))/number(clip.speed,1)) : 7200;
     let html = `<div class="splice-clip-heading"><small>${escape(clip.type)} · ${clip.track > 0 ? 'V' + clip.track : 'A' + Math.abs(clip.track)}</small><strong>${escape(title)}</strong></div>`;
     if(locked) html += '<p class="splice-compat">This track is locked. Unlock it in the timeline to edit this clip.</p>';
     html += section('Timing',
       field('Timeline start', 'start', number(clip.start, 0).toFixed(2), 0, 7200, 1/fps) +
-      (clip.type === 'title' ? '' : field('Source in', 'in', number(clip.in, 0).toFixed(2), 0, source?.duration || 7200, 1/fps)) +
+      (clip.type === 'title' || source?.still ? '' : field('Source in', 'in', number(clip.in, 0).toFixed(2), 0, source?.duration || 7200, 1/fps)) +
       field('Duration', 'duration', number(clip.duration, 1).toFixed(2), 1/fps, maximumDuration, 1/fps));
-    if (clip.type!=='title' && !clip.nativeTimeRemap) html += section('Speed',
+    if (clip.type!=='title' && !source?.still && !clip.nativeTimeRemap) html += section('Speed',
       field('Speed (%)','speedPercent',Math.round(number(clip.speed,1)*10000)/100,10,800,.01) +
       `<label class="splice-safe-toggle"><input aria-label="Reverse clip" type="checkbox" data-field="reverse" ${clip.reverse?'checked':''}> Reverse clip</label>`);
     if (clip.type === 'video') {
@@ -73,7 +73,7 @@
       html += section('Incoming transition',
         `<label class="splice-number"><span>Style</span><select aria-label="Transition style" data-field="transition">${clip.transition==='native'?option('native','Imported: '+(clip.transitionMatchName||'Premiere effect'),'native'):''}${option('none','Cut',clip.transition || 'none')}${option('dissolve','Cross dissolve',clip.transition || 'none')}${option('fade','Fade through black',clip.transition || 'none')}${option('wipe','Wipe left to right',clip.transition || 'none')}</select></label>` +
         field('Length', 'transitionDuration', number(clip.transitionDuration, .5).toFixed(2), 1/fps, 7200, 1/fps) +
-        (['dissolve','wipe'].includes(clip.transition) ? `<p class="splice-handle ${handle+1e-6 < number(clip.transitionDuration,.5)-number(clip.transitionBefore,0) ? 'splice-handle-warn' : ''}">Outgoing source handle: ${handle.toFixed(2)} s. ${previous ? '' : 'Place a video clip directly before this one.'}</p>` : '') +
+        (['dissolve','wipe'].includes(clip.transition) && !previousMedia?.still ? `<p class="splice-handle ${handle+1e-6 < number(clip.transitionDuration,.5)-number(clip.transitionBefore,0) ? 'splice-handle-warn' : ''}">Outgoing source handle: ${handle.toFixed(2)} s. ${previous ? '' : 'Place a video clip directly before this one.'}</p>` : '') +
         (clip.transition!=='none' && clip.transition!=='native' && number(clip.transitionDuration,.5)>clip.duration+number(clip.transitionBefore,0)+1e-6 ?
           `<p class="splice-handle">The available shot limits playback to ${(clip.duration+number(clip.transitionBefore,0)).toFixed(2)} s.</p>` : ''));
     }

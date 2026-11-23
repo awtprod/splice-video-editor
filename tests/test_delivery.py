@@ -77,11 +77,19 @@ class MovieDelivery(unittest.TestCase):
             render_to_file(self.project, self.destination)
 
     def test_final_render_uses_original_still(self):
+        from premiere import open_project, save_project
         self.project['media']=[dict(id='still',src='/assets/ridge.jpg')]
-        self.project['clips']=[self.clip('still','still',0,1)]
+        self.project['clips']=[{**self.clip('still','still',0,8),'in':0}]
         render_to_file(self.project,self.destination)
-        self.assertEqual(next(s['nb_frames'] for s in self.streams() if s['codec_type']=='video'),'25')
-        self.assertGreater(statistics.mean(self.frame(.8)),30)
+        self.assertEqual(next(s['nb_frames'] for s in self.streams() if s['codec_type']=='video'),'200')
+        first, last = self.frame(.4), self.frame(7.96)
+        self.assertGreater(statistics.mean(last),30)
+        reopened=open_project(save_project(self.project))
+        self.assertTrue(reopened['media'][0]['still'])
+        self.assertEqual(reopened['clips'][0]['duration'],8)
+        render_to_file(reopened,self.destination)
+        self.assertEqual(self.frame(.4),first)
+        self.assertEqual(self.frame(7.96),last)
 
     def test_hdr_mp4_tone_maps_and_sets_rec709_signaling(self):
         from premiere import MEDIA_ROOT
