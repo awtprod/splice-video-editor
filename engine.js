@@ -1042,9 +1042,18 @@
         value.trackCounts.video < 1 || value.trackCounts.video > 64 ||
         value.trackCounts.audio < 1 || value.trackCounts.audio > 64))
       throw new Error("This project file has invalid track counts.");
-    if (value.trackMix != null && (typeof value.trackMix !== "object" ||
-        Array.isArray(value.trackMix) || Object.values(value.trackMix).some(mix => !mix || typeof mix !== "object" || Array.isArray(mix))))
-      throw new Error("This project file has invalid audio mixer settings.");
+    if (value.trackMix != null) {
+      if (typeof value.trackMix !== "object" || Array.isArray(value.trackMix))
+        throw new Error("This project file has invalid audio mixer settings.");
+      for (const mix of Object.values(value.trackMix)) {
+        if (!mix || typeof mix !== "object" || Array.isArray(mix) ||
+            (mix.gain !== undefined && !Number.isFinite(mix.gain)) ||
+            (mix.pan !== undefined && !Number.isFinite(mix.pan)) ||
+            (mix.mute !== undefined && typeof mix.mute !== "boolean") ||
+            (mix.solo !== undefined && typeof mix.solo !== "boolean"))
+          throw new Error("This project file has invalid audio mixer settings.");
+      }
+    }
     if (value.markers != null && (!Array.isArray(value.markers) ||
         value.markers.some(marker => !marker || typeof marker.name !== "string" || !Number.isFinite(marker.time))))
       throw new Error("This project file has invalid markers.");

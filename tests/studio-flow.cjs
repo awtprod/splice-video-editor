@@ -168,6 +168,13 @@ async function main() {
         await waitState(()=>document.querySelector('.toast')?.textContent==='Invalid 3D LUT sample.');
         assert.equal(await saveButton.isEnabled(),true);
         assert.equal(await page.evaluate(()=>Editor.get().project.name),name);
+        const badMix={...malformed,name:'Malformed mixer',clips:[],trackMix:{'-1':{gain:'loud',pan:'x',mute:'no'}}};
+        await page.locator('#project-input').setInputFiles({
+          name:'malformed-mixer.splice.json',mimeType:'application/json',buffer:Buffer.from(JSON.stringify(badMix)),
+        });
+        await waitState(()=>document.querySelector('.toast')?.textContent==='This project file has invalid audio mixer settings.');
+        assert.equal(await saveButton.isEnabled(),true);
+        assert.equal(await page.evaluate(()=>Editor.get().project.name),name);
         await page.reload();await page.evaluate(()=>SpliceSession.ready);
         assert.equal(await page.evaluate(()=>Editor.get().project.clips.find(c=>c.type==='title').title),'Opening '+pass);
         await click('#export-video'); await click('.studio-dialog [type=submit]');
