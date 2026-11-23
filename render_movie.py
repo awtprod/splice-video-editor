@@ -231,14 +231,31 @@ def _picture_input(index, source, length, speed, width, height, fps, reverse, st
 
 
 def _lut_filter(color, destination):
-    if not color.get('lut'):
+    lut = color.get('lut')
+    if not lut:
         return ''
     intensity = _number(color.get('lutIntensity',100),'LUT intensity',0,100)
     if not intensity:
         return ''
     from lut import cube_text
-    destination.write_text(cube_text(color['lut'],intensity))
-    return f',lut3d=file={destination}:interp=trilinear'
+    domain_min = lut.get('domainMin', [0,0,0]) if isinstance(lut, dict) else [0,0,0]
+    domain_max = lut.get('domainMax', [1,1,1]) if isinstance(lut, dict) else [1,1,1]
+    custom_domain = domain_min != [0,0,0] or domain_max != [1,1,1]
+    destination.write_text(cube_text(lut,100 if custom_domain else intensity,normalized_domain=custom_domain))
+    apply_lut = f'lut3d=file={destination}:interp=trilinear'
+    if not custom_domain:
+        return ','+apply_lut
+    # Apply the input offset and scale explicitly. FFmpeg's .cube reader
+    # ignores the offset and caps the input scale at one.
+    channels = ':'.join(f"{channel}='clip((val-maxval*({low!r}))/({high-low!r}),0,maxval)'"
+                        for channel, low, high in zip('rgb',domain_min,domain_max))
+    graded = f'format=gbrap16le,lutrgb={channels},format=gbrapf32le,{apply_lut}'
+    if intensity == 100:
+        return ','+graded
+    label = '_lut_'+destination.stem.replace('-','_')
+    return (f',format=gbrapf32le,split[{label}_original][{label}_input];'
+            f'[{label}_input]{graded}[{label}_graded];'
+            f'[{label}_graded][{label}_original]blend=all_mode=normal:all_opacity={intensity/100:.12g}')
 
 
 def _mask_alpha(expression, alpha_format, full_alpha):

@@ -2,7 +2,7 @@
 import math
 
 
-def cube_text(lut, intensity=100):
+def cube_text(lut, intensity=100, *, normalized_domain=False):
     if not isinstance(lut, dict):
         raise ValueError('Invalid LUT')
     size = lut.get('size')
@@ -25,6 +25,8 @@ def cube_text(lut, intensity=100):
     alpha = float(intensity)/100
     if not math.isfinite(alpha) or not 0 <= alpha <= 1:
         raise ValueError('Invalid LUT intensity')
+    if normalized_domain:
+        domain_min, domain_max = [0,0,0], [1,1,1]
     lines = [f'LUT_3D_SIZE {size}', 'DOMAIN_MIN '+ ' '.join(str(v) for v in domain_min),
              'DOMAIN_MAX '+ ' '.join(str(v) for v in domain_max)]
     for blue in range(size):
