@@ -172,7 +172,8 @@ def _hdr_grade(color, lut, high_depth, profile, target=None):
     if not high_depth:
         return chain+','+HDR_TONE_MAP+lut
     if lut:
-        chain+=',zscale=t=bt709,format=gbrpf32le'+lut+',zscale=t=linear,format=gbrpf32le'
+        # The approximate transfer tables can clip extended-range RGB.
+        chain+=',zscale=t=bt709:agamma=0,format=gbrpf32le'+lut+',zscale=t=linear:agamma=0,format=gbrpf32le'
     primaries,transfer,matrix=target or profile
     return chain+f',zscale=p={primaries},zscale=t={transfer}:m={matrix}:r=limited:npl={peak:.9f},format=yuv444p10le'
 
@@ -230,7 +231,7 @@ def _picture_input(index, source, length, speed, width, height, fps, reverse, st
             f'setpts=(PTS-STARTPTS)/{speed:.6f},fps={fps}')
 
 
-def _lut_filter(color, destination):
+def _lut_filter(color, destination, *, preserve_headroom=False):
     lut = color.get('lut')
     if not lut:
         return ''
@@ -241,19 +242,34 @@ def _lut_filter(color, destination):
     domain_min = lut.get('domainMin', [0,0,0]) if isinstance(lut, dict) else [0,0,0]
     domain_max = lut.get('domainMax', [1,1,1]) if isinstance(lut, dict) else [1,1,1]
     custom_domain = domain_min != [0,0,0] or domain_max != [1,1,1]
-    destination.write_text(cube_text(lut,100 if custom_domain else intensity,normalized_domain=custom_domain))
+    mix_after_lookup = custom_domain or preserve_headroom
+    destination.write_text(cube_text(lut,100 if mix_after_lookup else intensity,normalized_domain=custom_domain))
     apply_lut = f'lut3d=file={destination}:interp=trilinear'
-    if not custom_domain:
+    if not mix_after_lookup:
         return ','+apply_lut
     # Apply the input offset and scale explicitly. FFmpeg's .cube reader
     # ignores the offset and caps the input scale at one.
-    channels = ':'.join(f"{channel}='clip((val-maxval*({low!r}))/({high-low!r}),0,maxval)'"
-                        for channel, low, high in zip('rgb',domain_min,domain_max))
-    graded = f'format=gbrap16le,lutrgb={channels},format=gbrapf32le,{apply_lut}'
+    if preserve_headroom:
+        # Keep both branches in float RGB. Adding an alpha plane or using
+        # integer RGB here clips HDR values before the LUT can read them.
+        working_format = 'gbrpf32le'
+        normalize = 'format='+working_format
+        if domain_min == [0,0,0] and min(domain_max) >= .5:
+            normalize += _linear_gain(tuple(1/maximum for maximum in domain_max))
+        else:
+            channels = ':'.join(f"{channel}='clip(({channel}(X,Y)-({low!r}))/({high-low!r}),0,1)'"
+                                for channel, low, high in zip('rgb',domain_min,domain_max))
+            normalize += ',geq='+channels
+    else:
+        working_format = 'gbrapf32le'
+        channels = ':'.join(f"{channel}='clip((val-maxval*({low!r}))/({high-low!r}),0,maxval)'"
+                            for channel, low, high in zip('rgb',domain_min,domain_max))
+        normalize = f'format=gbrap16le,lutrgb={channels},format={working_format}'
+    graded = f'{normalize},{apply_lut}'
     if intensity == 100:
         return ','+graded
     label = '_lut_'+destination.stem.replace('-','_')
-    return (f',format=gbrapf32le,split[{label}_original][{label}_input];'
+    return (f',format={working_format},split[{label}_original][{label}_input];'
             f'[{label}_input]{graded}[{label}_graded];'
             f'[{label}_graded][{label}_original]blend=all_mode=normal:all_opacity={intensity/100:.12g}')
 
@@ -661,7 +677,8 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
             render_source=max(0,render_source-source_offsets.get(item['id'],0)-.000001)
             color = clip.get('color') or {}
             transform,position=_transform(clip,width,height,before)
-            lut_filter=_lut_filter(color,Path(lut_directory)/f'clip-{number}.cube')
+            lut_filter=_lut_filter(color,Path(lut_directory)/f'clip-{number}.cube',preserve_headroom=bool(
+                hdr_profile and (item.get('_sourceProfile') or REC709)[1] in HDR_TRANSFERS))
             opacity=_number(clip.get('opacity',100),'opacity',0,100)/100
             opacity_keys=(clip.get('keyframes') or {}).get('opacity')
             still_frames = max(1,math.ceil(render_length*fps-1e-6)) if item.get('_renderStill') else 0
@@ -690,10 +707,11 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
                     chain += f',format={dip_rgb},fade=t=out:st={max(0,render_length-dip_tail):.6f}:d={dip_tail:.6f}'
             overlap_transition = previous is not None and clip.get('transition') in ('dissolve','wipe')
             if overlap_transition:
+                prior_item = media_by_id[previous['mediaId']]
                 prior_index = indexes.get(previous['mediaId'])
                 prior_speed=_number(previous.get('speed',1),'speed',.1,16)
                 prior_available=(float(previous.get('in',0))/prior_speed if previous.get('reverse') else
-                                 (media_by_id[previous['mediaId']]['_actualDuration']-(float(previous.get('in',0))+float(previous['duration'])*prior_speed))/prior_speed)
+                                 (prior_item['_actualDuration']-(float(previous.get('in',0))+float(previous['duration'])*prior_speed))/prior_speed)
                 frame_duration = 1 / float(fps)
                 tail = max(0, transition_duration - before)
                 if tail >= frame_duration - 1e-6 and prior_available + 1e-6 < tail:
@@ -701,7 +719,7 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
                 prior_source = float(previous.get('in',0))-tail*prior_speed if previous.get('reverse') else float(previous.get('in',0))+float(previous['duration'])*prior_speed
                 prior_reverse=',reverse' if previous.get('reverse') else ''
                 if not prior_reverse and prior_speed==1:
-                    prior_source=_video_sample_time(prior_source,media_by_id[previous['mediaId']],fps)
+                    prior_source=_video_sample_time(prior_source,prior_item,fps)
                 prior_source=max(0,prior_source-source_offsets.get(previous['mediaId'],0)-.000001)
                 prior_tail={**previous,'keyframes':{},'transform':dict(previous.get('transform') or {})}
                 for key in ('x','y','scale','rotation','opacity'):
@@ -712,10 +730,10 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
                         else: prior_tail['transform'][key]=terminal
                 prior_transform,prior_position=_transform(prior_tail,width,height)
                 prior_color=previous.get('color') or {}
-                prior_lut=_lut_filter(prior_color,Path(lut_directory)/f'tail-{number}.cube')
+                prior_lut=_lut_filter(prior_color,Path(lut_directory)/f'tail-{number}.cube',preserve_headroom=bool(
+                    hdr_profile and (prior_item.get('_sourceProfile') or REC709)[1] in HDR_TRANSFERS))
                 prior_opacity=_number(prior_tail.get('opacity',100),'opacity',0,100)/100
                 if tail + 1e-6 >= frame_duration:
-                    prior_item=media_by_id[previous['mediaId']]
                     still_tail = max(1,math.ceil(tail*fps-1e-6)) if prior_item.get('_renderStill') else 0
                     prior_prefix = _picture_input(prior_index,prior_source,tail,prior_speed,width,height,fps,prior_reverse,still_tail)
                     prior_fit = _fit_picture(width,height,prior_color,prior_lut,alpha_format,high_depth,

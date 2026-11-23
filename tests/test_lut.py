@@ -1,3 +1,4 @@
+import struct
 import subprocess
 import tempfile
 import unittest
@@ -40,6 +41,23 @@ class LUTSerialization(unittest.TestCase):
                     self.assertEqual(len(output), len(expected))
                     for actual, reference in zip(output, expected):
                         self.assertAlmostEqual(actual, reference, delta=1)
+
+    def test_hdr_lut_preserves_rgb_above_reference_white(self):
+        lut = {'size': 2, 'data': [value for b in (0,1) for g in (0,1) for r in (0,1) for value in (r,g,b)]}
+        samples = [1.58,1.88]*3
+        with tempfile.TemporaryDirectory() as folder:
+            for low, high in ((0,1),(0,2),(.25,2.25)):
+                with self.subTest(low=low,high=high):
+                    lut['domainMin'], lut['domainMax'] = [low]*3, [high]*3
+                    filters = _lut_filter({'lut':lut,'lutIntensity':50}, Path(folder)/'clip-0.cube', preserve_headroom=True)
+                    output = subprocess.check_output([
+                        'ffmpeg','-nostdin','-v','error','-f','rawvideo','-pixel_format','gbrpf32le',
+                        '-video_size','2x1','-i','pipe:0','-filter_complex',f'[0:v]null{filters}[result]',
+                        '-map','[result]','-frames:v','1','-pix_fmt','gbrpf32le','-f','rawvideo','pipe:1',
+                    ], input=struct.pack('<6f',*samples), timeout=10)
+                    for measured, original in zip(struct.unpack('<6f',output), samples):
+                        mapped = min(1,max(0,(original-low)/(high-low)))
+                        self.assertAlmostEqual(measured, (original+mapped)/2, places=5)
 
 
 if __name__ == '__main__':
