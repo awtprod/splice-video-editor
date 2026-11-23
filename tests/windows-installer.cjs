@@ -25,6 +25,7 @@ async function windowForEditor() {
   page.setDefaultTimeout(20000)
   await page.waitForFunction(() => !!window.SpliceSession)
   await page.evaluate(() => SpliceSession.ready)
+  page.on('pageerror', error => console.error(error))
   await app.evaluate(({session}, directory) => {
     const { join } = process.getBuiltinModule('path')
     session.defaultSession.on('will-download', (event, item) => {
@@ -74,7 +75,12 @@ async function main() {
     await page.locator('.studio-dialog [data-cancel]').click()
     await page.waitForFunction(() => document.querySelector('.render-state')?.textContent === 'Render cancelled.')
     await page.locator('.studio-dialog [type=submit]').click()
-    await page.waitForFunction(() => document.querySelector('.render-state')?.textContent.startsWith('MP4 exported'), null, { timeout: 90000 })
+    await page.waitForFunction(() => {
+      const render = document.querySelector('.studio-dialog [type=submit]')
+      return render && !render.disabled
+    }, null, { timeout: 45000 })
+    const status = await page.locator('.render-state').textContent()
+    assert.ok(status.startsWith('MP4 exported'), status)
     await waitForFile(rendered)
     const { streams } = JSON.parse(execFileSync(ffprobe, [
       '-v', 'error', '-show_entries', 'stream=codec_name,nb_frames,width,height', '-of', 'json', rendered
@@ -83,6 +89,10 @@ async function main() {
     assert.equal(streams[1].codec_name, 'aac')
     await page.screenshot({ path: path.join(proof, 'Windows-export.png') })
     console.log(JSON.stringify({ native, rendered, streams, cancelledThenRetried: true }))
+  } catch (error) {
+    await page.screenshot({ path: path.join(proof, 'Windows-error.png') }).catch(() => {})
+    console.error(await page.locator('.render-state').allTextContents())
+    throw error
   } finally {
     await app.close()
   }

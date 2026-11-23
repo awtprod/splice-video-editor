@@ -3,7 +3,7 @@ Name "Splice"
 OutFile "Splice-Setup-x64.exe"
 InstallDir "$LOCALAPPDATA\Programs\Splice"
 RequestExecutionLevel user
-SetCompressor /SOLID lzma
+SetCompressor zlib
 ShowInstDetails show
 ShowUninstDetails show
 
