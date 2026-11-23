@@ -89,8 +89,11 @@ class MovieDelivery(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=MEDIA_ROOT) as directory:
             source = Path(directory) / 'hlg.mov'
             fixture = ('color=gray:s=160x90:r=25:d=1,'
-                       'setparams=color_primaries=bt2020:color_trc=arib-std-b67:colorspace=bt2020nc')
+                       'setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv')
+            to_hlg = ('zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt2020,'
+                      'zscale=t=arib-std-b67:m=bt2020nc:r=limited:npl=203,format=yuv422p10le')
             subprocess.run(['ffmpeg','-nostdin','-v','error','-f','lavfi','-i',fixture,
+                            '-vf',to_hlg,
                             '-c:v','prores_ks','-profile:v','3','-threads','1','-pix_fmt','yuv422p10le',
                             '-color_primaries','bt2020','-color_trc','arib-std-b67','-colorspace','bt2020nc',
                             '-movflags','+write_colr',str(source)], check=True, timeout=15)
@@ -101,7 +104,7 @@ class MovieDelivery(unittest.TestCase):
             self.assertEqual(tuple(video[field] for field in ('color_primaries','color_transfer','color_space')),
                              ('bt709','bt709','bt709'))
             self.assertEqual(video['nb_frames'], '25')
-            self.assertGreater(statistics.mean(self.frame(.4)), 15)
+            self.assertAlmostEqual(statistics.mean(self.frame(.4)), 128, delta=6)
 
     def test_slow_audio_preview_keeps_pitch_and_samples_across_windows(self):
         from media_proxy import audition_audio
@@ -147,6 +150,24 @@ class MovieDelivery(unittest.TestCase):
         self.project['clips'] = [front, behind]
         render_to_file(self.project, self.destination)
         self.assertGreater(max(self.frame(.4)[0::3]),230)
+
+    def test_video_covers_lower_title_only_where_picture_is_opaque(self):
+        from premiere import MEDIA_ROOT
+        MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=MEDIA_ROOT) as directory:
+            source = Path(directory) / 'blue.mp4'
+            subprocess.run(['ffmpeg','-nostdin','-v','error','-f','lavfi','-i',
+                            'color=blue:s=160x90:r=25:d=1','-c:v','libx264','-threads','1',str(source)],check=True,timeout=10)
+            self.project['media'] = [{'id':'blue','src':'/media/'+str(source.relative_to(MEDIA_ROOT))}]
+            title = {'type':'title','track':1,'start':0,'duration':1,'title':'TITLE',
+                     'titleStyle':{'fontSize':30,'color':'#00ff00'}}
+            video = {**self.clip('blue','blue',0,1),'track':2,'in':0}
+            self.project['clips'] = [video,title]
+            render_to_file(self.project,self.destination)
+            self.assertLess(max(self.frame(.44)[1::3]),15)
+            video['transform'] = {'scale':25}
+            render_to_file(self.project,self.destination)
+            self.assertGreater(max(self.frame(.44)[1::3]),200)
 
     def test_growing_rotated_clip_keeps_picture_at_the_edges(self):
         self.project['media']=[dict(id='still',src='/assets/ridge.jpg')]

@@ -784,6 +784,33 @@
     return layerVideos.get(clip.id);
   }
   const previewProjects = new WeakMap();
+  function paintTitle(ctx,canvas,title) {
+    ctx.save();ctx.globalAlpha=clamp(animated(title,'opacity',Number(title.opacity??100))/100,0,1);
+    ctx.fillStyle = "#fff";
+    const style=title.titleStyle||{};
+    ctx.font = `${Math.round(canvas.height * (Number(style.fontSize)||8)/100)}px "${style.fontFamily||'DM Sans'}"`;
+    ctx.fillStyle=style.color||'#ffffff';
+    ctx.textAlign = ['left','center','right'].includes(style.align) ? style.align : 'center';
+    ctx.textBaseline = "alphabetic";
+    ctx.shadowColor = "#000";
+    ctx.shadowBlur = 0;
+    ctx.shadowOffsetX=3;ctx.shadowOffsetY=3;
+    const tx=canvas.width * (Number(style.x??50)/100), ty=canvas.height * (Number(style.y??78)/100);
+    const lines=title.title.split(/\r?\n/).slice(0,20);
+    const lineHeight=Math.round(canvas.height * (Number(style.fontSize)||8)/100)*1.2;
+    for (let i=0;i<lines.length;i++) {
+      const metrics=ctx.measureText(lines[i]);
+      const lineY=ty+(i-(lines.length-1)/2)*lineHeight+
+        (metrics.actualBoundingBoxAscent-metrics.actualBoundingBoxDescent)/2;
+      if (Number(style.strokeWidth)>0) {
+        ctx.lineWidth=Number(style.strokeWidth)*canvas.height/90;
+        ctx.strokeStyle=style.strokeColor||'#000000';
+        ctx.strokeText(lines[i],tx,lineY);
+      }
+      ctx.fillText(lines[i],tx,lineY);
+    }
+    ctx.restore();
+  }
   function drawFrame(canvas) {
     const active = at('video', time);
     if (!mutedTracks.video && active && mediaOf(active)?.src &&
@@ -792,76 +819,50 @@
     const ctx = canvas.getContext("2d");
     ctx.fillStyle = '#000';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
-    if (!mutedTracks.video) {
-      const visible=project.clips.filter(c=>c.type==='video' && c.start-transitionBefore(c)<=time && time<c.start+c.duration)
-        .sort((a,b)=>a.track-b.track || a.start-b.start);
-      const dissolvePairs=new Map(), outgoingIds=new Set();
-      for (const clip of visible) {
-        if (clip.transition!=='dissolve' || time>=clip.start+transitionLength(clip)-transitionBefore(clip)) continue;
-        const previous=preceding(clip);
-        if (previous) {dissolvePairs.set(clip.id,previous);outgoingIds.add(previous.id);}
-      }
-      for (const clip of visible) {
-        if (outgoingIds.has(clip.id) || mediaOf(clip)?.nativeGenerator===1414680150) continue;
-        if (clip.transition==='fade' && time<clip.start) continue;
-        const element=videoFor(clip);
-        const progress=clamp((time-(clip.start-transitionBefore(clip)))/transitionLength(clip),0,1);
-        const previous=dissolvePairs.get(clip.id);
-        if (previous) {
-          if (dissolveCanvas.width!==canvas.width || dissolveCanvas.height!==canvas.height) {
-            dissolveCanvas.width=canvas.width;dissolveCanvas.height=canvas.height;
-          }
-          const mix=dissolveCanvas.getContext('2d');
-          mix.clearRect(0,0,canvas.width,canvas.height);
-          paintVideo(mix,videoFor(previous),previous,canvas,1-progress);
-          mix.save();mix.globalCompositeOperation='lighter';
-          paintVideo(mix,element,clip,canvas,progress);mix.restore();
-          ctx.drawImage(dissolveCanvas,0,0);
-          continue;
-        }
-        let brightness=1;
-        const head=transitionLength(clip)-transitionBefore(clip);
-        if (clip.transition==='fade' && head>0) brightness=clamp((time-clip.start)/head,0,1);
-        const nextDip=videoDipFollowers.get(clip.id);
-        if (nextDip && transitionBefore(nextDip)>0) brightness*=clamp((nextDip.start-time)/transitionBefore(nextDip),0,1);
-        if (clip.transition==='wipe') {
-          const tail=transitionTail(clip,time);
-          if (tail) paintVideo(ctx,videoFor(tail),tail,canvas);
-          ctx.save();ctx.beginPath();ctx.rect(0,0,canvas.width*progress,canvas.height);ctx.clip();
-        }
-        paintVideo(ctx,element,clip,canvas,clip.transition==='dissolve'?progress:1,brightness);
-        if (clip.transition==='wipe') ctx.restore();
-      }
-      ctx.globalAlpha=1;ctx.filter='none';
+    const visible=project.clips.filter(clip=>clip.type==='video' ? !mutedTracks.video &&
+      clip.start-transitionBefore(clip)<=time && time<clip.start+clip.duration :
+      clip.type==='title' && !mutedTracks.title && clip.title && clip.start<=time && time<clip.start+clip.duration);
+    visible.sort((a,b)=>(a.track??4)-(b.track??4) || Number(a.type==='title')-Number(b.type==='title') || a.start-b.start);
+    const dissolvePairs=new Map(), outgoingIds=new Set();
+    for (const clip of visible) {
+      if (clip.type!=='video' || clip.transition!=='dissolve' || time>=clip.start+transitionLength(clip)-transitionBefore(clip)) continue;
+      const previous=preceding(clip);
+      if (previous) {dissolvePairs.set(clip.id,previous);outgoingIds.add(previous.id);}
     }
-    const titles = mutedTracks.title ? [] : project.clips.filter(c=>c.type==='title'&&c.title&&c.start<=time&&time<c.start+c.duration)
-      .sort((a,b)=>a.track-b.track||a.start-b.start);
-    for (const title of titles) {
-      ctx.save();ctx.globalAlpha=clamp(animated(title,'opacity',Number(title.opacity??100))/100,0,1);
-      ctx.fillStyle = "#fff";
-      const style=title.titleStyle||{};
-      ctx.font = `${Math.round(canvas.height * (Number(style.fontSize)||8)/100)}px "${style.fontFamily||'DM Sans'}"`;
-      ctx.fillStyle=style.color||'#ffffff';
-      ctx.textAlign = ['left','center','right'].includes(style.align) ? style.align : 'center';
-      ctx.textBaseline = "alphabetic";
-      ctx.shadowColor = "#000";
-      ctx.shadowBlur = 0;
-      ctx.shadowOffsetX=3;ctx.shadowOffsetY=3;
-      const tx=canvas.width * (Number(style.x??50)/100), ty=canvas.height * (Number(style.y??78)/100);
-      const lines=title.title.split(/\r?\n/).slice(0,20);
-      const lineHeight=Math.round(canvas.height * (Number(style.fontSize)||8)/100)*1.2;
-      for (let i=0;i<lines.length;i++) {
-        const metrics=ctx.measureText(lines[i]);
-        const lineY=ty+(i-(lines.length-1)/2)*lineHeight+
-          (metrics.actualBoundingBoxAscent-metrics.actualBoundingBoxDescent)/2;
-        if (Number(style.strokeWidth)>0) {
-          ctx.lineWidth=Number(style.strokeWidth)*canvas.height/90;
-          ctx.strokeStyle=style.strokeColor||'#000000';
-          ctx.strokeText(lines[i],tx,lineY);
-        }
-        ctx.fillText(lines[i],tx,lineY);
+    for (const clip of visible) {
+      if (clip.type==='title') {
+        paintTitle(ctx,canvas,clip);
+        continue;
       }
-      ctx.restore();
+      if (outgoingIds.has(clip.id) || mediaOf(clip)?.nativeGenerator===1414680150) continue;
+      if (clip.transition==='fade' && time<clip.start) continue;
+      const element=videoFor(clip);
+      const progress=clamp((time-(clip.start-transitionBefore(clip)))/transitionLength(clip),0,1);
+      const previous=dissolvePairs.get(clip.id);
+      if (previous) {
+        if (dissolveCanvas.width!==canvas.width || dissolveCanvas.height!==canvas.height) {
+          dissolveCanvas.width=canvas.width;dissolveCanvas.height=canvas.height;
+        }
+        const mix=dissolveCanvas.getContext('2d');
+        mix.clearRect(0,0,canvas.width,canvas.height);
+        paintVideo(mix,videoFor(previous),previous,canvas,1-progress);
+        mix.save();mix.globalCompositeOperation='lighter';
+        paintVideo(mix,element,clip,canvas,progress);mix.restore();
+        ctx.drawImage(dissolveCanvas,0,0);
+        continue;
+      }
+      let brightness=1;
+      const head=transitionLength(clip)-transitionBefore(clip);
+      if (clip.transition==='fade' && head>0) brightness=clamp((time-clip.start)/head,0,1);
+      const nextDip=videoDipFollowers.get(clip.id);
+      if (nextDip && transitionBefore(nextDip)>0) brightness*=clamp((nextDip.start-time)/transitionBefore(nextDip),0,1);
+      if (clip.transition==='wipe') {
+        const tail=transitionTail(clip,time);
+        if (tail) paintVideo(ctx,videoFor(tail),tail,canvas);
+        ctx.save();ctx.beginPath();ctx.rect(0,0,canvas.width*progress,canvas.height);ctx.clip();
+      }
+      paintVideo(ctx,element,clip,canvas,clip.transition==='dissolve'?progress:1,brightness);
+      if (clip.transition==='wipe') ctx.restore();
     }
   }
   function tick(timestamp) {

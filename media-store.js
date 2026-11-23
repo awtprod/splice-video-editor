@@ -142,7 +142,8 @@ window.SpliceMedia = (() => {
     Object.assign(item,metadata,{src,originalSrc:original});
   }
   function needsSourceProbe(item) {
-    return !Number.isInteger(item.audioStreams) || (item.audioStreams>1 && !Array.isArray(item.audioStreamChannels));
+    return !Number.isInteger(item.audioStreams) || (item.audioStreams>1 && !Array.isArray(item.audioStreamChannels)) ||
+      (item.hdr && item.hdrPreviewVersion!==2);
   }
   async function restore(project) {
     const db = await open();

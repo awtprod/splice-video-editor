@@ -18,8 +18,11 @@ MAX_AUDIO_STREAMS = 16
 HDR_TRANSFERS = frozenset({'arib-std-b67', 'smpte2084'})
 REC709 = ('bt709', 'bt709', 'bt709')
 AVC_REC709 = 'h264_metadata=colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1'
-HDR_TO_REC709 = ('zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,'
-                'tonemap=mobius:desat=2:peak=10,zscale=t=bt709:m=bt709:r=limited,format=yuv444p10le')
+HDR_PREVIEW_VERSION = 2
+# BT.2408 reference white is 203 cd/m². Reserve the upper tenth of the SDR
+# linear range for highlights from a nominal 1,000 cd/m² HDR master.
+HDR_TO_REC709 = ('zscale=t=linear:npl=203,format=gbrpf32le,zscale=p=bt709,'
+                'tonemap=mobius:param=0.9:desat=0:peak=4.926108,zscale=t=bt709:m=bt709:r=limited,format=yuv444p10le')
 AUDITION_SECONDS = 4
 _audition_decoders = threading.BoundedSemaphore(4)
 
@@ -119,6 +122,7 @@ def describe(src):
     native_container = path.suffix.lower() in ('.mp4','.m4v','.m4a','.webm','.wav','.mp3','.ogg','.flac','.aac')
     hdr = video.get('color_transfer') in HDR_TRANSFERS
     return dict(type='video' if video else 'audio', duration=duration, width=video.get('width'), height=video.get('height'), hdr=hdr,
+                hdrPreviewVersion=HDR_PREVIEW_VERSION if hdr else None,
                 fps=fps, videoCodec=vcodec, audioCodec=acodec, audioChannels=2 if len(audio_streams)>1 else audio.get('channels',0),
                 audioStreams=len(audio_streams), audioStreamChannels=[stream.get('channels',1) for stream in audio_streams], still=still,
                 proxyRecommended=hdr or len(audio_streams)>1 or not (native_video and native_audio and native_container))
@@ -146,7 +150,7 @@ def proxy(src, seek_optimized=False, audio_stream=None):
     stat = original.stat()
     profile = 'proxy-seek-v1' if seek_optimized else 'proxy-v3'
     if info['hdr']:
-        profile += ':hdr-rec709-v1'
+        profile += f':hdr-rec709-v{HDR_PREVIEW_VERSION}'
     audio_map = _source_audio_map(info['audioStreamChannels'],audio_stream,info['duration'])
     if info['audioStreams']>1:
         profile += f':audio-v2:{audio_stream}'

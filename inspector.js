@@ -83,7 +83,7 @@
       html += section('Title',
         `<label class="splice-text"><span>Text</span><textarea aria-label="Title text" data-field="title" rows="2" maxlength="500">${escape(clip.title)}</textarea></label>` +
         `<label class="splice-number"><span>Typeface</span><select aria-label="Title typeface" data-field="fontFamily" data-group="titleStyle">${fonts.map(name => option(name,name,text.fontFamily || 'DM Sans')).join('')}</select></label>` +
-        label('Size', 'fontSize', number(text.fontSize, 8), 2, 20, .5, '%', 'titleStyle') +
+        label('Size', 'fontSize', number(text.fontSize, 8), 2, 100, .5, '%', 'titleStyle') +
         label('Opacity', 'opacity', number(clip.opacity, 100), 0, 100, 1, '%') +
         label('Horizontal', 'x', number(text.x, 50), 0, 100, 1, '%', 'titleStyle') +
         label('Vertical', 'y', number(text.y, 78), 0, 100, 1, '%', 'titleStyle') +

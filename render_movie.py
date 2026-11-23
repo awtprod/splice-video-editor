@@ -230,6 +230,45 @@ def _slice_keyframes(keyframes, offset, length):
     return result
 
 
+def _draw_title(filters, active, number, clip, height, fps, directory):
+    begin = float(clip['start']); end = begin + float(clip['duration'])
+    first_frame = math.ceil(begin * fps - 1e-6)
+    out_frame = math.ceil(end * fps - 1e-6)
+    style=clip.get('titleStyle') or {}
+    font_path=_font_path(style.get('fontFamily','DM Sans'))
+    fontsize=round(height*_number(style.get('fontSize',8),'title size',2,100)/100)
+    x=_number(style.get('x',50),'title horizontal',0,100)/100
+    y=_number(style.get('y',78),'title vertical',0,100)/100
+    opacity = _number(clip.get('opacity',100),'title opacity',0,100)
+    alpha = _keyframe_expr(clip,'opacity',opacity,0,100,f'(t-{begin:.9f})')
+    color=str(style.get('color','#ffffff'))
+    if len(color)!=7 or not color.startswith('#') or any(c not in '0123456789abcdefABCDEF' for c in color[1:]):
+        raise ValueError('Invalid title color')
+    align=style.get('align','center')
+    if align not in ('left','center','right'): raise ValueError('Invalid title alignment')
+    xpos={'left':f'w*{x:.5f}','center':f'w*{x:.5f}-text_w/2','right':f'w*{x:.5f}-text_w'}[align]
+    stroke=str(style.get('strokeColor','#000000'))
+    if len(stroke)!=7 or not stroke.startswith('#') or any(c not in '0123456789abcdefABCDEF' for c in stroke[1:]):
+        raise ValueError('Invalid title outline color')
+    border=int(_number(style.get('strokeWidth',0),'title outline',0,8)*height/180)
+    lines = str(clip['title'])[:500].split('\n')[:20]
+    for row, line in enumerate(lines):
+        if not line.strip():
+            continue
+        text_file = Path(directory) / f'title-{number}-{row}.txt'
+        text_file.write_text(line.rstrip('\r'), encoding='utf-8')
+        offset = (row - (len(lines) - 1) / 2) * fontsize * 1.2
+        label = f'title{number}line{row}'
+        filters.append(
+            f'[{active}]drawtext=fontfile={font_path}:textfile={text_file}:expansion=none:'
+            f'fontsize={fontsize}:fontcolor=0x{color[1:]}:borderw={border}:bordercolor=0x{stroke[1:]}:'
+            f'shadowcolor=black:shadowx=3:shadowy=3:x={xpos}:y=h*{y:.5f}+({offset:.3f})-text_h/2:'
+            f"alpha='({alpha})/100':"
+            f'enable=gte(n\\,{first_frame})*lt(n\\,{out_frame})[{label}]')
+        active = label
+    return active
+
+
 def _render_window(project, output_path, *, options=None, cancelled=None):
     with tempfile.TemporaryDirectory(prefix='splice-lut-') as lut_directory:
         return _render_window_inner(project, output_path, lut_directory, options=options, cancelled=cancelled)
@@ -336,8 +375,13 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
     base_index = len(indexes)
     filters = [f'[{base_index}:v]format={base_format}[base0]']
     active = 'base0'
-    video_clips = sorted((c for c in clips if c['type'] == 'video'), key=lambda c: (c.get('track', 0), c['start']))
-    if not muted.get('video'):
+    video_clips = [] if muted.get('video') else sorted((c for c in clips if c['type']=='video'),
+                                                       key=lambda c: (c.get('track',0),c['start']))
+    titles = [] if muted.get('title') else [c for c in clips if c['type']=='title' and c.get('title')]
+    picture_layers = [(clip.get('track',0),False,number,clip) for number,clip in enumerate(video_clips)]
+    picture_layers.extend((clip.get('track',4),True,number,clip) for number,clip in enumerate(titles))
+    picture_layers.sort(key=lambda row: (row[0],row[1],row[3]['start']))
+    if picture_layers:
         by_end = {}
         predecessors, followers = {}, {}
         for number, clip in enumerate(video_clips):
@@ -349,7 +393,10 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
                 predecessors[number] = prior
                 followers[prior] = number
             by_end[track,round((clip['start']+clip['duration'])*fps)] = number
-        for number, clip in enumerate(video_clips):
+        for _, is_title, number, clip in picture_layers:
+            if is_title:
+                active = _draw_title(filters,active,number,clip,height,fps,lut_directory)
+                continue
             item = media_by_id[clip['mediaId']]
             if item.get('nativeGenerator')==1414680150: continue
             index = indexes.get(item['id'])
@@ -460,151 +507,112 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
             else:
                 filters.append(f'[{active}][clip{number}]overlay={position}:{overlay}[base{number+1}]')
             active = f'base{number+1}'
-    with tempfile.TemporaryDirectory(prefix='splice-render-') as work:
-        titles = sorted((c for c in clips if c['type']=='title' and c.get('title') and not muted.get('title')),
-                        key=lambda c: (c.get('track',4),c['start']))
-        for number, clip in enumerate(titles):
-            begin = float(clip['start']); end = begin + float(clip['duration'])
-            first_frame = math.ceil(begin * fps - 1e-6)
-            out_frame = math.ceil(end * fps - 1e-6)
-            style=clip.get('titleStyle') or {}
-            font_path=_font_path(style.get('fontFamily','DM Sans'))
-            fontsize=round(height*_number(style.get('fontSize',8),'title size',2,20)/100)
-            x=_number(style.get('x',50),'title horizontal',0,100)/100
-            y=_number(style.get('y',78),'title vertical',0,100)/100
-            opacity = _number(clip.get('opacity',100),'title opacity',0,100)
-            alpha = _keyframe_expr(clip,'opacity',opacity,0,100,f'(t-{begin:.9f})')
-            color=str(style.get('color','#ffffff'))
-            if len(color)!=7 or not color.startswith('#') or any(c not in '0123456789abcdefABCDEF' for c in color[1:]):
-                raise ValueError('Invalid title color')
-            align=style.get('align','center')
-            if align not in ('left','center','right'): raise ValueError('Invalid title alignment')
-            xpos={'left':f'w*{x:.5f}','center':f'w*{x:.5f}-text_w/2','right':f'w*{x:.5f}-text_w'}[align]
-            stroke=str(style.get('strokeColor','#000000'))
-            if len(stroke)!=7 or not stroke.startswith('#') or any(c not in '0123456789abcdefABCDEF' for c in stroke[1:]):
-                raise ValueError('Invalid title outline color')
-            border=int(_number(style.get('strokeWidth',0),'title outline',0,8)*height/180)
-            lines = str(clip['title'])[:500].split('\n')[:20]
-            for row, line in enumerate(lines):
-                if not line.strip():
-                    continue
-                text_file = Path(work) / f'title-{number}-{row}.txt'
-                text_file.write_text(line.rstrip('\r'), encoding='utf-8')
-                offset = (row - (len(lines) - 1) / 2) * fontsize * 1.2
-                label = f'title{number}line{row}'
-                filters.append(
-                    f'[{active}]drawtext=fontfile={font_path}:textfile={text_file}:expansion=none:'
-                    f'fontsize={fontsize}:fontcolor=0x{color[1:]}:borderw={border}:bordercolor=0x{stroke[1:]}:'
-                    f'shadowcolor=black:shadowx=3:shadowy=3:x={xpos}:y=h*{y:.5f}+({offset:.3f})-text_h/2:'
-                    f"alpha='({alpha})/100':"
-                    f'enable=gte(n\\,{first_frame})*lt(n\\,{out_frame})[{label}]')
-                active = label
-        audio_labels = []
-        track_mix=project.get('trackMix') or {}
-        solo=any(v.get('solo') for v in track_mix.values() if isinstance(v,dict))
-        if not muted.get('audio') and not video_only:
-            for number, clip in enumerate(c for c in clips if c['type'] in ('audio', 'video')):
-                item = media_by_id[clip['mediaId']]
-                if item.get('nativeGenerator') in (1112293707,1414680150): continue
-                mix = track_mix.get(str(clip.get('track', -1))) or {}
-                if mix.get('mute') or (solo and not mix.get('solo')): continue
-                if 'audio' not in kinds[item['id']] or (clip['type'] == 'video' and clip.get('embeddedAudio') is False):
-                    continue
-                index = indexes[item['id']]
-                source_in = float(clip.get('in', 0)); length = float(clip['duration']); start=float(clip['start'])
-                speed=_number(clip.get('speed',1),'speed',.1,16)
-                before=_number(clip.get('transitionBefore',0),'transition lead')
-                render_source=(source_in if clip.get('reverse') else source_in-before*speed)-source_offsets.get(item['id'],0)
-                render_length=length+before
-                delay=round((start-before)*48000)
-                volume_keys=(clip.get('keyframes') or {}).get('volume')
-                gain = (100 if volume_keys else _number(clip.get('volume',100),'volume',0,200)) * _number(mix.get('gain',100),'track gain',0,200) / 10000
-                pan = max(-1,min(1,(_number(clip.get('pan', 0), 'pan', -100, 100) + _number(mix.get('pan',0),'track pan',-100,100))/100))
-                streams = dict(enumerate(item['_audioStreams']))
-                selection = item.get('audioStream')
-                if selection is not None:
-                    if type(selection) is not int or selection not in streams:
-                        raise ValueError('The selected source audio stream is unavailable')
-                    streams = {selection:streams[selection]}
-                panner = _stereo_pan(pan,2 if len(streams)>1 else next(iter(streams.values())))
-                fade_in = min(length,_number(clip.get('fadeIn',0),'fade in',0,7200))
-                fade_out = min(length,_number(clip.get('fadeOut',0),'fade out',0,7200))
-                chain = _trim_audio(filters,f'mix{number}',index,streams,render_source,render_length*speed,clip.get('reverse'))
-                processing=','.join([*tempo_filters(speed),f'volume={gain:.4f}',panner])
-                chain += processing
-                envelope=[]
-                if volume_keys:
-                    volume_expr=_keyframe_expr(clip,'volume',float(clip.get('volume',100)),0,200,f'(t-{before:.6f})')
-                    envelope.append(f'({volume_expr})/100')
-                if clip.get('transition') in ('dissolve','wipe','fade'):
-                    incoming=min(_number(clip.get('transitionDuration',.5),'transition duration',1/float(fps)),render_length)
-                    envelope.append(f'min(1,t/{incoming:.9f})')
-                next_clip=next((candidate for candidate in clips if candidate is not clip and candidate.get('type')==clip['type'] and candidate.get('track')==clip.get('track') and candidate.get('transition') in ('dissolve','wipe') and round(float(candidate['start'])*fps)==round((start+length)*fps)),None)
-                if next_clip:
-                    next_before=_number(next_clip.get('transitionBefore',0),'transition lead')
-                    next_duration=_number(next_clip.get('transitionDuration',.5),'transition duration',1/float(fps))
-                    next_duration=min(next_duration,next_before+float(next_clip['duration']))
-                    fade_start=before+length-next_before
-                    envelope.append(f'max(0,min(1,1-(t-{fade_start:.9f})/{next_duration:.9f}))')
-                if fade_in or fade_out:
-                    head = f'max(0,(t-{before:.9f})/{fade_in:.9f})' if fade_in else '1'
-                    tail = f'max(0,({render_length:.9f}-t)/{fade_out:.9f})' if fade_out else '1'
-                    envelope.append(f'min(1,min({head},{tail}))')
-                if envelope:
-                    gain_expr='*'.join(envelope)
-                    chain += f",aeval=exprs='val(ch)*{gain_expr}':channel_layout=stereo"
-                filters.append(chain + f',adelay={delay}S:all=1[audio{number}]')
-                audio_labels.append(f'[audio{number}]')
-                if next_clip and not fade_out:
-                    after=max(0,next_duration-next_before)
-                    if after>=1/float(fps):
-                        available=(source_in/speed if clip.get('reverse') else (item['_actualDuration']-source_in-length*speed)/speed)
-                        if available+1e-3<after: raise ValueError('Audio crossfade needs more outgoing source footage')
-                        tail_source=source_in-after*speed if clip.get('reverse') else source_in+length*speed
-                        tail_source-=source_offsets.get(item['id'],0)
-                        tail_chain=_trim_audio(filters,f'tailmix{number}',index,streams,tail_source,after*speed,clip.get('reverse'))
-                        tail_chain+=processing
-                        if volume_keys:
-                            terminal=sorted(volume_keys,key=lambda point:point['time'])[-1]['value']
-                            tail_chain+=f",volume={_number(terminal,'volume keyframe',0,200)/100:.6f}"
-                        tail_gain=f'max(0,1-({next_before:.9f}+t)/{next_duration:.9f})'
-                        tail_delay=round((start+length)*48000)
-                        tail_chain+=f",aeval=exprs='val(ch)*{tail_gain}':channel_layout=stereo,adelay={tail_delay}S:all=1[tailaudio{number}]"
-                        filters.append(tail_chain)
-                        audio_labels.append(f'[tailaudio{number}]')
-        if audio_labels:
-            filters.append(f"{''.join(audio_labels)}amix=inputs={len(audio_labels)}:duration=longest:normalize=0,aformat=channel_layouts=stereo,alimiter=limit=0.95:level=0:latency=1,apad,atrim=duration={duration:.6f}[aout]")
-        elif not video_only:
-            command.extend(['-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo'])
-            filters.append(f'[{base_index+1}:a]atrim=duration={duration:.6f}[aout]')
-        audio_output = 'aout'
-        window = (options or {}).get('_output_frames')
-        if window is not None:
-            first, stop = window
-            filters.append(f'[{active}]trim=start_frame={first}:end_frame={stop},setpts=PTS-STARTPTS[vwindow]')
-            active = 'vwindow'
-            if not video_only:
-                first_sample,stop_sample = (round(frame*48000/fps) for frame in (first,stop))
-                filters.append(f'[aout]atrim=start_sample={first_sample}:end_sample={stop_sample},asetpts=PTS-STARTPTS[awindow]')
-                audio_output = 'awindow'
-            duration = (stop-first)/fps
-        output = Path(output_path)
-        command.extend(['-filter_complex', ';'.join(filters), '-map', f'[{active}]'])
-        if not video_only: command.extend(['-map', f'[{audio_output}]'])
-        if codec=='prores':
-            command.extend(['-t',f'{duration:.6f}','-r',str(fps),'-c:v','prores_ks','-profile:v','3','-pix_fmt','yuv422p10le','-threads','4'])
-            if not video_only: command.extend(['-c:a','pcm_s24le','-ar','48000'])
-        else:
-            command.extend(['-t',f'{duration:.6f}','-r',str(fps),'-c:v','libx264','-threads','4','-preset','veryfast','-crf',str(int(_number((options or {}).get('crf',20),'quality',14,32))),'-pix_fmt','yuv420p'])
-            if not video_only: command.extend(['-c:a','aac','-b:a',str(int(_number((options or {}).get('audioBitrate',192),'audio bitrate',64,320)))+'k'])
-        profile = (options or {}).get('_color_profile')
-        if profile:
-            command.extend(['-color_primaries',profile[0],'-color_trc',profile[1],'-colorspace',profile[2]])
-            if high_depth and profile[1] in HDR_TRANSFERS:
-                command.extend(['-bsf:v',f'prores_metadata=color_primaries={profile[0]}:color_trc={profile[1]}:colorspace={profile[2]}'])
-        command.extend(['-movflags','+faststart+write_colr' if profile else '+faststart',str(output)])
-        _run_controlled(command,cancelled,min(3600,max(120,duration*8)))
-        return output.stat().st_size
+    audio_labels = []
+    track_mix=project.get('trackMix') or {}
+    solo=any(v.get('solo') for v in track_mix.values() if isinstance(v,dict))
+    if not muted.get('audio') and not video_only:
+        for number, clip in enumerate(c for c in clips if c['type'] in ('audio', 'video')):
+            item = media_by_id[clip['mediaId']]
+            if item.get('nativeGenerator') in (1112293707,1414680150): continue
+            mix = track_mix.get(str(clip.get('track', -1))) or {}
+            if mix.get('mute') or (solo and not mix.get('solo')): continue
+            if 'audio' not in kinds[item['id']] or (clip['type'] == 'video' and clip.get('embeddedAudio') is False):
+                continue
+            index = indexes[item['id']]
+            source_in = float(clip.get('in', 0)); length = float(clip['duration']); start=float(clip['start'])
+            speed=_number(clip.get('speed',1),'speed',.1,16)
+            before=_number(clip.get('transitionBefore',0),'transition lead')
+            render_source=(source_in if clip.get('reverse') else source_in-before*speed)-source_offsets.get(item['id'],0)
+            render_length=length+before
+            delay=round((start-before)*48000)
+            volume_keys=(clip.get('keyframes') or {}).get('volume')
+            gain = (100 if volume_keys else _number(clip.get('volume',100),'volume',0,200)) * _number(mix.get('gain',100),'track gain',0,200) / 10000
+            pan = max(-1,min(1,(_number(clip.get('pan', 0), 'pan', -100, 100) + _number(mix.get('pan',0),'track pan',-100,100))/100))
+            streams = dict(enumerate(item['_audioStreams']))
+            selection = item.get('audioStream')
+            if selection is not None:
+                if type(selection) is not int or selection not in streams:
+                    raise ValueError('The selected source audio stream is unavailable')
+                streams = {selection:streams[selection]}
+            panner = _stereo_pan(pan,2 if len(streams)>1 else next(iter(streams.values())))
+            fade_in = min(length,_number(clip.get('fadeIn',0),'fade in',0,7200))
+            fade_out = min(length,_number(clip.get('fadeOut',0),'fade out',0,7200))
+            chain = _trim_audio(filters,f'mix{number}',index,streams,render_source,render_length*speed,clip.get('reverse'))
+            processing=','.join([*tempo_filters(speed),f'volume={gain:.4f}',panner])
+            chain += processing
+            envelope=[]
+            if volume_keys:
+                volume_expr=_keyframe_expr(clip,'volume',float(clip.get('volume',100)),0,200,f'(t-{before:.6f})')
+                envelope.append(f'({volume_expr})/100')
+            if clip.get('transition') in ('dissolve','wipe','fade'):
+                incoming=min(_number(clip.get('transitionDuration',.5),'transition duration',1/float(fps)),render_length)
+                envelope.append(f'min(1,t/{incoming:.9f})')
+            next_clip=next((candidate for candidate in clips if candidate is not clip and candidate.get('type')==clip['type'] and candidate.get('track')==clip.get('track') and candidate.get('transition') in ('dissolve','wipe') and round(float(candidate['start'])*fps)==round((start+length)*fps)),None)
+            if next_clip:
+                next_before=_number(next_clip.get('transitionBefore',0),'transition lead')
+                next_duration=_number(next_clip.get('transitionDuration',.5),'transition duration',1/float(fps))
+                next_duration=min(next_duration,next_before+float(next_clip['duration']))
+                fade_start=before+length-next_before
+                envelope.append(f'max(0,min(1,1-(t-{fade_start:.9f})/{next_duration:.9f}))')
+            if fade_in or fade_out:
+                head = f'max(0,(t-{before:.9f})/{fade_in:.9f})' if fade_in else '1'
+                tail = f'max(0,({render_length:.9f}-t)/{fade_out:.9f})' if fade_out else '1'
+                envelope.append(f'min(1,min({head},{tail}))')
+            if envelope:
+                gain_expr='*'.join(envelope)
+                chain += f",aeval=exprs='val(ch)*{gain_expr}':channel_layout=stereo"
+            filters.append(chain + f',adelay={delay}S:all=1[audio{number}]')
+            audio_labels.append(f'[audio{number}]')
+            if next_clip and not fade_out:
+                after=max(0,next_duration-next_before)
+                if after>=1/float(fps):
+                    available=(source_in/speed if clip.get('reverse') else (item['_actualDuration']-source_in-length*speed)/speed)
+                    if available+1e-3<after: raise ValueError('Audio crossfade needs more outgoing source footage')
+                    tail_source=source_in-after*speed if clip.get('reverse') else source_in+length*speed
+                    tail_source-=source_offsets.get(item['id'],0)
+                    tail_chain=_trim_audio(filters,f'tailmix{number}',index,streams,tail_source,after*speed,clip.get('reverse'))
+                    tail_chain+=processing
+                    if volume_keys:
+                        terminal=sorted(volume_keys,key=lambda point:point['time'])[-1]['value']
+                        tail_chain+=f",volume={_number(terminal,'volume keyframe',0,200)/100:.6f}"
+                    tail_gain=f'max(0,1-({next_before:.9f}+t)/{next_duration:.9f})'
+                    tail_delay=round((start+length)*48000)
+                    tail_chain+=f",aeval=exprs='val(ch)*{tail_gain}':channel_layout=stereo,adelay={tail_delay}S:all=1[tailaudio{number}]"
+                    filters.append(tail_chain)
+                    audio_labels.append(f'[tailaudio{number}]')
+    if audio_labels:
+        filters.append(f"{''.join(audio_labels)}amix=inputs={len(audio_labels)}:duration=longest:normalize=0,aformat=channel_layouts=stereo,alimiter=limit=0.95:level=0:latency=1,apad,atrim=duration={duration:.6f}[aout]")
+    elif not video_only:
+        command.extend(['-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo'])
+        filters.append(f'[{base_index+1}:a]atrim=duration={duration:.6f}[aout]')
+    audio_output = 'aout'
+    window = (options or {}).get('_output_frames')
+    if window is not None:
+        first, stop = window
+        filters.append(f'[{active}]trim=start_frame={first}:end_frame={stop},setpts=PTS-STARTPTS[vwindow]')
+        active = 'vwindow'
+        if not video_only:
+            first_sample,stop_sample = (round(frame*48000/fps) for frame in (first,stop))
+            filters.append(f'[aout]atrim=start_sample={first_sample}:end_sample={stop_sample},asetpts=PTS-STARTPTS[awindow]')
+            audio_output = 'awindow'
+        duration = (stop-first)/fps
+    output = Path(output_path)
+    command.extend(['-filter_complex', ';'.join(filters), '-map', f'[{active}]'])
+    if not video_only: command.extend(['-map', f'[{audio_output}]'])
+    if codec=='prores':
+        command.extend(['-t',f'{duration:.6f}','-r',str(fps),'-c:v','prores_ks','-profile:v','3','-pix_fmt','yuv422p10le','-threads','4'])
+        if not video_only: command.extend(['-c:a','pcm_s24le','-ar','48000'])
+    else:
+        command.extend(['-t',f'{duration:.6f}','-r',str(fps),'-c:v','libx264','-threads','4','-preset','veryfast','-crf',str(int(_number((options or {}).get('crf',20),'quality',14,32))),'-pix_fmt','yuv420p'])
+        if not video_only: command.extend(['-c:a','aac','-b:a',str(int(_number((options or {}).get('audioBitrate',192),'audio bitrate',64,320)))+'k'])
+    profile = (options or {}).get('_color_profile')
+    if profile:
+        command.extend(['-color_primaries',profile[0],'-color_trc',profile[1],'-colorspace',profile[2]])
+        if high_depth and profile[1] in HDR_TRANSFERS:
+            command.extend(['-bsf:v',f'prores_metadata=color_primaries={profile[0]}:color_trc={profile[1]}:colorspace={profile[2]}'])
+    command.extend(['-movflags','+faststart+write_colr' if profile else '+faststart',str(output)])
+    _run_controlled(command,cancelled,min(3600,max(120,duration*8)))
+    return output.stat().st_size
 
 
 def render_to_file(project, output_path, *, options=None, progress=None, cancelled=None, _nested_depth=0):
