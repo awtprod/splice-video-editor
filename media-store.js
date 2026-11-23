@@ -9,7 +9,7 @@ window.SpliceMedia = (() => {
       .pop()
       .toLowerCase();
   const bundled = (src) =>
-    /^(?:\.\/|\/)?assets\/(?:ridge|forest|valley|lake)\.mp4$|^(?:\.\/|\/)?assets\/score\.wav$/.test(
+    /^(?:\.\/|\/)?assets\/(?:ridge|forest|valley|lake)\.(?:mp4|jpg)$|^(?:\.\/|\/)?assets\/score\.wav$/.test(
       src,
     );
   const localMedia = (src) => /^\/media\/[a-f0-9]{32}\/[^/]+$/.test(src);
@@ -111,11 +111,11 @@ window.SpliceMedia = (() => {
   function hdrPreviewStatus(item, stream=item?.audioStream??null) {
     return item?.src ? previewJobs.get(previewKey(item,stream,true)) : undefined;
   }
-  function preparePreview(item, stream, grading=false) {
+  function preparePreview(item, stream, grading=false, retry=false) {
     if (!item.src || item.offline) return;
     const key=previewKey(item,stream,grading);
     let job=previewJobs.get(key);
-    if (job) return job;
+    if (job && !(retry && job.error)) return job;
     job={pending:true};
     previewJobs.set(key,job);
     if (previewJobs.size>500) {
@@ -169,7 +169,7 @@ window.SpliceMedia = (() => {
   }
   function needsSourceProbe(item) {
     return !Number.isInteger(item.audioStreams) || (item.audioStreams>1 && !Array.isArray(item.audioStreamChannels)) ||
-      (item.hdr && item.hdrPreviewVersion!==3);
+      (item.hdr && item.hdrPreviewVersion!==3) || (item.still && item.stillPreviewVersion!==1);
   }
   async function restore(project) {
     const db = await open();
@@ -186,7 +186,8 @@ window.SpliceMedia = (() => {
       }
       if ((bundled(item.src) || localMedia(item.src)) && await exists(item.src)) {
         const original=item.originalSrc||item.src;
-        if (localMedia(item.src) && (!item.originalSrc || needsSourceProbe(item)) &&
+        const bundledStill=bundled(item.src) && /\.(png|jpe?g|bmp)$/i.test(item.src);
+        if ((bundledStill || localMedia(item.src) && (!item.originalSrc || needsSourceProbe(item))) &&
             (original===item.src || await exists(original))) await restoreSource(item,original);
         item.offline = false;
         continue;
@@ -234,7 +235,7 @@ window.SpliceMedia = (() => {
     for (const item of copy.media) {
       delete item.thumb;
       if(Number.isInteger(item.nestedSequence)) {if(item.nestedProject) item.nestedProject=await forPremiere(item.nestedProject);continue;}
-      if(item.originalSrc && localMedia(item.originalSrc)) {item.src=item.originalSrc;continue;}
+      if(localMedia(item.originalSrc) || bundled(item.originalSrc)) {item.src=item.originalSrc;continue;}
       if (!item.src || bundled(item.src) || localMedia(item.src)) continue;
       const record = await read(
         db

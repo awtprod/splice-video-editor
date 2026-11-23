@@ -1162,10 +1162,10 @@
       selectedId = id;
       notify();
     },
-    setSourceMarks(id, inPoint, outPoint) {
+    setSourceSettings(id, settings) {
       const item=project.media.find(entry=>entry.id===id);
       if (!item) return;
-      item.sourceMarks={in:inPoint,out:outPoint};
+      Object.assign(item,settings);
       revision++;
       notify();
     },

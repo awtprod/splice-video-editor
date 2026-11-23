@@ -19,6 +19,7 @@ HDR_TRANSFERS = frozenset({'arib-std-b67', 'smpte2084'})
 REC709 = ('bt709', 'bt709', 'bt709')
 AVC_REC709 = 'h264_metadata=colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1'
 HDR_PREVIEW_VERSION = 3
+STILL_PREVIEW_VERSION = 1
 # BT.2408 reference white is 203 cd/m². Leave enough room in the SDR
 # highlight shoulder to distinguish bright patches on an 8-bit display.
 HDR_LINEAR_REC709 = 'zscale=t=linear:npl={peak:.9f},format=gbrpf32le,zscale=p=bt709'
@@ -130,6 +131,7 @@ def describe(src):
                 hdrPreviewVersion=HDR_PREVIEW_VERSION if hdr else None,
                 fps=fps, videoCodec=vcodec, audioCodec=acodec, audioChannels=2 if len(audio_streams)>1 else audio.get('channels',0),
                 audioStreams=len(audio_streams), audioStreamChannels=[stream.get('channels',1) for stream in audio_streams], still=still,
+                stillPreviewVersion=STILL_PREVIEW_VERSION if still else None,
                 proxyRecommended=hdr or len(audio_streams)>1 or not (native_video and native_audio and native_container))
 
 
@@ -156,6 +158,9 @@ def proxy(src, seek_optimized=False, audio_stream=None, grading_data=False):
         raise ValueError('A seek proxy requires moving video')
     stat = original.stat()
     profile = 'proxy-seek-v1' if seek_optimized else 'proxy-v3'
+    alpha = info['still'] and original.suffix.lower() in ('.png','.bmp')
+    if alpha:
+        profile += f':still-alpha-v{STILL_PREVIEW_VERSION}'
     if info['hdr']:
         profile += ':hdr-grading-v1' if grading_data else f':hdr-rec709-v{HDR_PREVIEW_VERSION}'
     audio_map = _source_audio_map(info['audioStreamChannels'],audio_stream,info['duration'])
@@ -164,7 +169,7 @@ def proxy(src, seek_optimized=False, audio_stream=None, grading_data=False):
     key = hashlib.sha256(f'{profile}:{original}:{stat.st_size}:{stat.st_mtime_ns}'.encode()).hexdigest()
     directory = MEDIA_ROOT / key[:32]
     video = info['type']=='video'
-    target = directory / ('grade.mp4' if grading_data else 'seek.mp4' if seek_optimized else 'edit.mp4' if video else 'edit.m4a')
+    target = directory / ('edit.webm' if alpha else 'grade.mp4' if grading_data else 'seek.mp4' if seek_optimized else 'edit.mp4' if video else 'edit.m4a')
     if target.is_file():
         return _playback_url(target)
     if not _encoders.acquire(timeout=5):
@@ -187,15 +192,24 @@ def proxy(src, seek_optimized=False, audio_stream=None, grading_data=False):
                     picture = (HDR_GRADE_DATA if grading_data else HDR_TO_REC709)+','+fit if info['hdr'] else fit
                     if grading_data:
                         picture += ',setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv'
-                    cmd += ['-map','0:V:0','-vf',picture,'-c:v','libx264','-threads','2','-preset','veryfast',
-                            '-crf','22' if seek_optimized else '19','-maxrate','4M','-bufsize','8M',
-                            '-g','1' if seek_optimized else '24','-pix_fmt','yuv420p']
+                    cmd += ['-map','0:V:0','-vf',picture]
+                    if alpha:
+                        cmd += ['-c:v','libvpx-vp9','-threads','2','-deadline','realtime','-cpu-used','5',
+                                '-b:v','0','-crf','18','-auto-alt-ref','0','-pix_fmt','yuva420p']
+                    else:
+                        cmd += ['-c:v','libx264','-threads','2','-preset','veryfast',
+                                '-crf','22' if seek_optimized else '19','-maxrate','4M','-bufsize','8M',
+                                '-g','1' if seek_optimized else '24','-pix_fmt','yuv420p']
                     if info['hdr']:
                         cmd += ['-bsf:v',AVC_REC709,'-color_primaries','bt709','-color_trc','bt709','-colorspace','bt709']
                 else:
                     cmd += ['-vn']
-                cmd += audio_map
-                cmd += ['-t',str(info['duration']),'-c:a','aac','-b:a','160k','-ac',str(min(2,max(1,info['audioChannels']))),'-movflags','+faststart',out.name]
+                cmd += ['-t',str(info['duration'])]
+                if alpha:
+                    cmd += ['-an']
+                else:
+                    cmd += audio_map + ['-c:a','aac','-b:a','160k','-ac',str(min(2,max(1,info['audioChannels']))),'-movflags','+faststart']
+                cmd.append(out.name)
                 completed = subprocess.run(cmd,capture_output=True,timeout=min(3600,max(60,info['duration']*3)))
                 if completed.returncode:
                     raise ValueError('Proxy creation failed for '+original.name+': '+completed.stderr.decode(errors='replace')[-400:])

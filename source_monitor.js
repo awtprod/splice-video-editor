@@ -47,7 +47,7 @@
       markOut=Math.max(point,Math.min(media.duration,1/fps));
       markIn=Math.min(markIn,Math.max(0,markOut-1/fps));
     }
-    Editor.setSourceMarks(media.id,markIn,markOut);
+    Editor.setSourceSettings(media.id,{sourceMarks:{in:markIn,out:markOut}});
   }
   function place(mode) {
     if (dialog.dataset.preparing) return;
@@ -162,7 +162,7 @@
         if (dialog!==active) return false;
         let src=item.src;
         if(stream!==(item.audioStream??null)) {
-          const job=SpliceMedia.preparePreview(item,stream);
+          const job=SpliceMedia.preparePreview(item,stream,false,true);
           await job?.done;
           if (dialog!==active) return false;
           if (!job?.src) throw Error(job?.error||'Could not prepare this audio stream.');
@@ -208,9 +208,17 @@
       trackPicker.onchange=async()=>{
         const active=dialog;
         const choice=trackPicker.value===''?null:Number(trackPicker.value);
+        Editor.setSourceSettings(media.id,{sourceAudioStream:choice});
         proxyButton.disabled=trackPicker.disabled=true;
         try {await setPreviewSource({audioStream:choice});}
-        catch(error){if(dialog===active){trackPicker.value=media.audioStream??'';show(error.message);}}
+        catch(error){
+          if(dialog===active){
+            const previous=media.audioStream??null;
+            trackPicker.value=previous??'';
+            Editor.setSourceSettings(media.id,{sourceAudioStream:previous});
+            show(error.message);
+          }
+        }
         finally {trackPicker.disabled=false;proxyButton.disabled=!!media?.seekOptimized;}
       };
     }
@@ -232,6 +240,12 @@
     dialog.addEventListener('cancel',event=>{event.preventDefault();close();});
     dialog.addEventListener('click',event=>{if(event.target===dialog)close();});
     dialog.showModal();update();
+    const choice=item.sourceAudioStream;
+    if(media.audioStreams>1 && (choice===null || Number.isInteger(choice) && choice>=0 && choice<media.audioStreams) &&
+        choice!==(media.audioStream??null)){
+      trackPicker.value=choice??'';
+      trackPicker.onchange();
+    }
   }
   document.addEventListener('keydown',onKey,true);
   window.SpliceSource={open};

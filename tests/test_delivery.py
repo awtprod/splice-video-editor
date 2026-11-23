@@ -181,6 +181,43 @@ class MovieDelivery(unittest.TestCase):
                     for component,code in zip(zip(*red_pixels),red):
                         self.assertAlmostEqual(statistics.median(component),code,delta=5)
 
+    def test_hdr_master_preserves_still_alpha_and_graphics_white(self):
+        from premiere import MEDIA_ROOT
+        MEDIA_ROOT.mkdir(parents=True,exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=MEDIA_ROOT) as directory:
+            directory = Path(directory)
+            logo = directory/'logo.png'
+            row = b''.join(bytes(color)*40 for color in ((0,0,255,0),(255,255,255,128),
+                                                         (255,255,255,255),(255,0,0,255)))
+            subprocess.run(['ffmpeg','-nostdin','-v','error','-f','rawvideo','-pixel_format','rgba',
+                            '-video_size','160x90','-i','pipe:0','-frames:v','1',str(logo)],
+                           input=row*90,check=True,timeout=10)
+            for transfer,white,red in (('smpte2084',573,(392,438,608)),('arib-std-b67',721,(392,395,715))):
+                with self.subTest(transfer=transfer):
+                    source = directory/'under.mov'
+                    fixture = ('color=black:s=160x90:r=25:d=1,'
+                               f'setparams=color_primaries=bt2020:color_trc={transfer}:colorspace=bt2020nc:range=tv')
+                    subprocess.run(['ffmpeg','-nostdin','-v','error','-y','-f','lavfi','-i',fixture,
+                                    '-c:v','prores_ks','-profile:v','3','-threads','1','-pix_fmt','yuv422p10le',
+                                    '-movflags','+write_colr',str(source)],check=True,timeout=10)
+                    self.project['media'] = [{'id':key,'src':'/media/'+str(file.relative_to(MEDIA_ROOT))}
+                                             for key,file in (('hdr',source),('logo',logo))]
+                    self.project['clips'] = [{**self.clip('hdr','hdr',0,1),'in':0},
+                                             {**self.clip('logo','logo',0,1),'in':0,'track':2}]
+                    self.destination = directory/'master.mov'
+                    render_to_file(self.project,self.destination,options={'codec':'prores'})
+                    video = next(s for s in self.streams() if s['codec_type']=='video')
+                    self.assertEqual((video['color_transfer'],video['pix_fmt'],video['nb_frames']),
+                                     (transfer,'yuv422p10le','25'))
+                    data = subprocess.check_output(['ffmpeg','-nostdin','-v','error','-ss','0.96','-i',str(self.destination),
+                                                    '-frames:v','1','-pix_fmt','yuv422p10le','-f','rawvideo','pipe:1'],timeout=10)
+                    channels = memoryview(data).cast('H')
+                    area, offset = 160*90, 160*45
+                    for x,code in ((20,64),(60,(white+64)/2),(100,white),(140,red[0])):
+                        self.assertAlmostEqual(channels[offset+x],code,delta=5)
+                    for plane,code in zip((area,area*3//2),red[1:]):
+                        self.assertAlmostEqual(channels[plane+(offset+140)//2],code,delta=5)
+
     def test_pq_master_exposure_and_combined_grades_round_trip(self):
         from premiere import MEDIA_ROOT, open_project, save_project
         MEDIA_ROOT.mkdir(parents=True,exist_ok=True)

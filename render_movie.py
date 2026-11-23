@@ -88,7 +88,7 @@ def _channel_mixer(matrix):
     return 'colorchannelmixer='+':'.join(f'{r}{c}={matrix[i][j]:.6f}' for i,r in enumerate('rgb') for j,c in enumerate('rgb'))
 
 
-def _css_color_filter(color, high_depth):
+def _css_color_filter(color, high_depth, still=False):
     brightness,contrast,saturation,gains=_grade_values(color)
     if (brightness,contrast,saturation,gains)==(1,1,1,(1,1,1)):
         return ''
@@ -97,7 +97,7 @@ def _css_color_filter(color, high_depth):
     contrast_filter=':'.join(f"{c}=(val-maxval/2)*{contrast:.6f}+maxval/2" for c in channels)
     mixer=_channel_mixer(_saturation_matrix(saturation))
     grade_filter=':'.join(f'{c}=val*{g:.7f}' for c,g in zip(channels,gains))
-    rgb = 'gbrp10le' if high_depth else 'rgb24'
+    rgb = ('gbrap10le' if still else 'gbrp10le') if high_depth else ('rgba' if still else 'rgb24')
     return f',format={rgb},lutrgb={brightness_filter},lutrgb={contrast_filter},{mixer},lutrgb={grade_filter}'
 
 
@@ -164,17 +164,52 @@ def _hdr_grade(color, lut, high_depth, profile):
     return chain+f',zscale=p={primaries},zscale=t={transfer}:m={matrix}:r=limited:npl={peak:.9f},format=yuv444p10le'
 
 
-def _fit_picture(width, height, color, lut, alpha_format, high_depth, profile=None, rec709=False):
+def _hdr_still_filter(profile):
+    primaries, transfer, matrix = profile
+    # zscale applies the requested legal range to every plane. Keep the
+    # converted picture in legal range and restore full-range opacity.
+    limited = (f':m={matrix}:r=limited,format=yuva444p10le,'
+               "geq=lum='p(X,Y)':cb='p(X,Y)':cr='p(X,Y)':a='clip((p(X,Y)-64)*1023/876,0,1023)'")
+    chain = (',format=gbrapf32le,setparams=color_primaries=bt709:color_trc=iec61966-2-1:colorspace=gbr:range=pc,'
+             f'zscale=t=linear:p={primaries},format=gbrapf32le')
+    if transfer != 'arib-std-b67' or primaries != 'bt2020':
+        return chain+f',zscale=t={transfer}:npl=203'+limited
+    # Match the reference-display inverse OOTF used for solid title swatches.
+    luma = 'max(.000001,.203*(.2627*r(X,Y)+.6780*g(X,Y)+.0593*b(X,Y)))'
+    channels = [
+        f"{c}='st(0,.203*max(0,{c}(X,Y))*pow({luma},-1/6));"
+        "if(lte(ld(0),1/12),sqrt(3*ld(0)),.17883277*log(12*ld(0)-.28466892)+.55991073)'"
+        for c in 'rgb'
+    ]
+    return (chain+',geq='+':'.join(channels)+":a='alpha(X,Y)',"
+            f'setparams=color_primaries={primaries}:color_trc={transfer}:colorspace=gbr:range=pc,'
+            'zscale=t='+transfer+limited)
+
+
+def _fit_picture(width, height, color, lut, alpha_format, high_depth, profile=None, rec709=False,
+                 *, still_frames=0, hdr_profile=None):
     if profile and profile[1] in HDR_TRANSFERS:
         grade = _hdr_grade(color,lut,high_depth and not rec709,profile)
     else:
         convert = (',zscale=p=bt709:t=bt709:m=bt709:r=limited,format=yuv444p10le'
                    if rec709 and profile and profile!=REC709
                    and all(value not in (None,'unknown','unspecified') for value in profile) else '')
-        grade = convert+_css_color_filter(color,high_depth)+lut
+        grade = convert+_css_color_filter(color,high_depth,bool(still_frames))+lut
+        if still_frames and hdr_profile:
+            grade += _hdr_still_filter(hdr_profile)
+    repeat = f',loop=loop={still_frames-1}:size=1:start=0,setpts=N' if still_frames>1 else ''
     return (f'scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2'
             f'{grade},format={alpha_format},'
-            f'pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black@0')
+            f'pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black@0{repeat}')
+
+
+def _picture_input(index, source, length, speed, width, height, fps, reverse, still_frames):
+    if still_frames:
+        return f'[{index}:v]trim=end_frame=1,setpts=PTS-STARTPTS'
+    if index is None:
+        return f'color=c=black:s={width}x{height}:r={fps}:d={length:.6f},setpts=PTS-STARTPTS'
+    return (f'[{index}:v]trim=start={source:.6f}:duration={length*speed:.6f}{reverse},'
+            f'setpts=(PTS-STARTPTS)/{speed:.6f},fps={fps}')
 
 
 def _lut_filter(color, destination):
@@ -517,6 +552,7 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
             paths[item['id']] = path
             if path.suffix.lower() in STILL_IMAGES:
                 kinds[item['id']], item['_actualDuration'], item['_audioStreams'] = {'video'}, 7200, []
+                item['_renderStill'] = True
             else:
                 probe = probes.get(path) or _probe(path)
                 kinds[item['id']], item['_actualDuration'], item['_audioStreams'], item['_videoFPS'], profile = probe
@@ -588,9 +624,10 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
             lut_filter=_lut_filter(color,Path(lut_directory)/f'clip-{number}.cube')
             opacity=_number(clip.get('opacity',100),'opacity',0,100)/100
             opacity_keys=(clip.get('keyframes') or {}).get('opacity')
-            prefix=(f'color=c=black:s={width}x{height}:r={fps}:d={render_length:.6f},setpts=PTS-STARTPTS' if index is None else
-                    f'[{index}:v]trim=start={render_source:.6f}:duration={render_length*speed:.6f}{reverse},setpts=(PTS-STARTPTS)/{speed:.6f},fps={fps}')
-            fit = _fit_picture(width,height,color,lut_filter,alpha_format,high_depth,item.get('_sourceProfile'),rec709)
+            still_frames = max(1,math.ceil(render_length*fps-1e-6)) if item.get('_renderStill') else 0
+            prefix = _picture_input(index,render_source,render_length,speed,width,height,fps,reverse,still_frames)
+            fit = _fit_picture(width,height,color,lut_filter,alpha_format,high_depth,item.get('_sourceProfile'),rec709,
+                               still_frames=still_frames,hdr_profile=hdr_profile)
             chain = f'{prefix},{fit}{transform}'
             if opacity_keys:
                 opacity_expr=_keyframe_expr(clip,'opacity',opacity*100,0,100,f'(T-{before:.6f})')
@@ -638,10 +675,11 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
                 prior_lut=_lut_filter(prior_color,Path(lut_directory)/f'tail-{number}.cube')
                 prior_opacity=_number(prior_tail.get('opacity',100),'opacity',0,100)/100
                 if tail + 1e-6 >= frame_duration:
-                    prior_prefix=(f'color=c=black:s={width}x{height}:r={fps}:d={tail:.6f},setpts=PTS-STARTPTS' if prior_index is None else
-                                  f'[{prior_index}:v]trim=start={prior_source:.6f}:duration={tail*prior_speed:.6f}{prior_reverse},setpts=(PTS-STARTPTS)/{prior_speed:.6f},fps={fps}')
+                    prior_item=media_by_id[previous['mediaId']]
+                    still_tail = max(1,math.ceil(tail*fps-1e-6)) if prior_item.get('_renderStill') else 0
+                    prior_prefix = _picture_input(prior_index,prior_source,tail,prior_speed,width,height,fps,prior_reverse,still_tail)
                     prior_fit = _fit_picture(width,height,prior_color,prior_lut,alpha_format,high_depth,
-                                             media_by_id[previous['mediaId']].get('_sourceProfile'),rec709)
+                                             prior_item.get('_sourceProfile'),rec709,still_frames=still_tail,hdr_profile=hdr_profile)
                     prior_alpha = _mask_alpha(f'{prior_opacity:.6f}',alpha_format,full_alpha) if prior_opacity!=1 else ''
                     cut_frame = math.ceil(start*fps-1e-6)
                     filters.append(f'{prior_prefix},{prior_fit}{prior_transform}{prior_alpha},setpts=PTS+{cut_frame}[tail{number}]')
@@ -839,8 +877,6 @@ def _render_prepared(project, output_path, *, options=None, progress=None, cance
             if path.suffix.lower() not in STILL_IMAGES:
                 if path not in probes:probes[path]=_probe(path)
                 profiles.add(probes[path][-1])
-            else:
-                profiles.add((None,None,None))
     hdr = any(profile[1] in HDR_TRANSFERS for profile in profiles)
     if hdr and codec=='prores' and len(profiles)!=1 and color_space=='source':
         raise ValueError('A ProRes HDR master needs one HDR color space. Select Rec. 709 to combine HDR and SDR sources.')
