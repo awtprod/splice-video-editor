@@ -99,12 +99,37 @@ window.SpliceMedia = (() => {
     if(!response.ok) throw Error(data.error||'Could not inspect the original source');
     return data;
   }
-  async function makeProxy(src, seekOptimized=false, audioStream=null) {
+  async function makeProxy(src, seekOptimized=false, audioStream=null, gradingData=false) {
     const response=await fetch('/api/media/proxy',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({src,seekOptimized,audioStream}),signal:AbortSignal.timeout(3650000)});
+      body:JSON.stringify({src,seekOptimized,audioStream,gradingData}),signal:AbortSignal.timeout(3650000)});
     const data=await response.json();
     if(!response.ok || !localMedia(data.src)) throw Error(data.error||'Could not create edit proxy');
     return data.src;
+  }
+  const hdrPreviewJobs = new Map();
+  const hdrPreviewKey = item => JSON.stringify([item.originalSrc,item.seekOptimized,item.audioStream]);
+  function hdrPreviewStatus(item) {
+    return item?.originalSrc ? hdrPreviewJobs.get(hdrPreviewKey(item)) : undefined;
+  }
+  function prepareHdrPreview(item) {
+    if (!item.originalSrc || item.offline) return;
+    const key=hdrPreviewKey(item);
+    let job=hdrPreviewJobs.get(key);
+    if (job) return job.src;
+    job={pending:true};
+    hdrPreviewJobs.set(key,job);
+    if (hdrPreviewJobs.size>500) {
+      const expired=[...hdrPreviewJobs].find(([,entry])=>!entry.pending);
+      if (expired) hdrPreviewJobs.delete(expired[0]);
+    }
+    makeProxy(item.originalSrc,item.seekOptimized===true,item.audioStream??null,true).then(src=>{
+      job.src=src;
+    }).catch(error=>{
+      job.error=error.message;
+    }).finally(()=>{
+      job.pending=false;
+      window.Editor?.refreshMedia?.();
+    });
   }
   async function importFile(file) {
     const originalSrc=await upload(file);
@@ -239,5 +264,5 @@ window.SpliceMedia = (() => {
     }
     return copy;
   }
-  return { importFile, remember, rememberMany, makeProxy, prepareNested, restore, matches, matchFolder, forPremiere };
+  return { importFile, remember, rememberMany, makeProxy, prepareNested, prepareHdrPreview, hdrPreviewStatus, restore, matches, matchFolder, forPremiere };
 })();

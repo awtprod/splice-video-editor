@@ -300,6 +300,11 @@
   let lastPlay, lastFrame, lastOverallKey;
   function refresh(state) {
     monitorState = state;
+    const hdrStatus=window.SpliceMedia?.hdrPreviewStatus(mediaFor(state.project,state.activeClip||{}));
+    const previewStatus=$('hdr-preview-status');
+    previewStatus.hidden=!(hdrStatus?.pending || hdrStatus?.error);
+    previewStatus.textContent=hdrStatus?.pending ? 'Preparing HDR preview…' : hdrStatus?.error ? 'HDR preview proxy unavailable' : '';
+    previewStatus.title=hdrStatus?.error||'';
     const fraction=Math.round(state.time*state.project.fps);
     if(fraction!==lastFrame || state.playing!==lastPlay || state.revision!==lastOverallKey){
       renderPreview(state);

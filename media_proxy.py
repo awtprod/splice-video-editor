@@ -24,6 +24,10 @@ HDR_PREVIEW_VERSION = 2
 HDR_LINEAR_REC709 = 'zscale=t=linear:npl=203,format=gbrpf32le,zscale=p=bt709'
 HDR_TONE_MAP = 'tonemap=mobius:param=0.9:desat=0:peak=4.926108,zscale=t=bt709:m=bt709:r=limited,format=yuv444p10le'
 HDR_TO_REC709 = HDR_LINEAR_REC709 + ',' + HDR_TONE_MAP
+# Pack wide-gamut PQ channel values into a browser-decodable proxy. Its
+# Rec.709 tags prevent the browser from tone-mapping these data samples.
+HDR_GRADE_DATA = ('zscale=t=linear:npl=203,format=gbrpf32le,zscale=p=bt2020,'
+                  'zscale=t=smpte2084:m=bt709:r=limited:npl=203,format=yuv420p')
 AUDITION_SECONDS = 4
 _audition_decoders = threading.BoundedSemaphore(4)
 
@@ -143,22 +147,24 @@ def _source_audio_map(channels, selection, duration):
     return ['-map',f'0:a:{chosen[0]}' if chosen else '0:a:0?']
 
 
-def proxy(src, seek_optimized=False, audio_stream=None):
+def proxy(src, seek_optimized=False, audio_stream=None, grading_data=False):
     original = _media_path(src)
     info = describe(src)
+    if grading_data and not info['hdr']:
+        raise ValueError('An HDR grading proxy requires HDR video')
     if seek_optimized and (info['type']!='video' or info['still']):
         raise ValueError('A seek proxy requires moving video')
     stat = original.stat()
     profile = 'proxy-seek-v1' if seek_optimized else 'proxy-v3'
     if info['hdr']:
-        profile += f':hdr-rec709-v{HDR_PREVIEW_VERSION}'
+        profile += ':hdr-grading-v1' if grading_data else f':hdr-rec709-v{HDR_PREVIEW_VERSION}'
     audio_map = _source_audio_map(info['audioStreamChannels'],audio_stream,info['duration'])
     if info['audioStreams']>1:
         profile += f':audio-v2:{audio_stream}'
     key = hashlib.sha256(f'{profile}:{original}:{stat.st_size}:{stat.st_mtime_ns}'.encode()).hexdigest()
     directory = MEDIA_ROOT / key[:32]
     video = info['type']=='video'
-    target = directory / ('seek.mp4' if seek_optimized else 'edit.mp4' if video else 'edit.m4a')
+    target = directory / ('grade.mp4' if grading_data else 'seek.mp4' if seek_optimized else 'edit.mp4' if video else 'edit.m4a')
     if target.is_file():
         return _playback_url(target)
     if not _encoders.acquire(timeout=5):
@@ -178,7 +184,9 @@ def proxy(src, seek_optimized=False, audio_stream=None):
                 if video:
                     width,height = (960,540) if seek_optimized else (1280,720)
                     fit = f"scale=w='min({width},iw)':h='min({height},ih)':force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1"
-                    picture = HDR_TO_REC709+','+fit if info['hdr'] else fit
+                    picture = (HDR_GRADE_DATA if grading_data else HDR_TO_REC709)+','+fit if info['hdr'] else fit
+                    if grading_data:
+                        picture += ',setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv'
                     cmd += ['-map','0:V:0','-vf',picture,'-c:v','libx264','-threads','2','-preset','veryfast',
                             '-crf','22' if seek_optimized else '19','-maxrate','4M','-bufsize','8M',
                             '-g','1' if seek_optimized else '24','-pix_fmt','yuv420p']

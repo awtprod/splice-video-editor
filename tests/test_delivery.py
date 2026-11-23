@@ -160,7 +160,7 @@ class MovieDelivery(unittest.TestCase):
                     for component,code in zip(zip(*red_pixels),red):
                         self.assertAlmostEqual(statistics.median(component),code,delta=5)
 
-    def test_pq_master_exposure_doubles_linear_light(self):
+    def test_pq_master_exposure_and_combined_grades_round_trip(self):
         from premiere import MEDIA_ROOT, open_project, save_project
         MEDIA_ROOT.mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(dir=MEDIA_ROOT) as directory:
@@ -190,6 +190,20 @@ class MovieDelivery(unittest.TestCase):
             self.assertAlmostEqual(reopened['clips'][0]['color']['exposure'],1)
             render_to_file(reopened,master,options={'codec':'prores'})
             self.assertAlmostEqual(linear_patch(master),original*2,delta=.03)
+            for grade in ({'brightness':120,'contrast':150}, {'brightness':120,'exposure':4}):
+                with self.subTest(grade=grade):
+                    self.project['clips'][0]['color'] = grade
+                    render_to_file(self.project,master,options={'codec':'prores'})
+                    before = linear_patch(master)
+                    reopened = open_project(save_project(self.project))
+                    for key,value in grade.items():
+                        self.assertAlmostEqual(reopened['clips'][0]['color'][key],value,delta=.001)
+                    render_to_file(reopened,master,options={'codec':'prores'})
+                    self.assertEqual(linear_patch(master),before)
+            self.assertGreater(before,2.03)
+            self.project['clips'][0]['color'] = {**grade,'lut':{'size':2,'data':[0]*24},'lutIntensity':0}
+            render_to_file(self.project,master,options={'codec':'prores'})
+            self.assertEqual(linear_patch(master),before)
 
     def test_title_lines_center_independently_and_end_on_out_frame(self):
         self.project.update(width=640,height=360,clips=[

@@ -18,6 +18,7 @@ from py_premiere.xml.mutations import remove_child
 
 TEMPLATES = Path(__file__).resolve().parent / 'vendor' / 'splice-effects'
 NEUTRAL = {'brightness': 100, 'contrast': 100, 'saturation': 100, 'temperature': 0, 'tint': 0}
+HDR_BRIGHTNESS_NAME = 'Splice HDR Brightness'
 
 
 def _component(clip, name):
@@ -105,10 +106,23 @@ def _apply_scalar_keys(param, clip, points, decode=lambda value: value, encode=l
                          for t,v in prepared])
 
 
+def _lumetri_layers(clip):
+    lumetri=brightness=None
+    for component in clip.components:
+        if component.match_name != 'AE.ADBE Lumetri':
+            continue
+        if component._element.findtext('Component/InstanceName') == HDR_BRIGHTNESS_NAME:
+            if brightness is None: brightness=component
+        elif lumetri is None:
+            lumetri=component
+    return lumetri,brightness
+
+
 def read(clip):
-    lumetri = _component(clip, 'AE.ADBE Lumetri')
+    lumetri,brightness_layer = _lumetri_layers(clip)
     volume = next((c for c in clip.components if c.match_name.startswith('Internal Volume')), None)
-    color = {'brightness': 100, 'exposure': _value(lumetri, 'Exposure', 0),
+    brightness = round(100 * 2 ** (_value(brightness_layer,'Exposure',0)/2.4),5)
+    color = {'brightness': 0 if brightness<=.01 else brightness, 'exposure': _value(lumetri, 'Exposure', 0),
              'contrast': 100 + _value(lumetri, 'Contrast', 0),
              'saturation': _value(lumetri, 'Saturation', 100),
              'temperature': _value(lumetri, 'Temperature', 0),
@@ -116,7 +130,7 @@ def read(clip):
     return color, round(100 * _value(volume, 'Level', 1), 5)
 
 
-def _attach(clip, name):
+def _attach(clip, name, *, instance_name=None, before=None):
     # These isolated component templates come from py-premiere's Adobe-saved
     # fixtures. Allocate new IDs for every parameter and all internal edges.
     template = ET.fromstring(gzip.decompress((TEMPLATES / (name + '.xml.gz')).read_bytes()))
@@ -164,7 +178,14 @@ def _attach(clip, name):
     root_id = mapping[template.get('root')]
     element = doc.by_object_id[root_id]
     element.find('.//Component/ID').text = {'motion':'1','opacity':'2','volume':'1'}.get(name,str(max(existing + [2]) + 1))
-    ET.SubElement(holder, 'Component', Index=str(len(holder)), ObjectRef=root_id)
+    if instance_name:
+        ET.SubElement(element.find('Component'),'InstanceName').text=instance_name
+    ref = ET.SubElement(holder, 'Component', Index=str(len(holder)), ObjectRef=root_id)
+    if before is not None:
+        original = next(node for node in holder if node.get('ObjectRef')==before._element.get('ObjectID'))
+        holder.remove(ref)
+        holder.insert(list(holder).index(original),ref)
+        for index,node in enumerate(holder): node.set('Index',str(index))
     component = Component(element, clip)
     for ref in element.findall('.//Params/Param'):
         component._properties.append(ComponentParam(doc.resolve(ref), doc, component))
@@ -176,37 +197,30 @@ def _attach(clip, name):
 
 def apply(clip, color, volume, *, hdr=False):
     current, old_volume = read(clip)
-    current['brightness'] = round(100 * 2 ** current.pop('exposure'),5)
     color = {**NEUTRAL, **(color or {})}
     if color.get('lut'):
         raise ValueError('Premiere export cannot preserve this 3D LUT. Save a Splice working copy to keep it.')
     exposure = float(color.get('exposure', 0))
     if not math.isfinite(exposure) or not -4 <= exposure <= 4:
         raise ValueError('Invalid exposure')
-    if hdr:
+    if clip._element.tag == 'VideoClipTrackItem':
+        lumetri,brightness_layer = _lumetri_layers(clip)
         brightness = float(color['brightness'])
-        if not math.isfinite(brightness) or not 0 <= brightness <= 300:
-            raise ValueError('Invalid HDR brightness')
-        color['brightness'] = 100 * (brightness / 100) ** 2.4
-    color['brightness'] *= 2 ** exposure
-    color = {key: color[key] for key in NEUTRAL}
-    if clip._element.tag == 'VideoClipTrackItem' and color != current:
-        component = _component(clip, 'AE.ADBE Lumetri')
-        created = component is None
-        if created:
-            component = _attach(clip, 'lumetri')
-        # Exposure is logarithmic. Contrast and saturation use percentage points.
-        values = [('brightness', 'Exposure', math.log2(max(.01, color['brightness']) / 100)),
-                  ('contrast', 'Contrast', color['contrast'] - 100),
-                  ('saturation', 'Saturation', color['saturation']),
-                  ('temperature', 'Temperature', color['temperature']),
-                  ('tint', 'Tint', color['tint'])]
-        for key, name, value in values:
-            if created or color[key] != current[key]:
-                param = _parameter(component, name)
-                if param.is_time_varying:
-                    raise ValueError('An existing Premiere Lumetri animation needs manual review before replacing it.')
-                param.value = float(value)
+        if not math.isfinite(brightness) or brightness<0:
+            raise ValueError('Invalid brightness')
+        if hdr or brightness_layer:
+            if abs(brightness-current['brightness'])>1e-5:
+                brightness_layer = brightness_layer or _attach(clip,'lumetri',instance_name=HDR_BRIGHTNESS_NAME,before=lumetri)
+                _set_color_parameter(brightness_layer,'Exposure',2.4*math.log2(max(.009,brightness)/100))
+        else:
+            exposure += math.log2(max(.01,brightness)/100)
+        values = [('Exposure',exposure,0), ('Contrast',color['contrast']-100,0),
+                  ('Saturation',color['saturation'],100), ('Temperature',color['temperature'],0), ('Tint',color['tint'],0)]
+        if lumetri or any(abs(value-default)>1e-5 for _,value,default in values):
+            lumetri = lumetri or _attach(clip,'lumetri')
+            for name,value,default in values:
+                if abs(_value(lumetri,name,default)-value)>1e-5:
+                    _set_color_parameter(lumetri,name,value)
     if clip._element.tag == 'AudioClipTrackItem' and abs(volume - old_volume) > .00001:
         component = next((c for c in clip.components if c.match_name.startswith('Internal Volume')), None)
         if component is None:
@@ -218,6 +232,13 @@ def apply(clip, color, volume, *, hdr=False):
                 raise ValueError('Adjust this keyframed Premiere audio envelope in Premiere or save a Splice working copy.')
         else:
             level.value = float(volume) / 100
+
+
+def _set_color_parameter(component, name, value):
+    param = _parameter(component,name)
+    if param.is_time_varying:
+        raise ValueError('An existing Premiere Lumetri animation needs manual review before replacing it.')
+    param.value = float(value)
 
 
 def read_extended(clip):

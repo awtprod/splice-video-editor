@@ -383,19 +383,38 @@
   const decode709 = value => Math.sign(value)*Math.abs(value)**2.4;
   const encode709 = value => Math.sign(value)*Math.abs(value)**(1/2.4);
   const decodePixels709 = Array.from({length:256},(_,level)=>decode709(level/255));
+  const decodePixelsPQ = Array.from({length:256},(_,level)=>{
+    const value=(level/255)**(32/2523);
+    return (10000/203)*(Math.max(0,value-3424/4096)/(2413/128-(2392/128)*value))**(16384/2610);
+  });
+  function hasHdrGrade(color={}) {
+    return ['brightness','contrast','saturation'].some(key=>(color[key]??100)!==100) ||
+      ['exposure','temperature','tint'].some(key=>Number(color[key])||0);
+  }
+  function programSource(clip) {
+    const item=clip && mediaOf(clip);
+    if (item?.hdr && hasHdrGrade(clip.color||{}))
+      return window.SpliceMedia?.prepareHdrPreview(item)||item.src;
+    return item?.src;
+  }
   const hdrShoulder=.9, hdrPeak=1000/203;
   // Match the HDR preview proxy's Mobius shoulder. Undo it before grading.
   const shoulderA=-(hdrShoulder**2)*(hdrPeak-1)/(hdrShoulder**2-2*hdrShoulder+hdrPeak);
   const shoulderB=(hdrShoulder**2-2*hdrShoulder*hdrPeak+hdrPeak)/(hdrPeak-1);
   const shoulderScale=(shoulderB+hdrShoulder)**2/(shoulderB-shoulderA);
-  function gradeHdrPreview(pixels, color, gains) {
+  function gradeHdrPreview(pixels, color, gains, gradingData) {
     const brightness=(color.brightness??100)/100, contrast=(color.contrast??100)/100, saturation=(color.saturation??100)/100;
     const displayGrade=brightness!==1 || contrast!==1 || saturation!==1;
+    const decode=gradingData?decodePixelsPQ:decodePixels709;
     for(let i=0;i<pixels.length;i+=4) {
       if (!pixels[i+3]) continue;
-      let r=decodePixels709[pixels[i]],g=decodePixels709[pixels[i+1]],b=decodePixels709[pixels[i+2]];
+      let r=decode[pixels[i]],g=decode[pixels[i+1]],b=decode[pixels[i+2]];
       const before=Math.max(r,g,b);
-      if (before>hdrShoulder) {
+      if (gradingData) {
+        // Unpack the proxy's linear BT.2020 primaries into the working gamut.
+        const red=1.66049*r-.58764*g-.07285*b, green=-.12455*r+1.13290*g-.00835*b;
+        b=-.01815*r-.10058*g+1.11873*b;r=red;g=green;
+      } else if (before>hdrShoulder) {
         const inverse=(before*shoulderB-shoulderScale*shoulderA)/(shoulderScale-before);
         const ratio=Math.min(hdrPeak,inverse)/before;
         r*=ratio;g*=ratio;b*=ratio;
@@ -524,6 +543,7 @@
     const audioClips = project.clips.filter(c=>c.type==='audio' && c.start-transitionBefore(c)<=time &&
       time<c.start+c.duration+(followingTransition(c)?transitionLength(followingTransition(c))-transitionBefore(followingTransition(c)):0));
     const mediaItem = clip && mediaOf(clip);
+    const source = programSource(clip);
     if (clip && clip.id !== activeVideoId) {
       const preparedLayer=layerVideos.get(clip.id);
       const prepared=clip.id===preloadClipId?transitionVideo:preparedLayer;
@@ -552,14 +572,14 @@
     }
     if (
       clip?.id !== activeVideoId ||
-      (video.getAttribute("src") || "") !== (mediaItem?.src || "")
+      (video.getAttribute("src") || "") !== (source || "")
     ) {
       activeVideoId = clip?.id;
       video.pause();
       video.removeAttribute("src");
       video.load();
-      if (mediaItem?.src) {
-        video.src = mediaItem.src;
+      if (source) {
+        video.src = source;
         video.load();
       }
     }
@@ -569,17 +589,16 @@
       syncClipPlayback(video,clip,target,forceSeek);
     }
     const previous = clip ? transitionTail(clip,time) : null;
-    const previousMedia = previous && mediaOf(previous);
+    const priorSource = programSource(previous);
     if (
       (previous?.id || null) !== transitionVideoId ||
-      (previousMedia?.src &&
-        transitionVideo.src !== new URL(previousMedia.src, location.href).href)
+      (priorSource && transitionVideo.getAttribute('src') !== priorSource)
     ) {
       transitionVideoId = previous?.id;
       transitionVideo.removeAttribute("src");
       transitionVideo.load();
-      if (previousMedia?.src) {
-        transitionVideo.src = previousMedia.src;
+      if (priorSource) {
+        transitionVideo.src = priorSource;
         transitionVideo.load();
       }
     }
@@ -595,11 +614,11 @@
         .sort((a,b)=>a.start-b.start || b.track-a.track)
         .find(c=>at('video',c.start)?.id===c.id);
       if (upcoming && upcoming.id !== preloadClipId) {
-        const next = mediaOf(upcoming);
-        if (next?.src) {
+        const nextSource = programSource(upcoming);
+        if (nextSource) {
           transitionVideo.pause();
           transitionVideo.muted=true;
-          transitionVideo.src = next.src;
+          transitionVideo.src = nextSource;
           transitionVideo.load();
           const decoder = transitionVideo;
           decoder.addEventListener("loadedmetadata", () => {
@@ -643,14 +662,14 @@
     }
     for (const layer of layers.values()) {
       if (layer.id===activeVideoId || layer.id===preloadClipId) continue;
-      const item=mediaOf(layer);
-      if (!item?.src) continue;
+      const layerSource=programSource(layer);
+      if (!layerSource) continue;
       let element=layerVideos.get(layer.id);
       if(!element) {
         element=document.createElement('video');element.muted=true;element.playsInline=true;
-        element.preload='auto';element.style.display='none';element.src=item.src;document.body.append(element);layerVideos.set(layer.id,element);
+        element.preload='auto';element.style.display='none';element.src=layerSource;document.body.append(element);layerVideos.set(layer.id,element);
       }
-      if (element.getAttribute('src') !== item.src) element.src = item.src;
+      if (element.getAttribute('src') !== layerSource) element.src = layerSource;
       const preload = preloading.has(layer.id);
       const target=sourceTime(layer,preload?layer.start-transitionBefore(layer):time);
       seekVideo(element,layer,target,forceSeek);
@@ -770,10 +789,13 @@
   blackGenerator.getContext('2d').fillRect(0,0,16,9);
   function paintVideo(ctx,element,clip,canvas,alpha=1,brightness=1) {
     if (!element || (element instanceof HTMLVideoElement && element.readyState < 2)) return;
-    const color=clip.color||{}, lut=color.lut;
+    const color=clip.color||{}, lut=color.lutIntensity===0?null:color.lut;
     const gains=gradeGains(color);
     const graded=gains.some(g=>Math.abs(g-1)>.0001);
-    const hdrGrade=mediaOf(clip)?.hdr && (graded || ['brightness','contrast','saturation'].some(key=>(color[key]??100)!==100));
+    const item=mediaOf(clip);
+    const gradingSource=item?.hdr && window.SpliceMedia?.hdrPreviewStatus(item)?.src;
+    const gradingData=!!gradingSource && element.getAttribute('src')===gradingSource;
+    const hdrGrade=item?.hdr && (gradingData || hasHdrGrade(color));
     const previewScale=(lut || hdrGrade) && playing ? .5 : 1;
     const drawWidth=Math.max(1,Math.round(canvas.width*previewScale));
     const drawHeight=Math.max(1,Math.round(canvas.height*previewScale));
@@ -800,7 +822,7 @@
     target.restore();
     if (target!==ctx) {
       const image=target.getImageData(0,0,drawWidth,drawHeight);
-      if (hdrGrade) gradeHdrPreview(image.data,color,gains);
+      if (hdrGrade) gradeHdrPreview(image.data,color,gains,gradingData);
       else if (graded) {
         const pixels=image.data;
         for(let i=0;i<pixels.length;i+=4) {

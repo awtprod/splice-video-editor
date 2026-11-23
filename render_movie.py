@@ -149,6 +149,17 @@ def _fit_picture(width, height, color, lut, alpha_format, high_depth, hdr_profil
             f'pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black@0')
 
 
+def _lut_filter(color, destination):
+    if not color.get('lut'):
+        return ''
+    intensity = _number(color.get('lutIntensity',100),'LUT intensity',0,100)
+    if not intensity:
+        return ''
+    from lut import cube_text
+    destination.write_text(cube_text(color['lut'],intensity))
+    return f',lut3d=file={destination}:interp=trilinear'
+
+
 def _mask_alpha(expression, alpha_format, full_alpha):
     return f",format={full_alpha},geq=lum='p(X,Y)':cb='p(X,Y)':cr='p(X,Y)':a='p(X,Y)*({expression})',format={alpha_format}"
 
@@ -521,12 +532,7 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
             render_source=max(0,render_source-source_offsets.get(item['id'],0)-.000001)
             color = clip.get('color') or {}
             transform,position=_transform(clip,width,height,before)
-            lut_filter=''
-            if color.get('lut'):
-                from lut import cube_text
-                file=Path(lut_directory)/f'clip-{number}.cube'
-                file.write_text(cube_text(color['lut'], color.get('lutIntensity',100)))
-                lut_filter=f',lut3d=file={file}:interp=trilinear'
+            lut_filter=_lut_filter(color,Path(lut_directory)/f'clip-{number}.cube')
             opacity=_number(clip.get('opacity',100),'opacity',0,100)/100
             opacity_keys=(clip.get('keyframes') or {}).get('opacity')
             prefix=(f'color=c=black:s={width}x{height}:r={fps}:d={render_length:.6f},setpts=PTS-STARTPTS' if index is None else
@@ -576,12 +582,7 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
                         else: prior_tail['transform'][key]=terminal
                 prior_transform,prior_position=_transform(prior_tail,width,height)
                 prior_color=previous.get('color') or {}
-                prior_lut=''
-                if prior_color.get('lut'):
-                    from lut import cube_text
-                    prior_file=Path(lut_directory)/f'tail-{number}.cube'
-                    prior_file.write_text(cube_text(prior_color['lut'],prior_color.get('lutIntensity',100)))
-                    prior_lut=f',lut3d=file={prior_file}:interp=trilinear'
+                prior_lut=_lut_filter(prior_color,Path(lut_directory)/f'tail-{number}.cube')
                 prior_opacity=_number(prior_tail.get('opacity',100),'opacity',0,100)/100
                 if tail + 1e-6 >= frame_duration:
                     prior_prefix=(f'color=c=black:s={width}x{height}:r={fps}:d={tail:.6f},setpts=PTS-STARTPTS' if prior_index is None else
