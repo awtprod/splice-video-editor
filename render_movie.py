@@ -1,6 +1,7 @@
 """Render a Splice timeline to a deterministic MP4 with FFmpeg."""
 import json
 import math
+import struct
 from fractions import Fraction
 from functools import lru_cache
 import subprocess
@@ -291,13 +292,36 @@ def _hdr_graphic_color(color, primaries, transfer):
     # drawtext blends its glyph mask. BT.2408 places graphics white at 203 nits.
     swatch = (f'color=0x{color}:s=2x2,format=gbrp,'
               'setparams=color_primaries=bt709:color_trc=bt709:colorspace=gbr:range=pc,'
-              f'zscale=t=linear:npl=100,format=gbrpf32le,zscale=p={primaries},'
-              f'zscale=t={transfer}:m=gbr:r=full:npl=203,format=gbrp')
+              f'zscale=t=linear:npl=100,format=gbrpf32le,zscale=p={primaries}')
+    hlg = transfer=='arib-std-b67' and primaries=='bt2020'
+    if not hlg:
+        swatch += f',zscale=t={transfer}:m=gbr:r=full:npl=203,format=gbrp'
+    pixel_format = 'gbrpf32le' if hlg else 'rgb24'
     result = subprocess.check_output(['ffmpeg','-nostdin','-v','error','-f','lavfi','-i',swatch,
-                                      '-frames:v','1','-pix_fmt','rgb24','-f','rawvideo','pipe:1'],timeout=5)
-    if len(result) != 12:
+                                      '-frames:v','1','-pix_fmt',pixel_format,'-f','rawvideo','pipe:1'],timeout=5)
+    if len(result) != (48 if hlg else 12):
         raise ValueError('Could not convert the HDR title color')
+    if hlg:
+        samples = struct.unpack('<12f',result)
+        return _hlg_graphic_rgb(samples[8],samples[0],samples[4])
     return result[:3].hex()
+
+
+def _hlg_graphic_rgb(red, green, blue):
+    # BT.2100 inverse reference OOTF for a 1,000-nit display. Use the same
+    # luminance-derived gain for all channels before applying the HLG OETF.
+    display = [max(0,channel)*.203 for channel in (red,green,blue)]
+    luminance = sum(channel*weight for channel,weight in zip(display,(.2627,.6780,.0593)))
+    if not luminance:
+        return '000000'
+    inverse_gain = luminance**(1/1.2-1)
+    a,b,c = .17883277,.28466892,.55991073
+    encoded = []
+    for channel in display:
+        scene = channel*inverse_gain
+        value = math.sqrt(3*scene) if scene<=1/12 else a*math.log(12*scene-b)+c
+        encoded.append(round(255*min(1,value)))
+    return bytes(encoded).hex()
 
 
 def _draw_title(filters, active, number, clip, height, fps, directory, hdr_profile):

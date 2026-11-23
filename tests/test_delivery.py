@@ -125,11 +125,11 @@ class MovieDelivery(unittest.TestCase):
                     frequency=2*sum(a<0<=b for a,b in zip(part,part[1:]))
                     self.assertAlmostEqual(frequency,750,delta=6)
 
-    def test_hdr_master_white_title_matches_graphics_reference_white(self):
+    def test_hdr_master_title_matches_graphics_reference_white_and_red(self):
         from premiere import MEDIA_ROOT
         MEDIA_ROOT.mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(dir=MEDIA_ROOT) as directory:
-            for transfer, expected in [('smpte2084',573), ('arib-std-b67',721)]:
+            for transfer, expected, red in [('smpte2084',573,(392,438,608)), ('arib-std-b67',721,(392,395,715))]:
                 with self.subTest(transfer=transfer):
                     source = Path(directory) / (transfer+'.mov')
                     fixture = ('color=black:s=160x90:r=25:d=1,'
@@ -139,17 +139,26 @@ class MovieDelivery(unittest.TestCase):
                                     '-movflags','+write_colr',str(source)],check=True,timeout=10)
                     self.project['media'] = [{'id':'hdr','src':'/media/'+str(source.relative_to(MEDIA_ROOT))}]
                     self.project['clips'] = [{**self.clip('hdr','hdr',0,1),'in':0},
-                                             {'type':'title','track':2,'start':0,'duration':1,'title':'HDR',
-                                              'titleStyle':{'x':50,'y':50,'color':'#ffffff','fontSize':30}}]
+                                             {'type':'title','track':2,'start':0,'duration':1,'title':'W',
+                                              'titleStyle':{'x':25,'y':50,'color':'#ffffff','fontSize':30}},
+                                             {'type':'title','track':3,'start':0,'duration':1,'title':'R',
+                                              'titleStyle':{'x':75,'y':50,'color':'#ff0000','fontSize':30}}]
                     self.destination = Path(directory)/('master-'+transfer+'.mov')
                     render_to_file(self.project,self.destination,options={'codec':'prores'})
                     video = next(s for s in self.streams() if s['codec_type']=='video')
                     self.assertEqual((video['color_transfer'],video['pix_fmt']),(transfer,'yuv422p10le'))
                     data = subprocess.check_output(['ffmpeg','-nostdin','-v','error','-ss','0.4','-i',str(self.destination),
                                                     '-frames:v','1','-pix_fmt','yuv422p10le','-f','rawvideo','pipe:1'],timeout=10)
-                    luminance = memoryview(data).cast('H')[:160*90]
+                    channels = memoryview(data).cast('H')
+                    area = 160*90
+                    luminance = channels[:area]
                     self.assertGreater(sum(abs(value-expected)<=4 for value in luminance),20)
                     self.assertLess(max(luminance),expected+12)
+                    red_pixels = [(luminance[i],channels[area+i//2],channels[area*3//2+i//2])
+                                  for i in range(area) if channels[area*3//2+i//2]>=red[2]-3]
+                    self.assertGreater(len(red_pixels),20)
+                    for component,code in zip(zip(*red_pixels),red):
+                        self.assertAlmostEqual(statistics.median(component),code,delta=5)
 
     def test_pq_master_exposure_doubles_linear_light(self):
         from premiere import MEDIA_ROOT, open_project, save_project
