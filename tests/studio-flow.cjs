@@ -156,6 +156,18 @@ async function main() {
         assert.equal(await saveButton.isEnabled(),true);
         assert.equal(await page.evaluate(()=>Editor.get().project.name),name);
         if(screenshots)await page.screenshot({path:path.join(screenshots,'Splice-malformed-project-refused.png')});
+        const badLut=await page.evaluate(()=>{
+          const imported=structuredClone(Editor.get().project);
+          imported.name='Malformed LUT samples';
+          imported.clips.find(c=>c.type==='video').color.lut={size:2,data:Array(24).fill('bad')};
+          return imported;
+        });
+        await page.locator('#project-input').setInputFiles({
+          name:'malformed-lut.splice.json',mimeType:'application/json',buffer:Buffer.from(JSON.stringify(badLut)),
+        });
+        await waitState(()=>document.querySelector('.toast')?.textContent==='Invalid 3D LUT sample.');
+        assert.equal(await saveButton.isEnabled(),true);
+        assert.equal(await page.evaluate(()=>Editor.get().project.name),name);
         await page.reload();await page.evaluate(()=>SpliceSession.ready);
         assert.equal(await page.evaluate(()=>Editor.get().project.clips.find(c=>c.type==='title').title),'Opening '+pass);
         await click('#export-video'); await click('.studio-dialog [type=submit]');

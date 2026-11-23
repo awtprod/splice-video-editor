@@ -1,5 +1,8 @@
 (() => {
   const MAX_SIZE = 33;
+  const validSample = value => Number.isFinite(value) && value >= -4 && value <= 4;
+  const validDomain = values => Array.isArray(values) && values.length === 3 &&
+    values.every(value => Number.isFinite(value) && Math.abs(value) <= 16);
   function parseCube(content, title = 'Color LUT') {
     if (typeof content !== 'string' || content.length > 4_000_000) throw new Error('The LUT file is too large.');
     let size, domainMin = [0,0,0], domainMax = [1,1,1], rows = [];
@@ -15,12 +18,12 @@
       } else if (key === 'LUT_1D_SIZE') throw new Error('This editor supports 3D .cube LUTs.');
       else if (key === 'DOMAIN_MIN' || key === 'DOMAIN_MAX') {
         const values = parts.slice(1).map(Number);
-        if (values.length !== 3 || values.some(v=>!Number.isFinite(v)||Math.abs(v)>16)) throw new Error('Invalid LUT domain.');
+        if (!validDomain(values)) throw new Error('Invalid LUT domain.');
         if (key === 'DOMAIN_MIN') domainMin = values; else domainMax = values;
       } else {
         if (!size) throw new Error('The 3D LUT size must appear before its samples.');
         const values = parts.map(Number);
-        if (values.length !== 3 || values.some(v=>!Number.isFinite(v)||v < -4||v > 4)) throw new Error('Invalid LUT color sample.');
+        if (values.length !== 3 || !values.every(validSample)) throw new Error('Invalid LUT color sample.');
         rows.push(...values);
         if (rows.length > MAX_SIZE**3*3) throw new Error('The LUT has too many samples.');
       }
@@ -29,16 +32,19 @@
     if (!size || rows.length !== size**3*3) throw new Error('The LUT sample count does not match its size.');
     return {size,data:rows,domainMin,domainMax,title:String(title).slice(0,120)};
   }
-  function validate(lut) {
+  function validateShape(lut) {
     const {size,data,domainMin=[0,0,0],domainMax=[1,1,1]}=lut;
     if (!Number.isInteger(size)||size<2||size>MAX_SIZE||!Array.isArray(data)||data.length!==size**3*3) throw new Error('Invalid project LUT.');
-    for (let channel=0;channel<3;channel++) {
-      const min=domainMin?.[channel],max=domainMax?.[channel];
-      if (!Number.isFinite(min)||!Number.isFinite(max)||min>=max) throw new Error('Invalid project LUT domain.');
-    }
+    if (!validDomain(domainMin) || !validDomain(domainMax) || domainMin.some((min,channel)=>min>=domainMax[channel]))
+      throw new Error('Invalid project LUT domain.');
+  }
+  function validate(lut, intensity=100) {
+    validateShape(lut);
+    if (!lut.data.every(validSample)) throw new Error('Invalid 3D LUT sample.');
+    if (!Number.isFinite(intensity) || intensity<0 || intensity>100) throw new Error('Invalid LUT intensity.');
   }
   function applyImageData(imageData,lut,intensity=100) {
-    validate(lut);
+    validateShape(lut);
     const {size,data,domainMin=[0,0,0],domainMax=[1,1,1]}=lut;
     const pixels=imageData.data, mix=Math.max(0,Math.min(1,Number(intensity)/100));
     if (mix===0) return imageData;

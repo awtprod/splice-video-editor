@@ -1097,7 +1097,7 @@
           Object.values(clip.keyframes).some(points => !Array.isArray(points) ||
             points.some(point => !point || !Number.isFinite(point.time) || !Number.isFinite(point.value)))))
         throw new Error("This project file has invalid keyframes.");
-      if (clip.color?.lut) window.SpliceLUT.validate(clip.color.lut);
+      if (clip.color?.lut) window.SpliceLUT.validate(clip.color.lut,clip.color.lutIntensity);
       clipIds.add(clip.id);
     }
   }
