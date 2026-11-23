@@ -88,7 +88,7 @@ class MovieDelivery(unittest.TestCase):
         MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=MEDIA_ROOT) as directory:
             source = Path(directory) / 'hlg.mov'
-            fixture = ('color=gray:s=160x90:r=25:d=1,'
+            fixture = ('color=gray:s=160x90:r=25:d=2,'
                        'setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv')
             to_hlg = ('zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt2020,'
                       'zscale=t=arib-std-b67:m=bt2020nc:r=limited:npl=203,format=yuv422p10le')
@@ -105,6 +105,23 @@ class MovieDelivery(unittest.TestCase):
                              ('bt709','bt709','bt709'))
             self.assertEqual(video['nb_frames'], '25')
             self.assertAlmostEqual(statistics.mean(self.frame(.4)), 128, delta=6)
+
+            sdr = Path(directory) / 'sdr.mov'
+            subprocess.run(['ffmpeg','-nostdin','-v','error','-f','lavfi','-i',fixture,
+                            '-c:v','prores_ks','-profile:v','3','-threads','1','-movflags','+write_colr',
+                            str(sdr)],check=True,timeout=15)
+            self.project['media'].append({'id':'sdr','src':'/media/'+str(sdr.relative_to(MEDIA_ROOT))})
+            incoming = {**self.clip('sdr','sdr',1,1),'in':.24}
+            self.project['clips'].append(incoming)
+            self.destination = Path(directory) / 'range.mov'
+            for start, end, transfer in ((0,1,'arib-std-b67'),(1,2,'bt709')):
+                render_to_file(self.project,self.destination,options={'codec':'prores','range':{'start':start,'end':end}})
+                video = next(stream for stream in self.streams() if stream['codec_type']=='video')
+                self.assertEqual((video['nb_frames'],video['color_transfer']),('25',transfer))
+            incoming.update(transition='dissolve',transitionDuration=.48,transitionBefore=.24)
+            for start,end in ((.8,.96),(1,1.2)):
+                with self.assertRaisesRegex(ValueError,'one HDR color space'):
+                    render_to_file(self.project,self.destination,options={'codec':'prores','range':{'start':start,'end':end}})
 
     def test_slow_audio_preview_keeps_pitch_and_samples_across_windows(self):
         from media_proxy import audition_audio
@@ -204,6 +221,27 @@ class MovieDelivery(unittest.TestCase):
             self.project['clips'][0]['color'] = {**grade,'lut':{'size':2,'data':[0]*24},'lutIntensity':0}
             render_to_file(self.project,master,options={'codec':'prores'})
             self.assertEqual(linear_patch(master),before)
+            for grade, display_value in (({'contrast':0},.5),({'brightness':0,'contrast':50},.25)):
+                with self.subTest(grade=grade):
+                    self.project['clips'][0]['color'] = grade
+                    render_to_file(self.project,master,options={'codec':'prores'})
+                    expected = 2.03*display_value**2.4
+                    self.assertAlmostEqual(linear_patch(master),expected,delta=.01)
+            highlight = Path(directory) / 'highlight.mov'
+            bright_pq = to_pq.replace('zscale=p=bt2020','exposure=exposure=2.066,zscale=p=bt2020')
+            subprocess.run(['ffmpeg','-nostdin','-v','error','-f','lavfi','-i',fixture.replace('gray','white'),
+                            '-vf',bright_pq,'-c:v','prores_ks','-profile:v','3','-threads','1',
+                            '-movflags','+write_colr',str(highlight)],check=True,timeout=10)
+            self.project['media'][0]['src'] = '/media/'+str(highlight.relative_to(MEDIA_ROOT))
+            original = linear_patch(highlight)
+            self.assertGreater(original,8)
+            display = (original/2.03)**(1/2.4)
+            for grade, display_value in (({'saturation':99},display),({'brightness':101},display*1.01),
+                                         ({'contrast':101},(display-.5)*1.01+.5)):
+                with self.subTest(grade=grade):
+                    self.project['clips'][0]['color'] = grade
+                    render_to_file(self.project,master,options={'codec':'prores'})
+                    self.assertAlmostEqual(linear_patch(master),2.03*display_value**2.4,delta=.12)
 
     def test_title_lines_center_independently_and_end_on_out_frame(self):
         self.project.update(width=640,height=360,clips=[

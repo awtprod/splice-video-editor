@@ -101,45 +101,67 @@ def _css_color_filter(color, high_depth):
     return f',format={rgb},lutrgb={brightness_filter},lutrgb={contrast_filter},{mixer},lutrgb={grade_filter}'
 
 
-def _rgb_filter(expression):
-    return ',geq=' + ':'.join(f"{channel}='{expression(channel,index)}'" for index,channel in enumerate('rgb'))
-
-
 def _linear_gain(gains):
-    if gains==(1,1,1):
-        return ''
-    if max(gains)<=2:
-        return ',colorchannelmixer='+':'.join(f'{c}{c}={value:.7f}' for c,value in zip('rgb',gains))
-    return _rgb_filter(lambda c,i: f'{c}(X,Y)*{gains[i]:.7f}')
+    chain=''
+    # Keep the channel coefficients within ±2 without clipping float pixels.
+    while max(gains)>2:
+        factor=min(8,max(gains))
+        chain+=f',exposure=exposure={math.log2(factor):.12f}'
+        gains=tuple(value/factor for value in gains)
+    if gains!=(1,1,1):
+        chain+=',colorchannelmixer='+':'.join(f'{c}{c}={value:.9f}' for c,value in zip('rgb',gains))
+    return chain
+
+
+def _brightness_contrast(brightness, contrast, pivot=.5):
+    slope=brightness*contrast
+    offset=(1-contrast)*pivot
+    if not offset:
+        return _linear_gain((slope,)*3)
+    # FFmpeg uses (pixel - black) / abs(2**-exposure - black).
+    # Combine both operations when their settings are in range.
+    if slope:
+        black=-offset/slope
+        white=(1-offset)/slope
+        if -1<=black<=1 and .125<=white<=8:
+            return f',exposure=exposure={-math.log2(white):.12f}:black={black:.12f}'
+    # At zero or very low slope, apply the offset with a unit denominator.
+    return _linear_gain((slope,)*3)+f',exposure=exposure={-math.log2(1-offset):.12f}:black={-offset:.12f}'
 
 
 def _hdr_grade(color, lut, high_depth, profile):
     brightness,contrast,saturation,gains=_grade_values(color)
     if (brightness,contrast,saturation,gains)==(1,1,1,(1,1,1)) and (not lut or not high_depth):
         return '' if high_depth else ','+HDR_TO_REC709+lut
-    chain=','+HDR_LINEAR_REC709
-    if (brightness,contrast,saturation)!=(1,1,1):
+    display_grade=(brightness,contrast,saturation)!=(1,1,1)
+    scale=1
+    if display_grade and high_depth and not lut:
+        # Scale the working signal below reference white for zscale's fast
+        # gamma tables. PQ's 10,000-nit peak remains below 8 in gamma 2.4
+        # after the Rec.709 matrix, before the grading controls are applied.
+        scale=8*max(1,brightness*contrast*max(1,saturation))
+    peak=203*scale**2.4
+    chain=','+HDR_LINEAR_REC709.format(peak=peak)
+    if display_grade:
         # Brightness, contrast, and saturation retain their display-referred
         # controls. Exposure and white balance below use linear light.
-        chain+=',zscale=t=bt709,format=gbrpf32le'
-        if contrast==1:
-            chain+=_linear_gain((brightness,)*3)
-        else:
-            chain+=_rgb_filter(lambda c,i: f'({c}(X,Y)*{brightness:.6f}-0.5)*{contrast:.6f}+0.5')
+        gamma=f'agamma={int(scale!=1)}'
+        chain+=f',zscale=t=bt709:{gamma},format=gbrpf32le'
+        chain+=_brightness_contrast(brightness,contrast,pivot=.5/scale)
         if saturation!=1:
             matrix=_saturation_matrix(saturation)
             # colorchannelmixer limits a coefficient to ±2. Preserve the
             # extra gain for imported projects with a stronger saturation.
-            peak=max(1,max(abs(value) for row in matrix for value in row)/2)
-            chain+=','+_channel_mixer([[value/peak for value in row] for row in matrix])+_linear_gain((peak,)*3)
-        chain+=',zscale=t=linear,format=gbrpf32le'
+            matrix_gain=max(1,max(abs(value) for row in matrix for value in row)/2)
+            chain+=','+_channel_mixer([[value/matrix_gain for value in row] for row in matrix])+_linear_gain((matrix_gain,)*3)
+        chain+=f',zscale=t=linear:{gamma},format=gbrpf32le'
     chain+=_linear_gain(gains)
     if not high_depth:
         return chain+','+HDR_TONE_MAP+lut
     if lut:
         chain+=',zscale=t=bt709,format=gbrpf32le'+lut+',zscale=t=linear,format=gbrpf32le'
     primaries,transfer,matrix=profile
-    return chain+f',zscale=p={primaries},zscale=t={transfer}:m={matrix}:r=limited:npl=203,format=yuv444p10le'
+    return chain+f',zscale=p={primaries},zscale=t={transfer}:m={matrix}:r=limited:npl={peak:.9f},format=yuv444p10le'
 
 
 def _fit_picture(width, height, color, lut, alpha_format, high_depth, hdr_profile=None):
@@ -385,6 +407,40 @@ def _render_window(project, output_path, *, options=None, cancelled=None):
         return _render_window_inner(project, output_path, lut_directory, options=options, cancelled=cancelled)
 
 
+def _picture_transitions(clips, media_by_id, fps):
+    by_end = {}
+    predecessors, followers = {}, {}
+    for number, clip in enumerate(clips):
+        if media_by_id.get(clip.get('mediaId'), {}).get('nativeGenerator') == 1414680150:
+            continue
+        track = clip.get('track',0)
+        start = float(clip['start'])
+        prior = by_end.get((track,round(start*fps)))
+        if prior is not None and clip.get('transition') in ('dissolve','wipe','fade'):
+            predecessors[number] = prior
+            followers[prior] = number
+        by_end[track,round((start+float(clip['duration']))*fps)] = number
+    return predecessors, followers
+
+
+def _picture_range_media(clips, media_by_id, fps, first, stop):
+    _, followers = _picture_transitions(clips, media_by_id, fps)
+    active = set()
+    for number, clip in enumerate(clips):
+        cut = float(clip['start'])
+        lead = float(clip.get('transitionBefore',0) or 0) if clip.get('transition') in ('dissolve','wipe') else 0
+        end = cut+float(clip['duration'])
+        following = clips[followers[number]] if number in followers else None
+        if following and following.get('transition') in ('dissolve','wipe'):
+            before = float(following.get('transitionBefore',0) or 0)
+            tail = min(float(following.get('transitionDuration',.5))-before,float(following['duration']))
+            if tail >= 1/fps-1e-6:
+                end = max(end,float(following['start'])+tail)
+        if math.ceil((cut-lead)*fps-1e-6)<stop and math.ceil(end*fps-1e-6)>first:
+            active.add(clip.get('mediaId'))
+    return active
+
+
 def _render_window_inner(project, output_path, lut_directory, *, options=None, cancelled=None):
     if not isinstance(project, dict):
         raise ValueError('Invalid project')
@@ -497,17 +553,7 @@ def _render_window_inner(project, output_path, lut_directory, *, options=None, c
     picture_layers.extend((clip.get('track',4),True,number,clip) for number,clip in enumerate(titles))
     picture_layers.sort(key=lambda row: (row[0],row[1],row[3]['start']))
     if picture_layers:
-        by_end = {}
-        predecessors, followers = {}, {}
-        for number, clip in enumerate(video_clips):
-            if media_by_id[clip['mediaId']].get('nativeGenerator') == 1414680150:
-                continue
-            track = clip.get('track',0)
-            prior = by_end.get((track,round(clip['start']*fps)))
-            if prior is not None and clip.get('transition') in ('dissolve','wipe','fade'):
-                predecessors[number] = prior
-                followers[prior] = number
-            by_end[track,round((clip['start']+clip['duration'])*fps)] = number
+        predecessors, followers = _picture_transitions(video_clips,media_by_id,fps)
         for _, is_title, number, clip in picture_layers:
             if is_title:
                 active = _draw_title(filters,active,number,clip,height,fps,lut_directory,hdr_profile)
@@ -773,7 +819,10 @@ def _render_prepared(project, output_path, *, options=None, progress=None, cance
     probes = {}
     profiles = set()
     if codec!='wav' and not ((project.get('renderOptions') or {}).get('mutedTracks') or {}).get('video'):
-        vid_ids = {c.get('mediaId') for c in project['clips'] if c.get('type')=='video'}
+        by_id = {item['id']:item for item in project['media']}
+        video_clips = sorted((clip for clip in project['clips'] if clip.get('type')=='video'),
+                             key=lambda clip:(clip.get('track',0),float(clip['start'])))
+        vid_ids = _picture_range_media(video_clips,by_id,fps,first,stop)
         for item in project['media']:
             if item.get('id') not in vid_ids or item.get('nativeGenerator') is not None:continue
             path = _media_path(item.get('src',''))

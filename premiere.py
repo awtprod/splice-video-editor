@@ -892,8 +892,7 @@ def save_project(data):
             premiere_effects.apply_extended(companion, audio_item)
             item = {**item, 'fadeIn': 0, 'fadeOut': 0, 'pan': 0,
                     'keyframes': {key: points for key, points in (item.get('keyframes') or {}).items() if key != 'volume'}}
-        source_info = media_by_id.get(item.get('mediaId'),{})
-        premiere_effects.apply(clip, item.get('color') or {}, float(item.get('volume', 100)), hdr=source_info.get('hdr') is True)
+        premiere_effects.apply(clip, item.get('color') or {}, float(item.get('volume', 100)))
         premiere_effects.apply_extended(clip, item)
         if item.get('transition') in TRANSITIONS and not is_audio:
             pending_transitions.append((clip, item, *TRANSITIONS[item['transition']]))

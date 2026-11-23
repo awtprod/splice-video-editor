@@ -18,7 +18,8 @@ from py_premiere.xml.mutations import remove_child
 
 TEMPLATES = Path(__file__).resolve().parent / 'vendor' / 'splice-effects'
 NEUTRAL = {'brightness': 100, 'contrast': 100, 'saturation': 100, 'temperature': 0, 'tint': 0}
-HDR_BRIGHTNESS_NAME = 'Splice HDR Brightness'
+BRIGHTNESS_NAME = 'Splice Brightness'
+BRIGHTNESS_LAYERS = {BRIGHTNESS_NAME, 'Splice HDR Brightness'}
 
 
 def _component(clip, name):
@@ -111,7 +112,7 @@ def _lumetri_layers(clip):
     for component in clip.components:
         if component.match_name != 'AE.ADBE Lumetri':
             continue
-        if component._element.findtext('Component/InstanceName') == HDR_BRIGHTNESS_NAME:
+        if component._element.findtext('Component/InstanceName') in BRIGHTNESS_LAYERS:
             if brightness is None: brightness=component
         elif lumetri is None:
             lumetri=component
@@ -195,7 +196,7 @@ def _attach(clip, name, *, instance_name=None, before=None):
     return component
 
 
-def apply(clip, color, volume, *, hdr=False):
+def apply(clip, color, volume):
     current, old_volume = read(clip)
     color = {**NEUTRAL, **(color or {})}
     if color.get('lut'):
@@ -208,12 +209,9 @@ def apply(clip, color, volume, *, hdr=False):
         brightness = float(color['brightness'])
         if not math.isfinite(brightness) or brightness<0:
             raise ValueError('Invalid brightness')
-        if hdr or brightness_layer:
-            if abs(brightness-current['brightness'])>1e-5:
-                brightness_layer = brightness_layer or _attach(clip,'lumetri',instance_name=HDR_BRIGHTNESS_NAME,before=lumetri)
-                _set_color_parameter(brightness_layer,'Exposure',2.4*math.log2(max(.009,brightness)/100))
-        else:
-            exposure += math.log2(max(.01,brightness)/100)
+        if abs(brightness-current['brightness'])>1e-5:
+            brightness_layer = brightness_layer or _attach(clip,'lumetri',instance_name=BRIGHTNESS_NAME,before=lumetri)
+            _set_color_parameter(brightness_layer,'Exposure',2.4*math.log2(max(.009,brightness)/100))
         values = [('Exposure',exposure,0), ('Contrast',color['contrast']-100,0),
                   ('Saturation',color['saturation'],100), ('Temperature',color['temperature'],0), ('Tint',color['tint'],0)]
         if lumetri or any(abs(value-default)>1e-5 for _,value,default in values):

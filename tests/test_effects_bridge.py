@@ -82,6 +82,21 @@ class ExtendedEffectsRoundTrip(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '3D LUT'):
             premiere_effects.apply(clip, {'lut':{'size':2,'data':[0]*24}},100)
 
+    def test_sdr_brightness_stays_separate_from_contrast_and_exposure(self):
+        project = {
+            'name':'Grade', 'fps':25, 'media':[{'id':'ridge','src':'/assets/ridge.mp4'}],
+            'clips':[{'type':'video','track':1,'mediaId':'ridge','start':0,'duration':2,'in':0}],
+        }
+        for grade in ({'brightness':120,'contrast':150},{'brightness':120,'exposure':4}):
+            with self.subTest(grade=grade):
+                project['clips'][0]['color'] = grade
+                reopened = open_project(save_project(project))
+                for control, value in grade.items():
+                    self.assertAlmostEqual(reopened['clips'][0]['color'][control],value,delta=.001)
+                reopened['clips'][0]['color']['brightness'] = 100
+                reset = open_project(save_project(reopened))
+                self.assertEqual(reset['clips'][0]['color']['brightness'],100)
+
 
 if __name__ == '__main__':
     unittest.main()
