@@ -40,6 +40,14 @@ window.SpliceDialogs = (() => {
       const custom=form.elements.rangeMode.value==='custom';
       for(const field of rangeFields){field.closest('label').hidden=!custom;field.required=custom;}
     };
+    // A timeline In/Out range becomes the default custom export range.
+    const marks=state.project.marks||{};
+    if(Number.isFinite(marks.in)&&Number.isFinite(marks.out)){
+      rangeFields[0].value=marks.in.toFixed(6);
+      rangeFields[1].value=Math.min(marks.out,state.duration).toFixed(6);
+      form.elements.rangeMode.value='custom';
+      form.elements.rangeMode.onchange();
+    }
     form.querySelector('.export-spec').textContent=state.project.name+' · '+state.project.width+' × '+state.project.height+' · '+Number(state.project.fps.toFixed(3))+' fps';
     const nativeBlocks=state.project.clips.filter(c=>c.transition==='native'||c.nativeTimeRemap||c.nativeUnsupported);
     if(nativeBlocks.length) {
@@ -110,13 +118,8 @@ window.SpliceDialogs = (() => {
   function shortcuts() {
     const node=dialog('Keyboard and mouse');
     const list=document.createElement('dl');
-    for(const [keys,action] of [
-        ['Space · J K L','Play / pause · reverse, stop, forward'],['← →','Step one frame'],
-        ['S · Delete','Split at playhead · delete selection'],['Ctrl/Cmd + click','Select multiple clips'],
-        ['Ctrl/Cmd + C / V','Copy / paste clips at playhead'],['N · R','Toggle snapping · ripple trim'],
-        ['Drag clip edge','Trim source range'],['Shift + drag edge','Roll the cut between adjacent clips'],
-        ['Alt + drag clip','Slip source under the edit'],['M · [ / ]','Add marker · previous / next marker'],
-        ['Ctrl/Cmd + Z · Shift + Z','Undo · redo'],['Ctrl/Cmd + S · Shift + S','Save Premiere · save working project']]){
+    // Rendered from the timeline keymap so the reference always matches the bindings.
+    for(const {keys,action} of window.SpliceKeymap||[]){
       const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=keys;dd.textContent=action;list.append(dt,dd);
     }
     const close=document.createElement('button');close.textContent='Close';close.onclick=()=>node.close();

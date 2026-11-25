@@ -23,3 +23,14 @@
 .source-controls{gap:9px;padding:14px 20px}
 @media(max-height:720px){.source-stage{height:min(30vh,240px)}}
 .source-shortcuts{color:#9aaa98;font:11px 'IBM Plex Mono',monospace}
+/* Non-modal: a floating monitor over the asset and program panels; the timeline stays usable. */
+.source-dialog{position:fixed;inset:64px auto auto 14px;margin:0;z-index:40;width:min(760px,calc(100vw - 28px));max-height:calc(100vh - 80px)}
+.source-dialog:focus{outline:none}
+.source-dialog:focus-within{border-color:#8fb05e}
+.source-plan{color:#c6dba8;font:11px 'IBM Plex Mono',monospace}
+/* Compact enough to leave most of the timeline in view; scrolls inside on short windows. */
+.source-dialog{max-height:min(620px,calc(100vh - 150px))}
+.source-dialog .source-stage{height:min(26vh,240px)}
+.source-dialog .source-controls{gap:7px;padding:11px 16px 14px}
+.source-dialog .source-bin,.source-dialog .source-track-label{gap:10px}
+.source-dialog .source-bin input,.source-dialog .source-track-label select{padding:6px}

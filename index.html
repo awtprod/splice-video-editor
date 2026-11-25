@@ -56,11 +56,23 @@
       <div class="utility-bar">
         <div class="utility-left">
           <details class="file-menu"><summary>File</summary><div>
-            <button id="new-project">New project…</button><button id="save-as">Save Premiere as…</button>
+            <button id="new-project">New project…</button>
+            <button id="save-as">Save Premiere as…</button>
             <button id="save-working">Save working project…</button>
             <button id="versions">Recent projects &amp; recovery</button>
             <button id="compatibility">Project compatibility…</button>
-            <button id="shortcuts">Keyboard and mouse</button></div></details><button id="import-media" class="menu-button">
+            <button id="sequence-settings">Sequence settings…</button>
+            <button id="shortcuts">Keyboard and mouse</button>
+          </div></details><details class="edit-menu"><summary>Edit</summary><div>
+            <button data-command="markClip">Mark clip <kbd>X</kbd></button>
+            <button data-command="clearMarks">Clear In and Out <kbd>Ctrl+Shift+X</kbd></button>
+            <button data-command="lift">Lift In/Out range <kbd>;</kbd></button>
+            <button data-command="extract">Extract In/Out range <kbd>'</kbd></button>
+            <button data-command="addEditAll">Add edit to all tracks <kbd>Ctrl+Shift+K</kbd></button>
+            <button data-command="rippleStart">Ripple trim start to playhead <kbd>Q</kbd></button>
+            <button data-command="rippleEnd">Ripple trim end to playhead <kbd>W</kbd></button>
+            <button data-command="link">Link / unlink <kbd>Ctrl+L</kbd></button>
+          </div></details><button id="import-media" class="menu-button">
             Import media <span>+</span></button
           ><span class="utility-sep"></span
           ><span class="sequence-label">SEQUENCE 01</span
@@ -93,7 +105,7 @@
             ><button data-library="effects">Effects</button
             ><button data-library="titles">Titles</button><button data-library="captions">Captions</button>
           </div>
-          <div class="pool-tools"><select id="bin-filter" aria-label="Media bin"><option value="">All bins</option></select><input id="media-search" type="search" placeholder="Search media" aria-label="Search media" /><select id="media-filter" aria-label="Filter media"><option value="all">All media</option><option value="video">Video</option><option value="audio">Audio</option><option value="offline">Offline</option></select></div><div class="library-body" id="library-body"></div>
+          <div class="pool-tools"><select id="bin-filter" aria-label="Media bin"><option value="">All bins</option></select><input id="media-search" type="search" placeholder="Search media" aria-label="Search media" /><select id="media-filter" aria-label="Filter media"><option value="all">All media</option><option value="video">Video</option><option value="audio">Audio</option><option value="offline">Offline</option></select><button id="media-view" type="button" aria-pressed="false" title="Show media as a sortable list">List</button></div><div class="library-body" id="library-body"></div>
           <div class="library-footer">
             <span class="status-dot"></span
             ><span id="asset-footer">Project ready</span>
@@ -136,7 +148,7 @@
           </div>
           <div class="viewer-bottom">
             <div class="viewer-info">
-              <span class="viewer-timecode" id="viewer-time">00:00:00:00</span
+              <span class="viewer-timecode" id="viewer-time" role="button" tabindex="0" title="Click to type a timecode">00:00:00:00</span
               ><span class="viewer-duration" id="viewer-duration"
                 >/ 00:00:00:00</span
               >
@@ -186,9 +198,15 @@
             ><button id="delete-selected" title="Delete selected clip">
               ⌫ <span>Delete</span></button
             ><span class="tool-sep"></span
-            ><button id="add-marker" title="Add marker (M)">Marker</button><button id="snap-toggle" class="active" title="Snap to edit points (N)">Snap</button><button id="ripple-toggle" title="Ripple trim (R)">Ripple</button><button id="zoom-out" title="Zoom out">−</button
-            ><span id="zoom-label">55%</span
-            ><button id="zoom-in" title="Zoom in">+</button>
+            ><button id="add-marker" title="Add marker (M)">Marker</button
+            ><button id="snap-toggle" class="active" title="Snap to edit points (N)">Snap</button
+            ><button id="ripple-toggle" title="Ripple trim (R)">Ripple</button
+            ><button id="linked-toggle" class="active" aria-pressed="true" title="Linked selection: linked picture and sound select, move and trim together (Ctrl/Cmd+Shift+L)">Linked</button
+            ><span class="tool-sep"></span
+            ><button id="zoom-out" title="Zoom out (−)">−</button
+            ><span id="zoom-label">—</span
+            ><button id="zoom-in" title="Zoom in (=)">+</button
+            ><button id="zoom-fit" title="Zoom to fit the whole timeline (\)">Fit</button>
           </div>
         </div>
         <div class="timeline-body" id="timeline-body">
@@ -208,7 +226,8 @@
             <span class="status-dot"></span
             ><span id="timeline-status">Ready to edit</span>
           </div>
-          <span>Drag assets to the timeline · Space to play · S to split</span>
+          <span id="mark-status" class="mark-status" hidden></span>
+          <span>Drag assets to the timeline · Space to play · S to split · I/O mark</span>
         </div>
       </section>
     </div>

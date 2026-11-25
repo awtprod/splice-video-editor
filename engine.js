@@ -84,6 +84,10 @@
   let revision = 0;
   let gesture = false;
   let gestureBefore = null;
+  // Linked selection: when off, linked clips move and trim on their own (Premiere's toggle).
+  let linkedSelection = true;
+  let linkSuspended = 0;
+  const linkingActive = () => linkedSelection && !linkSuspended;
   let audioContext;
   const audioNodes = new WeakMap();
   const auditionSpan = 4;
@@ -269,12 +273,54 @@
   const duration = () =>
     Math.max(0, ...project.clips.map((c) => c.start + c.duration));
   const notify = () => subscribers.forEach((fn) => fn(Editor.get()));
-  const snapshot = () => {
-    if (gesture) return;
-    revision += 1;
-    history.push(structuredClone(project));
+  // Undo states share large immutable payloads instead of copying them per edit:
+  // LUT tables are replaced, never mutated, and strings (the embedded Premiere
+  // original) are immutable. Everything else is copied so drafts never alias.
+  function cloneState(value, key) {
+    if (value === null || typeof value !== "object") return value;
+    if (key === "lut") return value;
+    if (Array.isArray(value)) return value.map((item) => cloneState(item));
+    const copy = {};
+    for (const name of Object.keys(value)) copy[name] = cloneState(value[name], name);
+    return copy;
+  }
+  function sameValue(left, right) {
+    if (left === right) return true;
+    if (!left || !right || typeof left !== "object" || typeof right !== "object")
+      return Number.isNaN(left) && Number.isNaN(right);
+    if (Array.isArray(left) !== Array.isArray(right)) return false;
+    if (Array.isArray(left))
+      return left.length === right.length && left.every((item, index) => sameValue(item, right[index]));
+    const keys = Object.keys(left).filter((key) => left[key] !== undefined);
+    if (keys.length !== Object.keys(right).filter((key) => right[key] !== undefined).length) return false;
+    return keys.every((key) => sameValue(left[key], right[key]));
+  }
+  // After an edit, point unchanged clips and media back at the previous state's
+  // objects so fifty undo steps of a 2,000-clip timeline hold one copy of each.
+  function shareUnchanged(before, after) {
+    for (const field of ["clips", "media"]) {
+      const previous = new Map((before[field] || []).map((item) => [item.id, item]));
+      const items = after[field] || [];
+      for (let index = 0; index < items.length; index++) {
+        const prior = previous.get(items[index]?.id);
+        if (prior && sameValue(prior, items[index])) items[index] = prior;
+      }
+    }
+  }
+  function remember(previous) {
+    history.push(previous);
     if (history.length > 50) history.shift();
     future = [];
+    revision += 1;
+  }
+  // In-place edits: retire the current state to history and continue on a copy.
+  const snapshot = () => {
+    if (gesture) {
+      if (project === gestureBefore) project = cloneState(project);
+      return;
+    }
+    remember(project);
+    project = cloneState(project);
   };
   const mediaOf = (clip) => project.media.find((m) => m.id === clip.mediaId);
   const titleTrack = () => Math.min(64,Math.max(4,...project.clips.filter(c=>c.type==='video').map(c=>c.track+1)));
@@ -282,9 +328,10 @@
     const usedLength=project.clips.find(c=>c.mediaId===item.id)?.duration;
     const available=item.duration||usedLength||5;
     const selection={in:0,duration:available};
-    if(Number.isFinite(marks?.in) && Number.isFinite(marks?.out)) {
-      const from=clamp(marks.in,0,available);
-      const to=clamp(marks.out,from,available);
+    // Either mark may be missing: an In alone runs to the end, an Out alone from the start.
+    if(Number.isFinite(marks?.in) || Number.isFinite(marks?.out)) {
+      const from=Number.isFinite(marks.in) ? clamp(marks.in,0,available) : 0;
+      const to=Number.isFinite(marks.out) ? clamp(marks.out,from,available) : available;
       const frames=Math.min(Math.round((to-from)*project.fps),Math.floor((available-from)*project.fps+1e-6));
       if(frames<1) throw Error('Mark a range at least one sequence frame long.');
       Object.assign(selection,{in:from,duration:frames/project.fps});
@@ -305,8 +352,37 @@
     if (trackLocked(clip.type, clip.track) || trackLocked(clip.type, destination))
       throw new Error(`Unlock ${clip.type} track ${Math.abs(clip.track)} before editing.`);
   };
-  const linkedClips = (clip) => clip.linkGroup
-    ? project.clips.filter((other) => other.id !== clip.id && other.linkGroup === clip.linkGroup) : [];
+  const trackHidden = (kind, track, source = project) => trackState(kind, track, source).hidden === true;
+  const groupMembers = (clip, source = project) => clip.linkGroup
+    ? source.clips.filter((other) => other.id !== clip.id && other.linkGroup === clip.linkGroup) : [];
+  const linkedClips = (clip) => linkingActive() ? groupMembers(clip) : [];
+  // A link group reduced to one clip (linked selection off) is no longer a link.
+  function dropLoneLinks(source) {
+    const counts = new Map();
+    for (const clip of source.clips) if (clip.linkGroup) counts.set(clip.linkGroup, (counts.get(clip.linkGroup) || 0) + 1);
+    for (const clip of source.clips) if (clip.linkGroup && counts.get(clip.linkGroup) < 2) delete clip.linkGroup;
+  }
+  const hasEmbeddedAudio = (clip, source = project) => {
+    if (clip.type !== "video" || clip.embeddedAudio === false) return false;
+    const item = source.media.find((entry) => entry.id === clip.mediaId);
+    return !!item && !item.still && item.audioChannels > 0;
+  };
+  const frameSeconds = () => 1 / project.fps;
+  // Timeline seconds before the clip's first frame and after its last that the source can still supply.
+  const sourceHead = (clip) => mediaOf(clip)?.still ? Infinity : clip.in / (Number(clip.speed) || 1);
+  const sourceTail = (clip) => mediaOf(clip)?.still ? Infinity :
+    ((mediaOf(clip)?.duration || Infinity) - clip.in) / (Number(clip.speed) || 1) - clip.duration;
+  const roomBefore = (clip) => clip.reverse ? sourceTail(clip) : sourceHead(clip);
+  const roomAfter = (clip) => clip.reverse ? sourceHead(clip) : sourceTail(clip);
+  // Frames by which a linked clip's picture or sound has drifted from its partner.
+  function syncOffset(clip, source = project) {
+    const partner = groupMembers(clip, source).find((other) => other.mediaId === clip.mediaId && other.type !== clip.type);
+    if (!partner || clip.reverse || partner.reverse) return null;
+    const speed = Number(clip.speed) || 1, partnerSpeed = Number(partner.speed) || 1;
+    if (Math.abs(speed - partnerSpeed) > 1e-6) return null;
+    const origin = clip.start - clip.in / speed, partnerOrigin = partner.start - partner.in / partnerSpeed;
+    return {partner, frames: Math.round((origin - partnerOrigin) * source.fps)};
+  }
   const ensureLinkedEditable = (clip) => {
     ensureEditable(clip);
     for (const other of linkedClips(clip)) ensureEditable(other);
@@ -337,14 +413,30 @@
     left.start < right.start + right.duration - .001 && right.start < left.start + left.duration - .001;
   const assertNoNewOverlaps = (before, after) => {
     const original = new Map(before.clips.map(clip => [clip.id, clip]));
+    const unchanged = (clip, prior) => prior && prior.start === clip.start && prior.duration === clip.duration &&
+      prior.track === clip.track && prior.type === clip.type;
+    const lanes = new Map();
     for (const clip of after.clips) {
-      const prior = original.get(clip.id);
-      if (prior && prior.start === clip.start && prior.duration === clip.duration && prior.track === clip.track && prior.type === clip.type) continue;
-      for (const other of after.clips) {
-        if (other.id === clip.id || !sameLaneOverlap(clip, other)) continue;
-        const oldOther = original.get(other.id);
-        if (!prior || !oldOther || !sameLaneOverlap(prior, oldOther))
-          throw new Error(`Move blocked: ${clip.type} track ${Math.abs(clip.track)} already has a clip there.`);
+      const key = (clip.type === 'audio' ? 'a' : 'v') + clip.track;
+      if (!lanes.has(key)) lanes.set(key, []);
+      lanes.get(key).push(clip);
+    }
+    // Sweep each lane in start order, comparing a clip only with clips still running.
+    for (const clips of lanes.values()) {
+      clips.sort((a, b) => a.start - b.start);
+      let running = [];
+      for (const clip of clips) {
+        running = running.filter(other => other.start + other.duration - .001 > clip.start);
+        for (const other of running) {
+          if (!sameLaneOverlap(clip, other)) continue;
+          const prior = original.get(clip.id), oldOther = original.get(other.id);
+          if (unchanged(clip, prior) && unchanged(other, oldOther)) continue;
+          if (!prior || !oldOther || !sameLaneOverlap(prior, oldOther)) {
+            const moved = unchanged(clip, prior) ? other : clip;
+            throw new Error(`Move blocked: ${moved.type} track ${Math.abs(moved.track)} already has a clip there.`);
+          }
+        }
+        running.push(clip);
       }
     }
   };
@@ -352,16 +444,18 @@
     const oldClips = new Map(before.clips.map((clip) => [clip.id, clip]));
     const newClips = new Map(after.clips.map((clip) => [clip.id, clip]));
     for (const clip of before.clips)
-      if (trackLocked(clip.type, clip.track, before) && JSON.stringify(clip) !== JSON.stringify(newClips.get(clip.id)))
+      if (trackLocked(clip.type, clip.track, before) && !sameValue(clip, newClips.get(clip.id)))
         throw new Error(`Unlock ${clip.type} track ${Math.abs(clip.track)} before editing.`);
     for (const clip of after.clips)
-      if (trackLocked(clip.type, clip.track, after) && JSON.stringify(clip) !== JSON.stringify(oldClips.get(clip.id)))
+      if (trackLocked(clip.type, clip.track, after) && !sameValue(clip, oldClips.get(clip.id)))
         throw new Error(`Unlock ${clip.type} track ${Math.abs(clip.track)} before editing.`);
   };
+  // The topmost clip of a kind at a time. Hidden picture tracks never reach the program monitor.
   const at = (kind, t) =>
     project.clips
       .filter(
-        (c) => c.type === kind && c.start <= t && t < c.start + c.duration,
+        (c) => c.type === kind && c.start <= t && t < c.start + c.duration &&
+          (kind === "audio" || !trackHidden(kind, c.track)),
       )
       .sort((a, b) => b.track - a.track)[0];
   const requestedTransitionLength = clip => clamp(Number(clip.transitionDuration || .5), 1/project.fps, 7200);
@@ -919,9 +1013,9 @@
     const ctx = canvas.getContext("2d");
     ctx.fillStyle = '#000';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
-    const visible=project.clips.filter(clip=>clip.type==='video' ? !mutedTracks.video &&
+    const visible=project.clips.filter(clip=>clip.type!=='audio' && !trackHidden(clip.type,clip.track) && (clip.type==='video' ? !mutedTracks.video &&
       clip.start-transitionBefore(clip)<=time && time<clip.start+clip.duration :
-      clip.type==='title' && !mutedTracks.title && clip.title && clip.start<=time && time<clip.start+clip.duration);
+      !mutedTracks.title && clip.title && clip.start<=time && time<clip.start+clip.duration));
     visible.sort((a,b)=>(a.track??4)-(b.track??4) || Number(a.type==='title')-Number(b.type==='title') || a.start-b.start);
     const dissolvePairs=new Map(), outgoingIds=new Set();
     for (const clip of visible) {
@@ -1024,6 +1118,8 @@
     if (mix.gain < 0 || mix.gain > 200) throw new Error("Track gain must be between 0% and 200%.");
     if (mix.pan < -100 || mix.pan > 100) throw new Error("Track pan must be between -100 and 100.");
   }
+  // LUT tables are immutable once validated; skip re-checking 100k samples on every edit.
+  const validatedLuts = new WeakSet();
   function validateProject(value, depth = 0) {
     if (depth >= 4) throw new Error("This project nests sequences more than four levels deep.");
     if (
@@ -1049,7 +1145,8 @@
         if (!/^(?:video:[1-9]\d*|audio:-[1-9]\d*|title:[1-9]\d*)$/.test(key) ||
             !state || typeof state !== "object" || Array.isArray(state) ||
             (state.locked !== undefined && typeof state.locked !== "boolean") ||
-            (state.syncLocked !== undefined && typeof state.syncLocked !== "boolean"))
+            (state.syncLocked !== undefined && typeof state.syncLocked !== "boolean") ||
+            (state.hidden !== undefined && typeof state.hidden !== "boolean"))
           throw new Error("This project file has invalid track controls.");
     }
     if (value.trackCounts !== undefined && (!value.trackCounts ||
@@ -1062,6 +1159,15 @@
         throw new Error("This project file has invalid audio mixer settings.");
       for (const [key,mix] of Object.entries(value.trackMix)) validateTrackMix(key,mix);
     }
+    if (value.marks != null && (typeof value.marks !== "object" || Array.isArray(value.marks) ||
+        ["in", "out"].some(edge => value.marks[edge] != null && (!Number.isFinite(value.marks[edge]) || value.marks[edge] < 0)) ||
+        (value.marks.in != null && value.marks.out != null && value.marks.out <= value.marks.in)))
+      throw new Error("This project file has an invalid timeline In/Out range.");
+    if (value.startTimecode != null && (!Number.isInteger(value.startTimecode) || value.startTimecode < 0 ||
+        value.startTimecode >= 24 * 3600 * Math.ceil(value.fps)))
+      throw new Error("This project file has an invalid start timecode.");
+    if (value.dropFrame != null && typeof value.dropFrame !== "boolean")
+      throw new Error("This project file has an invalid timecode setting.");
     if (value.markers != null && (!Array.isArray(value.markers) ||
         value.markers.some(marker => !marker || typeof marker.name !== "string" || !Number.isFinite(marker.time))))
       throw new Error("This project file has invalid markers.");
@@ -1114,17 +1220,214 @@
           Object.values(clip.keyframes).some(points => !Array.isArray(points) ||
             points.some(point => !point || !Number.isFinite(point.time) || !Number.isFinite(point.value)))))
         throw new Error("This project file has invalid keyframes.");
-      if (clip.color?.lut) window.SpliceLUT.validate(clip.color.lut,clip.color.lutIntensity);
+      if (clip.color?.lut) {
+        const intensity = clip.color.lutIntensity ?? 100;
+        if (!Number.isFinite(intensity) || intensity < 0 || intensity > 100) throw new Error('Invalid LUT intensity.');
+        if (!validatedLuts.has(clip.color.lut)) {
+          window.SpliceLUT.validate(clip.color.lut,intensity);
+          validatedLuts.add(clip.color.lut);
+        }
+      }
       clipIds.add(clip.id);
     }
   }
+  // Titles share the picture lane of their track number, as they do in Premiere.
+  const laneOf = (clip) => (clip.type === "audio" ? "audio:" : "video:") + clip.track;
+  const hasSound = (item) => item?.type === "video" && !item.still && item.audioChannels > 0;
+  const startOfLane = (lane) => ({kind: lane.startsWith("audio") ? "audio" : "video", track: Number(lane.split(":")[1])});
+  function freeAudioTrack(source, from, to) {
+    for (let track = -1; track >= -64; track--) {
+      if (trackLocked("audio", track, source)) continue;
+      const busy = source.clips.some((clip) => clip.type === "audio" && clip.track === track &&
+        clip.start < to - 1e-6 && clip.start + clip.duration > from + 1e-6);
+      if (!busy) return track;
+    }
+    return null;
+  }
+  // Give a video clip's embedded camera sound its own audio clip, linked to the picture.
+  function detachAudio(source, clip) {
+    const track = freeAudioTrack(source, clip.start - transitionBefore(clip), clip.start + clip.duration);
+    if (track === null) throw new Error("There is no free, unlocked audio track for this clip's sound.");
+    const group = clip.linkGroup || uid();
+    const sound = {id: uid(), mediaId: clip.mediaId, type: "audio", track, start: clip.start,
+      duration: clip.duration, in: clip.in, title: "", volume: clip.volume ?? 100, transition: "none", linkGroup: group};
+    for (const key of ["speed", "reverse", "pan", "fadeIn", "fadeOut", "audioStream"])
+      if (key in clip) sound[key] = clip[key];
+    if (clip.keyframes?.volume) {
+      sound.keyframes = {volume: cloneState(clip.keyframes.volume)};
+      delete clip.keyframes.volume;
+    }
+    if (["dissolve", "wipe", "fade"].includes(clip.transition)) {
+      sound.transition = "dissolve";
+      sound.transitionDuration = clip.transitionDuration;
+      if (clip.transitionBefore) sound.transitionBefore = clip.transitionBefore;
+    }
+    clip.embeddedAudio = false;
+    clip.linkGroup = group;
+    for (const key of ["pan", "fadeIn", "fadeOut"]) delete clip[key];
+    source.clips.push(sound);
+    return sound;
+  }
+  // A new edit from a source. Camera media with sound becomes a linked picture/sound pair.
+  function sourceClips(item, selection, start, videoTrack, audioTrack) {
+    const base = {mediaId: item.id, start, title: "", volume: 100, transition: "none", ...selection};
+    if (item.type === "audio") return [{id: uid(), type: "audio", track: audioTrack, ...base}];
+    const picture = {id: uid(), type: "video", track: videoTrack, color: {brightness: 100, contrast: 100, saturation: 100}, ...base};
+    if (audioTrack == null || !hasSound(item)) return [picture];
+    const group = uid();
+    Object.assign(picture, {embeddedAudio: false, linkGroup: group});
+    return [picture, {id: uid(), type: "audio", track: audioTrack, ...base, linkGroup: group}];
+  }
+  // Right-hand pieces of a cut link group become a new group of their own.
+  function regrouper() {
+    const groups = new Map();
+    return (clip) => {
+      if (!clip?.linkGroup) return clip;
+      if (!groups.has(clip.linkGroup)) groups.set(clip.linkGroup, uid());
+      clip.linkGroup = groups.get(clip.linkGroup);
+      return clip;
+    };
+  }
+  // Remove material between two times on the given lanes, cutting clips that cross the range.
+  // A link survives only when the range cuts every member of the group the same way.
+  function clearRange(source, lanes, from, to) {
+    const crossing = (clip) => lanes.has(laneOf(clip)) && clip.start < to - 1e-6 && clip.start + clip.duration > from + 1e-6;
+    const groups = new Map();
+    for (const clip of source.clips) if (clip.linkGroup) {
+      if (!groups.has(clip.linkGroup)) groups.set(clip.linkGroup, []);
+      groups.get(clip.linkGroup).push(clip);
+    }
+    for (const members of groups.values()) {
+      if (!members.some(crossing)) continue;
+      const [first] = members;
+      const intact = members.every((member) => crossing(member) && Math.abs(member.start - first.start) < 1e-6 &&
+        Math.abs(member.duration - first.duration) < 1e-6);
+      if (!intact) for (const member of members) delete member.linkGroup;
+    }
+    const regroup = regrouper();
+    const kept = [];
+    for (const clip of source.clips) {
+      if (!crossing(clip)) { kept.push(clip); continue; }
+      const head = clip.start < from - 1e-6, tail = clip.start + clip.duration > to + 1e-6;
+      if (head && tail) {
+        const middle = splitClipAt(clip, from);
+        kept.push(clip, regroup(splitClipAt(middle, to)));
+      } else if (head) {
+        splitClipAt(clip, from);
+        kept.push(clip);
+      } else if (tail) {
+        const right = splitClipAt(clip, to);
+        const native = {};
+        for (const key of ["premiereIndex", "premiereTrack"]) if (key in clip) native[key] = clip[key];
+        kept.push({...right, ...native, id: clip.id});
+      }
+    }
+    source.clips = kept;
+  }
+  // Open a gap for an insert edit on the target lanes and every sync-locked track.
+  function insertSpace(source, lanes, at, length) {
+    const regroup = regrouper();
+    const additions = [];
+    for (const clip of source.clips) {
+      if (trackLocked(clip.type, clip.track, source)) continue;
+      if (!lanes.has(laneOf(clip)) && !syncLocked(clip.type, clip.track, source)) continue;
+      if (clip.start >= at - 1e-5) clip.start += length;
+      else if (clip.start + clip.duration > at + 1e-5) {
+        const right = splitClipAt(clip, at);
+        if (!right) continue;
+        right.start += length;
+        additions.push(regroup(right));
+      }
+    }
+    source.clips.push(...additions);
+  }
+  // Cut the chosen clips at a frame. Members of a cut link group that lie wholly after
+  // the cut join the right-hand group, so J- and L-cuts stay linked to their own side.
+  function splitClips(source, ids, cut) {
+    const crossing = new Set(source.clips.filter((clip) => ids.has(clip.id) &&
+      clip.start < cut - 1e-6 && clip.start + clip.duration > cut + 1e-6).map((clip) => clip.id));
+    const groups = new Map();
+    for (const clip of source.clips)
+      if (crossing.has(clip.id) && clip.linkGroup && !groups.has(clip.linkGroup)) groups.set(clip.linkGroup, uid());
+    const rights = [];
+    for (const clip of source.clips) {
+      if (crossing.has(clip.id)) {
+        const right = splitClipAt(clip, cut);
+        if (!right) continue;
+        if (clip.linkGroup) right.linkGroup = groups.get(clip.linkGroup);
+        rights.push(right);
+      } else if (groups.has(clip.linkGroup) && clip.start >= cut - 1e-6) clip.linkGroup = groups.get(clip.linkGroup);
+    }
+    source.clips.push(...rights);
+    dropLoneLinks(source);
+    return rights;
+  }
+  // SMPTE drop-frame applies to the NTSC rates 29.97 and 59.94 only.
+  const isDropFrameRate = fps => Math.abs(fps - 30000/1001) < .001 || Math.abs(fps - 60000/1001) < .001;
+  const usesDropFrame = (source = project) => isDropFrameRate(source.fps) && source.dropFrame !== false;
+  function framesToTimecode(frames, fps, dropFrame) {
+    const nominal = Math.round(fps);
+    let count = Math.max(0, Math.round(frames));
+    if (dropFrame) {
+      // Skip frame labels 00 and 01 (00-03 at 59.94) each minute except every tenth.
+      const dropped = nominal / 15;
+      const perTenMinutes = nominal * 600 - dropped * 9, perMinute = nominal * 60 - dropped;
+      const tens = Math.floor(count / perTenMinutes), rest = count % perTenMinutes;
+      count += dropped * 9 * tens + (rest > dropped ? dropped * Math.floor((rest - dropped) / perMinute) : 0);
+    }
+    const whole = Math.floor(count / nominal);
+    const fields = [Math.floor(whole / 3600), Math.floor(whole / 60) % 60, whole % 60, count % nominal]
+      .map(value => String(value).padStart(2, "0"));
+    return fields.slice(0, 3).join(":") + (dropFrame ? ";" : ":") + fields[3];
+  }
+  function timecodeFields(text) {
+    const digits = text.replace(/[^\d:;.]/g, "");
+    const parts = /[:;.]/.test(digits) ? digits.split(/[:;.]/) :
+      digits.padStart(8, "0").match(/../g);
+    if (!parts || parts.length > 4 || parts.some(part => !/^\d{1,4}$/.test(part)))
+      throw new Error("Type a timecode such as 01:00:10:00.");
+    return [0, 0, 0, ...parts.map(Number)].slice(-4);
+  }
+  function timecodeToFrames(text, fps, dropFrame) {
+    const [hours, minutes, seconds, frames] = timecodeFields(text);
+    const nominal = Math.round(fps);
+    if (frames >= nominal || minutes > 59 || seconds > 59) throw new Error("That timecode is out of range for " + Number(fps.toFixed(3)) + " fps.");
+    const totalMinutes = hours * 60 + minutes;
+    let count = (totalMinutes * 60 + seconds) * nominal + frames;
+    if (dropFrame) count -= (nominal / 15) * (totalMinutes - Math.floor(totalMinutes / 10));
+    return count;
+  }
+  const defaultStartTimecode = (fps, dropFrame) => timecodeToFrames("01:00:00:00", fps, dropFrame);
   const Editor = {
-    formatTimecode(seconds, fps = 30) {
-      const frames = Math.max(0, Math.round((seconds || 0) * fps));
-      const nominal = Math.round(fps);
-      const whole = Math.floor(frames / nominal);
-      return [Math.floor(whole/3600),Math.floor(whole/60)%60,whole%60,frames%nominal]
-        .map(value=>String(value).padStart(2,'0')).join(':');
+    formatTimecode(seconds, fps = 30, dropFrame = isDropFrameRate(fps)) {
+      return framesToTimecode((seconds || 0) * fps, fps, dropFrame);
+    },
+    // Sequence timecode: the sequence start offset plus drop-frame labels when the rate uses them.
+    sequenceTimecode(seconds, source = project) {
+      return framesToTimecode(Math.round((seconds || 0) * source.fps) + (source.startTimecode || 0), source.fps, usesDropFrame(source));
+    },
+    parseSequenceTimecode(text, base = time) {
+      const value = String(text).trim();
+      const relative = /^[+-]/.test(value) ? (value[0] === "-" ? -1 : 1) : 0;
+      if (relative) {
+        const [hours, minutes, seconds, frames] = timecodeFields(value.slice(1));
+        const offset = ((hours * 60 + minutes) * 60 + seconds) * Math.round(project.fps) + frames;
+        return Math.round(base * project.fps + relative * offset) / project.fps;
+      }
+      const frames = timecodeToFrames(value, project.fps, usesDropFrame()) - (project.startTimecode || 0);
+      if (frames < 0) throw new Error("That timecode is before the sequence start.");
+      return frames / project.fps;
+    },
+    seekTimecode(text) { Editor.seek(Editor.parseSequenceTimecode(text)); },
+    isDropFrameRate,
+    setTimecodeSettings({startTimecode, dropFrame}) {
+      const drop = isDropFrameRate(project.fps) ? dropFrame !== false : undefined;
+      const start = timecodeToFrames(String(startTimecode), project.fps, drop === true);
+      Editor.editProject(next => {
+        next.startTimecode = start;
+        if (drop === undefined) delete next.dropFrame;
+        else next.dropFrame = drop;
+      });
     },
     get: () => ({
       project,
@@ -1142,49 +1445,71 @@
       activeClip: at("video", time),
       activeTitle: at("title", time),
       activeAudio: at("audio", time),
+      linkedSelection,
     }),
     drawFrame,
     refreshMedia() { syncMedia(true);notify(); },
     editProject(fn) {
-      const next=structuredClone(project);
-      fn(next); validateProject(next); assertLockedTracksUnchanged(project,next);
-      assertLinksStayAligned(project,next); assertNoNewOverlaps(project,next);
-      assertTransitionHandles(project,next);
-      if (JSON.stringify(project)===JSON.stringify(next)) return;
-      snapshot(); project=next;
-      project.duration=duration(); time=clamp(time,0,project.duration); syncMedia(true); notify();
+      const next = cloneState(project);
+      fn(next);
+      if (!linkingActive()) dropLoneLinks(next);
+      shareUnchanged(project, next);
+      validateProject(next);
+      assertLockedTracksUnchanged(project, next);
+      if (linkingActive()) assertLinksStayAligned(project, next);
+      assertNoNewOverlaps(project, next);
+      assertTransitionHandles(project, next);
+      if (sameValue(project, next)) return;
+      if (!gesture) remember(project);
+      project = next;
+      project.duration = duration();
+      time = clamp(time, 0, project.duration);
+      syncMedia(true);
+      notify();
     },
     isTrackLocked(track, kind) { return trackLocked(kind || (track < 0 ? "audio" : "video"), track); },
     isTrackSyncLocked(track, kind) { return syncLocked(kind || (track < 0 ? "audio" : "video"), track); },
+    isTrackHidden(track, kind) { return trackHidden(kind || (track < 0 ? "audio" : "video"), track); },
     setTrackState(track, kind, patch) {
       const key=trackKey(kind, track);
       const current={locked:false,syncLocked:true,...project.trackState?.[key]};
       const next={...current,...patch};
-      if (next.locked===current.locked && next.syncLocked===current.syncLocked) return;
-      if (typeof next.locked!=="boolean" || typeof next.syncLocked!=="boolean") throw new Error("Invalid track state.");
+      if (next.locked===current.locked && next.syncLocked===current.syncLocked && !!next.hidden===!!current.hidden) return;
+      if (typeof next.locked!=="boolean" || typeof next.syncLocked!=="boolean" ||
+          (next.hidden!==undefined && typeof next.hidden!=="boolean")) throw new Error("Invalid track state.");
+      if (next.hidden && kind==="audio") throw new Error("Mute audio tracks instead of hiding them.");
+      if (!next.hidden) delete next.hidden;
       snapshot(); project.trackState ||= {}; project.trackState[key]=next;
       if(track===4 && (kind==="title" || kind==="video"))
         project.trackState[trackKey(kind==="title"?"video":"title",4)]={...next};
+      lastPaintedFrame=-1;
+      syncMedia(true);
       notify();
     },
     updateTrackMix(track, patch) {
       const key=String(track);
       const next={ gain:100, pan:0, mute:false, solo:false, ...project.trackMix?.[key], ...patch };
       validateTrackMix(key,next);
-      if (JSON.stringify(next)===JSON.stringify(project.trackMix?.[key])) return;
+      if (sameValue(next, project.trackMix?.[key])) return;
       snapshot();
       project.trackMix ||= {};
       project.trackMix[key] = next;
       syncMedia(); notify();
     },
-    beginGesture() { if (gesture) return; gestureBefore=structuredClone(project); gesture=true; },
+    beginGesture() { if (gesture) return; gestureBefore=project; gesture=true; },
     endGesture() {
       if (!gesture) return;
       gesture=false;
-      if (JSON.stringify(gestureBefore)!==JSON.stringify(project)) {
-        history.push(gestureBefore);if(history.length>50) history.shift();future=[];revision++;
-      }
+      if (!sameValue(gestureBefore, project)) remember(gestureBefore);
       gestureBefore=null;notify();
+    },
+    get linkedSelection() { return linkedSelection; },
+    setLinkedSelection(enabled) { linkedSelection=!!enabled; notify(); },
+    // Run an edit with links ignored, e.g. an Alt-drag that trims one side of a linked pair.
+    withoutLinks(action) {
+      linkSuspended++;
+      try { return action(); }
+      finally { linkSuspended--; }
     },
     renameProject(name) { const next=String(name).trim(); if (!next || next===project.name) return; snapshot(); project.name=next; notify(); },
     setRate(rate) {
@@ -1292,7 +1617,9 @@
       const item={...original,...decoded,id:itemId,path:original.path||file.name};
       await SpliceMedia.remember(item);
       if(!project.media.includes(original)) throw Error('The active media changed during relink.');
-      snapshot();Object.assign(original,item);activeVideoId=null;syncMedia(true);notify();
+      snapshot();
+      Object.assign(project.media.find(m=>m.id===itemId),item);
+      activeVideoId=null;syncMedia(true);notify();
     },
     async relinkFolder(files) {
       const sequence=project;
@@ -1313,7 +1640,9 @@
       }
       if(sequence!==project)throw Error('The sequence changed during relinking. Choose the folder again.');
       await SpliceMedia.rememberMany(rows.map(row=>row.updated));
-      snapshot();rows.forEach(row=>Object.assign(row.item,row.updated));activeVideoId=null;syncMedia(true);notify();
+      snapshot();
+      for(const row of rows) Object.assign(project.media.find(m=>m.id===row.item.id),row.updated);
+      activeVideoId=null;syncMedia(true);notify();
     },
     async relinkMedia(files) {
       const matched=Array.from(files).filter(f=>project.media.some(m=>SpliceMedia.matches(m,f)));
@@ -1332,20 +1661,13 @@
                 .filter((c) => c.type === "video")
                 .map((c) => c.start + c.duration),
             ));
-      const clip = {
-        id: uid(),
-        mediaId: id,
-        start,
-        ...sourceSelection(item),
-        track: placement?.track ?? (item.type === "audio" ? -1 : 1),
-        type: item.type,
-        title: "",
-        color: { brightness: 100, contrast: 100, saturation: 100 },
-        volume: 100,
-        transition: "none",
-      };
-      Editor.editProject(next=>next.clips.push(clip));
-      selectedId = clip.id;
+      const selection = sourceSelection(item);
+      const track = placement?.track ?? (item.type === "audio" ? -1 : 1);
+      const sound = item.type === "audio" ? track :
+        hasSound(item) ? freeAudioTrack(project, start, start + selection.duration) : null;
+      const clips = sourceClips(item, selection, start, track, sound);
+      Editor.editProject(next=>next.clips.push(...clips));
+      selectedId = clips[0].id;
       notify();
     },
     updateClip(id, patch) {
@@ -1354,7 +1676,7 @@
       if ('track' in patch && (!Number.isInteger(patch.track) || Math.abs(patch.track)>64 ||
           (clip.type==='audio' ? patch.track>=0 : patch.track<=0))) throw Error('Choose a valid timeline track.');
       ensureEditable(clip, "track" in patch ? Number(patch.track) : clip.track);
-      if (Object.entries(patch).every(([key,value]) => JSON.stringify(clip[key])===JSON.stringify(value))) return;
+      if (Object.entries(patch).every(([key,value]) => sameValue(clip[key],value))) return;
       const linkedFields=["start","duration","in","speed","reverse"];
       const partners=linkedFields.some(key=>key in patch) ? linkedClips(clip) : [];
       const changes=[{id,patch}];
@@ -1401,11 +1723,15 @@
       const clip=project.clips.find(c=>c.id===id);
       if(!clip)return;
       if(clip.nativeTimeRemap)throw Error('Edit this Premiere speed curve in Premiere.');
-      if(!Number.isFinite(speed) || speed<.1 || speed>8)throw Error('Choose a clip speed between 10% and 800%.');
+      if(!Number.isFinite(speed) || speed<.1 || speed>16)throw Error('Choose a clip speed between 10% and 1600%.');
       const oldSpeed=Number(clip.speed)||1;
       if(Math.abs(speed-oldSpeed)<1e-6)return;
       const sourceLength=clip.duration*oldSpeed;
-      const frames=Math.floor(sourceLength*project.fps/speed+1e-6);
+      // Nearest whole timeline frame, unless rounding up would read past the end of the source.
+      const item=mediaOf(clip);
+      const available=item?.still || !item?.duration ? Infinity : item.duration-clip.in;
+      let frames=Math.round(sourceLength*project.fps/speed);
+      if(frames*speed/project.fps>available+.01) frames=Math.floor(sourceLength*project.fps/speed+1e-6);
       if(frames<1)throw Error('This speed would make the clip shorter than a timeline frame.');
       Editor.updateClip(id,{speed,duration:frames/project.fps});
     },
@@ -1506,6 +1832,268 @@
       if (!shift) return;
       Editor.editProject(next=>{for(const member of next.clips.filter(c=>members.some(m=>m.id===c.id)))member.in=Math.max(0,member.in+shift);});
     },
+    // Slide: move a clip between its neighbours, which give and take the frames.
+    slideClip(id, delta) {
+      const clip = project.clips.find((c) => c.id === id);
+      if (!clip) return;
+      const frame = frameSeconds(), near = .5 / project.fps;
+      const parts = [clip, ...linkedClips(clip)].map((member) => {
+        const lane = project.clips.filter((other) => other.id !== member.id && laneOf(other) === laneOf(member));
+        const end = member.start + member.duration;
+        return {member, lane,
+          before: lane.find((other) => Math.abs(other.start + other.duration - member.start) < near),
+          after: lane.find((other) => Math.abs(other.start - end) < near)};
+      });
+      let lower = -Infinity, upper = Infinity;
+      for (const {member, lane, before, after} of parts) {
+        for (const item of [member, before, after]) if (item) ensureEditable(item);
+        const end = member.start + member.duration;
+        if (before) {
+          lower = Math.max(lower, frame - before.duration);
+          upper = Math.min(upper, roomAfter(before));
+        } else {
+          lower = Math.max(lower, Math.max(0, ...lane.filter((other) => other.start < member.start)
+            .map((other) => other.start + other.duration)) - member.start);
+        }
+        if (after) {
+          upper = Math.min(upper, after.duration - frame);
+          lower = Math.max(lower, -roomBefore(after));
+        } else {
+          upper = Math.min(upper, Math.min(Infinity, ...lane.filter((other) => other.start >= end - near)
+            .map((other) => other.start)) - end);
+        }
+      }
+      const shift = clamp(snap(delta), Math.ceil((lower - 1e-7) * project.fps) * frame, Math.floor((upper + 1e-7) * project.fps) * frame);
+      if (!Number.isFinite(shift) || Math.abs(shift) < 1e-7) return;
+      const before = project;
+      Editor.editProject((next) => {
+        const find = (item) => next.clips.find((other) => other.id === item.id);
+        const original = (item) => before.clips.find((other) => other.id === item.id);
+        for (const part of parts) {
+          const member = find(part.member);
+          member.start = snap(member.start + shift);
+          if (part.before) {
+            const left = find(part.before), speed = Number(left.speed) || 1;
+            left.duration = snap(left.duration + shift);
+            if (left.reverse) left.in = Math.max(0, left.in - shift * speed);
+            resizeKeyframes(left, original(left), 0);
+          }
+          if (part.after) {
+            const right = find(part.after), speed = Number(right.speed) || 1;
+            right.start = snap(right.start + shift);
+            right.duration = snap(right.duration - shift);
+            if (!right.reverse) right.in = Math.max(0, right.in + shift * speed);
+            resizeKeyframes(right, original(right), shift);
+          }
+        }
+      });
+    },
+    // Edit points (clip starts and ends) in timeline order, for Up/Down navigation.
+    editPoints() {
+      const points = new Set([0]);
+      for (const clip of project.clips) {
+        points.add(Math.round(clip.start * project.fps));
+        points.add(Math.round((clip.start + clip.duration) * project.fps));
+      }
+      return [...points].sort((a, b) => a - b).map((frame) => frame / project.fps);
+    },
+    // Timeline In/Out marks, in seconds on frame boundaries.
+    setMark(edge, at = time) {
+      if (!["in", "out"].includes(edge)) throw new Error("Choose an In or Out mark.");
+      const marks = {...project.marks};
+      if (at === null) delete marks[edge];
+      else {
+        if (!Number.isFinite(Number(at))) throw new Error("Choose a timeline position.");
+        marks[edge] = Math.max(0, snap(at));
+        // A new mark that crosses the other one replaces it, as in Premiere.
+        if (Number.isFinite(marks.in) && Number.isFinite(marks.out) && marks.out <= marks.in) delete marks[edge === "in" ? "out" : "in"];
+      }
+      if (sameValue(marks, project.marks || {})) return;
+      snapshot();
+      project.marks = marks;
+      notify();
+    },
+    clearMarks() {
+      if (!project.marks || !Object.keys(project.marks).length) return;
+      snapshot();
+      delete project.marks;
+      notify();
+    },
+    markClip(id = selectedId) {
+      const clip = project.clips.find((c) => c.id === id) || at("video", time);
+      if (!clip) throw new Error("Select a clip to mark its range.");
+      snapshot();
+      project.marks = {in: clip.start, out: snap(clip.start + clip.duration)};
+      notify();
+    },
+    // Three- and four-point editing from a source into the timeline.
+    // Ranges come from the source In/Out and the timeline In/Out; with both timeline marks
+    // the timeline decides the length (back-timed from a lone source Out, or fit to fill
+    // when all four marks disagree); with a lone timeline Out the edit is back-timed.
+    placeSource(id, {mode = "overwrite", track, audioTrack = null, marks} = {}) {
+      const item = project.media.find((entry) => entry.id === id);
+      if (!item) throw new Error("Media is unavailable.");
+      if (!["insert", "overwrite", "append"].includes(mode)) throw new Error("Choose insert, overwrite or append.");
+      const pictureTrack = item.type === "video" ? Number(track) : null;
+      const soundTrack = item.type === "audio" ? Number(track) : hasSound(item) && audioTrack != null ? Number(audioTrack) : null;
+      const lanes = new Set();
+      if (pictureTrack !== null) lanes.add("video:" + pictureTrack);
+      if (soundTrack !== null) lanes.add("audio:" + soundTrack);
+      for (const lane of lanes) {
+        const {kind, track: number} = startOfLane(lane);
+        if (!Number.isInteger(number) || !number || Math.abs(number) > 64 || (kind === "audio") !== number < 0)
+          throw new Error("Choose a valid timeline track.");
+        if (trackLocked(kind, number)) throw new Error(`Unlock ${kind} track ${Math.abs(number)} before editing.`);
+      }
+      const frame = frameSeconds();
+      const sourceMarks = marks ?? item.sourceMarks ?? {};
+      const hasIn = Number.isFinite(sourceMarks.in), hasOut = Number.isFinite(sourceMarks.out);
+      const range = sourceSelection(item, sourceMarks, item.sourceAudioStream);
+      const timeline = project.marks || {};
+      const timelineIn = Number.isFinite(timeline.in) ? timeline.in : null;
+      const timelineOut = Number.isFinite(timeline.out) ? timeline.out : null;
+      let start, length = range.duration, sourceIn = range.in, speed = 1, method = "playhead";
+      if (mode === "append") {
+        start = Math.max(0, ...project.clips.filter((clip) => lanes.has(laneOf(clip))).map((clip) => clip.start + clip.duration));
+        method = "append";
+      } else if (timelineIn !== null && timelineOut !== null) {
+        start = timelineIn;
+        length = Math.round((timelineOut - timelineIn) * project.fps) / project.fps;
+        if (hasIn && hasOut && Math.abs(range.duration - length) >= frame / 2) {
+          speed = range.duration / length;
+          if (speed < .1 || speed > 16) throw new Error("Fitting this source range to the timeline range needs a speed outside 10% to 1600%.");
+          method = "fit to fill";
+        } else if (!hasIn && hasOut) {
+          sourceIn = sourceMarks.out - length;
+          method = "back-timed from source Out";
+        } else method = "timeline In/Out";
+      } else if (timelineIn !== null) {
+        start = timelineIn;
+        method = "timeline In";
+      } else if (timelineOut !== null) {
+        start = timelineOut - length;
+        method = "back-timed from timeline Out";
+      } else start = time;
+      start = snap(start);
+      if (start < 0) throw new Error("The edit would start before the beginning of the sequence.");
+      if (sourceIn < -1e-6) throw new Error("The source has too little media before its Out mark for this range.");
+      if (!item.still && item.duration && sourceIn + length * speed > item.duration + .01)
+        throw new Error("The source has too little media after its In mark to fill the timeline range.");
+      const selection = {...range, in: Math.max(0, sourceIn), duration: length};
+      if (speed !== 1) selection.speed = speed;
+      const placed = [];
+      Editor.editProject((next) => {
+        if (mode === "insert") insertSpace(next, lanes, start, length);
+        else clearRange(next, lanes, start, start + length);
+        const clips = sourceClips(item, selection, start, pictureTrack, soundTrack);
+        next.clips.push(...clips);
+        placed.push(...clips);
+      });
+      selectedId = placed[0]?.id ?? selectedId;
+      notify();
+      return {start, duration: length, speed, method, clips: placed.map((clip) => clip.id)};
+    },
+    // Lift leaves a gap; extract closes it. Both act on every unlocked track.
+    liftRange({extract = false} = {}) {
+      const {in: from, out: to} = project.marks || {};
+      if (!Number.isFinite(from) || !Number.isFinite(to)) throw new Error("Mark a timeline In and Out first (I and O).");
+      const lanes = new Set(project.clips.filter((clip) => !trackLocked(clip.type, clip.track)).map(laneOf));
+      Editor.editProject((next) => {
+        clearRange(next, lanes, from, to);
+        if (!extract) return;
+        for (const clip of next.clips)
+          if (lanes.has(laneOf(clip)) && clip.start >= to - 1e-6) clip.start = snap(clip.start - (to - from));
+        delete next.marks;
+      });
+      if (extract) Editor.seek(from);
+    },
+    // Add an edit at the playhead on every unlocked track.
+    addEditAll() {
+      const cut = snap(time);
+      const ids = new Set(project.clips.filter((clip) => !trackLocked(clip.type, clip.track) &&
+        clip.start < cut - 1e-6 && clip.start + clip.duration > cut + 1e-6).map((clip) => clip.id));
+      if (!ids.size) return;
+      Editor.withoutLinks(() => Editor.editProject((next) => splitClips(next, ids, cut)));
+    },
+    // Ctrl/Cmd+L. Unlinks linked clips, separates a camera clip's embedded sound,
+    // or links the selected picture and sound clips.
+    toggleLink(ids) {
+      const chosen = project.clips.filter((clip) => ids.includes(clip.id));
+      if (!chosen.length) return null;
+      const groups = new Set(chosen.map((clip) => clip.linkGroup).filter(Boolean));
+      if (groups.size) {
+        for (const clip of project.clips) if (groups.has(clip.linkGroup)) ensureEditable(clip);
+        Editor.editProject((next) => {
+          for (const clip of next.clips) if (groups.has(clip.linkGroup)) delete clip.linkGroup;
+        });
+        return "unlinked";
+      }
+      if (chosen.length === 1) {
+        const [clip] = chosen;
+        if (!hasEmbeddedAudio(clip)) throw new Error("Select a picture clip and a sound clip to link them.");
+        ensureEditable(clip);
+        Editor.editProject((next) => {
+          const picture = next.clips.find((item) => item.id === clip.id);
+          const sound = detachAudio(next, picture);
+          delete picture.linkGroup;
+          delete sound.linkGroup;
+        });
+        return "separated";
+      }
+      if (chosen.some((clip) => clip.type === "title")) throw new Error("Titles cannot be linked.");
+      for (const clip of chosen) ensureEditable(clip);
+      const group = uid();
+      Editor.editProject((next) => {
+        for (const clip of next.clips) if (ids.includes(clip.id)) clip.linkGroup = group;
+      });
+      return "linked";
+    },
+    // Give an embedded camera clip a linked audio clip (used before trimming one side).
+    detachAudio(id) {
+      const clip = project.clips.find((c) => c.id === id);
+      if (!clip || !hasEmbeddedAudio(clip)) return null;
+      ensureEditable(clip);
+      let sound;
+      Editor.editProject((next) => { sound = detachAudio(next, next.clips.find((item) => item.id === id)); });
+      return sound.id;
+    },
+    hasEmbeddedAudio: (clip) => hasEmbeddedAudio(clip),
+    syncOffset: (clip) => syncOffset(clip)?.frames ?? null,
+    // Put a drifted linked clip back in sync by moving it or by slipping its source.
+    bringIntoSync(id, how = "move") {
+      const clip = project.clips.find((c) => c.id === id);
+      const offset = clip && syncOffset(clip);
+      if (!offset?.frames) return;
+      const shift = offset.frames / project.fps;
+      Editor.withoutLinks(() => {
+        if (how === "slip") Editor.slipClip(id, shift * (Number(clip.speed) || 1));
+        else Editor.updateClip(id, {start: clip.start - shift});
+      });
+      if (syncOffset(project.clips.find((c) => c.id === id))?.frames)
+        throw new Error(how === "slip" ? "Not enough source media to slip this clip into sync." : "Another clip is in the way of moving this clip into sync.");
+    },
+    // Return every effect and adjustment on a clip to its default.
+    resetClip(id) {
+      const clip = project.clips.find((c) => c.id === id);
+      if (!clip) return;
+      ensureEditable(clip);
+      Editor.editProject((next) => {
+        const target = next.clips.find((c) => c.id === id);
+        for (const key of ["pan", "opacity", "transform", "keyframes", "fadeIn", "fadeOut", "transitionBefore",
+          "transitionDuration", "transitionMatchName"]) delete target[key];
+        target.volume = 100;
+        target.transition = "none";
+        if (target.type === "video") target.color = {brightness: 100, contrast: 100, saturation: 100};
+        else if (target.type === "title") target.color = {};
+      });
+      const current = project.clips.find((c) => c.id === id);
+      if (current.reverse) Editor.updateClip(id, {reverse: false});
+      if ((Number(current.speed) || 1) === 1 || current.nativeTimeRemap) return;
+      try { Editor.setClipSpeed(id, 1); }
+      catch (error) {
+        throw new Error("Effects were reset, but speed stays at " + Math.round(current.speed * 100) + "%: " + error.message);
+      }
+    },
     splitClipAt,
     split() {
       const clip = selected() || at("video", time);
@@ -1513,16 +2101,8 @@
       if (!clip || cut <= clip.start || cut >= clip.start + clip.duration)
         return;
       ensureLinkedEditable(clip);
-      const members=[clip,...linkedClips(clip)];
-      const rightGroup=clip.linkGroup?uid():null;
-      Editor.editProject(next=>{
-        for(const member of next.clips.filter(c=>members.some(m=>m.id===c.id))){
-          const right=splitClipAt(member,cut);
-          if (!right) throw new Error("Linked clip does not cross the playhead.");
-          if(rightGroup)right.linkGroup=rightGroup;
-          next.clips.push(right);
-        }
-      });
+      const ids=new Set([clip,...linkedClips(clip)].map(member=>member.id));
+      Editor.withoutLinks(()=>Editor.editProject(next=>splitClips(next,ids,cut)));
       time = cut;
     },
     deleteClips(ids, {ripple=false} = {}) {
@@ -1593,7 +2173,7 @@
     },
     undo() {
       if (!history.length) return;
-      future.push(structuredClone(project));
+      future.push(project);
       project = history.pop();
       revision += 1;
       time=clamp(time,0,duration());
@@ -1603,7 +2183,7 @@
     },
     redo() {
       if (!future.length) return;
-      history.push(structuredClone(project));
+      history.push(project);
       project = future.pop();
       revision += 1;
       time=clamp(time,0,duration());
@@ -1622,6 +2202,8 @@
         width,
         height,
         fps,
+        // New sequences start at 01:00:00:00 like broadcast masters; older projects keep 00:00:00:00.
+        startTimecode: defaultStartTimecode(fps, isDropFrameRate(fps)),
         trackCounts: {video: 4, audio: 3},
         media: [],
         clips: [],
