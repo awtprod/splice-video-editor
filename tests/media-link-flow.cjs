@@ -1,7 +1,8 @@
 /* Link media in place through the in-app picker: no copy, playback, reopen,
    offline after a move, relink through the picker, and the media cache view. */
 const assert = require('node:assert/strict');
-const {spawn, execFileSync} = require('node:child_process');
+const {execFileSync} = require('node:child_process');
+const {startSplice} = require('./splice-server.cjs');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -25,16 +26,9 @@ async function main() {
     '-i', 'sine=440:sample_rate=48000:d=3', '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
     '-c:a', 'aac', '-movflags', '+faststart', original], {timeout: 60000});
   const originalHash = digest(original);
-  const server = spawn('python3', ['-u', 'server.py', '--port', '0'], {
-    cwd: root, env: {...process.env, HOME: temp, XDG_DATA_HOME: temp, SPLICE_DATA_DIR: data}, stdio: ['ignore', 'pipe', 'pipe']});
-  let browser, logs = '';
-  server.stderr.on('data', chunk => { logs = (logs + chunk).slice(-4000); });
+  const splice = await startSplice({root, env: {HOME: temp, XDG_DATA_HOME: temp, SPLICE_DATA_DIR: data}});
+  let browser;
   try {
-    const url = await new Promise((resolve, reject) => {
-      server.stdout.once('data', d => resolve(d.toString().trim()));
-      server.once('error', reject);
-      server.once('exit', code => reject(Error('Server exited ' + code + ' ' + logs)));
-    });
     const executablePath = [process.env.SPLICE_CHROME, '/opt/google/chrome/chrome', '/usr/bin/chromium', '/usr/bin/google-chrome',
       chromium.executablePath()].find(p => p && fs.existsSync(p));
     assert.ok(executablePath, 'Install Chromium or set SPLICE_CHROME');
@@ -44,8 +38,7 @@ async function main() {
     const errors = [];
     page.on('pageerror', e => errors.push(e.message));
     page.on('dialog', d => d.accept());
-    await page.goto(url);
-    await page.evaluate(() => SpliceSession.ready);
+    await splice.open(page);
 
     // Pick the file through the in-app browser: File → Link media in place.
     const pick = async (folder, button) => {
@@ -115,8 +108,7 @@ async function main() {
     console.log('Linked in place without a copy, played, reopened, went offline after a move, relinked through the picker.');
   } finally {
     await browser?.close();
-    server.kill('SIGTERM');
-    await new Promise(resolve => server.exitCode !== null ? resolve() : server.once('exit', resolve));
+    await splice.stop();
     fs.rmSync(temp, {recursive: true, force: true});
   }
 }

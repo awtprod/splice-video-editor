@@ -6,9 +6,10 @@ from the Splice page this server handed out:
 * ``Sec-Fetch-Site``, when the browser sends it, must be ``same-origin`` or
   ``none``. Pages on other sites, including other localhost ports, are
   refused even for <img>/<audio> GETs that carry no Origin header.
-* A per-launch session cookie (HttpOnly, SameSite=Strict) that the server
-  sets only on a top-level navigation to the app (desktop app: only through
-  its one-time launch link). Media elements and downloads carry it.
+* A per-launch session cookie (HttpOnly, SameSite=Strict). The only way to
+  get it is the one-time launch link ``/?launch=<token>``: the desktop
+  launcher opens it, and ``python3 server.py`` prints it. Media elements and
+  downloads carry the cookie.
 * An ``X-Splice-Token`` header, carrying a per-launch token embedded in the
   app page, on every /api/ request except the two routes that <video> and
   download links read directly.
@@ -18,12 +19,12 @@ function with @get(path) or @post(path).
 """
 import argparse
 import hmac
-from http.cookies import CookieError, SimpleCookie
 import os
 import re
 import secrets
 import shutil
 import signal
+import sys
 from export_jobs import ExportJobs
 import json
 import hashlib
@@ -40,7 +41,6 @@ from premiere import open_project, save_project
 ROOT = Path(__file__).resolve().parent
 from premiere import MEDIA_ROOT
 import media_links
-from media_links import resolve_media
 from media_proxy import audition_audio, decodable, describe, nested_preview, proxy
 from media_peaks import waveform
 
@@ -54,7 +54,19 @@ TOKEN_HEADER = 'X-Splice-Token'
 # Read by <video> elements and download links, which cannot send a header.
 ELEMENT_ROUTES = re.compile(r'/api/exports/[a-f0-9]{32}/(?:file|preview)')
 FORBIDDEN_PAGE = (b'<!doctype html><meta charset="utf-8"><title>Splice</title>'
-                  b'<p>Open Splice from its launcher, or from the address printed by <code>server.py</code>.</p>')
+                  b'<h1>Open Splice from its launch link</h1>'
+                  b'<p>For your security this address only works in the browser that opened Splice\'s one-time '
+                  b'launch link. Use the desktop launcher, or open the full link that <code>python3 server.py</code> '
+                  b'printed in its terminal (it ends in <code>?launch=</code> and a code). If you already used that '
+                  b'link in another browser, stop the server and start it again for a new one.</p>')
+# A launch from a page on another origin (the desktop launcher's local
+# redirect file) arrives cross-site, and a SameSite=Strict cookie is not sent
+# on the rest of that redirect chain. This page continues as a same-origin
+# navigation instead.
+CONTINUE_PAGE = (b'<!doctype html><meta charset="utf-8"><title>Splice</title>'
+                 b'<meta http-equiv="refresh" content="0;url=/"><script>location.replace("/")</script>'
+                 b'<p><a href="/">Open Splice</a></p>')
+LAUNCH_PARAMETER = re.compile(r'(launch=)[^&\s"]*')
 
 GET_ROUTES = {}
 POST_ROUTES = {}
@@ -124,13 +136,36 @@ def media_cache(handler, query):
 
 @post('/api/media/cache/prune')
 def prune_cache(handler, body):
+    """Derived files (proxies, previews) only. Imported copies are deleted
+    one by one through /api/media/cache/delete."""
     payload = _json_body(body)
     handler._json(200, media_links.prune(payload.get('referenced')))
 
 
+@post('/api/media/cache/delete')
+def delete_cache_entries(handler, body):
+    payload = _json_body(body)
+    if payload.get('confirm') is not True:
+        raise ValueError('Confirm that imported copies cannot be rebuilt')
+    handler._json(200, media_links.delete_entries(payload.get('ids')))
+
+
+@post('/api/media/links/forget')
+def forget_links(handler, body):
+    """Forget linked originals (the files are not touched): the listed ids,
+    or every link the listed project sources do not use."""
+    payload = _json_body(body)
+    if isinstance(payload.get('ids'), list):
+        removed = media_links.forget(payload['ids'])
+    else:
+        removed = media_links.forget_unreferenced(payload.get('referenced'))
+    handler._json(200, {'forgotten': len(removed)})
+
+
 @post('/api/media/link', limit=MAX_SMALL_BODY)
 def link_media(handler, body):
-    """Reference user-picked originals in place. No bytes are copied."""
+    """Reference user-picked originals in place. No bytes are copied. The
+    registry is written once for the whole batch."""
     payload = _json_body(body)
     if isinstance(payload.get('folder'), str):
         chosen = media_links.folder_files(payload['folder'])
@@ -139,14 +174,10 @@ def link_media(handler, body):
         if not isinstance(paths, list) or not 0 < len(paths) <= media_links.MAX_LINK_BATCH:
             raise ValueError(f'Choose between 1 and {media_links.MAX_LINK_BATCH} files')
         chosen = [(path, None) for path in paths]
-    linked = []
-    for path, relative in chosen:
-        try:
-            entry = media_links.link(path, validate=decodable)
-            linked.append({**entry, 'name': Path(entry['sourcePath']).name, 'relativePath': relative})
-        except (ValueError, OSError) as error:
-            linked.append({'error': str(error), 'name': Path(str(path)).name, 'relativePath': relative})
-    handler._json(200, {'files': linked})
+    results = media_links.link_many([path for path, _ in chosen], validate=decodable)
+    linked = [{**result, 'name': Path(result['sourcePath']).name if 'sourcePath' in result else Path(str(path)).name,
+               'relativePath': relative} for result, (path, relative) in zip(results, chosen)]
+    handler._json(200, {'files': linked, 'notice': media_links.recovery_notice()})
 
 
 @post('/api/media/upload', limit=MAX_MEDIA, stream=True)
@@ -175,6 +206,7 @@ def upload_media(handler, length, query):
         decodable(temporary, name)
         directory = MEDIA_ROOT / digest.hexdigest()[:32]
         directory.mkdir(mode=0o700, exist_ok=True)
+        media_links.mark(directory, 'import')
         destination = directory / name
         try:
             os.link(temporary, destination)
@@ -260,12 +292,23 @@ class Handler(BaseHTTPRequestHandler):
         return self.headers.get('Sec-Fetch-Site') in (None, 'same-origin', 'none')
 
     def _session(self):
-        try:
-            cookie = SimpleCookie(self.headers.get('Cookie', ''))
-        except CookieError:
-            return False
-        morsel = cookie.get(self.server.cookie_name)
-        return morsel is not None and hmac.compare_digest(morsel.value.encode(), self.server.session.encode())
+        """Any cookie named like ours holding this launch's session. Parsed
+        by hand: cookies on 127.0.0.1 are shared by every local port, and
+        http.cookies stops at the first value another app formats loosely
+        (JSON, spaces, non-ASCII), which would lock Splice out."""
+        expected = self.server.session.encode()
+        found = False
+        for header in self.headers.get_all('Cookie') or ():
+            for pair in header.split(';'):
+                name, separator, value = pair.partition('=')
+                if separator and name.strip() == self.server.cookie_name:
+                    value = value.strip().strip('"').encode('utf-8', 'surrogateescape')
+                    found = hmac.compare_digest(value, expected) or found
+        return found
+
+    def log_message(self, format, *args):
+        # Launch links are secrets until used: never write them to the log.
+        super().log_message('%s', LAUNCH_PARAMETER.sub(r'\1…', format % args))
 
     def _authorized(self, path):
         if not (self._local_request() and self._same_site_fetch() and self._session()):
@@ -326,8 +369,8 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith('/media/'):
             # Managed copies and proxies, or originals the user linked.
             try:
-                target = resolve_media(parts.path)
-            except ValueError:
+                source = media_links.open_media(parts.path)
+            except (ValueError, OSError):
                 self.send_error(404)
                 return
         else:
@@ -336,35 +379,41 @@ class Handler(BaseHTTPRequestHandler):
                     or '.git' in target.parts or 'vendor' in target.parts):
                 self.send_error(404)
                 return
-        mime = mimetypes.guess_type(target.name)[0] or 'application/octet-stream'
-        if path.startswith('/media/') and (not mime.startswith(('video/', 'audio/', 'image/')) or mime == 'image/svg+xml'):
-            mime = 'application/octet-stream'  # User files never render as pages on this origin.
-        with target.open('rb') as source:
+            source = target.open('rb')
+        with source:
+            mime = mimetypes.guess_type(Path(source.name).name)[0] or 'application/octet-stream'
+            if path.startswith('/media/') and (not mime.startswith(('video/', 'audio/', 'image/')) or mime == 'image/svg+xml'):
+                mime = 'application/octet-stream'  # User files never render as pages on this origin.
             self._serve_file(source, mime)
 
     def _serve_app(self, query):
-        """The only response that hands out the session cookie and page token."""
+        """The only responses that hand out the session cookie (the one-time
+        launch link) and the page token (the app page, to that cookie)."""
         server = self.server
         launch = query.get('launch', [''])[0]
+        page_headers = [('X-Frame-Options', 'DENY'), ('Referrer-Policy', 'no-referrer'),
+                        ('X-Content-Type-Options', 'nosniff')]
         if launch:
-            if server.launch_token is None or not server.claim_launch(launch):
-                self._reply(403, FORBIDDEN_PAGE, 'text/html; charset=utf-8')
-                return
-            self._reply(303, b'', 'text/plain', [('Location', '/'), ('Set-Cookie', server.cookie())])
+            if server.claim_launch(launch):
+                # The token is the proof, so a browser that sends no
+                # Sec-Fetch headers (Safari < 16.4, Firefox < 90) can launch.
+                cookie = [('Set-Cookie', server.cookie())]
+                if self._same_site_fetch():
+                    self._reply(303, b'', 'text/plain', cookie + [('Location', '/')] + page_headers)
+                else:
+                    self._reply(200, CONTINUE_PAGE, 'text/html; charset=utf-8', cookie + page_headers)
+            elif self._session() and self._same_site_fetch():
+                # The printed link opened again in the browser that used it.
+                self._reply(303, b'', 'text/plain', [('Location', '/')] + page_headers)
+            else:
+                self._reply(403, FORBIDDEN_PAGE, 'text/html; charset=utf-8', page_headers)
             return
-        navigation = (self.headers.get('Sec-Fetch-Mode') == 'navigate' and
-                      self.headers.get('Sec-Fetch-Site') in ('none', 'same-origin'))
-        if self._session() and self._same_site_fetch():
-            headers = []
-        elif navigation and server.launch_token is None:
-            headers = [('Set-Cookie', server.cookie())]
-        else:
-            self._reply(403, FORBIDDEN_PAGE, 'text/html; charset=utf-8')
+        if not (self._session() and self._same_site_fetch()):
+            self._reply(403, FORBIDDEN_PAGE, 'text/html; charset=utf-8', page_headers)
             return
         page = (ROOT / 'index.html').read_bytes().replace(
             b'<head>', b'<head>\n    <meta name="splice-token" content="' + server.page_token.encode() + b'" />', 1)
-        self._reply(200, page, 'text/html; charset=utf-8',
-                    headers + [('X-Frame-Options', 'DENY'), ('Referrer-Policy', 'no-referrer')])
+        self._reply(200, page, 'text/html; charset=utf-8', page_headers)
 
     def _serve_file(self, source, mime, disposition=None):
         size = os.fstat(source.fileno()).st_size
@@ -451,7 +500,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class StudioServer(ThreadingHTTPServer):
-    def __init__(self, *args, launch_token=None):
+    def __init__(self, *args, launch_token):
         self.jobs = ExportJobs()
         # Per-launch secrets. The cookie proves a request comes from a page
         # this server served; the page token proves a fetch was made by it.
@@ -460,20 +509,27 @@ class StudioServer(ThreadingHTTPServer):
         self.launch_token = launch_token
         self._launch_claimed = False
         self._launch_lock = threading.Lock()
+        self.on_launch = None
         super().__init__(*args)
         self.cookie_name = f'splice_session_{self.server_port}'
 
     def cookie(self):
         return f'{self.cookie_name}={self.session}; Path=/; HttpOnly; SameSite=Strict'
 
+    def launch_url(self):
+        return f'http://127.0.0.1:{self.server_port}/?launch={self.launch_token}'
+
     def claim_launch(self, token):
-        """The desktop launch link works once, so seeing it in a process
-        list afterwards grants nothing."""
+        """The launch link works once, so a copy seen later (shell history,
+        a process list, browser history) grants nothing."""
         with self._launch_lock:
-            if self._launch_claimed or not hmac.compare_digest(token.encode(), self.launch_token.encode()):
+            if self._launch_claimed or not hmac.compare_digest(token.encode('utf-8', 'replace'),
+                                                               self.launch_token.encode()):
                 return False
             self._launch_claimed = True
-            return True
+        if self.on_launch:
+            self.on_launch()
+        return True
 
     def server_close(self):
         self.jobs.shutdown()
@@ -481,10 +537,9 @@ class StudioServer(ThreadingHTTPServer):
 
 
 def create_server(port=0, launch_token=None):
-    """``launch_token`` (desktop app): the session cookie is issued only by
-    the one-time ``/?launch=<token>`` link. Without it (``python3 server.py``)
-    a top-level navigation the user made in their browser receives it."""
-    return StudioServer(('127.0.0.1', port), Handler, launch_token=launch_token)
+    """The session cookie is issued only by the one-time launch link,
+    ``server.launch_url()``. ``launch_token`` defaults to a fresh secret."""
+    return StudioServer(('127.0.0.1', port), Handler, launch_token=launch_token or secrets.token_urlsafe(32))
 
 def _exit_on_terminate(signum, frame):
     raise KeyboardInterrupt
@@ -496,7 +551,10 @@ if __name__ == '__main__':
     server = create_server(args.port)
     with server:
         signal.signal(signal.SIGTERM,_exit_on_terminate)
-        print(f'http://127.0.0.1:{server.server_port}', flush=True)
+        # The first stdout line is the one-time launch link (tests read it).
+        print(server.launch_url(), flush=True)
+        print('Open the link above in your browser to start Splice. It works once; restart the server for a new '
+              f'one. http://127.0.0.1:{server.server_port}/ alone is refused.', file=sys.stderr, flush=True)
         try:
             server.serve_forever()
         except KeyboardInterrupt:

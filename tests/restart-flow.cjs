@@ -31,7 +31,7 @@ async function stop(child){if(child.exitCode!==null||child.signalCode)return;con
    const browser=await chromium.connectOverCDP('http://127.0.0.1:'+port,{timeout:8000});
    const context=browser.contexts()[0];
    const page=context.pages()[0]||await context.newPage();
-   if(page.url()!==u+'/')await page.goto(u);
+   if(page.url()!==new URL(u).origin+'/')await page.goto(u);
    await page.waitForFunction(()=>window.SpliceSession);
    await page.evaluate(()=>SpliceSession.ready);
    return page;
@@ -49,8 +49,10 @@ async function stop(child){if(child.exitCode!==null||child.signalCode)return;con
   await bounded(pending,'Save request was not sent');
   await stop(chrome);
   await stop(server);
-  assert.equal(await startServer(new URL(url).port),url);
-  p=await app(url);
+  // A new launch on the same port (and so the same browser storage origin).
+  const relaunch=await startServer(new URL(url).port);
+  assert.equal(new URL(relaunch).origin,new URL(url).origin);
+  p=await app(url=relaunch);
   const recovered=await p.evaluate(()=>Editor.get().project.name);
   assert.equal(recovered,name);
   if (process.env.SPLICE_PROOF_DIR) {

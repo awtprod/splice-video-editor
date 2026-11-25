@@ -94,12 +94,14 @@ window.SpliceMedia = (() => {
   }
   // A picked original stays where it is. Picker entries look like Files to
   // the editor (name, webkitRelativePath) and carry the absolute path.
+  let noticeShown = false;
   async function link(file) {
     if (file.spliceLinked) return file.spliceLinked;
     const response = await fetch('/api/media/link', {method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({paths:[file.splicePath]}),signal:AbortSignal.timeout(120000)});
     const result = await response.json();
     const entry = result.files?.[0];
+    if (result.notice && !noticeShown) { noticeShown = true; window.alert(result.notice); }
     if (!response.ok || !entry || entry.error || !localMedia(entry.src)) throw Error(entry?.error || result.error || 'Could not link '+file.name+'.');
     return entry;
   }

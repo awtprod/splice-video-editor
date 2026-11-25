@@ -252,12 +252,28 @@ window.SpliceSession = (() => {
     touched = savedRevision!==editor.get().revision;
     await persist(true);
   }
-  async function prune() {
+  // While "Recent projects & recovery" is open in any tab, nothing listed
+  // there may disappear: the dialog holds a shared lock and pruning runs only
+  // when it can take the lock exclusively at once (otherwise it skips; the
+  // next start or list does it).
+  const LIST_LOCK = 'splice-recovery-list';
+  let listing = 0;
+  function whileListed(work) {
+    listing++;
+    const run = async () => { try { return await work(); } finally { listing--; } };
+    return navigator.locks ? navigator.locks.request(LIST_LOCK, {mode:'shared'}, run) : run();
+  }
+  function prune() {
+    if (listing) return Promise.resolve(0);
+    if (!navigator.locks) return pruneNow();
+    return navigator.locks.request(LIST_LOCK, {ifAvailable:true}, lock => lock ? pruneNow() : 0);
+  }
+  async function pruneNow() {
     const db=await dbReady;
     const tx=db.transaction(['sessions','versions','originals','handles','metadata'],'readwrite');
     const done=complete(tx);
     const last=await request(tx.objectStore('metadata').get('lastSession'));
-    const sessions=(await request(tx.objectStore('sessions').getAll())).sort((a,b)=>b.stamp-a.stamp);
+    const sessions=(await request(tx.objectStore("sessions").getAll())).sort((a,b)=>(b.stamp||0)-(a.stamp||0));
     const cutoff=Date.now()-KEEP_DAYS*864e5;
     const kept=new Set(sessions.filter((row,index)=>index<KEEP_RECENT || index<KEEP_MAX && row.stamp>=cutoff ||
                                                    row.id===id || row.id===last).map(row=>row.id));
@@ -280,12 +296,13 @@ window.SpliceSession = (() => {
     await done;
     return removed;
   }
-  // Every managed media source a retained project or version still uses,
-  // so the media cache can delete only what nothing refers to.
+  // Every managed or linked media source a retained project or version in
+  // this browser still uses. The media cache marks these "used here"; it
+  // cannot see other browsers, the desktop app or project files on disk.
   async function mediaReferences() {
     await ready;
     const db=await dbReady, found=new Set();
-    const scan=value=>{for(const match of JSON.stringify(value).matchAll(/\/media\/[a-f0-9]{32}\/[^"\\]*/g))found.add(match[0]);};
+    const scan=value=>{for(const match of JSON.stringify(value).matchAll(/\/media\/(?:linked\/)?[a-f0-9]{32}\/[^"\\]*/g))found.add(match[0]);};
     scan(editor.get().project);
     for(const store of ['sessions','versions'])
       for(const row of await request(db.transaction(store).objectStore(store).getAll()))scan(row.data);
@@ -294,14 +311,16 @@ window.SpliceSession = (() => {
   async function history() {
     await leave();
     await prune();
-    const db=await dbReady;
-    const sessions=await request(db.transaction('sessions').objectStore('sessions').getAll());
-    const versions=await request(db.transaction('versions').objectStore('versions').index('session').getAll(id));
-    const rows=[
-      ...sessions.sort((a,b)=>b.stamp-a.stamp).map(v=>({label:v.name+' · '+new Date(v.stamp).toLocaleString(),value:v})),
-      ...versions.sort((a,b)=>b.stamp-a.stamp).map(v=>({label:'Restore version · '+new Date(v.stamp).toLocaleString(),value:v}))
-    ];
-    const choice=await choose('Recent projects and versions',rows);
+    const choice=await whileListed(async()=>{
+      const db=await dbReady;
+      const sessions=await request(db.transaction('sessions').objectStore('sessions').getAll());
+      const versions=await request(db.transaction('versions').objectStore('versions').index('session').getAll(id));
+      const rows=[
+        ...sessions.sort((a,b)=>b.stamp-a.stamp).map(v=>({label:v.name+' · '+new Date(v.stamp).toLocaleString(),value:v})),
+        ...versions.sort((a,b)=>b.stamp-a.stamp).map(v=>({label:'Restore version · '+new Date(v.stamp).toLocaleString(),value:v}))
+      ];
+      return choose('Recent projects and versions',rows);
+    });
     if(choice) {
       await switchProject('Restoring project…',async()=>{
         await restore(choice,!!choice.session);

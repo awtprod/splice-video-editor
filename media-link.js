@@ -99,7 +99,8 @@ window.SpliceLink = (() => {
       } catch (error) { message.textContent = error.message; refresh(); cancel.disabled = false; }
     }
     async function linkFolder() {
-      const {files} = await post('/api/media/link', {folder: current}, 600000);
+      const {files, notice} = await post('/api/media/link', {folder: current}, 600000);
+      if (notice) window.alert(notice);
       const failed = files.filter(file => file.error);
       const linked = files.filter(file => !file.error);
       if (!linked.length) throw Error(failed[0]?.error || 'The folder contains no media files.');
@@ -119,41 +120,88 @@ window.SpliceLink = (() => {
     return dialog;
   }
 
+  // Media cache. Proxies and previews are rebuilt on demand, so unused ones
+  // can go in bulk. Imported copies are originals the user handed to Splice,
+  // possibly the only copy, and another Splice window, the desktop app or a
+  // project file saved to disk may use one this browser does not know about:
+  // they are deleted only when the user selects them, after a confirmation.
   async function openCache() {
     const dialog = modal('Media cache', 'splice-cache');
     const body = element('div', {className: 'cache-body', textContent: 'Measuring…'});
     const message = element('p', {className: 'link-message', id: 'cache-message', role: 'status'});
-    const prune = element('button', {type: 'button', id: 'cache-prune', textContent: 'Delete unused copies and proxies'});
+    const prune = element('button', {type: 'button', id: 'cache-prune', textContent: 'Delete unused proxies'});
+    const remove = element('button', {type: 'button', id: 'cache-delete', textContent: 'Delete selected copies…', disabled: true});
+    const forget = element('button', {type: 'button', id: 'cache-forget', textContent: 'Forget unused links…'});
     const close = element('button', {type: 'button', textContent: 'Close', className: 'primary', onclick: () => dialog.close()});
     dialog.append(body, message, element('p', {className: 'link-note', textContent:
-      'Unused means no project in Recent projects & recovery refers to it. Proxies are rebuilt on demand. ' +
-      'A project saved elsewhere that used a deleted imported copy will ask you to relink that source.'}),
-      element('footer', {}, prune, close));
+      '"Used" means a project in this browser\'s Recent projects & recovery refers to it. Other Splice windows, the ' +
+      'desktop app and project files saved to disk are not known here. Proxies are rebuilt on demand.'}),
+      element('footer', {}, forget, remove, prune, close));
     dialog.showModal();
+    let report, used = new Set();
+    const date = seconds => seconds ? new Date(seconds * 1000).toLocaleDateString() : '—';
+    const checked = () => [...body.querySelectorAll('input.cache-select:checked')].map(box => box.value);
+    const refresh = () => { remove.disabled = !checked().length; };
     async function render() {
-      const report = await api('/api/media/cache');
-      const rows = report.entries.slice(0, 40).map(entry => element('tr', {},
-        element('td', {textContent: entry.kind === 'proxy' ? 'Proxy' : 'Imported copy'}),
-        element('td', {textContent: entry.files.join(', ')}), element('td', {textContent: size(entry.bytes)})));
+      const [next, references] = await Promise.all([api('/api/media/cache'), SpliceSession.mediaReferences()]);
+      report = next;
+      used = new Set(references.map(src => (src.match(/^\/media\/(?:linked\/)?([a-f0-9]{32})\//) || [])[1]).filter(Boolean));
+      const imports = report.entries.filter(entry => entry.kind === 'import');
+      const rows = imports.map(entry => element('tr', {className: 'cache-import'},
+        element('td', {}, element('input', {type: 'checkbox', className: 'cache-select', value: entry.id, onchange: refresh,
+                                            ariaLabel: 'Select ' + entry.files.join(', ')})),
+        element('td', {textContent: entry.files.join(', ') || entry.id}), element('td', {textContent: size(entry.bytes)}),
+        element('td', {textContent: date(entry.lastUsed)}),
+        element('td', {className: used.has(entry.id) ? 'cache-used' : 'cache-unused',
+                       textContent: used.has(entry.id) ? 'Used here' : 'Not used by a project here'})));
+      const linkedUnused = report.links.filter(link => !used.has(link.id)).length;
       body.replaceChildren(
         element('dl', {},
           element('dt', {textContent: 'Imported copies'}), element('dd', {textContent: size(report.importBytes), id: 'cache-imports'}),
           element('dt', {textContent: 'Proxies'}), element('dd', {textContent: size(report.proxyBytes), id: 'cache-proxies'}),
-          element('dt', {textContent: 'Linked originals'}), element('dd', {textContent: report.linkedFiles + ' files, ' + size(report.linkedBytes) + ' (not copied)'}),
+          element('dt', {textContent: 'Linked originals'}), element('dd', {id: 'cache-links', textContent: report.linkedFiles +
+            ' files, ' + size(report.linkedBytes) + ' (not copied)' + (report.linkedFiles >= report.maxLinks ? ' — list full' : '')}),
           element('dt', {textContent: 'Free space'}), element('dd', {textContent: size(report.freeBytes)})),
-        element('table', {}, ...rows));
-      prune.disabled = !report.entries.length;
+        ...(report.notice ? [element('p', {className: 'link-message', id: 'cache-notice', textContent: report.notice})] : []),
+        element('h3', {textContent: 'Imported copies'}),
+        imports.length ? element('table', {id: 'cache-import-list'},
+          element('thead', {}, element('tr', {}, ...['', 'File', 'Size', 'Last used', 'Projects'].map(text => element('th', {textContent: text})))),
+          element('tbody', {}, ...rows)) : element('p', {textContent: 'None.'}));
+      prune.disabled = !report.entries.some(entry => entry.kind === 'proxy');
+      forget.disabled = !report.linkedFiles;
+      forget.title = linkedUnused + ' of the newest ' + report.links.length + ' links are not used here';
+      refresh();
     }
-    prune.onclick = async () => {
-      if (!window.confirm('Delete imported copies and proxies that no recent project uses?')) return;
-      prune.disabled = true;
-      try {
+    const done = (verb, result) => `${verb} ${result.deleted.length} item(s), freed ${size(result.freedBytes)}.` +
+      (result.failed.length ? ` ${result.failed.length} could not be deleted.` : '');
+    async function act(button, action) {
+      button.disabled = true;
+      try { message.textContent = await action(); await render(); }
+      catch (error) { message.textContent = error.message; button.disabled = false; }
+    }
+    prune.onclick = () => act(prune, async () => {
+      const referenced = await SpliceSession.mediaReferences();
+      return done('Deleted', await post('/api/media/cache/prune', {referenced})) + ' Imported copies were kept.';
+    });
+    remove.onclick = () => {
+      const ids = checked();
+      const chosen = report.entries.filter(entry => ids.includes(entry.id));
+      const inUse = chosen.filter(entry => used.has(entry.id)).length;
+      if (!window.confirm(`Delete ${chosen.length} imported cop${chosen.length === 1 ? 'y' : 'ies'} (` +
+          size(chosen.reduce((sum, entry) => sum + entry.bytes, 0)) + ')? These are the files you imported into Splice. ' +
+          'They cannot be rebuilt: if you no longer have the original elsewhere, it is gone. Projects in other Splice ' +
+          'windows, the desktop app or saved project files that use them will need the source relinked.' +
+          (inUse ? ` ${inUse} of them ${inUse === 1 ? 'is' : 'are'} used by a project here.` : ''))) return;
+      act(remove, async () => done('Deleted', await post('/api/media/cache/delete', {ids, confirm: true})));
+    };
+    forget.onclick = () => {
+      if (!window.confirm('Forget linked originals no project in this browser uses? The files stay where they are. ' +
+          'A project elsewhere that uses one shows it offline until you relink it.')) return;
+      act(forget, async () => {
         const referenced = await SpliceSession.mediaReferences();
-        const result = await post('/api/media/cache/prune', {referenced});
-        message.textContent = `Deleted ${result.deleted.length} item(s), freed ${size(result.freedBytes)}.` +
-          (result.failed.length ? ` ${result.failed.length} could not be deleted.` : '');
-        await render();
-      } catch (error) { message.textContent = error.message; prune.disabled = false; }
+        const result = await post('/api/media/links/forget', {referenced});
+        return `Forgot ${result.forgotten} link(s). No files were deleted.`;
+      });
     };
     render().catch(error => { body.textContent = error.message; });
     return dialog;

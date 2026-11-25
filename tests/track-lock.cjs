@@ -1,6 +1,6 @@
 /* Browser regression for track locks, sync-lock and linked timeline edits. */
 const assert = require('node:assert/strict');
-const {spawn} = require('node:child_process');
+const {startSplice} = require('./splice-server.cjs');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -9,24 +9,16 @@ const {chromium} = require('playwright-core');
 async function main() {
   const root = path.resolve(__dirname, '..');
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'splice-tracks-'));
-  const server = spawn('python3', ['-u', 'server.py', '--port', '0'], {
-    cwd: root, env: {...process.env, HOME: temp, XDG_DATA_HOME: temp}, stdio: ['ignore', 'pipe', 'pipe'],
-  });
+  const splice = await startSplice({root, env: {HOME: temp, XDG_DATA_HOME: temp}});
   let browser;
   try {
-    const url = await new Promise((resolve, reject) => {
-      server.stdout.once('data', data => resolve(data.toString().trim()));
-      server.once('error', reject);
-      server.once('exit', code => reject(Error('Server exited: ' + code)));
-    });
     const executablePath = [process.env.SPLICE_CHROME, '/opt/google/chrome/chrome',
       '/usr/bin/chromium', chromium.executablePath()].find(file => file && fs.existsSync(file));
     browser = await chromium.launch({executablePath, args: ['--no-sandbox']});
     const page = await browser.newPage({viewport: {width: 1440, height: 900}});
     const errors = [];
     page.on('pageerror', error => errors.push(error.message));
-    await page.goto(url);
-    await page.evaluate(() => SpliceSession.ready);
+    await splice.open(page);
     const result = await page.evaluate(() => {
       Editor.newProject({name: 'Track check', width: 1280, height: 720, fps: 25});
       Editor.editProject(project => {
@@ -171,11 +163,7 @@ async function main() {
     console.log('Track locks, linked edits, source insert guard and narrow UI passed; screenshot: ' + screenshot);
   } finally {
     await browser?.close();
-    if (server.exitCode === null) {
-      const stopped = new Promise(resolve => server.once('exit', resolve));
-      server.kill('SIGTERM');
-      await stopped;
-    }
+    await splice.stop();
     fs.rmSync(temp, {recursive: true, force: true});
   }
 }

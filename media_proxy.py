@@ -14,7 +14,7 @@ import threading
 
 from premiere import MEDIA_ROOT, STILL_IMAGES, _playback_url
 from media_exec import run_bounded
-from media_links import camera_raw_error, resolve_media as _media_path
+from media_links import camera_raw_error, mark, resolve_media as _media_path
 
 _encoders = threading.BoundedSemaphore(2)
 _locks = tuple(threading.Lock() for _ in range(32))
@@ -167,9 +167,18 @@ def _tag(tags, *names):
     return None
 
 
+class ProbeTimeout(ValueError):
+    """FFprobe did not answer in time: a slow or disconnected drive, not a
+    file FFmpeg cannot decode."""
+
+
 def _ffprobe(path, *arguments, limit=PROBE_LIMIT, timeout=25):
-    result = run_bounded(['ffprobe', '-v', 'error', '-protocol_whitelist', 'file', *arguments, '-of', 'json', str(path)],
-                         timeout=timeout, max_output=limit)
+    try:
+        result = run_bounded(['ffprobe', '-v', 'error', '-protocol_whitelist', 'file', *arguments, '-of', 'json', str(path)],
+                             timeout=timeout, max_output=limit)
+    except subprocess.TimeoutExpired:
+        raise ProbeTimeout(f'Reading {Path(path).name} timed out after {timeout:g} s. Its drive may be slow or '
+                           'disconnected; try again once it responds.') from None
     if result.returncode:
         raise ValueError('Could not read media streams in ' + Path(path).name)
     data = json.loads(result.stdout)
@@ -178,17 +187,28 @@ def _ffprobe(path, *arguments, limit=PROBE_LIMIT, timeout=25):
     return data
 
 
+VFR_PACKETS = 300
+VFR_MIN_STEPS = 8
+
+
 def _variable_rate(path, stream_index, nominal, average):
-    """Confirm a frame-rate mismatch from the first packets' timestamps."""
-    if nominal is None or average is None or abs(nominal - average) / nominal < Fraction(1, 1000):
-        return False
-    data = _ffprobe(path, '-select_streams', str(stream_index), '-read_intervals', '%+#300',
+    """Whether the first packets' timestamps step irregularly. Always
+    scanned: Matroska/WebM report matching nominal and average rates even
+    when the rate changes. Too few packets to judge falls back to whether
+    the nominal and average rates disagree."""
+    mismatch = nominal is not None and average is not None and abs(nominal - average) / nominal >= Fraction(1, 1000)
+    data = _ffprobe(path, '-select_streams', str(stream_index), '-read_intervals', f'%+#{VFR_PACKETS}',
                     '-show_entries', 'packet=pts_time', limit=SCAN_LIMIT, timeout=15)
-    times = sorted(float(p['pts_time']) for p in data.get('packets', [])
-                   if isinstance(p, dict) and p.get('pts_time') not in (None, 'N/A'))
+    times = []
+    for packet in data.get('packets', []):
+        try:
+            times.append(float(packet['pts_time']))
+        except (KeyError, TypeError, ValueError):
+            continue
+    times.sort()
     steps = sorted(b - a for a, b in zip(times, times[1:]) if b > a)
-    if len(steps) < 8:
-        return True
+    if len(steps) < VFR_MIN_STEPS:
+        return mismatch
     median = steps[len(steps) // 2]
     irregular = sum(abs(step - median) > median * .1 for step in steps)
     return irregular / len(steps) > .05
@@ -224,6 +244,8 @@ def _describe_file(path, size, modified):
     audio = audio_streams[0] if audio_streams else {}
     if not video and not audio:
         raise ValueError('The source contains no editable audio or video stream')
+    if _text_art(fmt, streams):
+        raise ValueError(f'The installed FFmpeg cannot decode {path.name}: it is a text file, not media')
     still = bool(video) and (path.suffix.lower() in STILL_IMAGES or fmt.get('format_name') in STILL_FORMATS)
     try:
         duration = 5 if still else float(fmt.get('duration') or video.get('duration') or audio.get('duration') or 0)
@@ -292,17 +314,35 @@ def describe(src):
     return describe_path(_media_path(src))
 
 
+# FFmpeg renders any text file as a picture through its tty demuxer (and
+# reads BBS art formats): never media a user meant to edit.
+TEXT_FORMATS = frozenset({'tty', 'bin', 'xbin', 'adf', 'idf'})
+TEXT_CODECS = frozenset({'ansi', 'bintext', 'xbin', 'idf'})
+
+
+def _text_art(fmt, streams):
+    names = set(str(fmt.get('format_name') or '').split(','))
+    return bool(names & TEXT_FORMATS) or any(s.get('codec_name') in TEXT_CODECS for s in streams if isinstance(s, dict))
+
+
 def decodable(path, name):
     """Whether the installed FFmpeg can edit this file. The probe decides,
-    not the filename extension, except for camera RAW it never decodes."""
+    not the filename extension, except for camera RAW it never decodes and
+    text files FFmpeg would draw as a picture. A probe that times out is
+    reported as a timeout."""
     message = camera_raw_error(name)
     if message:
         raise ValueError(message)
     try:
-        data = _ffprobe(path, '-show_entries', 'stream=codec_type', timeout=25, limit=SCAN_LIMIT)
+        data = _ffprobe(path, '-show_entries', 'stream=codec_type,codec_name:format=format_name',
+                        timeout=25, limit=SCAN_LIMIT)
+    except ProbeTimeout:
+        raise
     except (ValueError, OSError, subprocess.SubprocessError):
         data = {}
-    if not any(isinstance(s, dict) and s.get('codec_type') in ('video', 'audio') for s in data.get('streams', [])):
+    streams = [s for s in data.get('streams', []) if isinstance(s, dict)]
+    fmt = data.get('format') if isinstance(data.get('format'), dict) else {}
+    if _text_art(fmt, streams) or not any(s.get('codec_type') in ('video', 'audio') for s in streams):
         raise ValueError(f'The installed FFmpeg cannot decode {Path(name).name}')
 
 
@@ -350,6 +390,7 @@ def proxy(src, seek_optimized=False, audio_stream=None, grading_data=False):
             if target.is_file():
                 return _playback_url(target)
             directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            mark(directory, 'derived')
             if shutil.disk_usage(directory).free < 512 * 1024**2 + info['duration'] * (525000 if video else 24000):
                 raise ValueError('Insufficient free space for an edit proxy')
             with tempfile.TemporaryDirectory(dir=directory,prefix='.proxy-') as staging:
@@ -403,6 +444,7 @@ def premiere_audio(src, audio_stream=None):
         with _locks[int(key[:2],16)%len(_locks)]:
             if target.is_file():return target
             target.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
+            mark(target.parent, 'derived')
             duration = info['duration']
             if shutil.disk_usage(target.parent).free < 512*1024**2 + duration*288000:
                 raise ValueError('Insufficient free space for Premiere audio media')
@@ -467,6 +509,7 @@ def nested_preview(project):
             ratio=min(1,1280/width,720/height)
             prepared={**project,'width':max(16,2*round(width*ratio/2)),'height':max(16,2*round(height*ratio/2))}
             directory.mkdir(mode=0o700,parents=True,exist_ok=True)
+            mark(directory, 'derived')
             with tempfile.TemporaryDirectory(dir=directory,prefix='.nested-') as staging:
                 output = Path(staging) / target.name
                 render_to_file(prepared,output,options={'codec':'h264','crf':19})

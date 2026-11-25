@@ -4,6 +4,7 @@ from array import array
 import gzip
 import http.client
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -59,20 +60,23 @@ class ServerProcess:
 
     def __init__(self, data):
         self.data = Path(data)
+        self.log = tempfile.TemporaryFile()
         self.process = subprocess.Popen([sys.executable, '-u', 'server.py', '--port', '0'], cwd=ROOT,
                                         env={**os.environ, 'SPLICE_DATA_DIR': str(self.data)},
-                                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                        stdout=subprocess.PIPE, stderr=self.log,
                                         preexec_fn=_limit_memory if os.name == 'posix' else None)
         line = self.process.stdout.readline().decode().strip()
-        match = re.fullmatch(r'http://127\.0\.0\.1:(\d+)', line)
+        match = re.fullmatch(r'http://127\.0\.0\.1:(\d+)/\?launch=([A-Za-z0-9_-]{20,})', line)
         if not match:
             self.stop()
             raise RuntimeError('Server did not start: ' + line)
         self.port = int(match.group(1))
-        status, headers, page = self.request('GET', '/', auth=False, headers={
-            'Sec-Fetch-Site': 'none', 'Sec-Fetch-Mode': 'navigate', 'Sec-Fetch-Dest': 'document'})
-        assert status == 200, status
+        navigate = {'Sec-Fetch-Site': 'none', 'Sec-Fetch-Mode': 'navigate', 'Sec-Fetch-Dest': 'document'}
+        status, headers, _ = self.request('GET', '/?launch=' + match.group(2), auth=False, headers=navigate)
+        assert status == 303, status
         self.cookie = headers['set-cookie'].split(';', 1)[0]
+        status, headers, page = self.request('GET', '/', token=False, headers=navigate)
+        assert status == 200, status
         self.token = re.search(rb'name="splice-token" content="([^"]+)"', page).group(1).decode()
 
     def request(self, method, path, body=None, headers=None, auth=True, token=True, timeout=60):
@@ -107,6 +111,14 @@ class ServerProcess:
                 self.process.wait()
         self.process.stdout.close()
 
+    def logs(self):
+        self.log.seek(0)
+        return self.log.read().decode(errors='replace')
+
+    def close(self):
+        self.stop()
+        self.log.close()
+
 
 class ServerTestCase(unittest.TestCase):
     @classmethod
@@ -119,7 +131,7 @@ class ServerTestCase(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        cls.server.stop()
+        cls.server.close()
         cls.temp.cleanup()
 
     def media_bytes(self):
@@ -132,6 +144,38 @@ class ServerTestCase(unittest.TestCase):
         entry = data['files'][0]
         self.assertNotIn('error', entry)
         return entry
+
+
+class InProcessServer:
+    """create_server() in this process, for launch-link checks."""
+
+    def __init__(self, launch_token=None, quiet=True):
+        from server import create_server
+        self.server = create_server(0, launch_token=launch_token)
+        self.port = self.server.server_port
+        if quiet:
+            self.server.RequestHandlerClass = type('QuietHandler', (self.server.RequestHandlerClass,),
+                                                   {'log_message': lambda *args: None})
+
+    def __enter__(self):
+        import threading
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(10)
+
+    def get(self, path, headers):
+        connection = http.client.HTTPConnection('127.0.0.1', self.port, timeout=10)
+        try:
+            connection.request('GET', path, headers={'Host': f'127.0.0.1:{self.port}', **headers})
+            response = connection.getresponse()
+            return response.status, response.getheader('Set-Cookie'), response.read()
+        finally:
+            connection.close()
 
 
 class RequestProof(ServerTestCase):
@@ -170,32 +214,125 @@ class RequestProof(ServerTestCase):
         status, _, _ = self.server.request('POST', '/api/render', {'project': project})
         self.assertEqual(status, 404)
 
-    def test_desktop_launch_link_works_once(self):
-        import threading
-        from server import create_server
-        server = create_server(0, launch_token='launch-secret')
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
-            def get(path):
-                connection = http.client.HTTPConnection('127.0.0.1', server.server_port, timeout=10)
-                connection.request('GET', path, headers={'Host': f'127.0.0.1:{server.server_port}',
-                                                         'Sec-Fetch-Site': 'none', 'Sec-Fetch-Mode': 'navigate'})
-                response = connection.getresponse()
-                response.read()
-                connection.close()
-                return response.status, response.getheader('Set-Cookie')
-            self.assertEqual(get('/'), (403, None))
-            self.assertEqual(get('/?launch=wrong'), (403, None))
-            status, cookie = get('/?launch=launch-secret')
+    def test_launch_link_works_once(self):
+        with InProcessServer('launch-secret') as server:
+            navigate = {'Sec-Fetch-Site': 'none', 'Sec-Fetch-Mode': 'navigate'}
+            self.assertEqual(server.get('/', navigate)[:2], (403, None))
+            self.assertEqual(server.get('/?launch=wrong', navigate)[:2], (403, None))
+            status, cookie, _ = server.get('/?launch=launch-secret', navigate)
             self.assertEqual(status, 303)
             self.assertIn('HttpOnly', cookie)
             self.assertIn('SameSite=Strict', cookie)
-            self.assertEqual(get('/?launch=launch-secret'), (403, None))
-        finally:
-            server.shutdown()
-            server.server_close()
-            thread.join(10)
+            self.assertEqual(server.get('/?launch=launch-secret', navigate)[:2], (403, None))
+            # The same browser opening the printed link again just continues.
+            session = {**navigate, 'Cookie': cookie.split(';')[0]}
+            self.assertEqual(server.get('/?launch=launch-secret', session)[:2], (303, None))
+
+    def test_server_py_issues_no_session_without_the_launch_link(self):
+        # A local process imitating a browser navigation used to get a full
+        # session (and with it /api/files and linking) from python3 server.py.
+        with InProcessServer() as server:
+            for headers in ({'Sec-Fetch-Site': 'none', 'Sec-Fetch-Mode': 'navigate', 'Sec-Fetch-Dest': 'document'},
+                            {'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'navigate'}, {}):
+                status, cookie, page = server.get('/', headers)
+                self.assertEqual((status, cookie), (403, None), headers)
+                self.assertIn(b'launch', page)
+                self.assertNotIn(b'splice-token', page)
+
+    def test_launch_works_without_sec_fetch_headers(self):
+        # Safari < 16.4 and Firefox < 90 send no Sec-Fetch headers.
+        with InProcessServer('old-browser') as server:
+            status, cookie, _ = server.get('/?launch=old-browser', {})
+            self.assertEqual(status, 303)
+            status, _, page = server.get('/', {'Cookie': cookie.split(';')[0]})
+            self.assertEqual(status, 200)
+            self.assertIn(b'splice-token', page)
+
+    def test_cross_site_launch_continues_as_a_same_origin_navigation(self):
+        # The desktop launcher opens a local file that forwards to the link.
+        with InProcessServer('from-file') as server:
+            status, cookie, page = server.get('/?launch=from-file', {'Sec-Fetch-Site': 'cross-site', 'Sec-Fetch-Mode': 'navigate'})
+            self.assertEqual(status, 200)
+            self.assertIn('SameSite=Strict', cookie)
+            self.assertIn(b'location.replace("/")', page)
+            self.assertNotIn(b'splice-token', page)
+
+    def test_desktop_launcher_keeps_the_link_off_the_command_line(self):
+        from splice_app import write_launcher
+        with tempfile.TemporaryDirectory() as temp:
+            launcher = write_launcher(Path(temp), 'http://127.0.0.1:1/?launch=abc&x=<y>')
+            try:
+                self.assertTrue(launcher.as_uri().startswith('file://'))
+                self.assertNotIn('launch=', launcher.as_uri())
+                self.assertIn('url=http://127.0.0.1:1/?launch=abc&amp;x=&lt;y&gt;', launcher.read_text())
+                if os.name == 'posix':
+                    self.assertEqual(launcher.stat().st_mode & 0o077, 0)
+            finally:
+                launcher.unlink()
+
+    def test_the_desktop_launcher_file_is_removed_when_the_link_is_used(self):
+        used = []
+        with InProcessServer('once') as server:
+            server.server.on_launch = lambda: used.append(1)
+            server.get('/?launch=once', {'Sec-Fetch-Site': 'cross-site'})
+            server.get('/?launch=once', {'Sec-Fetch-Site': 'cross-site'})
+        self.assertEqual(used, [1])
+
+    def test_launch_token_is_not_logged(self):
+        import contextlib
+        import io
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured), InProcessServer('do-not-log-me', quiet=False) as server:
+            server.get('/?launch=do-not-log-me', {'Sec-Fetch-Site': 'none'})
+            server.get('/?launch=do-not-log-me&x=1', {'Sec-Fetch-Site': 'none'})
+        self.assertIn('launch=', captured.getvalue())
+        self.assertNotIn('do-not-log-me', captured.getvalue())
+
+    def test_cookies_from_other_local_apps_do_not_lock_splice_out(self):
+        # Cookies on 127.0.0.1 are shared by every port. One other app's
+        # loosely formatted cookie used to hide Splice's session.
+        src = '/api/media/info?src=' + quote('/assets/score.wav')
+        name, value = self.server.cookie.split('=', 1)
+        for jar in (f'prefs={{"theme":"dark"}}; {name}={value}', f'a=b c; ü=ö; {name}={value}; z="q', 
+                    f'{name}=forged; {name}={value}', f'{name}={value}; {name}=forged', f'x; {name}="{value}"'):
+            self.assertEqual(self.server.request('GET', src, headers={'Cookie': jar})[0], 200, jar)
+        for jar in (f'{name}=forged', f'other_{name}={value}', f'{name}x={value}', f'prefs={{"a":"b"}}'):
+            self.assertEqual(self.server.request('GET', src, headers={'Cookie': jar})[0], 403, jar)
+
+    def test_origin_must_be_this_server(self):
+        src = '/api/media/info?src=' + quote('/assets/score.wav')
+        for origin in ('http://evil.example', 'null', f'http://localhost:{self.server.port}', 'http://127.0.0.1:1'):
+            self.assertEqual(self.server.request('GET', src, headers={'Origin': origin})[0], 403, origin)
+        self.assertEqual(self.server.request('GET', src, headers={'Origin': f'http://127.0.0.1:{self.server.port}'})[0], 200)
+
+    def test_app_page_needs_a_same_origin_request_even_with_the_cookie(self):
+        for site in ('cross-site', 'same-site'):
+            status, headers, page = self.server.request('GET', '/', token=False,
+                                                        headers={'Sec-Fetch-Site': site, 'Sec-Fetch-Mode': 'navigate'})
+            self.assertEqual(status, 403, site)
+            self.assertNotIn(self.server.token.encode(), page)
+        status, headers, page = self.server.request('GET', '/', token=False, headers={'Sec-Fetch-Site': 'none'})
+        self.assertEqual(status, 200)
+        self.assertEqual(headers['x-frame-options'], 'DENY')
+        self.assertEqual(headers['x-content-type-options'], 'nosniff')
+
+    def test_user_files_never_render_as_pages(self):
+        managed = self.data / 'media' / ('d' * 32)
+        managed.mkdir(parents=True, exist_ok=True)
+        for name in ('page.html', 'image.svg', 'notes.txt', 'clip.mp4'):
+            (managed / name).write_bytes(b'<html><script>alert(1)</script>')
+        for name, expected in (('page.html', 'application/octet-stream'), ('image.svg', 'application/octet-stream'),
+                               ('notes.txt', 'application/octet-stream'), ('clip.mp4', 'video/mp4')):
+            status, headers, _ = self.server.request('GET', f'/media/{"d" * 32}/{name}', token=False)
+            self.assertEqual((status, headers['content-type']), (200, expected), name)
+            self.assertEqual(headers['x-content-type-options'], 'nosniff')
+
+    def test_only_the_exact_element_routes_skip_the_token(self):
+        fake = 'a' * 32
+        for path in (f'/api/files/api/exports/{fake}/file?path=%2F', f'/api/media/cache/api/exports/{fake}/preview',
+                     f'/api/exports/{fake}/file/x'):
+            self.assertEqual(self.server.request('GET', path, token=False)[0], 403, path)
+        self.assertEqual(self.server.request('GET', f'/api/exports/{fake}/file', token=False)[0], 404)
 
 
 class LinkInPlace(ServerTestCase):
@@ -420,7 +557,8 @@ class SourceMetadata(unittest.TestCase):
                          ('bt2020', 'smpte2084', 'bt2020nc', 'tv'))
         self.assertEqual(info['pixelFormat'], 'yuv420p10le')
         self.assertTrue(info['hdr'])
-        self.assertIn(info['rotation'], (90, 270))
+        # -display_rotation is counterclockwise; describe() reports clockwise.
+        self.assertEqual(info['rotation'], 270)
         self.assertEqual(self.describe(flat)['rotation'], 0)
 
 
@@ -476,6 +614,442 @@ class CachePrune(unittest.TestCase):
             self.assertEqual(result['deleted'], ['a' * 32])
             self.assertEqual(result['freedBytes'], 1000)
             self.assertEqual(sorted(p.name for p in root.iterdir()), ['b' * 32, 'c' * 32])
+
+
+class IsolatedRegistry(unittest.TestCase):
+    """media_links pointed at a temporary data folder."""
+
+    def setUp(self):
+        import media_links
+        self.ml = media_links
+        temp = tempfile.TemporaryDirectory(prefix='splice-registry-')
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.data = self.root / 'data'
+        (self.data / 'media').mkdir(parents=True)
+        saved = dict(MEDIA_ROOT=media_links.MEDIA_ROOT, REGISTRY=media_links.REGISTRY)
+        media_links.MEDIA_ROOT = self.data / 'media'
+        media_links.REGISTRY = self.data / 'linked-media.json'
+        media_links._cache.update(stamp=None, links={}, recovered=None)
+
+        def restore():
+            for key, value in saved.items():
+                setattr(media_links, key, value)
+            media_links._cache.update(stamp=None, links={}, recovered=None)
+        self.addCleanup(restore)
+
+    def files(self, count, folder='card'):
+        directory = self.root / folder
+        directory.mkdir(exist_ok=True)
+        paths = []
+        for index in range(count):
+            path = directory / f'clip{index:03}.wav'
+            path.write_bytes(b'RIFF' + index.to_bytes(4, 'little') * 8)
+            paths.append(path)
+        return paths
+
+
+class LinkRegistry(IsolatedRegistry):
+    def test_two_processes_linking_at_once_keep_every_entry(self):
+        paths = self.files(120)
+        script = ('import sys; sys.path.insert(0, sys.argv[1]); import media_links\n'
+                  'for path in sys.argv[2:]: media_links.link(path)\n')
+        env = {**os.environ, 'SPLICE_DATA_DIR': str(self.data)}
+        workers = [subprocess.Popen([sys.executable, '-c', script, str(ROOT), *map(str, chunk)], env=env)
+                   for chunk in (paths[:60], paths[60:])]
+        for worker in workers:
+            self.assertEqual(worker.wait(120), 0)
+        self.ml._cache.update(stamp=None)
+        self.assertEqual(sorted(e['path'] for e in self.ml._links().values()), sorted(map(str, paths)))
+        self.assertEqual([p.name for p in self.data.iterdir() if p.name.startswith('.linked-media-')], [])
+
+    def test_an_outside_rewrite_with_the_same_size_and_mtime_is_noticed(self):
+        first, second = self.files(2)
+        entry = self.ml.link(str(first))
+        identifier = entry['src'].split('/')[3]
+        stat = self.ml.REGISTRY.stat()
+        text = self.ml.REGISTRY.read_text()
+        swapped = text.replace(str(first), str(second)).replace('clip000', 'clip001')
+        self.assertEqual(len(swapped), len(text))
+        with open(self.ml.REGISTRY, 'r+', encoding='utf-8') as sink:  # In place: same inode.
+            sink.write(swapped)
+        os.utime(self.ml.REGISTRY, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        self.assertEqual(self.ml._links()[identifier]['path'], str(second))
+
+    def test_link_ids_are_random_and_stable_for_a_path(self):
+        import hashlib
+        path, = self.files(1)
+        entry = self.ml.link(str(path))
+        identifier = entry['src'].split('/')[3]
+        self.assertRegex(identifier, r'^[a-f0-9]{32}$')
+        self.assertNotEqual(identifier, hashlib.sha256(str(path.resolve()).encode()).hexdigest()[:32])
+        self.ml._cache.update(stamp=None, links={})  # As after a restart.
+        self.assertEqual(self.ml.link(str(path))['src'], entry['src'])
+        other = self.root / 'other'
+        other.mkdir()
+        (other / path.name).write_bytes(path.read_bytes())
+        self.assertNotEqual(self.ml.link(str(other / path.name))['src'].split('/')[3], identifier)
+
+    def test_a_damaged_registry_is_set_aside_and_replaced(self):
+        first, second = self.files(2)
+        self.ml.link(str(first))
+        self.ml.REGISTRY.write_text('{"version":1,"links":{"x"')
+        entry = self.ml.link(str(second))
+        aside = [p for p in self.data.iterdir() if p.name.startswith('linked-media.damaged-')]
+        self.assertEqual(len(aside), 1)
+        self.assertEqual(aside[0].read_text(), '{"version":1,"links":{"x"')
+        self.assertEqual([e['path'] for e in self.ml._links().values()], [entry['sourcePath']])
+        notice = self.ml.cache_report()['notice']
+        self.assertIn(str(aside[0]), notice)
+        self.assertIn('relink', notice)
+        aside[0].unlink()
+        self.assertIsNone(self.ml.recovery_notice())
+
+    def test_full_registry_refuses_new_links_until_links_are_forgotten(self):
+        paths = self.files(3)
+        saved = self.ml.MAX_LINKS
+        self.ml.MAX_LINKS = 2
+        try:
+            kept = self.ml.link(str(paths[0]))
+            self.ml.link(str(paths[1]))
+            with self.assertRaisesRegex(ValueError, 'full'):
+                self.ml.link(str(paths[2]))
+            self.ml.link(str(paths[0]))  # Relinking a known path still works.
+            self.assertEqual(self.ml.forget([kept['src'].split('/')[3], 'not-an-id']), [kept['src'].split('/')[3]])
+            self.ml.link(str(paths[2]))
+        finally:
+            self.ml.MAX_LINKS = saved
+        self.assertEqual(paths[0].read_bytes()[:4], b'RIFF', 'forgetting never touches the file')
+
+    def test_forget_unreferenced_keeps_used_and_recent_links(self):
+        used, unused, fresh = (self.ml.link(str(p)) for p in self.files(3))
+        stale = time.time() - 3600
+        def age(links):
+            for key, entry in links.items():
+                if entry['path'] != fresh['sourcePath']:
+                    entry['linkedAt'] = stale
+        self.ml._update(age)
+        self.assertEqual(self.ml.forget_unreferenced([used['src'], '/media/' + 'b' * 32 + '/x.mp4']),
+                         [unused['src'].split('/')[3]])
+        self.assertEqual(sorted(e['path'] for e in self.ml._links().values()),
+                         sorted([used['sourcePath'], fresh['sourcePath']]))
+
+    def test_a_folder_batch_writes_the_registry_once(self):
+        paths = self.files(25)
+        writes = []
+        original = self.ml._write
+        self.ml._write = lambda *args: (writes.append(1), original(*args))[1]
+        try:
+            results = self.ml.link_many([str(p) for p in paths] + ['relative.wav', str(self.root / 'missing.wav')])
+        finally:
+            self.ml._write = original
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(sum('src' in r for r in results), 25)
+        self.assertIn('absolute path', results[-2]['error'])
+        self.assertIn('not a readable file', results[-1]['error'])
+
+    def test_relative_paths_are_refused(self):
+        path, = self.files(1)
+        for value in ('card/clip000.wav', 'clip000.wav', './' + path.name, ''):
+            with self.assertRaises(ValueError, msg=value):
+                self.ml.link(value)
+
+    def test_an_mtime_only_change_takes_the_link_offline(self):
+        path, = self.files(1)
+        entry = self.ml.link(str(path))
+        self.assertEqual(self.ml.resolve_media(entry['src']), path.resolve())
+        os.utime(path, ns=(time.time_ns(), path.stat().st_mtime_ns + 1_000_000_000))
+        with self.assertRaisesRegex(ValueError, 'changed'):
+            self.ml.resolve_media(entry['src'])
+
+    def test_a_file_swapped_in_after_resolving_is_not_served(self):
+        path, = self.files(1)
+        impostor = self.root / 'impostor.wav'
+        impostor.write_bytes(b'Z' * path.stat().st_size)
+        entry = self.ml.link(str(path))
+        with self.ml.open_media(entry['src']) as source:
+            self.assertEqual(source.read(4), b'RIFF')
+        original = self.ml.resolve_media
+        self.ml.resolve_media = lambda src: impostor  # The path now names another file.
+        try:
+            with self.assertRaisesRegex(ValueError, 'changed'):
+                self.ml.open_media(entry['src'])
+        finally:
+            self.ml.resolve_media = original
+
+    def test_folder_walk_and_listing_are_bounded(self):
+        deep = self.root / 'card'
+        for level in range(self.ml.MAX_FOLDER_DEPTH + 3):
+            deep = deep / f'd{level}'
+        deep.mkdir(parents=True)
+        (deep / 'too-deep.wav').write_bytes(b'x')
+        (self.root / 'card' / 'top.wav').write_bytes(b'x')
+        hidden = self.root / 'card' / '.cache'
+        hidden.mkdir()
+        (hidden / 'hidden.wav').write_bytes(b'x')
+        (self.root / 'card' / '.dot.wav').write_bytes(b'x')
+        found = [relative for _, relative in self.ml.folder_files(str(self.root / 'card'))]
+        self.assertEqual(found, ['card/top.wav'])
+        many = self.root / 'many'
+        many.mkdir()
+        for index in range(6):
+            (many / f'{index}.wav').write_bytes(b'x')
+        saved = self.ml.MAX_FOLDER_FILES, self.ml.MAX_LISTING
+        self.ml.MAX_FOLDER_FILES, self.ml.MAX_LISTING = 5, 4
+        try:
+            with self.assertRaisesRegex(ValueError, 'more than 5'):
+                self.ml.folder_files(str(many))
+            listing = self.ml.browse(str(many))
+        finally:
+            self.ml.MAX_FOLDER_FILES, self.ml.MAX_LISTING = saved
+        self.assertEqual((len(listing['entries']), listing['truncated']), (4, True))
+        for value in ('many', 'relative/path', '\0'):
+            with self.assertRaises(ValueError):
+                self.ml.browse(value)
+            with self.assertRaises(ValueError):
+                self.ml.folder_files(value)
+
+    def test_a_hung_volume_scan_delays_only_the_first_browse(self):
+        import threading
+        release = threading.Event()
+        saved = self.ml._scan_places, dict(self.ml._places_state)
+        self.ml._places_state.update(at=0, value=None, worker=None)
+        self.ml._scan_places = lambda: release.wait(30) and [dict(name='Late', path='/')]
+        try:
+            for limit in (self.ml.PLACES_TIMEOUT + 1.5, .5):
+                started = time.monotonic()
+                places = self.ml.browse()['places']
+                self.assertLess(time.monotonic() - started, limit)
+                self.assertEqual([p['name'] for p in places], ['Home'])
+        finally:
+            release.set()
+            self.ml._places_state['worker'].join(5)
+            self.ml._scan_places = saved[0]
+            self.ml._places_state.update(saved[1])
+
+
+class MediaCache(IsolatedRegistry):
+    def entry(self, name, kind=None, content=b'x' * 1000, identifier=None, age=3600):
+        import hashlib
+        directory = self.ml.MEDIA_ROOT / (identifier or hashlib.sha256(content).hexdigest()[:32])
+        directory.mkdir()
+        (directory / name).write_bytes(content)
+        if kind:
+            self.ml.mark(directory, kind)
+        stale = time.time() - age
+        os.utime(directory / name, (stale, stale))
+        os.utime(directory, (stale, stale))
+        return directory.name
+
+    def test_bulk_prune_deletes_only_unused_old_derived_files(self):
+        imported = self.entry('interview.mp4', 'import', b'interview')
+        # From before markers existed: named like a proxy, stored under its content hash.
+        legacy_import = self.entry('edit.mp4', None, b'a phone clip the user named edit.mp4')
+        legacy_proxy = self.entry('edit.mp4', None, b'proxy', identifier='c' * 32)
+        proxy = self.entry('seek.mp4', 'derived', b'seek', identifier='d' * 32)
+        used_proxy = self.entry('edit.mp4', 'derived', b'used', identifier='e' * 32)
+        fresh_proxy = self.entry('edit.mp4', 'derived', b'fresh', identifier='f' * 32, age=0)
+        kinds = {e['id']: e['kind'] for e in self.ml.cache_report()['entries']}
+        self.assertEqual(kinds, {imported: 'import', legacy_import: 'import', legacy_proxy: 'proxy', proxy: 'proxy',
+                                 used_proxy: 'proxy', fresh_proxy: 'proxy'})
+        result = self.ml.prune([f'/media/{used_proxy}/edit.mp4'])
+        self.assertEqual(sorted(result['deleted']), sorted([legacy_proxy, proxy]))
+        left = sorted(p.name for p in self.ml.MEDIA_ROOT.iterdir())
+        self.assertEqual(left, sorted([imported, legacy_import, used_proxy, fresh_proxy]))
+
+    def test_imports_are_deleted_only_when_selected(self):
+        imported = self.entry('interview.mp4', 'import', b'interview')
+        other = self.entry('broll.mp4', 'import', b'broll')
+        report = {e['id']: e for e in self.ml.cache_report()['entries']}
+        self.assertEqual(report[imported]['files'], ['interview.mp4'])
+        self.assertEqual(report[imported]['src'], f'/media/{imported}/interview.mp4')
+        self.assertGreater(report[imported]['lastUsed'], 0)
+        result = self.ml.delete_entries([imported])
+        self.assertEqual((result['deleted'], result['freedBytes']), ([imported], len(b'interview')))
+        self.assertEqual([p.name for p in self.ml.MEDIA_ROOT.iterdir()], [other])
+        for bad in ([], ['../x'], 'all', [None]):
+            with self.assertRaises(ValueError):
+                self.ml.delete_entries(bad)
+
+
+class CacheRoutes(ServerTestCase):
+    def test_uploads_are_marked_as_imports_and_survive_the_bulk_prune(self):
+        status, data = self.server.json('POST', '/api/media/upload?name=edit.mp4', (ROOT / 'assets/ridge.mp4').read_bytes())
+        self.assertEqual(status, 200, data)
+        identifier = data['src'].split('/')[2]
+        directory = self.data / 'media' / identifier
+        self.assertTrue((directory / '.splice-import').exists())
+        stale = time.time() - 3600
+        os.utime(directory, (stale, stale))
+        status, result = self.server.json('POST', '/api/media/cache/prune', {'referenced': []})
+        self.assertEqual(status, 200)
+        self.assertNotIn(identifier, result['deleted'])
+        self.assertEqual(self.server.request('HEAD', data['src'], token=False)[0], 200)
+        status, _ = self.server.json('POST', '/api/media/cache/delete', {'ids': [identifier]})
+        self.assertEqual(status, 400)
+        status, result = self.server.json('POST', '/api/media/cache/delete', {'ids': [identifier], 'confirm': True})
+        self.assertEqual((status, result['deleted']), (200, [identifier]))
+        self.assertEqual(self.server.request('HEAD', data['src'], token=False)[0], 404)
+
+    def test_links_can_be_forgotten(self):
+        clip = self.outside / 'forget-me.wav'
+        ffmpeg('-f', 'lavfi', '-i', 'sine=440:sample_rate=48000:d=1', clip)
+        entry = self.link(clip)
+        identifier = entry['src'].split('/')[3]
+        status, report = self.server.json('GET', '/api/media/cache')
+        self.assertIn(identifier, [link['id'] for link in report['links']])
+        status, result = self.server.json('POST', '/api/media/links/forget', {'ids': [identifier]})
+        self.assertEqual((status, result['forgotten']), (200, 1))
+        self.assertEqual(self.server.request('HEAD', entry['src'], token=False)[0], 404)
+        self.assertTrue(clip.exists())
+
+
+class RunnerBounds(unittest.TestCase):
+    def test_output_cap_is_exact(self):
+        from media_exec import OutputLimitError, run_bounded
+        write = 'import sys; sys.stdout.buffer.write(b"x" * {})'
+        self.assertEqual(len(run_bounded([sys.executable, '-c', write.format(4096)], timeout=20, max_output=4096).stdout), 4096)
+        with self.assertRaises(OutputLimitError):
+            run_bounded([sys.executable, '-c', write.format(4097)], timeout=20, max_output=4096)
+
+    def test_timeout_kills_the_child(self):
+        from media_exec import run_bounded
+        started = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            run_bounded([sys.executable, '-c', 'import time; time.sleep(60)'], timeout=1, max_output=1024)
+        self.assertLess(time.monotonic() - started, 6)
+
+    def test_stderr_keeps_only_a_tail(self):
+        from media_exec import MAX_STDERR, run_bounded
+        result = run_bounded([sys.executable, '-c', 'import sys; sys.stderr.buffer.write(b"e" * 4_000_000 + b"END")'],
+                             timeout=20, max_output=1024)
+        self.assertLessEqual(len(result.stderr), MAX_STDERR)
+        self.assertTrue(result.stderr.endswith(b'END'))
+
+
+class DecoderBounds(unittest.TestCase):
+    """Audio preview and waveform checks that must hold before FFmpeg runs."""
+
+    def ffmpeg_calls(self, module):
+        calls = []
+        original = module.run_bounded
+
+        def watched(cmd, **options):
+            if cmd[0] == 'ffmpeg':
+                calls.append((cmd, options))
+            return original(cmd, **options)
+        module.run_bounded = watched
+        self.addCleanup(setattr, module, 'run_bounded', original)
+        return calls
+
+    def test_audition_just_past_the_end_is_silence_without_ffmpeg(self):
+        import media_proxy
+        calls = self.ffmpeg_calls(media_proxy)
+        duration = media_proxy.describe('/assets/score.wav')['duration']
+        index = math.ceil(duration / media_proxy.AUDITION_SECONDS)
+        audio = media_proxy.audition_audio('/assets/score.wav', index, 1)
+        self.assertEqual(calls, [])
+        self.assertFalse(any(audio[44:]))
+        self.assertEqual(len(audio), 44 + media_proxy.AUDITION_SECONDS * 48000 * 4)
+
+    def test_audition_decoder_is_capped_and_padded_to_the_window(self):
+        import media_proxy
+        calls = self.ffmpeg_calls(media_proxy)
+        audio = media_proxy.audition_audio('/assets/score.wav', 2, 1.5)
+        (cmd, options), = calls
+        self.assertLessEqual(options['max_output'], 1024 * 1024)
+        self.assertLessEqual(len(audio), options['max_output'])
+        filters = cmd[cmd.index('-af') + 1].split(',')
+        self.assertTrue(all(f.startswith('apad=whole_dur=') for f in filters if f.startswith('apad')), filters)
+        self.assertEqual(filters[-1], f'apad=whole_dur={media_proxy.AUDITION_SECONDS + .02:.9f}')
+
+    def test_out_of_range_streams_are_refused_before_decoding(self):
+        import media_peaks
+        import media_proxy
+        calls = self.ffmpeg_calls(media_proxy)
+        for stream in (1, 5, -1, '0', 1.0):
+            with self.assertRaisesRegex(ValueError, 'unavailable'):
+                media_proxy.audition_audio('/assets/score.wav', 0, 1, stream=stream)
+        self.assertEqual(calls, [])
+        probes = []
+        original = media_peaks.run_bounded
+        media_peaks.run_bounded = lambda *a, **k: probes.append(a) or original(*a, **k)
+        self.addCleanup(setattr, media_peaks, 'run_bounded', original)
+        for stream in (16, 99, -1, '1', None):
+            with self.assertRaisesRegex(ValueError, 'unavailable'):
+                media_peaks.waveform('/assets/score.wav', stream)
+        self.assertEqual(probes, [])
+
+
+class ProbeDetails(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(prefix='splice-probe-')
+        self.addCleanup(temp.cleanup)
+        self.dir = Path(temp.name)
+
+    def test_rates_snap_to_the_standard_a_camera_wrote(self):
+        from fractions import Fraction
+        from media_proxy import _snap
+        for probed, expected in (('2997/100', '30000/1001'), ('23976/1000', '24000/1001'), ('5994/100', '60000/1001'),
+                                 ('25', '25'), ('2500/100', '25'), ('25/2', '25/2'), ('599/20', '599/20')):
+            self.assertEqual(_snap(Fraction(probed)), Fraction(expected), probed)
+
+    def test_variable_rate_in_matroska_is_found_by_the_packet_scan(self):
+        # Matroska reports equal nominal and average rates for this clip.
+        for name in ('vfr.mkv', 'vfr.webm'):
+            clip = self.dir / name
+            codec = ['-c:v', 'libx264', '-preset', 'ultrafast'] if name.endswith('mkv') else \
+                    ['-c:v', 'libvpx-vp9', '-deadline', 'realtime', '-cpu-used', '8']
+            ffmpeg('-f', 'lavfi', '-i', 'testsrc2=s=96x54:r=30:d=3', '-vf', "setpts='if(lt(N,30),N/15,2+(N-30)/30)/TB'",
+                   '-fps_mode', 'passthrough', *codec, clip)
+            from media_proxy import describe_path
+            info = describe_path(clip)
+            self.assertTrue(info['vfr'], name)
+            self.assertTrue(info['proxyRecommended'], name)
+        steady = self.dir / 'steady.mkv'
+        ffmpeg('-f', 'lavfi', '-i', 'testsrc2=s=96x54:r=30:d=2', '-c:v', 'libx264', '-preset', 'ultrafast', steady)
+        from media_proxy import describe_path
+        self.assertEqual((describe_path(steady)['vfr'], describe_path(steady)['rate']), (False, '30/1'))
+
+    def test_too_few_packets_fall_back_to_the_rate_mismatch(self):
+        from fractions import Fraction
+        import media_proxy
+        original = media_proxy._ffprobe
+        packets = [{'pts_time': str(t)} for t in (0, .05, .1, .2)]
+        media_proxy._ffprobe = lambda *a, **k: {'packets': packets}
+        try:
+            self.assertTrue(media_proxy._variable_rate('x', 0, Fraction(30), Fraction(20)))
+            self.assertFalse(media_proxy._variable_rate('x', 0, Fraction(30), Fraction(30)))
+            steady = [{'pts_time': str(i / 30)} for i in range(40)]
+            media_proxy._ffprobe = lambda *a, **k: {'packets': steady}
+            self.assertFalse(media_proxy._variable_rate('x', 0, Fraction(30), Fraction(20)))
+        finally:
+            media_proxy._ffprobe = original
+        short = self.dir / 'short.mp4'
+        ffmpeg('-f', 'lavfi', '-i', 'testsrc2=s=96x54:r=30:d=0.17', '-c:v', 'libx264', '-preset', 'ultrafast', short)
+        self.assertFalse(media_proxy.describe_path(short)['vfr'])
+
+    def test_text_files_are_not_media(self):
+        from media_proxy import decodable
+        notes = self.dir / 'notes.txt'
+        notes.write_text('Slate notes for the whole day of shooting.\n' * 40)
+        for name in ('notes.txt', 'notes.mov'):
+            with self.assertRaisesRegex(ValueError, 'cannot decode'):
+                decodable(notes, name)
+
+    def test_a_probe_timeout_is_reported_as_a_timeout(self):
+        import media_proxy
+        original = media_proxy.run_bounded
+
+        def slow(cmd, **options):
+            raise subprocess.TimeoutExpired(cmd, options['timeout'])
+        media_proxy.run_bounded = slow
+        try:
+            with self.assertRaisesRegex(ValueError, 'timed out') as caught:
+                media_proxy.decodable(ROOT / 'assets' / 'score.wav', 'score.wav')
+            self.assertIsInstance(caught.exception, media_proxy.ProbeTimeout)
+        finally:
+            media_proxy.run_bounded = original
 
 
 if __name__ == '__main__':
