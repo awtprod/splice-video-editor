@@ -1,13 +1,16 @@
 """Validate and serialize bounded 3D LUTs for FFmpeg."""
 import math
 
+# Keep in step with lut.js: 65 points per axis is what colorists commonly deliver.
+MAX_SIZE = 65
+
 
 def cube_text(lut, intensity=100, *, normalized_domain=False):
     if not isinstance(lut, dict):
         raise ValueError('Invalid LUT')
     size = lut.get('size')
     data = lut.get('data')
-    if isinstance(size, bool) or not isinstance(size, int) or not 2 <= size <= 33 or not isinstance(data, list) or len(data) != size**3*3:
+    if isinstance(size, bool) or not isinstance(size, int) or not 2 <= size <= MAX_SIZE or not isinstance(data, list) or len(data) != size**3*3:
         raise ValueError('Invalid 3D LUT shape')
     if any(isinstance(value,bool) or not isinstance(value,(float,int)) or not math.isfinite(value) or not -4 <= value <= 4 for value in data):
         raise ValueError('Invalid 3D LUT sample')
