@@ -1,16 +1,20 @@
 """Probe camera originals and produce reusable local edit proxies."""
 from fractions import Fraction
+from functools import lru_cache
 import hashlib
 import json
 import math
 from pathlib import Path
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 import threading
 
-from premiere import MEDIA_ROOT, STILL_IMAGES, _media_path, _playback_url
+from premiere import MEDIA_ROOT, STILL_IMAGES, _playback_url
+from media_exec import run_bounded
+from media_links import camera_raw_error, resolve_media as _media_path
 
 _encoders = threading.BoundedSemaphore(2)
 _locks = tuple(threading.Lock() for _ in range(32))
@@ -47,35 +51,63 @@ def tempo_filters(speed):
     return filters
 
 
-def audition_audio(src, index, rate=1, reverse=False):
+AUDITION_RATE = 48000
+# Two channels of 16-bit PCM for the window plus the tempo overlap, a WAV
+# header and generous slack. Nothing larger is ever held in memory.
+AUDITION_LIMIT = 1024 * 1024
+PROBE_LIMIT = 8 * 1024 * 1024
+SCAN_LIMIT = 256 * 1024
+
+
+def _silence(seconds):
+    frames = round(seconds * AUDITION_RATE)
+    data = frames * 4
+    header = (b'RIFF' + (36 + data).to_bytes(4, 'little') + b'WAVEfmt ' + (16).to_bytes(4, 'little') +
+              (1).to_bytes(2, 'little') + (2).to_bytes(2, 'little') + AUDITION_RATE.to_bytes(4, 'little') +
+              (AUDITION_RATE * 4).to_bytes(4, 'little') + (4).to_bytes(2, 'little') + (16).to_bytes(2, 'little') +
+              b'data' + data.to_bytes(4, 'little'))
+    return header + bytes(data)
+
+
+def audition_audio(src, index, rate=1, reverse=False, stream=0):
     """Read a bounded span and apply the same tempo processing as delivery."""
     if not math.isfinite(rate) or not .0625 <= rate <= 16:
         raise ValueError('Invalid audio preview speed')
     span = AUDITION_SECONDS * rate
-    if not 0 <= index < 86400 / span:
+    if type(index) is not int or not 0 <= index < 86400 / span:
         raise ValueError('Invalid audio preview position')
+    path = _media_path(src)
+    info = describe(src)
+    streams = info['audioStreams']
+    if type(stream) is not int or not 0 <= stream < max(1, streams):
+        raise ValueError('The selected source audio stream is unavailable')
+    if not streams:
+        raise ValueError('The source has no audio')
     start = index * span
+    overlap = .02 if rate != 1 else 0
+    if start >= info['duration']:
+        # Past the end of the source: answer with the silence the tail
+        # padding would have produced instead of decoding nothing forever.
+        return _silence(AUDITION_SECONDS + overlap)
     # Give the tempo filter extra source after the requested window so its
     # analysis latency cannot leave a silent tail on an ordinary boundary.
-    overlap = .02 if rate != 1 else 0
     extra = .25 * max(1, rate) if overlap else 0
     seek = max(0, start-extra) if reverse else start
     length = start+span-seek + (0 if reverse else extra)
-    filters = ['aresample=48000:first_pts=0', f'apad=whole_dur={length:.9f}', f'atrim=duration={length:.9f}']
+    filters = [f'aresample={AUDITION_RATE}:first_pts=0', f'apad=whole_dur={length:.9f}', f'atrim=duration={length:.9f}']
     if reverse:
         filters.append('areverse')
     filters.extend(tempo_filters(rate))
-    filters.append('apad')
-    path = _media_path(src)
+    filters.append(f'apad=whole_dur={AUDITION_SECONDS+overlap:.9f}')
     if not _audition_decoders.acquire(timeout=2):
         raise ValueError('Audio preview is busy')
     try:
-        result = subprocess.run([
+        result = run_bounded([
             'ffmpeg', '-nostdin', '-v', 'error', '-protocol_whitelist', 'file', '-threads', '1',
-            '-ss', f'{seek:.9f}', '-i', str(path), '-map', '0:a:0',
-            '-af', ','.join(filters), '-ac', '2', '-c:a', 'pcm_s16le',
+            '-ss', f'{seek:.9f}', '-i', str(path), '-map', f'0:a:{stream}',
+            '-af', ','.join(filters), '-ac', '2', '-ar', str(AUDITION_RATE), '-c:a', 'pcm_s16le',
             '-t', str(AUDITION_SECONDS+overlap), '-f', 'wav', 'pipe:1',
-        ], capture_output=True, timeout=8)
+        ], timeout=8, max_output=AUDITION_LIMIT)
         if result.returncode:
             raise ValueError('Could not decode audio for preview')
         return result.stdout
@@ -98,41 +130,180 @@ def stereo_mix_filters(sources, output, channels, duration):
     return filters
 
 
-def describe(src):
-    path = _media_path(src)
-    probe = subprocess.run(['ffprobe', '-v', 'error', '-protocol_whitelist', 'file',
-                            '-show_entries', 'format=duration:stream=codec_type,codec_name,width,height,avg_frame_rate,duration,channels,color_transfer:stream_disposition=attached_pic',
-                            '-of', 'json', str(path)], capture_output=True, timeout=25)
-    if probe.returncode:
-        raise ValueError('Could not read media streams in ' + path.name)
-    data = json.loads(probe.stdout)
-    streams = data.get('streams', [])
-    video = next((s for s in streams if s['codec_type']=='video' and not s.get('disposition',{}).get('attached_pic')), {})
-    audio_streams = [s for s in streams if s['codec_type']=='audio']
-    if len(audio_streams)>MAX_AUDIO_STREAMS:
+STANDARD_RATES = tuple(Fraction(r) for r in ('24000/1001', '24', '25', '30000/1001', '30', '48', '50',
+                                                '60000/1001', '60', '100', '120000/1001', '120'))
+LONG_GOP = frozenset({'h264', 'hevc', 'av1', 'vp8', 'vp9', 'mpeg2video', 'mpeg4'})
+STILL_FORMATS = frozenset({'image2', 'png_pipe', 'tiff_pipe', 'jpeg_pipe', 'bmp_pipe', 'exr_pipe', 'dpx_pipe',
+                           'webp_pipe', 'image2pipe'})
+_TIMECODE = re.compile(r'(\d{2}):(\d{2}):(\d{2})([:;.,])(\d{2,3})')
+
+
+def _fraction(value):
+    try:
+        rate = Fraction(str(value or '0'))
+    except (ValueError, ZeroDivisionError):
+        return None
+    return rate if 0 < rate <= 1000 else None
+
+
+def _rational(value):
+    return f'{value.numerator}/{value.denominator}'
+
+
+def _snap(rate):
+    """A probed average such as 2997/100 is the 30000/1001 a camera wrote."""
+    for standard in STANDARD_RATES:
+        if abs(rate - standard) / standard < Fraction(1, 2000):
+            return standard
+    return rate.limit_denominator(1001)
+
+
+def _tag(tags, *names):
+    lowered = {str(k).lower(): v for k, v in (tags or {}).items()}
+    for name in names:
+        value = lowered.get(name)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _ffprobe(path, *arguments, limit=PROBE_LIMIT, timeout=25):
+    result = run_bounded(['ffprobe', '-v', 'error', '-protocol_whitelist', 'file', *arguments, '-of', 'json', str(path)],
+                         timeout=timeout, max_output=limit)
+    if result.returncode:
+        raise ValueError('Could not read media streams in ' + Path(path).name)
+    data = json.loads(result.stdout)
+    if not isinstance(data, dict):
+        raise ValueError('Could not read media streams in ' + Path(path).name)
+    return data
+
+
+def _variable_rate(path, stream_index, nominal, average):
+    """Confirm a frame-rate mismatch from the first packets' timestamps."""
+    if nominal is None or average is None or abs(nominal - average) / nominal < Fraction(1, 1000):
+        return False
+    data = _ffprobe(path, '-select_streams', str(stream_index), '-read_intervals', '%+#300',
+                    '-show_entries', 'packet=pts_time', limit=SCAN_LIMIT, timeout=15)
+    times = sorted(float(p['pts_time']) for p in data.get('packets', [])
+                   if isinstance(p, dict) and p.get('pts_time') not in (None, 'N/A'))
+    steps = sorted(b - a for a, b in zip(times, times[1:]) if b > a)
+    if len(steps) < 8:
+        return True
+    median = steps[len(steps) // 2]
+    irregular = sum(abs(step - median) > median * .1 for step in steps)
+    return irregular / len(steps) > .05
+
+
+def _rotation(stream):
+    for side in stream.get('side_data_list') or []:
+        if isinstance(side, dict) and 'rotation' in side:
+            try:
+                return round(-float(side['rotation'])) % 360
+            except (TypeError, ValueError):
+                break
+    try:
+        return round(float(_tag(stream.get('tags'), 'rotate') or 0)) % 360
+    except ValueError:
+        return 0
+
+
+def _color(value):
+    return value if isinstance(value, str) and value not in ('unknown', 'unspecified', 'reserved') else None
+
+
+@lru_cache(maxsize=512)
+def _describe_file(path, size, modified):
+    path = Path(path)
+    data = _ffprobe(path, '-show_streams', '-show_format')
+    streams = [s for s in data.get('streams', []) if isinstance(s, dict)]
+    fmt = data.get('format') if isinstance(data.get('format'), dict) else {}
+    video = next((s for s in streams if s.get('codec_type') == 'video' and not (s.get('disposition') or {}).get('attached_pic')), {})
+    audio_streams = [s for s in streams if s.get('codec_type') == 'audio']
+    if len(audio_streams) > MAX_AUDIO_STREAMS:
         raise ValueError(f'Media has more than {MAX_AUDIO_STREAMS} audio streams')
     audio = audio_streams[0] if audio_streams else {}
     if not video and not audio:
         raise ValueError('The source contains no editable audio or video stream')
-    still = path.suffix.lower() in STILL_IMAGES
-    duration = 5 if still else float(data.get('format',{}).get('duration') or video.get('duration') or audio.get('duration') or 0)
+    still = bool(video) and (path.suffix.lower() in STILL_IMAGES or fmt.get('format_name') in STILL_FORMATS)
+    try:
+        duration = 5 if still else float(fmt.get('duration') or video.get('duration') or audio.get('duration') or 0)
+    except ValueError:
+        duration = 0
     if not math.isfinite(duration) or not 0 < duration <= 86400:
         raise ValueError('No supported media duration in ' + path.name)
-    try:
-        fps = float(Fraction(video.get('avg_frame_rate') or '0'))
-    except (ValueError, ZeroDivisionError):
-        fps = 0
+    nominal, average = _fraction(video.get('r_frame_rate')), _fraction(video.get('avg_frame_rate'))
+    fps = float(average) if average else 0
+    vfr = bool(video) and not still and _variable_rate(path, video.get('index', 0), nominal, average)
+    rate = None
+    if video and not still and (average or nominal):
+        if vfr or not nominal:
+            rate = _snap(average or nominal)
+        elif average and abs(nominal - average) / average >= Fraction(1, 1000):
+            rate = _snap(average)  # Field-rate nominal values on interlaced sources.
+        else:
+            rate = _snap(nominal)
+    timecode_stream = next((s for s in streams if s.get('codec_tag_string') == 'tmcd' or
+                            (s.get('codec_type') == 'data' and _tag(s.get('tags'), 'timecode'))), {})
+    timecode = None
+    for tags in (timecode_stream.get('tags'), video.get('tags'), fmt.get('tags'), *(s.get('tags') for s in streams)):
+        match = _TIMECODE.fullmatch(_tag(tags, 'timecode') or '')
+        if match:
+            timecode = match
+            break
+    drop = bool(timecode) and timecode.group(4) in ';,'
+    reel = None
+    for tags in (timecode_stream.get('tags'), video.get('tags'), fmt.get('tags')):
+        reel = _tag(tags, 'reel_name', 'reel', 'tape_name', 'tape')
+        if reel:
+            break
     vcodec, acodec = video.get('codec_name'), audio.get('codec_name')
+    width, height = video.get('width'), video.get('height')
     native_video = not video or vcodec in ('h264','vp8','vp9','av1')
     native_audio = not audio or acodec in ('aac','mp3','opus','vorbis','flac','pcm_s16le','pcm_s24le','pcm_f32le')
     native_container = path.suffix.lower() in ('.mp4','.m4v','.m4a','.webm','.wav','.mp3','.ogg','.flac','.aac')
     hdr = video.get('color_transfer') in HDR_TRANSFERS
-    return dict(type='video' if video else 'audio', duration=duration, width=video.get('width'), height=video.get('height'), hdr=hdr,
+    uhd_long_gop = vcodec in LONG_GOP and isinstance(width, int) and isinstance(height, int) and max(width, height) >= 3840
+    return dict(type='video' if video else 'audio', duration=duration, width=width, height=height, hdr=hdr,
                 hdrPreviewVersion=HDR_PREVIEW_VERSION if hdr else None,
-                fps=fps, videoCodec=vcodec, audioCodec=acodec, audioChannels=2 if len(audio_streams)>1 else audio.get('channels',0),
-                audioStreams=len(audio_streams), audioStreamChannels=[stream.get('channels',1) for stream in audio_streams], still=still,
+                fps=fps, rate=_rational(rate) if rate else None, vfr=vfr,
+                timecode=(':'.join(timecode.group(1, 2, 3)) + (';' if drop else ':') + timecode.group(5)) if timecode else None,
+                dropFrame=drop, reel=reel,
+                videoCodec=vcodec, audioCodec=acodec, audioChannels=2 if len(audio_streams)>1 else audio.get('channels',0),
+                audioStreams=len(audio_streams),
+                audioStreamDetails=[dict(index=i, streamIndex=s.get('index'), channels=s.get('channels', 1),
+                                   layout=s.get('channel_layout'), codec=s.get('codec_name'))
+                              for i, s in enumerate(audio_streams)],
+                audioStreamChannels=[stream.get('channels',1) for stream in audio_streams], still=still,
                 stillPreviewVersion=STILL_PREVIEW_VERSION if still else None,
-                proxyRecommended=hdr or len(audio_streams)>1 or not (native_video and native_audio and native_container))
+                pixelFormat=video.get('pix_fmt'), colorPrimaries=_color(video.get('color_primaries')),
+                colorTransfer=_color(video.get('color_transfer')), colorSpace=_color(video.get('color_space')),
+                colorRange=_color(video.get('color_range')), rotation=_rotation(video) if video else 0,
+                proxyRecommended=hdr or vfr or uhd_long_gop or len(audio_streams)>1 or
+                not (native_video and native_audio and native_container))
+
+
+def describe_path(path):
+    path = Path(path)
+    stat = path.stat()
+    return {**_describe_file(str(path), stat.st_size, stat.st_mtime_ns), 'sourcePath': str(path)}
+
+
+def describe(src):
+    return describe_path(_media_path(src))
+
+
+def decodable(path, name):
+    """Whether the installed FFmpeg can edit this file. The probe decides,
+    not the filename extension, except for camera RAW it never decodes."""
+    message = camera_raw_error(name)
+    if message:
+        raise ValueError(message)
+    try:
+        data = _ffprobe(path, '-show_entries', 'stream=codec_type', timeout=25, limit=SCAN_LIMIT)
+    except (ValueError, OSError, subprocess.SubprocessError):
+        data = {}
+    if not any(isinstance(s, dict) and s.get('codec_type') in ('video', 'audio') for s in data.get('streams', [])):
+        raise ValueError(f'The installed FFmpeg cannot decode {Path(name).name}')
 
 
 def _select_stream(channels, selection):
@@ -211,7 +382,7 @@ def proxy(src, seek_optimized=False, audio_stream=None, grading_data=False):
                 else:
                     cmd += audio_map + ['-c:a','aac','-b:a','160k','-ac',str(min(2,max(1,info['audioChannels']))),'-movflags','+faststart']
                 cmd.append(str(out))
-                completed = subprocess.run(cmd,capture_output=True,timeout=min(3600,max(60,info['duration']*3)))
+                completed = run_bounded(cmd,timeout=min(3600,max(60,info['duration']*3)),max_output=SCAN_LIMIT)
                 if completed.returncode:
                     raise ValueError('Proxy creation failed for '+original.name+': '+completed.stderr.decode(errors='replace')[-400:])
                 os.link(out,target)
@@ -246,7 +417,7 @@ def premiere_audio(src, audio_stream=None):
                 cmd=['ffmpeg','-nostdin','-v','error','-y','-threads','2','-filter_complex_threads','2',
                      '-protocol_whitelist','file','-i',str(original),'-filter_complex',';'.join(filters),
                      '-map','[audio]','-c:a','pcm_s24le','-t',str(duration),str(output)]
-                result=subprocess.run(cmd,capture_output=True,timeout=min(3600,max(60,duration*3)))
+                result=run_bounded(cmd,timeout=min(3600,max(60,duration*3)),max_output=SCAN_LIMIT)
                 if result.returncode:
                     raise ValueError('Could not write Premiere audio: '+result.stderr.decode(errors='replace')[-400:])
                 os.link(output,target)

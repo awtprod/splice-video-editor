@@ -30,6 +30,12 @@ window.SpliceSession = (() => {
     req.onerror = () => fail(req.error);
   });
   const get = async (store, id) => request((await dbReady).transaction(store).objectStore(store).get(id));
+  // Retention: "Recent projects & recovery" lists, and the database keeps,
+  // the 30 most recently edited projects plus any project edited in the last
+  // 30 days (at most 200), and always the open one. A removed project takes
+  // its versions, file handle and stored Premiere originals with it; an
+  // original no remaining project or version refers to is removed too.
+  const KEEP_RECENT = 30, KEEP_DAYS = 30, KEEP_MAX = 200;
   const tab = uuid();
   let id = uuid(), revision, touched = false, persisting = false, suppress = false;
   let fileHandle, diskSignature, savedFormat, original, originalKey, lastRecord, pending;
@@ -152,6 +158,7 @@ window.SpliceSession = (() => {
       persist().catch(()=>{});
     });
   })().catch(e=>signal('Could not restore the last session: '+e.message));
+  ready.then(()=>prune()).catch(e=>signal('Could not tidy recovery data: '+e.message));
   async function leave() {
     await ready;
     if (persisting) await chain;
@@ -245,8 +252,48 @@ window.SpliceSession = (() => {
     touched = savedRevision!==editor.get().revision;
     await persist(true);
   }
+  async function prune() {
+    const db=await dbReady;
+    const tx=db.transaction(['sessions','versions','originals','handles','metadata'],'readwrite');
+    const done=complete(tx);
+    const last=await request(tx.objectStore('metadata').get('lastSession'));
+    const sessions=(await request(tx.objectStore('sessions').getAll())).sort((a,b)=>b.stamp-a.stamp);
+    const cutoff=Date.now()-KEEP_DAYS*864e5;
+    const kept=new Set(sessions.filter((row,index)=>index<KEEP_RECENT || index<KEEP_MAX && row.stamp>=cutoff ||
+                                                   row.id===id || row.id===last).map(row=>row.id));
+    const originals=new Set(sessions.filter(row=>kept.has(row.id)).map(row=>row.originalKey).filter(Boolean));
+    let removed=0;
+    for(const row of sessions) if(!kept.has(row.id)){tx.objectStore('sessions').delete(row.id);tx.objectStore('handles').delete(row.id);removed++;}
+    await new Promise((ok,fail)=>{
+      const cursor=tx.objectStore('versions').openCursor();
+      cursor.onerror=()=>fail(cursor.error);
+      cursor.onsuccess=()=>{
+        const entry=cursor.result;
+        if(!entry)return ok();
+        if(!kept.has(entry.value.session))entry.delete();
+        else if(entry.value.originalKey)originals.add(entry.value.originalKey);
+        entry.continue();
+      };
+    });
+    for(const key of await request(tx.objectStore('originals').getAllKeys()))
+      if(!originals.has(key)){tx.objectStore('originals').delete(key);removed++;}
+    await done;
+    return removed;
+  }
+  // Every managed media source a retained project or version still uses,
+  // so the media cache can delete only what nothing refers to.
+  async function mediaReferences() {
+    await ready;
+    const db=await dbReady, found=new Set();
+    const scan=value=>{for(const match of JSON.stringify(value).matchAll(/\/media\/[a-f0-9]{32}\/[^"\\]*/g))found.add(match[0]);};
+    scan(editor.get().project);
+    for(const store of ['sessions','versions'])
+      for(const row of await request(db.transaction(store).objectStore(store).getAll()))scan(row.data);
+    return [...found];
+  }
   async function history() {
     await leave();
+    await prune();
     const db=await dbReady;
     const sessions=await request(db.transaction('sessions').objectStore('sessions').getAll());
     const versions=await request(db.transaction('versions').objectStore('versions').index('session').getAll(id));
@@ -277,6 +324,6 @@ window.SpliceSession = (() => {
     });
   }
   window.addEventListener('beforeunload',e=>{if(persisting){e.preventDefault();e.returnValue='';}});
-  return {ready,open,openFile,save,saveAs:format=>save(format,true),history,sequence,
+  return {ready,open,openFile,save,saveAs:format=>save(format,true),history,sequence,prune,mediaReferences,
           newProject:settings=>start(()=>editor.newProject(settings),null,null)};
 })();

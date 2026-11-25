@@ -1,6 +1,7 @@
 """Launch Splice in a dedicated desktop window."""
 import argparse
 import os
+import secrets
 import shutil
 import subprocess
 import sys
@@ -25,7 +26,8 @@ def main():
     profile = data_directory(browser=True) / "browser"
     profile.mkdir(mode=0o700, parents=True, exist_ok=True)
     try:
-        server = create_server(args.port)
+        launch = secrets.token_urlsafe(32)
+        server = create_server(args.port, launch_token=launch)
     except OSError as error:
         sys.exit(f"Could not open Splice on port {args.port}: {error}. Check for an existing window.")
     flags = ["--class=Splice"] if sys.platform.startswith("linux") else []
@@ -34,7 +36,7 @@ def main():
         thread.start()
         try:
             return subprocess.run([
-                browser, f"--app=http://127.0.0.1:{server.server_port}/",
+                browser, f"--app=http://127.0.0.1:{server.server_port}/?launch={launch}",
                 f"--user-data-dir={profile}", "--no-first-run", "--disable-sync",
                 "--window-size=1480,960", *flags,
             ], check=False).returncode
