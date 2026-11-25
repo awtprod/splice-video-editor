@@ -161,7 +161,7 @@ class Handler(BaseHTTPRequestHandler):
             except KeyError:
                 self._json(404, {'error': 'Unknown export'})
             return
-        if route not in ('/api/exports', '/api/media/nested-preview','/api/media/proxy', '/api/premiere/sequence', '/api/premiere/open', '/api/premiere/save', '/api/media/upload', '/api/render'):
+        if route not in ('/api/exports', '/api/media/nested-preview','/api/media/proxy', '/api/premiere/sequence', '/api/premiere/open', '/api/premiere/save', '/api/media/upload', '/api/render', '/api/interchange/export', '/api/interchange/import'):
             self.send_error(404)
             return
         try:
@@ -203,6 +203,10 @@ class Handler(BaseHTTPRequestHandler):
             body = self.rfile.read(length)
             if len(body) != length:
                 raise ValueError('Incomplete request')
+            if route.startswith('/api/interchange/'):
+                from interchange.api import handle
+                self._json(200, handle(route.rsplit('/', 1)[1], json.loads(body)))
+                return
             if route == '/api/media/nested-preview':
                 from media_proxy import nested_preview
                 self._json(200, {'src':nested_preview(json.loads(body)['project'])})
