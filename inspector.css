@@ -13,11 +13,19 @@
 .splice-number input:focus,.splice-number select:focus,.splice-text textarea:focus{outline:2px solid #c4ee78}
 .splice-number input[type=color]{padding:2px;height:30px}
 .splice-text textarea{resize:vertical;min-height:50px}
-.splice-scope{width:100%;height:72px;background:#111611;border:1px solid #3c483b;border-radius:4px}
 .splice-toggles{display:flex;gap:18px;font-size:12px;color:#b9c8b9}
 .splice-toggles label{display:flex;align-items:center;gap:6px;cursor:pointer}
 .splice-toggles input{accent-color:#c4ee78}
-.splice-scope{height:210px}
+.splice-scopes{display:grid;gap:7px}
+.splice-scope-tabs{display:flex;flex-wrap:wrap;gap:4px}
+.splice-scope-tabs button{flex:1 1 auto;border:1px solid #465346;background:#202820;color:#b6c9af;border-radius:4px;padding:5px 6px;font:11px 'DM Sans',sans-serif;cursor:pointer;white-space:nowrap}
+.splice-scope-tabs button[aria-selected=true]{background:#2f3d2b;border-color:#c4ee78;color:#e9f6d8}
+.splice-scope{display:block;width:100%;box-sizing:border-box;background:#0c110d;border:1px solid #3c483b;border-radius:4px}
+.splice-scope-luma{display:flex;align-items:center;gap:6px;font-size:11px;color:#aebaae}
+.splice-scope-luma[hidden]{display:none}
+.splice-scope-luma input{accent-color:#c4ee78}
+.splice-scope-size{display:grid;grid-template-columns:auto 1fr;align-items:center;gap:8px;font-size:11px;color:#aebaae}
+.splice-scope-size input{width:100%;min-width:0;accent-color:#c4ee78}
 .splice-lut-row{display:flex;gap:8px;align-items:center;font-size:11px;color:#b6c9af}
 .splice-lut-row button{border:1px solid #56684f;background:#253025;color:#e4f2d9;border-radius:4px;padding:6px 8px;cursor:pointer}
 .splice-lut-row button{white-space:nowrap}
