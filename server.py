@@ -161,6 +161,10 @@ class Handler(BaseHTTPRequestHandler):
             except KeyError:
                 self._json(404, {'error': 'Unknown export'})
             return
+        if route.startswith('/api/resolve/'):
+            from resolve.http import handle_post
+            handle_post(self, route, parse_qs(urlsplit(self.path).query))
+            return
         if route not in ('/api/exports', '/api/media/nested-preview','/api/media/proxy', '/api/premiere/sequence', '/api/premiere/open', '/api/premiere/save', '/api/media/upload', '/api/render'):
             self.send_error(404)
             return
