@@ -294,7 +294,7 @@ def _trim_to_range(cut: Cut, event: Event):
     if event.transition is not None:
         window = event.record_in - event.transition.before
         if window < first or head:
-            cut.report.note(f'{event.name} at the range start: its transition starts before the export range and was replaced by a cut.')
+            cut.report.note(f'{event.name}: its transition starts before the export range (or the timeline) and was replaced by a cut.')
             event.transition = None
     if head or tail:
         step = Fraction(1) / cut.rate * event.speed
@@ -302,6 +302,9 @@ def _trim_to_range(cut: Cut, event: Event):
             event.source_in += tail * step
         else:
             event.source_in += head * step
+        if event.source is not None and not event.source.still:
+            grid = event.source.rate or cut.rate  # a retimed clip can be cut between source frames
+            event.source_in = Fraction(math.floor(event.source_in * grid + Fraction(1, 2))) / grid
         event.frames -= head + tail
         event.fade_in = max(0, event.fade_in - head)
         event.fade_out = max(0, event.fade_out - tail)
