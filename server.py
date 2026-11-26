@@ -239,6 +239,96 @@ def start_export(handler, body):
     handler._json(202, {'id': handler.server.jobs.start(payload['project'], payload.get('options', {}))})
 
 
+# Delivery formats, presets and the render queue (delivery.py, render_queue.py).
+_queue_lock = threading.Lock()
+
+
+def _render_queue(handler):
+    with _queue_lock:
+        if getattr(handler.server, 'render_queue', None) is None:
+            from render_queue import RenderQueue
+            handler.server.render_queue = RenderQueue(handler.server.jobs)
+        return handler.server.render_queue
+
+
+@get('/api/delivery/capabilities')
+def delivery_capabilities(handler, query):
+    import delivery, render_queue
+    presets, problems = delivery.load_user_presets()
+    handler._json(200, {**delivery.describe(), 'machine': delivery.capabilities(refresh=query.get('refresh') == ['1']),
+                        'presets': delivery.BUILTIN_PRESETS, 'userPresets': presets, 'presetProblems': problems,
+                        'folder': str(render_queue.default_folder())})
+
+
+@post('/api/delivery/check', limit=MAX_SMALL_BODY)
+def delivery_check(handler, body):
+    import delivery
+    payload = _json_body(body)
+    sequence = payload.get('sequence') or {}
+    if not isinstance(sequence, dict):
+        raise ValueError('Invalid sequence')
+    spec = delivery.normalize(payload.get('options'))
+    width, height, fps = sequence.get('width'), sequence.get('height'), sequence.get('fps')
+    sized = all(isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0 for v in (width, height, fps))
+    handler._json(200, {'unavailable': delivery.unavailable_reason(payload['options']),
+                        'problems': delivery.frame_problems(spec, int(width), int(height), fps) if sized and spec['kind'] != 'audio' else [],
+                        'conversions': delivery.conversions(spec, int(width), int(height), fps) if sized and spec['kind'] != 'audio' else []})
+
+
+@post('/api/delivery/presets', limit=MAX_SMALL_BODY)
+def delivery_presets(handler, body):
+    import delivery
+    handler._json(200, {'userPresets': delivery.save_user_presets(_json_body(body).get('presets'))})
+
+
+@post('/api/delivery/presets/import', limit=MAX_SMALL_BODY)
+def delivery_presets_import(handler, body):
+    import delivery
+    handler._json(200, {'presets': delivery.import_presets(_json_body(body).get('text'))})
+
+
+@get('/api/queue')
+def queue_list(handler, query):
+    handler._json(200, _render_queue(handler).list())
+
+
+@post('/api/queue')
+def queue_add(handler, body):
+    from render_queue import ConflictError
+    payload = _json_body(body)
+    try:
+        ids = _render_queue(handler).add(payload['project'], payload.get('jobs'), folder=payload.get('folder'),
+                                         overwrite=payload.get('overwrite', False))
+    except ConflictError as error:
+        handler._json(409, {'error': str(error), 'conflict': True})
+        return
+    handler._json(202, {'ids': ids})
+
+
+@post('/api/queue/action', limit=MAX_SMALL_BODY)
+def queue_action(handler, body):
+    payload = _json_body(body)
+    try:
+        handler._json(200, _render_queue(handler).action(payload.get('id'), payload.get('action')))
+    except KeyError:
+        handler._json(404, {'error': 'Unknown queue job'})
+
+
+@post('/api/queue/pause', limit=MAX_SMALL_BODY)
+def queue_pause(handler, body):
+    queue = _render_queue(handler)
+    queue.set_paused(_json_body(body).get('paused'))
+    handler._json(200, queue.list())
+
+
+@post('/api/queue/reveal', limit=MAX_SMALL_BODY)
+def queue_reveal(handler, body):
+    try:
+        handler._json(200, {'path': _render_queue(handler).reveal(_json_body(body).get('id'))})
+    except KeyError:
+        handler._json(404, {'error': 'Unknown queue job'})
+
+
 @post('/api/premiere/sequence')
 def premiere_sequence(handler, body):
     payload = _json_body(body)

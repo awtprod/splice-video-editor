@@ -16,6 +16,7 @@ from pathlib import Path
 from premiere import MEDIA_ROOT, STILL_IMAGES, _media_path
 from media_proxy import AVC_REC709, HDR_LINEAR_REC709, HDR_TONE_MAP, HDR_TRANSFERS, HDR_TO_REC709, REC709, tempo_filters
 from splice_platform import data_directory, font_roots, installed_font
+import delivery
 
 
 PQ = ('bt2020','smpte2084','bt2020nc')
@@ -107,11 +108,17 @@ def _disabled_stand_ins(clips, fps):
     return kept
 
 
+# Stills the renderer loops as pictures. TIFF, OpenEXR and DPX keep their bit depth through
+# the high-depth (10-bit) pipeline.
+RENDER_STILLS = frozenset(STILL_IMAGES | {'.tif', '.tiff', '.exr', '.dpx'})
+
+
 def _render_source(item):
     src = item.get('src')
     if not src:
         raise ValueError(f"Relink {item.get('name') or 'the offline source'} before exporting.")
-    return _media_path(src)
+    import media_links
+    return media_links.resolve_media(src)
 
 
 def _number(value, label, low=0, high=MAX_SOURCE_SECONDS):
@@ -969,7 +976,7 @@ def _media_info(item, probes, heartbeat=None):
         return item
     path = _render_source(item)
     item['_path'] = path
-    if path.suffix.lower() in STILL_IMAGES:
+    if path.suffix.lower() in RENDER_STILLS:
         item.update(_kinds={'video'}, _actualDuration=math.inf, _audioStreams=[], _renderStill=True)
         return item
     probe = probes.get(path)
@@ -1076,16 +1083,18 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
     if duration <= 0 or duration > MAX_TIMELINE_SECONDS:
         raise ValueError(f'Timeline duration must be more than 0 and at most {_duration_text(MAX_TIMELINE_SECONDS)}')
     render_options = project.get('renderOptions') or {}
-    codec=options.get('codec','h264')
-    if codec not in ('h264','prores'): raise ValueError('Unsupported export codec')
-    high_depth = codec=='prores'
+    spec = options.get('_spec') or _delivery_spec(options)
+    if spec['kind'] == 'audio': raise ValueError('Unsupported export codec')
+    high_depth = spec['high_depth']
     rec709 = options.get('colorSpace')=='rec709'
     conform_pq = options.get('colorSpace')=='pq'
-    base_format = 'yuv422p10le' if high_depth else 'yuv420p'
-    alpha_format = 'yuva422p10le' if high_depth else 'yuva420p'
+    # Composite in 4:4:4 for 4:4:4 and RGB deliveries, with an alpha base when alpha is delivered.
+    wide = spec['chroma'] == '444'
+    base_format = ('yuva444p10le' if spec['alpha'] else 'yuv444p10le') if wide else 'yuv422p10le' if high_depth else 'yuv420p'
+    alpha_format = 'yuva444p10le' if wide else 'yuva422p10le' if high_depth else 'yuva420p'
     full_alpha = 'yuva444p10le' if high_depth else 'yuva444p'
     dip_rgb = 'gbrap10le' if high_depth else 'gbrap'
-    overlay = 'eof_action=pass:shortest=0:format=' + ('yuv422p10' if high_depth else 'yuv420')
+    overlay = 'eof_action=pass:shortest=0:format=' + ('yuv444p10' if wide else 'yuv422p10' if high_depth else 'yuv420')
     if not isinstance(render_options, dict) or not isinstance(render_options.get('mutedTracks', {}), dict):
         raise ValueError('Invalid render options')
     muted = render_options.get('mutedTracks', {})
@@ -1174,7 +1183,7 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
 
     command = ['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-filter_complex_threads', '3', '-y',
                *(argument for entry in inputs for argument in entry),
-               '-f', 'lavfi', '-i', f'color=c=black:s={width}x{height}:r={fps}:d={duration:.6f}']
+               '-f', 'lavfi', '-i', f'color=c=black{"@0" if spec["alpha"] else ""}:s={width}x{height}:r={fps}:d={duration:.6f}']
     base_index = len(inputs)
     profile = options.get('_color_profile') or REC709
     hdr_profile = profile if high_depth and profile[1] in HDR_TRANSFERS else None
@@ -1327,22 +1336,31 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
         filters.append(f'[{active}]trim=start_frame={first}:end_frame={stop},setpts=PTS-STARTPTS[vwindow]')
         active = 'vwindow'
         duration = (stop-first)/fps
+    tail = _delivery_tail(spec, width, height, fps, profile, options.get('_burn'), directory)
+    if tail:
+        filters.append(f'[{active}]{tail}[delivered]')
+        active = 'delivered'
+    command.extend([*_graph_args(';'.join(filters), directory, 'picture'), '-map', f'[{active}]', '-an',
+                    '-t', f'{float(duration):.6f}', '-r', str(fps)])
+    if spec['mode'] == 'stream':
+        # Raw frames in the delivery's pixel format for the one encoder (see _stream_picture).
+        command.extend(['-f', 'rawvideo', 'pipe:1'])
+        return command
     output = Path(output_path)
-    command.extend([*_graph_args(';'.join(filters), directory, 'picture'), '-map', f'[{active}]', '-an'])
-    if codec=='prores':
-        command.extend(['-t',f'{float(duration):.6f}','-r',str(fps),'-c:v','prores_ks','-profile:v','3','-pix_fmt','yuv422p10le','-threads','4'])
-    else:
-        command.extend(['-t',f'{float(duration):.6f}','-r',str(fps),'-c:v','libx264','-threads','4','-preset','veryfast',
-                        '-crf',str(int(_number(options.get('crf',20),'quality',14,32))),'-pix_fmt','yuv420p'])
-    command.extend(_color_tags(profile, codec))
-    command.extend(['-movflags','+write_colr',str(output)])
+    command.extend([*delivery.encoder_args(spec, fps, profile, threads=4), *_color_tags(profile, spec)])
+    if spec['container'] != 'mxf':
+        command.extend(['-movflags', '+write_colr'])
+    command.append(str(output))
     _run_ffmpeg(command,cancelled,options.get('_heartbeat'))
     return output.stat().st_size
 
 
-def _color_tags(profile, codec):
-    """Explicit stream color signaling: primaries, transfer, matrix and (legal) range."""
-    tags = ['-color_primaries',profile[0],'-color_trc',profile[1],'-colorspace',profile[2],'-color_range','tv']
+def _color_tags(profile, spec):
+    """Explicit stream color signaling: primaries, transfer, matrix and range (legal for video, full for RGB)."""
+    codec = spec if isinstance(spec, str) else spec['codec']
+    rgb = not isinstance(spec, str) and spec['kind'] == 'images'
+    tags = ['-color_primaries',profile[0],'-color_trc',profile[1],'-colorspace','rgb' if rgb else profile[2],
+            '-color_range','pc' if rgb else 'tv']
     if codec == 'prores':
         # ProRes carries its color description in each frame header as well.
         tags += ['-bsf:v',f'prores_metadata=color_primaries={profile[0]}:color_trc={profile[1]}:colorspace={profile[2]}']
@@ -1692,10 +1710,19 @@ def render_to_file(project, output_path, *, options=None, progress=None, cancell
             child=item.get('nestedProject')
             if not child or item.get('id') not in enabled_media: continue
             if _nested_depth>=4: raise ValueError('Nested Premiere sequences exceed four levels')
-            suffix='.mov' if options.get('codec')=='prores' else '.mp4'
+            # A nested sequence is rendered as an intermediate: ProRes 422 HQ under high-depth
+            # deliveries, H.264 under 8-bit ones, with the parent's audio and colour settings.
+            child_codec=delivery.legacy_codec(_delivery_spec(options))
+            child_codec='h264' if child_codec=='wav' else child_codec
+            suffix='.mov' if child_codec=='prores' else '.mp4'
             target=Path(directory)/f'nested-{index}{suffix}'
-            child_options={**options,'codec':'prores' if suffix=='.mov' else 'h264'}
-            child_options.pop('range',None)
+            child_options={key:options[key] for key in ('limiter','limiterCeiling','aacPeakSafe','audioBitrate','subtitleLanguage',
+                                                         'captions') if key in options}
+            child_options['codec']=child_codec
+            if child_codec=='prores' and options.get('colorSpace') in ('rec709','pq'):
+                child_options['colorSpace']=options['colorSpace']
+            if child_codec=='h264' and options.get('codec','h264')=='h264' and 'crf' in options and not options.get('rateControl'):
+                child_options['crf']=options['crf']
             render_to_file(child,target,options=child_options,cancelled=cancelled,heartbeat=heartbeat,work_directory=work_directory,
                            _nested_depth=_nested_depth+1)
             item['src']='/media/'+str(target.relative_to(MEDIA_ROOT))
@@ -1716,23 +1743,26 @@ def _track_hidden(track_state, kind, track):
     return bool(state and state.get('hidden') is True)
 
 
+def _delivery_spec(options):
+    """The delivery spec (delivery.normalize) for renderer options; underscore keys are internal."""
+    return delivery.normalize({key: value for key, value in options.items() if not key.startswith('_')})
+
+
 def _export_settings(options):
-    codec = options.get('codec','h264')
-    if codec not in ('h264','prores','wav'): raise ValueError('Unsupported export codec')
-    color_space = options.get('colorSpace','source')
-    if color_space!='source' and (codec!='prores' or color_space not in ('rec709','pq')):
-        raise ValueError('Invalid export color space')
+    unknown = [key for key in options if not key.startswith('_') and key not in delivery.KNOWN_OPTIONS]
+    if unknown: raise ValueError(f'Unknown export option {sorted(unknown)[0]!r}')
+    spec = _delivery_spec(options)
+    color_space = spec['color_space']
     enabled = options.get('limiter', True)
     if not isinstance(enabled, bool): raise ValueError('Invalid limiter setting: use true or false')
     ceiling = _number(options.get('limiterCeiling', DEFAULT_LIMITER_CEILING_DB), 'limiter ceiling (dBFS)', -24, 0)
     peak_safe = options.get('aacPeakSafe', False)
     if not isinstance(peak_safe, bool): raise ValueError('Invalid aacPeakSafe setting: use true or false')
-    _number(options.get('crf',20),'quality',14,32)
-    _number(options.get('audioBitrate',192),'audio bitrate',64,320)
+    if 'captions' in options and not isinstance(options['captions'], bool): raise ValueError('Invalid captions setting: use true or false')
     language = options.get('subtitleLanguage', 'und')
     if not isinstance(language, str) or len(language) != 3 or not language.isascii() or not language.isalpha() or not language.islower():
         raise ValueError('Invalid subtitle language: use a three-letter ISO 639-2 code such as eng, spa or und')
-    return codec, color_space, (ceiling if enabled else None), language, peak_safe
+    return spec, color_space, (ceiling if enabled else None), language, peak_safe
 
 
 def _validate_timeline(project):
@@ -1771,25 +1801,84 @@ def _validate_timeline(project):
     return total
 
 
-def _estimated_bytes(width, height, fps, seconds, codec):
-    bits_per_pixel = 3.6 if codec == 'prores' else .3
-    video = 0 if codec == 'wav' else width*height*fps*seconds*bits_per_pixel/8
+# Approximate bits per pixel of each delivery, for the free-space check.
+BITS_PER_PIXEL = {'prores': {'proxy': .5, 'lt': 1.1, 'standard': 1.6, 'hq': 2.4, '4444': 3.6, '4444xq': 5.4},
+                  'dnxhr': {'lb': .6, 'sq': 1.9, 'hq': 2.9, 'hqx': 2.9, '444': 5.8}}
+
+
+def _estimated_bytes(width, height, fps, seconds, spec):
+    if spec['kind'] == 'audio':
+        bits = 0
+    elif spec['kind'] == 'images':
+        bits = {'png': 24 if spec['profile'] == '8' else 40, 'tiff': 48, 'dpx': 32, 'exr': 30}[spec['codec']]
+    elif spec['codec'] in BITS_PER_PIXEL:
+        bits = BITS_PER_PIXEL[spec['codec']][spec['profile']] * 1.5
+    else:
+        rate = spec['rate']
+        bits = rate['kbps']*1000/(width*height*fps)*1.2 if rate and rate['kbps'] else .3
+    video = width*height*fps*seconds*bits/8
     return video, seconds*AUDIO_RATE*2*4
+
+
+def _start_timecode(project, first, fps_fraction):
+    """The delivered file's first-frame timecode: the sequence start (``startTimecode`` frames,
+    ``dropFrame``) plus the export range's first frame."""
+    start = project.get('startTimecode', 0)
+    if start is None:
+        start = 0
+    if isinstance(start, bool) or not isinstance(start, int) or not 0 <= start < 24*3600*math.ceil(fps_fraction):
+        raise ValueError('Invalid sequence start timecode')
+    drop = project.get('dropFrame')
+    if drop is not None and not isinstance(drop, bool):
+        raise ValueError('Invalid drop-frame setting')
+    from interchange.timecode import DROP_FRAME_RATES
+    drop = fps_fraction in DROP_FRAME_RATES and drop is not False
+    return start + first, drop
 
 
 def _render_prepared(project, output_path, *, options=None, progress=None, cancelled=None, heartbeat=None, work_directory=None,
                      report=None):
-    """Render bounded picture windows and audio chunks, then mux them in one pass."""
-    import copy
+    """Render the picture (bounded windows), the audio (bounded chunks), then mux once."""
+    import warnings
     options = dict(options or {})
-    codec, color_space, limiter, language, peak_safe = _export_settings(options)
+    spec = _export_settings(options)[0]
+    for attempt in range(2):
+        try:
+            return _render_delivery(project, output_path, options=options, progress=progress, cancelled=cancelled,
+                                    heartbeat=heartbeat, work_directory=work_directory, report=report)
+        except HardwareEncoderFailed as error:
+            if attempt:
+                raise
+            warnings.warn(f'The {delivery.HARDWARE[spec["hardware"]]["label"]} encoder failed during the export ({error}); '
+                          'the export was restarted with the software encoder.', stacklevel=2)
+            options = {**options, 'encoder': 'software'}
+            spec = _export_settings(options)[0]
+            if report is not None:
+                report['hardwareFallback'] = True
+
+
+class HardwareEncoderFailed(RuntimeError):
+    """A hardware encoder stopped with an error: the export restarts in software."""
+
+
+def _render_delivery(project, output_path, *, options, progress, cancelled, heartbeat, work_directory, report):
+    import copy
+    spec, color_space, limiter, language, peak_safe = _export_settings(options)
+    codec = spec['codec']
+    audio_only = spec['kind'] == 'audio'
     # One private copy: probe results are cached on its media items.
     project = copy.deepcopy(project)
     total = _validate_timeline(project)
-    width, height = _frame_size(project) if codec != 'wav' else (16, 16)
+    width, height = _frame_size(project) if not audio_only else (16, 16)
     fps_fraction = _sequence_fps(project)
     fps = float(fps_fraction)
     total = math.ceil((total-1e-9)*fps)/fps
+    out_size = spec['output_size'] or dict(width=width, height=height)
+    spec['_frame'] = dict(out_size)
+    if not audio_only:
+        problems = delivery.frame_problems(spec, width, height, fps_fraction)
+        if problems:
+            raise ValueError(' '.join(problems))
     track_state = project.get('trackState') or {}
     # A hidden track contributes no picture; a hidden video track still plays its audio.
     picture_clips = _disabled_stand_ins([clip for clip in project['clips'] if clip.get('type') in ('video','title') and not
@@ -1800,8 +1889,8 @@ def _render_prepared(project, output_path, *, options=None, progress=None, cance
                                  '_kinds': {'video'}, '_actualDuration': float(MAX_SOURCE_SECONDS), '_audioStreams': []})
     options['_output_frames'] = None
     options['_heartbeat'] = heartbeat
+    options['_spec'] = spec
     probes = options['_probes'] = {}
-    suffix='.mov' if codec=='prores' else '.mp4'
     total_frames = round(total*fps)
     first,stop = 0,total_frames
     requested = options.get('range')
@@ -1812,6 +1901,7 @@ def _render_prepared(project, output_path, *, options=None, progress=None, cance
         if stop<=first or stop>total_frames:raise ValueError('The export range must contain frames inside the sequence')
     out_start,out_end = first/fps,stop/fps
     out_duration = (stop-first)/fps
+    timecode_frames, drop_frame = _start_timecode(project, first, fps_fraction)
     media_by_id = {item['id']:item for item in project['media']}
     render_options = project.get('renderOptions') or {}
     if not isinstance(render_options, dict) or not isinstance(render_options.get('mutedTracks', {}), dict):
@@ -1820,7 +1910,7 @@ def _render_prepared(project, output_path, *, options=None, progress=None, cance
     profiles = set()
     video_clips = sorted((clip for clip in picture_clips if clip.get('type')=='video'),
                          key=lambda clip:(clip.get('track',0),float(clip['start'])))
-    if codec!='wav' and not muted.get('video'):
+    if not audio_only and not muted.get('video'):
         for identity in _picture_range_media(video_clips,media_by_id,fps,first,stop):
             item = media_by_id.get(identity)
             if item is None or item.get('nativeGenerator') is not None: continue
@@ -1828,13 +1918,19 @@ def _render_prepared(project, output_path, *, options=None, progress=None, cance
             if not item.get('_renderStill'):
                 profiles.add(item['_sourceProfile'])
     hdr = any(profile[1] in HDR_TRANSFERS for profile in profiles)
-    if hdr and codec=='prores' and len(profiles)!=1 and color_space=='source':
-        raise ValueError('A ProRes HDR master needs one HDR color space. Select Rec. 2100 PQ or Rec. 709 to combine HDR and SDR sources.')
+    if hdr and spec['hdr_capable'] and len(profiles)!=1 and color_space=='source':
+        raise ValueError(f'A {spec["label"]} HDR master needs one HDR color space. Select Rec. 2100 PQ or Rec. 709 to combine HDR and SDR sources.')
     profile = next(iter(profiles)) if len(profiles)==1 else None
     if profile and not all(value and value not in ('unknown','unspecified') for value in profile):profile=None
-    # Untagged or mixed SDR sources are delivered as explicitly tagged Rec. 709.
-    if profile is None or color_space=='rec709' or hdr and codec=='h264': profile=REC709
+    # Untagged or mixed SDR sources are delivered as explicitly tagged Rec. 709; HDR sources are
+    # tone-mapped to Rec. 709 in deliveries that cannot carry HDR (8-bit, image sequences).
+    if profile is None or color_space=='rec709' or hdr and not spec['hdr_capable']: profile=REC709
     if color_space=='pq': profile=PQ
+    if color_space=='hlg' and profile[1]!='arib-std-b67':
+        raise ValueError('An HLG delivery keeps HLG sources as they are; this range has no single HLG source. '
+                         'Splice does not convert other material to HLG: choose Rec. 2100 PQ or Rec. 709.')
+    if spec['hdr'] and profile[1]!='smpte2084':
+        spec['hdr'] = None  # HDR10 static metadata describes PQ programs only.
     options['_color_profile'] = profile
     captions=project.get('captions') or []
     if not isinstance(captions,list): raise ValueError('Invalid captions')
@@ -1849,9 +1945,6 @@ def _render_prepared(project, output_path, *, options=None, progress=None, cance
         begin,end = max(start,out_start),min(start+length,out_end)
         if end>begin:validated_captions.append((begin-out_start,end-out_start,caption['text']))
     validated_captions.sort(key=lambda item:item[0])
-    def srt_time(seconds):
-        ms=round(seconds*1000)
-        return f'{ms//3600000:02d}:{ms//60000%60:02d}:{ms//1000%60:02d},{ms%1000:03d}'
     track_mix=project.get('trackMix') or {}
     if not isinstance(track_mix, dict): raise ValueError('Invalid track mix')
     solo=any(v.get('solo') for v in track_mix.values() if isinstance(v,dict))
@@ -1863,39 +1956,57 @@ def _render_prepared(project, output_path, *, options=None, progress=None, cance
         events = _audio_events(project['clips'], media_by_id, fps, probes, track_mix, solo,
                                (max(0, out_start-AUDIO_PREROLL_SECONDS), out_end), heartbeat)
     root = Path(work_directory) if work_directory else work_root()
-    video_bytes, audio_bytes = _estimated_bytes(width, height, fps, out_duration, codec)
+    video_bytes, audio_bytes = _estimated_bytes(out_size['width'], out_size['height'], fps, out_duration, spec)
     # A speed-changed or resampled clip that crosses a chunk seam is rendered
     # whole first (32-bit float stereo). Count the most of those files that are
     # on disk at once, following the mix's own schedule (overlapping ones add up).
     # Lossy deliveries also keep an AAC file until the mux.
     audio_bytes += _prerender_peak_bytes(events, first_sample, stop_sample)
-    if codec == 'h264':
+    if spec['audio_lossy']:
         audio_bytes += out_duration*40_000
     output = Path(output_path)
-    final_bytes = video_bytes + (out_duration*AUDIO_RATE*2*3 if codec != 'h264' else out_duration*40_000)
-    same_volume = output.parent.exists() and os.stat(output.parent).st_dev == os.stat(root).st_dev
-    _ensure_space(root, video_bytes+audio_bytes+(final_bytes if same_volume else 0), 'this export')
-    if not same_volume and output.parent.exists():
-        _ensure_space(output.parent, final_bytes, 'the exported file')
+    final_bytes = video_bytes + (out_duration*AUDIO_RATE*2*4 if not spec['audio_lossy'] else out_duration*40_000)
+    destination = output if spec['kind'] == 'images' else output.parent
+    same_volume = destination.exists() and os.stat(destination).st_dev == os.stat(root).st_dev
+    # Window segments (intra codecs) and the streamed video file are on disk until the mux.
+    _ensure_space(root, (video_bytes if spec['kind'] != 'images' else 0)+audio_bytes+(final_bytes if same_volume else 0), 'this export')
+    if not same_volume and destination.exists():
+        _ensure_space(destination, final_bytes, 'the exported file')
+    if report is not None:
+        report['delivery'] = _delivery_report(spec, profile, out_size, fps_fraction, out_duration, width, height,
+                                              delivery.timecode_label(timecode_frames, fps_fraction, drop_frame)
+                                              if spec['timecode'] else None)
     def stage(low, high):
         return (lambda fraction: progress(low+(high-low)*fraction)) if progress else None
+    burn = None
+    if spec['burn_ins'] and not audio_only:
+        burn = dict(settings=spec['burn_ins'], timecode=timecode_frames - first, drop=drop_frame, media=media_by_id,
+                    font=_font_path('IBM Plex Mono'))
     with WorkDirectory('splice-segments-', root) as directory:
-        if codec=='wav':
+        if audio_only:
             chunks = _render_audio(events, first_sample, stop_sample, None if limiter is None else (limiter, False),
                                    directory, cancelled, heartbeat, stage(0, .95))
             _run_ffmpeg(['ffmpeg','-nostdin','-hide_banner','-loglevel','error','-y','-f','concat','-safe','0',
-                         '-i',str(_concat_list(directory,'audio.txt',chunks)),'-c:a','pcm_s24le','-ar',str(AUDIO_RATE),
-                         str(output)],cancelled,heartbeat)
+                         '-i',str(_concat_list(directory,'audio.txt',chunks)),
+                         *delivery.audio_args(spec, AUDIO_RATE), str(output)],cancelled,heartbeat)
             if progress: progress(1.0)
             return output.stat().st_size
-        segments = _render_picture(project, picture_clips, first, stop, total_frames, fps, width, height, codec, options,
-                                   directory, suffix, cancelled, heartbeat, stage(0, .8))
-        lossy = codec != 'prores'
+        if spec['mode'] == 'segments':
+            segments = _render_picture(project, picture_clips, first, stop, total_frames, fps, width, height, spec, options,
+                                       directory, cancelled, heartbeat, stage(0, .8), burn)
+            video_input = ['-f','concat','-safe','0','-i',str(_concat_list(directory,'segments.txt',segments))]
+        else:
+            if spec['kind'] == 'images':
+                output.mkdir(parents=True, exist_ok=True)
+            video_file = _stream_picture(project, picture_clips, first, stop, total_frames, fps, width, height, spec, options,
+                                         directory, output, cancelled, heartbeat, stage(0, .8), burn, report)
+            video_input = ['-i', str(video_file)] if video_file else []
+        lossy = spec['audio_lossy']
         mix_limiter = None if limiter is None else (limiter, lossy)
         chunks = _render_audio(events, first_sample, stop_sample, mix_limiter, directory, cancelled, heartbeat, stage(.8, .92))
         audio_list = _concat_list(directory,'audio.txt',chunks)
         if lossy:
-            bitrate = str(int(_number(options.get('audioBitrate',192),'audio bitrate',64,320)))+'k'
+            bitrate = str(spec['audio_bitrate'])+'k'
             audio_file, measured = _encode_aac(audio_list, bitrate, limiter, peak_safe, directory, cancelled, heartbeat)
             if report is not None and measured:
                 report['audio'] = measured
@@ -1903,33 +2014,91 @@ def _render_prepared(project, output_path, *, options=None, progress=None, cance
         else:
             audio_input = ['-f','concat','-safe','0','-i',str(audio_list)]
         if progress: progress(.96)
-        command=['ffmpeg','-nostdin','-hide_banner','-loglevel','error','-y',
-                 '-f','concat','-safe','0','-i',str(_concat_list(directory,'segments.txt',segments)),
-                 *audio_input]
+        sidecars = []
+        caption_text = lambda kind: _caption_text(validated_captions, kind)
         with_captions = validated_captions and options.get('captions',True)
+        subtitle_codec = delivery.CONTAINERS[spec['container']]['subtitles']
+        wanted = list(spec['caption_files'])
+        if with_captions and not subtitle_codec and 'srt' not in wanted:
+            # MXF and image sequences carry no subtitle stream: captions travel as a sidecar file.
+            wanted.insert(0, 'srt')
+            import warnings
+            carrier = 'An image sequence' if spec['kind'] == 'images' else delivery.CONTAINERS[spec['container']]['label']
+            warnings.warn(f'{carrier} carries no subtitle track: the captions were written to a sidecar SRT file beside it.',
+                          stacklevel=2)
+        if spec['kind'] == 'images':
+            # The sound travels beside the numbered frames as a WAV.
+            sound = output / (output.name + '.wav')
+            _run_ffmpeg(['ffmpeg','-nostdin','-hide_banner','-loglevel','error','-y',*audio_input,
+                         '-c:a',delivery.AUDIO_CODECS[spec['audio']]['encoder'],'-ar',str(AUDIO_RATE),
+                         '-t',f'{out_duration:.6f}',str(sound)],cancelled,heartbeat)
+            sidecar_base = output / output.name
+        else:
+            sidecar_base = output.with_suffix('')
         if with_captions:
+            for kind in wanted:
+                target = Path(str(sidecar_base) + '.' + kind)
+                target.write_text(caption_text(kind), encoding='utf-8')
+                sidecars.append(target)
+        if report is not None and sidecars:
+            report['sidecars'] = [path.name for path in sidecars]
+        if spec['kind'] == 'images':
+            if progress: progress(1.0)
+            return sum(path.stat().st_size for path in output.iterdir())
+        command=['ffmpeg','-nostdin','-hide_banner','-loglevel','error','-y',*video_input,*audio_input]
+        embed = with_captions and subtitle_codec
+        if embed:
             subtitle=Path(directory)/'captions.srt'
-            subtitle.write_text(''.join(f'{index}\n{srt_time(start)} --> {srt_time(end)}\n{text.replace(chr(13)," ").replace("-->","→").strip()}\n\n' for index,(start,end,text) in enumerate(validated_captions,1)),encoding='utf-8')
+            subtitle.write_text(caption_text('srt'),encoding='utf-8')
             command.extend(['-i',str(subtitle)])
         command.extend(['-map','0:v:0','-map','1:a:0'])
-        if with_captions: command.extend(['-map','2:s:0'])
-        command.extend(['-c:v','copy'])
-        if codec=='prores':
-            command.extend(['-c:a','pcm_s24le','-ar',str(AUDIO_RATE)])
-        else:
-            command.extend(['-c:a','copy'])
-        if with_captions:
-            command.extend(['-c:s','mov_text','-metadata:s:s:0',f'language={language}','-disposition:s:0','default'])
-        command.extend(_color_tags(profile, codec))
-        flags = '+write_colr' if codec=='prores' else '+faststart+write_colr'
+        if embed: command.extend(['-map','2:s:0'])
+        command.extend(['-c:v','copy',*delivery.audio_args(spec, AUDIO_RATE)])
+        if embed:
+            command.extend(['-c:s',subtitle_codec,'-metadata:s:s:0',f'language={language}','-disposition:s:0','default'])
+        command.extend(_color_tags(profile, spec))
+        command.extend(delivery.metadata_args(spec, delivery.timecode_label(timecode_frames, fps_fraction, drop_frame)
+                                              if spec['timecode'] else None))
+        if spec['codec'] == 'hevc':
+            command.extend(['-tag:v', 'hvc1'])
         # The segments and chunks already have the exact frame and sample
         # counts; -t only guards against a stray packet, so give it half a
         # frame (a -t of the exact duration drops the last audio sample).
-        command.extend(['-t',f'{out_duration+.5/fps:.6f}','-movflags',flags,str(output)])
+        command.extend(['-t',f'{out_duration+.5/fps:.6f}',*delivery.container_flags(spec),'-f',delivery.CONTAINERS[spec['container']]['muxer'],
+                        str(output)])
         _run_ffmpeg(command,cancelled,heartbeat)
         if cancelled and cancelled.is_set(): raise InterruptedError('Export cancelled')
         if progress: progress(1.0)
         return output.stat().st_size
+
+
+def _caption_text(captions, kind):
+    """SubRip or WebVTT text for (start, end, text) cues relative to the export's first frame."""
+    def stamp(seconds, separator):
+        ms = round(seconds*1000)
+        return f'{ms//3600000:02d}:{ms//60000%60:02d}:{ms//1000%60:02d}{separator}{ms%1000:03d}'
+    clean = lambda text: '\n'.join(line for line in text.replace('\r', '').replace('-->', '→').strip().split('\n') if line.strip())
+    if kind == 'vtt':
+        return 'WEBVTT\n\n' + ''.join(f'{index}\n{stamp(start,".")} --> {stamp(end,".")}\n{clean(text)}\n\n'
+                                      for index, (start, end, text) in enumerate(captions, 1))
+    return ''.join(f'{index}\n{stamp(start,",")} --> {stamp(end,",")}\n{text.replace(chr(13)," ").replace("-->","→").strip()}\n\n'
+                   for index, (start, end, text) in enumerate(captions, 1))
+
+
+def _delivery_report(spec, profile, size, fps, seconds, width, height, timecode):
+    notes = delivery.conversions(spec, width, height, fps)
+    if spec['codec'] in ('prores', 'tiff') and fps == Fraction(24000, 1001):
+        notes.append('The sequence is 23.976 fps. A DCP plays at 24.000 fps: conform the speed in the DCP tool '
+                     '(about 0.1% faster, audio pitch shifts accordingly) or keep 23.976 if the festival accepts it.')
+    if spec['kind'] == 'images' or spec['codec'] in ('prores', 'dnxhr'):
+        notes.append('DCP and IMF packaging is done in a mastering tool such as DCP-o-matic; Splice does not make DCPs.')
+    return dict(container=delivery.CONTAINERS[spec['container']]['label'], codec=spec['label'], profile=spec['profile_label'],
+                encoder=spec['encoder'], pixelFormat=spec['pix_fmt'], bitDepth=spec['depth'], alpha=spec['alpha'],
+                color=dict(primaries=profile[0], transfer=profile[1], matrix='rgb' if spec['kind'] == 'images' else profile[2],
+                           range='full' if spec['kind'] == 'images' else 'limited'),
+                width=size['width'], height=size['height'], frameRate=f'{fps.numerator}/{fps.denominator}',
+                seconds=round(seconds, 6), audio=delivery.AUDIO_CODECS[spec['audio']]['label'], timecode=timecode,
+                hardware=bool(spec['hardware']), notes=notes)
 
 
 def _measure_decoded(path, cancelled, heartbeat):
@@ -2011,9 +2180,8 @@ def _encode_aac(audio_list, bitrate, ceiling, peak_safe, directory, cancelled, h
     return target, measured
 
 
-def _render_picture(project, picture, first, stop, total_frames, fps, width, height, codec, options, directory,
-                    suffix, cancelled, heartbeat, progress):
-    """Render the picture in bounded windows; returns the segment files in order."""
+def _picture_windows(project, picture, first, stop, total_frames, fps, width, height, spec, options, burn):
+    """Plan the picture windows. Yields (index, count, segment project, window options, output frames)."""
     # Keep transitions and the preceding frame in a single window. Work in
     # frame numbers so snapping cannot move a boundary back into an effect.
     starts = []
@@ -2036,7 +2204,7 @@ def _render_picture(project, picture, first, stop, total_frames, fps, width, hei
     protected.sort()
     reversed_spans.sort()
     import bisect
-    frame_bytes = width*height*_alpha_bytes_per_pixel(codec=='prores')
+    frame_bytes = width*height*_alpha_bytes_per_pixel(spec['high_depth'])
     reverse_frames = max(1, int(REVERSE_BUFFER_BYTES // frame_bytes))
     frames = [0]
     reversed_active, reversed_next = [], 0
@@ -2082,9 +2250,7 @@ def _render_picture(project, picture, first, stop, total_frames, fps, width, hei
     # Sweep the clips once: each window sees only the clips that overlap it.
     ordered = sorted(picture, key=lambda clip: float(clip['start'])-float(clip.get('transitionBefore',0) or 0))
     active, pointer = [], 0
-    segments = []
     for index,(a_frame,b_frame) in enumerate(windows):
-        if cancelled and cancelled.is_set(): raise InterruptedError('Export cancelled')
         begin,end = a_frame/fps,b_frame/fps
         while pointer < len(ordered) and float(ordered[pointer]['start'])-float(ordered[pointer].get('transitionBefore',0) or 0) < end:
             active.append(ordered[pointer]); pointer += 1
@@ -2124,11 +2290,600 @@ def _render_picture(project, picture, first, stop, total_frames, fps, width, hei
         clips.append({'type':'title','start':0,'duration':end-begin,'in':0,'title':''})
         used = {clip.get('mediaId') for clip in clips}
         segment = {**project, 'clips': clips, 'media': [media_by_id[identity] for identity in used if identity in media_by_id]}
-        target=Path(directory)/f'{index:05d}{suffix}'
         output_window = (max(first,a_frame)-a_frame,min(stop,b_frame)-a_frame)
         window_options={**options,'_output_frames':output_window if output_window!=(0,b_frame-a_frame) else None}
-        _render_window(segment,target,directory,options=window_options,cancelled=cancelled)
-        segments.append(target)
+        if burn:
+            window_options['_burn'] = _window_burn(burn, clips, a_frame, output_window[0], fps)
+        yield index, len(windows), segment, window_options, output_window[1]-output_window[0]
+
+
+class _AnyEvent:
+    """Set when either event is set (a job's cancel, or a sibling window's failure)."""
+
+    def __init__(self, *events):
+        self.events = [event for event in events if event is not None]
+
+    def is_set(self):
+        return any(event.is_set() for event in self.events)
+
+
+def _memory_available():
+    """Bytes of memory available for new work (Linux MemAvailable; elsewhere a quarter of RAM)."""
+    try:
+        with open('/proc/meminfo', encoding='ascii') as handle:
+            for line in handle:
+                if line.startswith('MemAvailable:'):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        return os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES') // 4
+    except (ValueError, OSError, AttributeError):
+        return 4 * 1024**3
+
+
+# A window's FFmpeg peaks near 1.2 GB at 1920 x 1080 with 24 cuts (measured); scale by area.
+WINDOW_MEMORY_BYTES_1080 = 1_300_000_000
+MAX_PARALLEL_WINDOWS = 4
+
+
+def _parallel_windows(width, height):
+    """How many picture windows render at once: SPLICE_EXPORT_PARALLEL, else what CPU and free memory allow."""
+    value = os.environ.get('SPLICE_EXPORT_PARALLEL')
+    if value:
+        if not value.isdigit() or not 1 <= int(value) <= 16:
+            raise ValueError('SPLICE_EXPORT_PARALLEL must be a whole number from 1 to 16')
+        return int(value)
+    per_window = max(300_000_000, WINDOW_MEMORY_BYTES_1080 * width * height / (1920*1080))
+    by_memory = int(_memory_available() * .5 // per_window)
+    by_cpu = (os.cpu_count() or 2) // 4
+    return max(1, min(MAX_PARALLEL_WINDOWS, by_memory, by_cpu))
+
+
+def _render_picture(project, picture, first, stop, total_frames, fps, width, height, spec, options, directory,
+                    cancelled, heartbeat, progress, burn=None):
+    """Render intra-frame deliveries (ProRes, DNxHR) in bounded windows, several at once when
+    memory and cores allow; returns the segment files in order for a stream-copy concat."""
+    from concurrent.futures import ThreadPoolExecutor, FIRST_EXCEPTION, wait
+    import threading as _threading
+    suffix = spec['segment_suffix']
+    plans = _picture_windows(project, picture, first, stop, total_frames, fps, width, height, spec, options, burn)
+    workers = _parallel_windows(width, height)
+    failed = _threading.Event()
+    stop_all = _AnyEvent(cancelled, failed)
+    segments, done = {}, [0]
+    lock = _threading.Lock()
+
+    def render(index, count, segment, window_options):
+        target = Path(directory)/f'{index:05d}{suffix}'
+        try:
+            _render_window(segment, target, directory, options=window_options, cancelled=stop_all)
+        except BaseException:
+            failed.set()
+            raise
+        with lock:
+            segments[index] = target
+            done[0] += 1
+            if progress: progress(done[0]/count)
         if heartbeat: heartbeat()
-        if progress: progress((index+1)/len(windows))
-    return segments
+
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix='splice-window') as pool:
+        pending = set()
+        for index, count, segment, window_options, _ in plans:
+            if cancelled and cancelled.is_set(): break
+            if failed.is_set(): break
+            pending.add(pool.submit(render, index, count, segment, window_options))
+            if len(pending) >= workers*2:
+                finished, pending = wait(pending, return_when=FIRST_EXCEPTION)
+                for future in finished: future.result()
+        finished, pending = wait(pending, return_when=FIRST_EXCEPTION)
+        if pending:
+            failed.set()
+            wait(pending)
+        errors = [future.exception() for future in finished | pending if future.exception() is not None]
+    if cancelled and cancelled.is_set(): raise InterruptedError('Export cancelled')
+    # The first real error, not a sibling's InterruptedError from stopping it.
+    real = [error for error in errors if not isinstance(error, InterruptedError)]
+    if real or errors: raise (real or errors)[0]
+    return [segments[index] for index in sorted(segments)]
+
+
+PIXEL_BYTES = {'yuv420p': 1.5, 'yuv420p10le': 3, 'yuv422p': 2, 'yuv422p10le': 4, 'yuv444p10le': 6, 'yuva444p10le': 8,
+               'rgb24': 3, 'rgba': 4, 'rgb48be': 6, 'rgba64be': 8, 'rgb48le': 6, 'rgba64le': 8, 'gbrp10le': 6,
+               'gbrpf32le': 12, 'gbrapf32le': 16, 'gbrp16le': 6}
+READ_AHEAD_BYTES = 1024 * 1024 * 1024
+PIPE_CHUNK = 1 << 20
+
+
+class _Window:
+    """One window FFmpeg writing raw frames; read ahead into memory up to a cap while an earlier window streams."""
+
+    def __init__(self, command, expected, cap, activity):
+        self.expected, self.cap, self.activity = expected, cap, activity
+        self.chunks = collections.deque()
+        self.buffered = 0
+        self.received = 0
+        self.eof = False
+        self.head = False
+        self.errors = collections.deque(maxlen=100)
+        self.cond = threading.Condition()
+        self.process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.threads = [threading.Thread(target=self._read, daemon=True), threading.Thread(target=self._errors, daemon=True)]
+        for thread in self.threads:
+            thread.start()
+
+    def _read(self):
+        try:
+            while True:
+                with self.cond:
+                    while not self.head and self.buffered >= self.cap and not self.eof:
+                        self.cond.wait(.5)
+                data = self.process.stdout.read1(PIPE_CHUNK)
+                if not data:
+                    break
+                self.activity[0] = time.monotonic()
+                with self.cond:
+                    self.chunks.append(data)
+                    self.buffered += len(data)
+                    self.received += len(data)
+                    self.cond.notify_all()
+        except (OSError, ValueError):
+            pass
+        finally:
+            with self.cond:
+                self.eof = True
+                self.cond.notify_all()
+
+    def _errors(self):
+        try:
+            for raw in self.process.stderr:
+                self.errors.append(raw.decode('utf-8', 'replace'))
+        except (OSError, ValueError):
+            pass
+
+    def take(self):
+        """The next chunk, or None at the end of this window's output."""
+        with self.cond:
+            self.head = True
+            self.cond.notify_all()
+            while not self.chunks and not self.eof:
+                self.cond.wait(.5)
+            if not self.chunks:
+                return None
+            data = self.chunks.popleft()
+            self.buffered -= len(data)
+            self.cond.notify_all()
+            return data
+
+    def finish(self):
+        """Wait for the process; raise if it failed or delivered the wrong number of bytes."""
+        code = self.process.wait()
+        for thread in self.threads:
+            thread.join(timeout=5)
+        for stream in (self.process.stdout, self.process.stderr):
+            stream.close()
+        if code:
+            raise ValueError('FFmpeg render failed: ' + ''.join(self.errors)[-1500:])
+        if self.received != self.expected:
+            raise ValueError(f'A picture window produced {self.received} bytes instead of {self.expected}')
+
+    def stop(self):
+        if self.process.poll() is None:
+            _stop_tree(self.process)
+        try:
+            self.process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            pass
+        with self.cond:
+            self.eof = True
+            self.chunks.clear()
+            self.cond.notify_all()
+        for thread in self.threads:
+            thread.join(timeout=2)
+        for stream in (self.process.stdout, self.process.stderr):
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+
+def _encoder_command(spec, fps, profile, size, target, *, light_levels=None, pass_number=None, passlog=None, sink=None):
+    pix = spec['pix_fmt']
+    command = ['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y', *delivery.hardware_input_args(spec),
+               '-f', 'rawvideo', '-pix_fmt', pix, '-s', f'{size["width"]}x{size["height"]}', '-r', str(fps), '-i', 'pipe:0']
+    if sink == 'measure':
+        return command + light_level_filter_args(profile, target)
+    hw_filter = delivery.hardware_filter(spec)
+    if hw_filter:
+        command += ['-vf', hw_filter]
+    command += delivery.encoder_args(spec, fps, profile, light_levels=light_levels, pass_number=pass_number, passlog=passlog)
+    if spec['kind'] != 'images':
+        command += _color_tags(profile, spec)
+    if pass_number == 1:
+        return command + ['-an', '-f', 'null', '-']
+    if spec['kind'] == 'images':
+        name = Path(target).name
+        return command + ['-start_number', str(spec['start_number']), '-f', 'image2',
+                          str(Path(target) / f'{name}_%0{spec["padding"]}d.{spec["extension"]}')]
+    return command + ['-movflags', '+write_colr', '-f', 'mp4', str(target)]
+
+
+def _stream_picture(project, picture, first, stop, total_frames, fps, width, height, spec, options, directory, output,
+                    cancelled, heartbeat, progress, burn, report):
+    """Long-GOP and image-sequence deliveries: every window streams raw frames into ONE encoder.
+
+    One encoder sees the whole program (one GOP structure, real two-pass and HDR light levels);
+    several windows decode and composite at once, reading ahead into a bounded buffer. Returns the
+    video-only file to mux, or None for image sequences (written into ``output``)."""
+    size = spec['_frame']
+    profile = options['_color_profile']
+    video = Path(directory) / 'video.mp4'
+    light = None
+    hdr = spec.get('hdr')
+    passes = []
+    if hdr:
+        if hdr['lightLevels'] == 'manual':
+            light = (hdr['maxCll'], hdr['maxFall'])
+        else:
+            passes.append(('measure', None))
+    if spec['rate'] and spec['rate']['mode'] == 'twopass':
+        passes.append(('encode', 1))
+    passes.append(('encode', 2 if spec['rate'] and spec['rate']['mode'] == 'twopass' else None))
+    passlog = Path(directory) / 'twopass'
+    for number, (kind, pass_number) in enumerate(passes):
+        low, high = number/len(passes), (number+1)/len(passes)
+        stage = (lambda fraction, low=low, high=high: progress(low+(high-low)*fraction)) if progress else None
+        if kind == 'measure':
+            measured = Path(directory) / 'light-levels.txt'
+            command = _encoder_command(spec, fps, profile, size, measured, sink='measure')
+            _pump_windows(project, picture, first, stop, total_frames, fps, width, height, spec, options, directory, command,
+                          cancelled, heartbeat, stage, burn)
+            light = _read_light_levels(measured)
+            if report is not None:
+                report['lightLevels'] = dict(maxCll=light[0], maxFall=light[1], method='measured')
+            if hdr['lightLevels'] == 'source':
+                light = _source_light_levels(project, light)
+        else:
+            command = _encoder_command(spec, fps, profile, size, output if spec['kind'] == 'images' else video,
+                                       light_levels=light, pass_number=pass_number, passlog=passlog)
+            _pump_windows(project, picture, first, stop, total_frames, fps, width, height, spec, options, directory, command,
+                          cancelled, heartbeat, stage, burn)
+    if hdr and report is not None:
+        report.setdefault('lightLevels', {}).update(maxCll=light[0], maxFall=light[1],
+                                                    **({'method': 'entered'} if hdr['lightLevels'] == 'manual' else {}))
+    return None if spec['kind'] == 'images' else video
+
+
+def _pump_windows(project, picture, first, stop, total_frames, fps, width, height, spec, options, directory, command,
+                  cancelled, heartbeat, progress, burn):
+    """Run the window FFmpegs (several ahead) and forward their raw frames, in order, to ``command``."""
+    size = spec['_frame']
+    frame_bytes = round(size['width'] * size['height'] * PIXEL_BYTES[spec['pix_fmt']])
+    stall = _stall_seconds()
+    workers = _parallel_windows(width, height)
+    cap = max(PIPE_CHUNK, min(READ_AHEAD_BYTES, int(_memory_available() * .25)) // max(1, workers - 1))
+    activity = [time.monotonic()]
+    errors = collections.deque(maxlen=200)
+    encoder = subprocess.Popen(['ffmpeg', '-progress', 'pipe:1', '-stats_period', '1', *command[1:]],
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    state = dict(error=None, done=False, window=None, stop=False)
+    windows = collections.deque()
+    plans = _picture_windows(project, picture, first, stop, total_frames, fps, width, height, spec, options, burn)
+    lock = threading.Lock()
+
+    def read_progress():
+        for raw in encoder.stdout:
+            if raw.startswith(b'progress='):
+                activity[0] = time.monotonic()
+
+    def read_errors():
+        for raw in encoder.stderr:
+            errors.append(raw.decode('utf-8', 'replace'))
+
+    def launch():
+        """Start the next window, if any; returns False when the plan is exhausted."""
+        try:
+            index, count, segment, window_options, frames = next(plans)
+        except StopIteration:
+            return False
+        window_directory = tempfile.mkdtemp(prefix='window-', dir=directory)
+        try:
+            window_command = _render_window_inner(segment, None, window_directory, options=window_options, cancelled=cancelled)
+            window = _Window(window_command, frames * frame_bytes, cap, activity)
+        except BaseException:
+            shutil.rmtree(window_directory, ignore_errors=True)
+            raise
+        window.directory, window.index, window.count = window_directory, index, count
+        with lock:
+            windows.append(window)
+        return True
+
+    def forward():
+        try:
+            more = True
+            while True:
+                with lock:
+                    in_flight = len(windows)
+                while more and in_flight < workers:
+                    if cancelled and cancelled.is_set() or state['stop']:
+                        return
+                    more = launch()
+                    in_flight += more
+                with lock:
+                    if not windows:
+                        break
+                    window = windows[0]
+                state['window'] = window
+                while True:
+                    data = window.take()
+                    if data is None:
+                        break
+                    encoder.stdin.write(data)
+                    activity[0] = time.monotonic()
+                window.finish()
+                with lock:
+                    windows.popleft()
+                shutil.rmtree(window.directory, ignore_errors=True)
+                if heartbeat: heartbeat()
+                if progress: progress((window.index+1)/window.count)
+            encoder.stdin.close()
+            state['done'] = True
+        except BaseException as error:  # reported by the monitor below
+            state['error'] = error
+
+    readers = [threading.Thread(target=read_progress, daemon=True), threading.Thread(target=read_errors, daemon=True)]
+    for reader in readers:
+        reader.start()
+    forwarder = threading.Thread(target=forward, daemon=True)
+    forwarder.start()
+    seen = activity[0]
+    failure = None
+    try:
+        while forwarder.is_alive() or encoder.poll() is None:
+            if cancelled and cancelled.is_set():
+                raise InterruptedError('Export cancelled')
+            if state['error'] is not None:
+                break
+            if not forwarder.is_alive() and state['done'] and encoder.poll() is not None:
+                break
+            if encoder.poll() is not None and not state['done']:
+                break  # The encoder stopped while frames were still coming.
+            if activity[0] != seen:
+                seen = activity[0]
+                if heartbeat: heartbeat()
+            if time.monotonic() - activity[0] > stall:
+                raise TimeoutError(f'FFmpeg made no progress for {stall:g} seconds, so the export was stopped '
+                                   '(limit set by SPLICE_EXPORT_STALL_SECONDS)')
+            time.sleep(.1)
+        encoder_code = encoder.poll()
+        if state['error'] is not None and encoder_code is None:
+            failure = state['error']
+        elif encoder_code:
+            message = 'FFmpeg encoder failed: ' + ''.join(errors)[-1500:]
+            if spec['hardware']:
+                raise HardwareEncoderFailed(''.join(errors)[-300:].strip() or f'exit code {encoder_code}')
+            raise ValueError(message)
+        elif state['error'] is not None:
+            failure = state['error']
+        if failure is not None:
+            if isinstance(failure, (BrokenPipeError, OSError)) and not isinstance(failure, (InterruptedError, TimeoutError)):
+                raise ValueError('FFmpeg encoder stopped: ' + ''.join(errors)[-1500:])
+            raise failure
+    finally:
+        state['stop'] = True
+        if encoder.poll() is None:
+            _stop_tree(encoder)
+        for _ in range(2):
+            # Twice: the forwarder may have started one more window before it saw the stop.
+            with lock:
+                remaining = list(windows)
+                windows.clear()
+            for window in remaining:
+                window.stop()
+                shutil.rmtree(window.directory, ignore_errors=True)
+            try:
+                encoder.stdin.close()
+            except OSError:
+                pass
+            forwarder.join(timeout=10)
+        try:
+            encoder.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            pass
+        for reader in readers:
+            reader.join(timeout=2)
+        for stream in (encoder.stdout, encoder.stderr):
+            try:
+                stream.close()
+            except OSError:
+                pass
+        if not forwarder.is_alive():
+            plans.close()
+
+
+# PQ (SMPTE ST 2084) constants.
+_PQ_M1, _PQ_M2, _PQ_C1, _PQ_C2, _PQ_C3 = 0.1593017578125, 78.84375, 0.8359375, 18.8515625, 18.6875
+
+
+def pq_to_nits(signal):
+    """ST 2084 EOTF: a PQ signal (0..1) as absolute luminance in cd/m² (nits)."""
+    p = max(0.0, min(1.0, signal)) ** (1 / _PQ_M2)
+    return 10000 * (max(p - _PQ_C1, 0) / (_PQ_C2 - _PQ_C3 * p)) ** (1 / _PQ_M1)
+
+
+def light_level_filter_args(profile, target):
+    """Measure MaxCLL and MaxFALL (CTA-861.3) of a PQ program.
+
+    Each frame is converted from Y'CbCr (the program's matrix, legal range) to full-range 16-bit
+    R'G'B' in the PQ domain. max(R', G', B') per pixel is formed with two ``lighten`` blends on
+    planes moved by ``mergeplanes`` (no range conversion), so a frame's brightest pixel is that
+    plane's maximum (signalstats YMAX), turned into nits by the ST 2084 EOTF: MaxCLL is the
+    largest over all frames. For MaxFALL the same max(R', G', B') plane goes through the EOTF per
+    pixel (a lookup table, linear nits scaled so 65535 = 10,000 nits) and is averaged
+    (signalstats YAVG): MaxFALL is the largest frame average.
+    """
+    matrix = {'bt2020nc': 'bt2020', 'bt2020c': 'bt2020', 'bt709': 'bt709'}.get(profile[2], 'bt2020')
+    lut = (f"65535*pow(max(pow(val/65535\\,1/{_PQ_M2})-{_PQ_C1}\\,0)/({_PQ_C2}-{_PQ_C3}*pow(val/65535\\,1/{_PQ_M2}))\\,1/{_PQ_M1})")
+    peak, average = Path(str(target) + '.peak'), Path(str(target) + '.average')
+    graph = (f'scale=in_color_matrix={matrix}:in_range=limited:out_range=full,format=gbrp16le,split=3[g][b][r];'
+             '[r]mergeplanes=0x020202:yuv444p16le[rr];[g]mergeplanes=0x000000:yuv444p16le[gg];'
+             '[b]mergeplanes=0x010101:yuv444p16le[bb];[rr][gg]blend=all_mode=lighten[rg];'
+             '[rg][bb]blend=all_mode=lighten,split[p][q];'
+             f'[p]signalstats,metadata=print:key=lavfi.signalstats.YMAX:file={_filter_path(peak)}[po];'
+             f"[q]lutyuv=y='{lut}',signalstats,metadata=print:key=lavfi.signalstats.YAVG:file={_filter_path(average)}[qo]")
+    return ['-filter_complex', graph, '-map', '[po]', '-f', 'null', '-', '-map', '[qo]', '-f', 'null', '-']
+
+
+def _read_light_levels(target):
+    import re
+    peak_file, average_file = Path(str(target) + '.peak'), Path(str(target) + '.average')
+    peaks = [int(value) for value in re.findall(r'YMAX=(\d+)', peak_file.read_text(encoding='ascii'))]
+    averages = [float(value) for value in re.findall(r'YAVG=([0-9.]+)', average_file.read_text(encoding='ascii'))]
+    if not peaks or not averages:
+        raise ValueError('Could not measure the HDR light levels')
+    max_cll = max(pq_to_nits(value / 65535) for value in peaks)
+    max_fall = max(averages) / 65535 * 10000
+    return round(max_cll), min(round(max_cll), round(max_fall))
+
+
+def _source_light_levels(project, measured):
+    """A single untouched HDR10 source's own MaxCLL/MaxFALL, when it carries them; else the measurement."""
+    import warnings
+    sources = {item.get('_path') for item in project['media'] if item.get('_path') and not item.get('_renderStill')}
+    if len(sources) == 1:
+        path = next(iter(sources))
+        try:
+            result = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-read_intervals', '%+#1',
+                                     '-show_entries', 'frame=side_data_list', '-of', 'json', str(path)],
+                                    capture_output=True, text=True, timeout=30, check=True)
+            for frame in json.loads(result.stdout).get('frames', []):
+                for side in frame.get('side_data_list', []):
+                    if side.get('side_data_type') == 'Content light level metadata':
+                        return int(side.get('max_content', 0)), int(side.get('max_average', 0))
+        except (subprocess.SubprocessError, OSError, ValueError, TypeError):
+            pass
+    warnings.warn('The source carries no MaxCLL/MaxFALL: the measured values were written instead.', stacklevel=2)
+    return measured
+
+
+def _window_burn(burn, clips, a_frame, skip, fps):
+    """Burn-in data for one window: its first output frame's sequence frame and the clips on top."""
+    first_out = a_frame + skip
+    rows = []
+    media = burn['media']
+    top = {}
+    for clip in clips:
+        if clip.get('type') != 'video' or clip.get('mediaId') == DISABLED_MEDIA:
+            continue
+        begin = max(0, math.ceil(float(clip['start'])*fps - 1e-6) - skip)
+        end = math.ceil((float(clip['start'])+float(clip['duration']))*fps - 1e-6) - skip
+        if end <= begin:
+            continue
+        item = media.get(clip.get('mediaId')) or {}
+        source = None
+        if 'sourceTimecode' in burn['settings']['fields'] and not clip.get('reverse') and float(clip.get('speed', 1)) == 1:
+            start_tc = _media_timecode(item, fps)
+            if start_tc is not None:
+                source = start_tc + round((float(clip.get('in', 0)) + (begin + skip - float(clip['start'])*fps)/fps) * fps)
+        rows.append((clip.get('track', 0), begin, end, str(item.get('name') or 'Clip')[:120], source))
+    rows.sort(key=lambda row: (-row[0], row[1]))
+    return dict(settings=burn['settings'], timecode=burn['timecode'] + first_out, drop=burn['drop'], font=burn['font'],
+                frame=first_out, clips=[row[1:] for row in rows][:64])
+
+
+def _media_timecode(item, fps):
+    """A source's start timecode as a frame count at the sequence rate, when the source carries one at that rate."""
+    if '_timecode' in item:
+        return item['_timecode']
+    item['_timecode'] = None
+    path = item.get('_path')
+    if not path:
+        return None
+    try:
+        result = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'format_tags=timecode:stream_tags=timecode:stream=r_frame_rate,codec_type',
+                                 '-of', 'json', str(path)], capture_output=True, text=True, timeout=30, check=True)
+        data = json.loads(result.stdout)
+        labels = [data.get('format', {}).get('tags', {}).get('timecode')] + [s.get('tags', {}).get('timecode') for s in data.get('streams', [])]
+        rate = next((Fraction(s['r_frame_rate']) for s in data.get('streams', []) if s.get('codec_type') == 'video'), None)
+        label = next((value for value in labels if value), None)
+        if label and rate and abs(float(rate) - fps) < 1e-3:
+            from interchange.timecode import timecode_frames
+            item['_timecode'] = timecode_frames(label, Fraction(fps).limit_denominator(1001))
+    except (subprocess.SubprocessError, OSError, ValueError, TypeError, ZeroDivisionError, KeyError):
+        item['_timecode'] = None
+    return item['_timecode']
+
+
+BURN_IN_XY = {'top-left': ('{m}', '{m}'), 'top-center': ('(w-text_w)/2', '{m}'), 'top-right': ('w-text_w-{m}', '{m}'),
+              'bottom-left': ('{m}', 'h-text_h-{m}'), 'bottom-center': ('(w-text_w)/2', 'h-text_h-{m}'),
+              'bottom-right': ('w-text_w-{m}', 'h-text_h-{m}')}
+
+
+def _delivery_tail(spec, width, height, fps, profile, burn, directory):
+    """Filters after compositing: output size, burn-ins, safe margins and the delivery pixel format."""
+    steps = []
+    size = spec.get('output_size')
+    out_w, out_h = (size['width'], size['height']) if size else (width, height)
+    if size and (out_w, out_h) != (width, height):
+        if size['fit'] == 'fit':
+            pad = 'black@0' if spec['alpha'] else 'black'
+            steps.append(f'scale={out_w}:{out_h}:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=lanczos,'
+                         f'pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2:color={pad}')
+        elif size['fit'] == 'fill':
+            steps.append(f'scale={out_w}:{out_h}:force_original_aspect_ratio=increase:flags=lanczos,crop={out_w}:{out_h}')
+        else:
+            steps.append(f'scale={out_w}:{out_h}:flags=lanczos')
+        steps.append('setsar=1')
+    if burn:
+        steps.extend(_burn_in_filters(burn, out_w, out_h, fps, directory))
+    if spec['mode'] == 'stream' or spec['kind'] == 'images':
+        if spec['kind'] == 'images':
+            matrix = {'bt2020nc': 'bt2020', 'bt2020c': 'bt2020', 'smpte170m': 'smpte170m', 'bt470bg': 'bt470bg'}.get(profile[2], 'bt709')
+            steps.append(f'scale=in_color_matrix={matrix}:in_range=limited:out_range=full')
+        steps.append(f'format={spec["pix_fmt"]}')
+    return ','.join(steps)
+
+
+def _burn_in_filters(burn, width, height, fps, directory):
+    settings = burn['settings']
+    fields = settings['fields']
+    size = max(10, round(height * settings['size'] / 100))
+    margin = round(height * (0.06 if settings['safeMargins'] else 0.03))
+    font = _filter_path(burn['font'])
+    box = f'fontfile={font}:fontsize={size}:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw={max(2, size//6)}'
+    rate = Fraction(fps).limit_denominator(1001)
+    filters = []
+    if settings['safeMargins']:
+        for share, color in ((0.93, 'white@0.5'), (0.90, 'yellow@0.5')):
+            inset = (1 - share) / 2
+            filters.append(f'drawbox=x=iw*{inset:.4f}:y=ih*{inset:.4f}:w=iw*{share:.4f}:h=ih*{share:.4f}:color={color}:t=2')
+    def place(position, row=0):
+        x, y = BURN_IN_XY[position]
+        shift = f'-{row*round(size*1.5)}' if position.startswith('bottom') else f'+{row*round(size*1.5)}'
+        return f'x={x.format(m=margin)}:y={y.format(m=margin)}{shift}'
+    row = 0
+    if 'timecode' in fields:
+        label = delivery.timecode_label(burn['timecode'], rate, burn['drop']).replace(':', '\\:').replace(';', '\\;')
+        filters.append(f"drawtext={box}:timecode='{label}':rate={rate.numerator}/{rate.denominator}:{place(settings['position'], row)}")
+        row += 1
+    if 'frame' in fields:
+        filters.append(f"drawtext={box}:text='%{{frame_num}}':start_number={burn['frame']}:{place(settings['position'], row)}")
+        row += 1
+    name_row = 0
+    for number, (begin, end, name, source) in enumerate(burn['clips']):
+        enable = f'enable=between(n\\,{begin}\\,{end - 1})'
+        if 'clipName' in fields:
+            text = Path(directory) / f'burn-name-{number}.txt'
+            text.write_text(name, encoding='utf-8')
+            filters.append(f"drawtext={box}:textfile={_filter_path(text)}:expansion=none:{place(settings['clipNamePosition'], name_row)}:{enable}")
+        if 'sourceTimecode' in fields and source is not None:
+            # drawtext counts from the window's first frame: start the label `begin` frames earlier.
+            label = delivery.timecode_label(source - begin, rate, burn['drop']).replace(':', '\\:').replace(';', '\\;')
+            filters.append(f"drawtext={box}:timecode='{label}':rate={rate.numerator}/{rate.denominator}:"
+                           f"{place(settings['clipNamePosition'], name_row + ('clipName' in fields))}:{enable}")
+    if 'watermark' in fields and settings['watermark']:
+        text = Path(directory) / 'burn-watermark.txt'
+        text.write_text(settings['watermark'], encoding='utf-8')
+        filters.append(f"drawtext=fontfile={font}:textfile={_filter_path(text)}:expansion=none:fontsize={round(height/8)}:"
+                       f"fontcolor=white@{settings['watermarkOpacity']/100:.2f}:x=(w-text_w)/2:y=(h-text_h)/2")
+    return filters

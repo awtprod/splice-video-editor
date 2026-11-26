@@ -102,7 +102,16 @@ window.SpliceDialogs = (() => {
       const start=custom?rangeFields[0].valueAsNumber:0, end=custom?rangeFields[1].valueAsNumber:Infinity;
       return (state.project.captions||[]).some(c=>typeof c?.text==='string'&&Math.min(c.start+c.duration,end)>Math.max(c.start,Number.isFinite(start)?start:0));
     };
-    let controller, renderWarnings=[], renderReport={};
+    let controller, renderWarnings=[], renderReport={}, deliveryFields=null;
+    // Delivery formats, presets, timecode, burn-ins and the render queue (export-presets.js).
+    const delivery={state,syncFormat:()=>syncFormat(),prepareProject:()=>Editor.prepareExport(),requestOptions:()=>buildOptions(),
+      status:text=>{status.textContent=text;},formProblem:()=>{syncAudio();return form.checkValidity()?'':(form.querySelector(':invalid')?.validationMessage||'Check the highlighted field.');}};
+    const formatName=()=>{
+      const options=delivery.deliveryOptions?.()||{}, codec=form.elements.codec.value;
+      if(codec==='wav')return 'WAV';
+      if(['png','tiff','dpx','exr'].includes(codec))return codec.toUpperCase()+' sequence';
+      return (options.container||({h264:'mp4',hevc:'mp4',av1:'mp4',prores:'mov',dnxhr:'mov'}[codec]||'mp4')).toUpperCase();
+    };
     const syncFormat=()=>{
       const h264=form.elements.codec.value==='h264';
       const prores=form.elements.codec.value==='prores';
@@ -119,9 +128,11 @@ window.SpliceDialogs = (() => {
       colorNotice.hidden=!pq&&(!hdr||!(h264||prores&&form.elements.colorSpace.value==='rec709'));
       colorNotice.textContent=pq?'Maps SDR reference white to 203 nits and converts HDR footage to PQ.':
         'This export tone-maps HDR footage to Rec. 709.';
-      render.textContent='Render '+({h264:'MP4',prores:'MOV',wav:'WAV'}[form.elements.codec.value]);
+      render.textContent='Render '+formatName();
+      deliveryFields?.sync();
     };
     form.elements.codec.onchange=form.elements.colorSpace.onchange=syncFormat;
+    if(window.SpliceDelivery)deliveryFields=SpliceDelivery.enhance(form,delivery);
     const rangeChanged=form.elements.rangeMode.onchange;
     form.elements.rangeMode.onchange=()=>{rangeChanged();syncFormat();};
     for(const field of rangeFields)field.addEventListener('input',syncFormat);
@@ -151,27 +162,38 @@ window.SpliceDialogs = (() => {
     };
     cancel.onclick=()=>{if(controller){controller.abort();cancel.disabled=true;status.textContent='Cancelling…';}else node.close();};
     node.oncancel=e=>{if(controller){e.preventDefault();cancel.click();}};
+    function buildOptions(){
+      const opts={codec:form.elements.codec.value,crf:Number(form.elements.quality.value),audioBitrate:Number(form.elements.bitrate.value)};
+      if(!form.elements.colorSpace.closest('label').hidden)opts.colorSpace=form.elements.colorSpace.value;
+      // Types as the renderer validates them: booleans, a number, a lowercase three-letter string.
+      opts.limiter=limiter.checked;
+      if(limiter.checked)opts.limiterCeiling=ceiling.valueAsNumber;
+      if(!peakSafe.closest('label').hidden)opts.aacPeakSafe=peakSafe.checked;
+      if(!language.closest('label').hidden)opts.subtitleLanguage=language.value==='other'?languageCode.value.trim().toLowerCase():language.value;
+      if(form.elements.rangeMode.value==='custom')opts.range={start:rangeFields[0].valueAsNumber,end:rangeFields[1].valueAsNumber};
+      return Object.assign(opts,delivery.deliveryOptions?.()||{});
+    }
     form.onsubmit=async e=>{
       e.preventDefault();if(controller)return;
       syncAudio();
       if(!form.checkValidity()){form.reportValidity();return;}
+      const blocked=delivery.validate?.();
+      if(blocked){status.textContent=blocked;return;}
       controller=new AbortController();renderWarnings=[];renderReport={};showReport(null,[]);render.disabled=true;cancel.textContent='Cancel render';progress.hidden=false;
-      const settings=[form.elements.codec,form.elements.colorSpace,form.elements.quality,form.elements.rangeMode,...rangeFields,audioGroup];
+      const settings=[form.elements.codec,form.elements.colorSpace,form.elements.quality,form.elements.rangeMode,...rangeFields,audioGroup,
+        ...form.querySelectorAll('.export-format,.export-group,.export-preset-row,.export-queue-row')];
       for(const field of settings)field.disabled=true;
       status.textContent='Preparing media…';
       try {
-        const opts={codec:form.elements.codec.value,crf:Number(form.elements.quality.value),audioBitrate:Number(form.elements.bitrate.value)};
-        if(opts.codec==='prores')opts.colorSpace=form.elements.colorSpace.value;
-        // Types as the renderer validates them: booleans, a number, a lowercase three-letter string.
-        opts.limiter=limiter.checked;
-        if(limiter.checked)opts.limiterCeiling=ceiling.valueAsNumber;
-        if(opts.codec==='h264')opts.aacPeakSafe=peakSafe.checked;
-        if(!language.closest('label').hidden)opts.subtitleLanguage=language.value==='other'?languageCode.value.trim().toLowerCase():language.value;
-        if(form.elements.rangeMode.value==='custom')opts.range={start:rangeFields[0].valueAsNumber,end:rangeFields[1].valueAsNumber};
+        const opts=buildOptions();
+        if(delivery.queueOnly?.()){
+          // An image sequence is a folder of files: it renders through the queue into the output folder.
+          await delivery.renderViaQueue();progress.hidden=true;return;
+        }
         const result=await Editor.exportVideo(opts,job=>{
           renderWarnings=Array.isArray(job.warnings)?job.warnings:[]; renderReport=job.report||{}; progress.value=job.progress;status.textContent='Rendering · '+Math.round(100*job.progress)+'%';
         },controller.signal);
-        progress.value=1;status.textContent=({h264:'MP4',prores:'MOV',wav:'WAV'}[form.elements.codec.value])+' exported.'+(result?.url?' Review the render below.':'');
+        progress.value=1;status.textContent=formatName()+' exported.'+(result?.url?' Review the render below.':'');
         showReport(renderReport.audio,renderWarnings);
         // The result is what the editor looks for next: bring it above the footer.
         (report.hidden?status:report).scrollIntoView({block:'nearest'});
