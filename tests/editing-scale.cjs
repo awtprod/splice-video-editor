@@ -197,7 +197,8 @@ async function playback(page) {
   });
   // Only the playhead moves: the lanes are not touched while the sequence plays.
   assert.equal(played.laneMutations, 0, JSON.stringify(played));
-  assert.ok(played.longTaskMs < 1000, JSON.stringify(played));
+  // Before this round the program monitor drew every stacked layer each frame: 0.9-2.7 s of long tasks in 3 s.
+  assert.ok(played.longTaskMs < 400, JSON.stringify(played));
   const zoom = await page.evaluate(async () => {
     document.getElementById('zoom-fit').click();
     const started = performance.now(), steps = [];
@@ -210,7 +211,8 @@ async function playback(page) {
     return {totalMs: Math.round(performance.now() - started), slowestStepMs: Math.round(Math.max(...steps)),
       nodes: document.querySelectorAll('.timeline-clip').length};
   });
-  assert.ok(zoom.totalMs < 6000 && zoom.slowestStepMs < 400, JSON.stringify(zoom));
+  // Before this round: 3.7-6 s in total and up to 250 ms for one step.
+  assert.ok(zoom.totalMs < 3500 && zoom.slowestStepMs < 150, JSON.stringify(zoom));
   console.log('5,000 clips, 12 tracks, 3 h: playback at fit ' + JSON.stringify(played) + '; 40 zoom steps ' + JSON.stringify(zoom));
 }
 

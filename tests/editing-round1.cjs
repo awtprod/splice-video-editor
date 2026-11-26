@@ -155,6 +155,8 @@ async function outInclusive(page) {
   const longer = await place({in: 10 / 25, out: 42 / 25});
   assert.deepEqual([longer.method, longer.length, Math.abs(longer.speed - 32 / 31) < 1e-9], ['fit to fill', 31, true]);
   assert.deepEqual(await place({in: 10 / 25, out: 41 / 25}), {method: 'timeline In/Out', start: 50, length: 31, in: 10, speed: 1});
+  const shorter = await place({in: 10 / 25, out: 40 / 25});
+  assert.deepEqual([shorter.method, shorter.length, Math.abs(shorter.speed - 30 / 31) < 1e-9], ['fit to fill', 31, true]);
   // A lone timeline Out on frame 80 back-times the edit so it ends after frame 80.
   const backTimed = await state(page, () => {
     Editor.setMark('in', null);
@@ -637,6 +639,7 @@ async function layoutChecks(page, camera) {
 
 // Behaviour earlier tests did not pin down.
 async function unguarded(page) {
+  let clips;
   // Separating a camera clip's sound takes it out of the picture clip: it must not play twice.
   await state(page, () => SpliceSession.newProject({name: 'Guards', width: 1280, height: 720, fps: 25}));
   await state(page, () => Editor.editProject(project => {
@@ -648,17 +651,19 @@ async function unguarded(page) {
     const clips = Editor.get().project.clips, picture = clips.find(c => c.id === 'pic');
     return [picture.embeddedAudio, Editor.hasEmbeddedAudio(picture), clips.filter(c => c.type === 'audio').length];
   }), [false, false, 1]);
-  // Overwrite through a linked pair whose members differ in length unlinks the whole group.
-  await load(page, {clips: [clip('v', 0, 2, {in: 0, linkGroup: 'g', embeddedAudio: false}),
-    clip('s', 0, 2.4, {type: 'audio', track: -1, in: 0, linkGroup: 'g'})]});
+  // Overwrite on both lanes through a linked pair whose members differ in length unlinks the whole group.
+  await load(page, {media: [{id: 'long', name: 'Camera take', src: 'assets/ridge.mp4', type: 'video', duration: 30, audioChannels: 2}],
+    clips: [clip('v', 0, 2, {in: 0, linkGroup: 'g', embeddedAudio: false}), clip('s', 0, 2.4, {type: 'audio', track: -1, in: 0, linkGroup: 'g'})]});
   await state(page, () => { Editor.setMark('in', .8); Editor.setMark('out', 1.16);
-    Editor.placeSource('long', {mode: 'overwrite', track: 1, audioTrack: null, marks: {in: 10, out: 11}}); });
-  assert.deepEqual((await clipsOf(page)).filter(c => c.mediaId === 'long' && Math.abs(c.in - 10) > .01 && c.linkGroup).map(c => c.id), []);
+    Editor.placeSource('long', {mode: 'overwrite', track: 1, audioTrack: -1, marks: {in: 10, out: 11}}); });
+  clips = await clipsOf(page);
+  assert.equal(clips.filter(c => Math.abs(c.in - 10) < .01 && c.linkGroup).length, 2, 'the new picture and sound are linked');
+  assert.deepEqual(clips.filter(c => Math.abs(c.in - 10) > .01 && c.linkGroup).map(c => c.id), [], 'the cut pair is unlinked');
   // Split: a linked member wholly after the cut joins the right-hand piece; a lone left piece is unlinked.
   await load(page, {clips: [clip('v', 0, 4, {in: 0, linkGroup: 'g', embeddedAudio: false}),
     clip('s', 2.6, 1.4, {type: 'audio', track: -1, in: 2.6, linkGroup: 'g'})]});
   await state(page, () => { Editor.select('v'); Editor.seek(2); Editor.split(); });
-  let clips = await clipsOf(page);
+  clips = await clipsOf(page);
   const left = byId(clips, 'v'), right = clips.find(c => c.type === 'video' && c.id !== 'v');
   assert.deepEqual([left.linkGroup, typeof right.linkGroup, byId(clips, 's').linkGroup === right.linkGroup], [undefined, 'string', true]);
   // Insert opens space on sync-locked tracks only.

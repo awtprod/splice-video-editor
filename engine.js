@@ -2119,7 +2119,8 @@
       } else if (timelineIn !== null && timelineOut !== null) {
         start = timelineIn;
         length = Math.round((timelineOut - timelineIn) * project.fps) / project.fps;
-        if (hasIn && hasOut && Math.abs(range.duration - length) >= frame / 2) {
+        // Four marks whose lengths differ by a frame or more fit to fill (lengths are whole frames).
+        if (hasIn && hasOut && Math.round(range.duration * project.fps) !== Math.round(length * project.fps)) {
           speed = range.duration / length;
           if (speed < .1 || speed > 16) throw new Error("Fitting this source range to the timeline range needs a speed outside 10% to 1600%.");
           method = "fit to fill";
