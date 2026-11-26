@@ -115,6 +115,7 @@ class _Writer:
         self.files = {}           # source id -> file id
         self.masters = {}
         self.items = 0
+        self.rounded = Fraction(0)
         self.report = cut.report
 
     def note(self, event, message):
@@ -123,6 +124,35 @@ class _Writer:
     def media_seconds(self, source) -> Fraction:
         uses = [e.source_in + e.source_span for e in self.cut.events if e.source is source]
         return max([source.duration or Fraction(0), *uses])
+
+    def file_rate(self, source) -> Fraction:
+        return source.rate if source.rate and not source.still else self.rate
+
+    def file_frames(self, source) -> int:
+        """The file's ``<duration>``: whole frames at its own rate, never shorter than a use."""
+        rate = self.file_rate(source)
+        uses = [e.source_in + e.source_span for e in self.cut.events if e.source is source]
+        return max(1, math.floor((source.duration or 0) * rate), *[math.ceil(u * rate) for u in uses])
+
+    def file_seconds(self, source) -> Fraction:
+        """The media length a reader mirrors a reversed clip in: the file's ``<duration>``."""
+        return Fraction(self.file_frames(source)) / self.file_rate(source)
+
+    def frame(self, source):
+        """(width, height) of a source's picture in square pixels, None when unknown."""
+        if source is None or not source.width or not source.height:
+            return None
+        name, anamorphic, _exact = self.pixel_shape(source)
+        # the shape the receiving app is told: an unnamed ratio is written (and shown) as square
+        return Fraction(source.width) * pixel_aspect(name, anamorphic, source.width, source.height), Fraction(source.height)
+
+    def pixel_shape(self, source):
+        return pixel_aspect_name(source.sar, source.width, source.height) if source is not None else ('square', False, True)
+
+    def fit(self, source) -> Fraction:
+        """How much Splice enlarges a source to fit the frame; Premiere's Scale 100 is native size."""
+        frame = self.frame(source)
+        return min(self.cut.width / frame[0], self.cut.height / frame[1]) if frame else Fraction(1)
 
     # files -------------------------------------------------------------------------------------
     def file(self, parent, source):
@@ -140,9 +170,9 @@ class _Writer:
             _text(element, 'pathurl', quote(base_name(source.name), safe=''))
             self.report.add(FORMAT, f'Source {source.name}: its original path is unknown; the file references '
                                     f'"{source.name}" next to the XML. Relink in the receiving app.')
-        rate = source.rate if source.rate and not source.still else self.rate
+        rate = self.file_rate(source)
         _rate(element, rate)
-        _text(element, 'duration', max(1, math.floor(self.media_seconds(source) * rate)))
+        _text(element, 'duration', self.file_frames(source))
         tc_rate = source.tc_rate or rate
         drop = bool(source.drop and tc_rate in DROP_FRAME_RATES)
         start = source.tc_frames if source.tc_frames is not None else round(source.start * tc_rate)
@@ -163,8 +193,16 @@ class _Writer:
             if source.width and source.height:
                 _text(chars, 'width', source.width)
                 _text(chars, 'height', source.height)
-            _text(chars, 'anamorphic', 'FALSE')
-            _text(chars, 'pixelaspectratio', 'square')
+            name, anamorphic, exact = self.pixel_shape(source)
+            _text(chars, 'anamorphic', _bool(anamorphic))
+            _text(chars, 'pixelaspectratio', name)
+            if not exact:
+                self.report.add(FORMAT, f'Source {source.name}: its pixel aspect ratio {source.sar.numerator}:{source.sar.denominator} '
+                                        'has no FCP 7 XML name and is written as square, so the receiving app shows it '
+                                        'stretched horizontally; set its pixel aspect ratio there (Premiere: Modify > Interpret Footage).')
+            if not (source.width and source.height):
+                self.report.add(FORMAT, f'Source {source.name}: its frame size is unknown, so scale and position are written '
+                                        'as if it were the sequence size; check its framing in the receiving app.')
             _text(chars, 'fielddominance', 'none')
         if source.has_audio:
             audio = ET.SubElement(media, 'audio')
@@ -181,7 +219,7 @@ class _Writer:
         frames = event.frames + before + after
         source_in = event.source_in - Fraction(before) / self.rate * speed
         span = Fraction(frames) / self.rate * speed
-        media = self.media_seconds(event.source)
+        media = self.file_seconds(event.source)
         if event.reverse:  # in/out count the mirrored media timeline: the record head is the source's end
             first = media - (event.source_in + event.source_span) - Fraction(before) / self.rate * speed
         else:
@@ -189,6 +227,7 @@ class _Writer:
         first = max(Fraction(0), first)
         clip_in = round(first * self.rate / speed)
         duration = max(clip_in + frames, round(media * self.rate / speed))
+        self.rounded = first * self.rate / speed - clip_in   # Premiere uses the integer in
         return clip_in, clip_in + frames, duration, round(first * TICKS), round((first + span) * TICKS)
 
     # filters -----------------------------------------------------------------------------------
@@ -228,7 +267,7 @@ class _Writer:
             element.text = str(value)
 
     def time_remap(self, parent, event: Event, clip_in: int, duration: int):
-        media_frames = round(self.media_seconds(event.source) * self.rate)
+        media_frames = round(self.file_seconds(event.source) * self.rate)
         source_in = round(event.source_in * self.rate)
         source_out = round((event.source_in + event.source_span) * self.rate)
         if event.reverse:
@@ -243,18 +282,32 @@ class _Writer:
             ('graphdict', 'graphdict', 0, media_frames, 0, points)])
 
     def picture_filters(self, parent, event: Event, clip_in: int):
+        """Basic Motion in Premiere's terms: Scale 100 is the media at its own pixel size and the
+        centre is an offset in fractions of the media's own frame (width and height in square
+        pixels). Splice fits media to the sequence frame and moves it by a percentage of the
+        sequence, so Scale = fit x Splice scale and centre = offset in pixels / media size."""
         tf, keys = event.transform, event.keyframes
+        source = event.source if event.kind != 'title' else None
+        fit = self.fit(source)
+        width, height = self.frame(source) or (Fraction(self.cut.width), Fraction(self.cut.height))
+        horiz = lambda x: float(Fraction(repr(float(x))) / 100 * self.cut.width / width)
+        vert = lambda y: float(Fraction(repr(float(y))) / 100 * self.cut.height / height)
+        scale = lambda value: float(Fraction(repr(float(value))) * fit)
         moved = any(abs(tf.get(k, d) - d) > 1e-9 for k, d in (('x', 0), ('y', 0), ('scale', 100), ('rotation', 0)))
         animated = any(keys.get(k) for k in ('x', 'y', 'scale', 'rotation'))
-        if moved or animated:
+        if moved or animated or fit != 1:
             times = sorted({f for k in ('x', 'y') for f, _ in keys.get(k, ())})
-            center = [(clip_in + f, (_at(keys.get('x'), f, tf['x']) / 100, _at(keys.get('y'), f, tf['y']) / 100)) for f in times]
+            center = [(clip_in + f, (horiz(_at(keys.get('x'), f, tf['x'])), vert(_at(keys.get('y'), f, tf['y'])))) for f in times]
             self._filter(parent, 'Basic Motion', 'basic', 'motion', 'motion', 'video', [
-                ('scale', 'Scale', 0, 1000, tf['scale'], [(clip_in + f, v) for f, v in keys.get('scale', ())]),
+                ('scale', 'Scale', 0, 10000, scale(tf['scale']), [(clip_in + f, scale(v)) for f, v in keys.get('scale', ())]),
                 ('rotation', 'Rotation', -8640, 8640, tf['rotation'], [(clip_in + f, v) for f, v in keys.get('rotation', ())]),
-                ('center', 'Center', None, None, (tf['x'] / 100, tf['y'] / 100), center)])
-            self.note(event, 'scale, position and rotation are a Basic Motion filter (centre as a fraction of the frame); '
-                             'check the framing in the receiving app.')
+                ('center', 'Center', None, None, (horiz(tf['x']), vert(tf['y'])), center)])
+            if moved or animated:
+                self.note(event, f'scale, position and rotation are a Basic Motion filter: Scale {_number(scale(tf["scale"]))} '
+                                 f'(Splice {_number(tf["scale"])} % of the fitted frame) and centre offset '
+                                 f'{_number(float(Fraction(repr(float(tf["x"]))) / 100 * self.cut.width))} px, '
+                                 f'{_number(float(Fraction(repr(float(tf["y"]))) / 100 * self.cut.height))} px '
+                                 '(right and down positive) written as fractions of the media\'s own frame.')
         if event.opacity != 100 or keys.get('opacity'):
             self._filter(parent, 'Opacity', 'opacity', 'motion', 'motion', 'video', [
                 ('opacity', 'Opacity', 0, 100, event.opacity,
@@ -307,9 +360,15 @@ class _Writer:
         _text(item, 'pproTicksIn', ticks_in)
         _text(item, 'pproTicksOut', ticks_out)
         if mediatype == 'video':
+            shape, anamorphic, _exact = self.pixel_shape(source)
             _text(item, 'alphatype', 'none')
-            _text(item, 'pixelaspectratio', 'square')
-            _text(item, 'anamorphic', 'FALSE')
+            _text(item, 'pixelaspectratio', shape)
+            _text(item, 'anamorphic', _bool(anamorphic))
+        if self.rounded:
+            error = abs(self.rounded) * event.speed / self.rate * (source.rate or self.rate)
+            self.note(event, f'its in point lies between two sequence frames, and Premiere Pro reads the whole-frame <in>: '
+                             f'it starts {float(error):.2f} source frames {"later" if self.rounded < 0 else "earlier"} there '
+                             '(pproTicksIn keeps the exact position for applications that read it).')
         self.file(item, source)
         if mediatype == 'audio':
             sourcetrack = ET.SubElement(item, 'sourcetrack')
@@ -360,8 +419,8 @@ class _Writer:
             _text(value, tag, int(part, 16))
         if event.opacity != 100 or event.keyframes.get('opacity'):
             self.picture_filters(item, event, 0)
-        self.note(event, f'title "{first}" is a Text generator; Premiere Pro replaces it with a slug placeholder of the same '
-                         'name and length, Resolve with its Text generator. Restyle it there.')
+        self.note(event, f'title "{first}" is a Text generator; Premiere Pro 27 imports it as a graphic named after its text, '
+                         'Resolve as its Text generator; font, size and position may differ. Restyle it there.')
 
     def transition(self, track, event: Event, mediatype: str):
         tr = event.transition
@@ -465,9 +524,16 @@ class _Writer:
                 _text(track, 'outputchannelindex', channel)
         self.parents = {}
         for track in (*video.iterfind('track'), *audio.iterfind('track')):
-            for position, item in enumerate(track.iterfind('clipitem'), 1):
+            # Premiere counts every item of the track, transitions included, from 1
+            items = [child for child in track if child.tag in ('clipitem', 'generatoritem', 'transitionitem')]
+            for position, item in enumerate(items, 1):
                 self.parents[item] = position
         self._links(item_of, track_index, pictures)
+        for event in cut.events:
+            if event.reverse and event.kind == 'video' and (event.embedded_audio or event.link_group):
+                self.note(event, 'reversed and linked to its sound; Premiere Pro imports a reversed picture clip unlinked '
+                                 'from its sound (its own XML export writes that pair unlinked too). Relink them there '
+                                 '(select both, Clip > Link).')
         timecode = ET.SubElement(sequence, 'timecode')
         _rate(timecode, self.rate)
         label = cut.timecode(0)
@@ -569,7 +635,7 @@ def _int(element, tag, default=None):
         return default
     try:
         number = int(float(value.strip()))
-    except ValueError:
+    except (ValueError, OverflowError):  # OverflowError: 'inf'
         raise ValueError(f'<{tag}> {value.strip()[:20]!r} is not a number') from None
     if abs(number) > 10 ** 18:
         raise ValueError(f'<{tag}> is out of range')
@@ -681,6 +747,7 @@ class _Reader:
             clip = self.clipitem(item, kind, number, start, end, trail)
             if clip is None:
                 continue
+            clip['_trackname'] = (track.get('MZ.TrackName') or '').strip()
             if lead is not None:
                 cut_ticks = _int(lead, 'cutPointTicks', None)
                 lead_start, lead_end = _int(lead, 'start', 0), _int(lead, 'end', 0)
@@ -774,6 +841,11 @@ class _Reader:
     def clipitem(self, item, kind, number, start, end, trail):
         name = clean(item.findtext('name') or 'Clip')
         file_element = item.find('file')
+        definition = self.files.get(file_element.get('id'), file_element) if file_element is not None else None
+        graphic = item.find("filter/effect[effectid='GraphicAndType']")
+        if kind == 'video' and (graphic is not None or (definition is not None and
+                                (definition.findtext('mediaSource') or '').strip() == 'GraphicAndType')):
+            return self.graphic(item, graphic, name, start, end, number)
         if file_element is None:
             self.warnings.append(f'{name} has no file and was not imported.')
             return None
@@ -803,8 +875,14 @@ class _Reader:
         else:
             first = Fraction(clip_in) / self.rate * speed
         if reverse:
-            duration_frames = _int(item, 'duration', clip_out) or clip_out
-            media = Fraction(duration_frames) / self.rate * speed
+            # the mirror is the file's own length at the file's rate when the file gives it (the
+            # clipitem <duration> is that length rounded to sequence frames of the retimed clip)
+            file_frames = _int(definition, 'duration', None) if definition is not None else None
+            if file_frames and file_frames > 0:
+                media = Fraction(file_frames) / _rate_of(definition, self.rate)
+            else:
+                duration_frames = _int(item, 'duration', clip_out) or clip_out
+                media = Fraction(duration_frames) / self.rate * speed
             span = Fraction(end - start) / self.rate * speed
             first = max(Fraction(0), media - first - span)
         sourcetrack = _int(item, 'sourcetrack/trackindex', 1) if kind == 'audio' else 1
@@ -815,41 +893,77 @@ class _Reader:
                 '_links': [(link.findtext('linkclipref') or '').strip() for link in item.iterfind('link')]}
         if kind == 'video':
             clip['embeddedAudio'] = False
-            self.picture(item, clip, clip_in)
+            self.picture(item, clip, clip_in, self.frame_of(definition))
         else:
             self.levels(item, clip, clip_in)
         self.clips.append(clip)
         return clip
 
-    def picture(self, item, clip, origin):
+    def frame_of(self, definition):
+        """(display width, height) of a file's picture in square pixels, or None when unknown."""
+        chars = definition.find('media/video/samplecharacteristics') if definition is not None else None
+        if chars is None:
+            return None
+        width, height = _int(chars, 'width', 0) or 0, _int(chars, 'height', 0) or 0
+        if not (1 <= width <= 16384 and 1 <= height <= 16384):
+            return None
+        par = pixel_aspect(chars.findtext('pixelaspectratio'), (chars.findtext('anamorphic') or '').strip().upper() == 'TRUE',
+                           width, height)
+        return float(width * par), float(height)
+
+    def picture(self, item, clip, origin, frame):
+        """Basic Motion as Premiere means it: Scale 100 shows the media at its own size and the
+        centre is a fraction of the media's own frame. Splice fits media to the sequence frame and
+        moves it by a percentage of the sequence, so both are converted with the fit factor."""
+        width, height = frame or (float(self.width), float(self.height))
+        fit = min(self.width / width, self.height / height)
+        aspect = None
+        for effect in item.iterfind('filter/effect'):
+            if (effect.findtext('effectid') or '').strip() == 'deformation':
+                param = _param(effect, 'aspect')
+                aspect = _float(param.findtext('value')) if param is not None else None
+        # Premiere's own XML export writes a pixel aspect ratio it cannot name as a Distort
+        # "aspect" of 100 - k and a Basic Motion scale k times the user's: fold it back out
+        compensation = (100 - aspect) / 100 if aspect is not None and -99 < aspect < 0 else 1.0
+        if abs(fit - 1) > 1e-9 and item.find("filter/effect[effectid='basic']") is None:
+            # no Basic Motion: Premiere shows the media at its own size, which in Splice is 100 / fit
+            clip['transform'] = {'x': 0.0, 'y': 0.0, 'scale': round(100 / fit, 4), 'rotation': 0.0}
         for effect in item.iterfind('filter/effect'):
             effect_id = (effect.findtext('effectid') or '').strip()
             if effect_id == 'basic':
                 transform, keys = {'x': 0.0, 'y': 0.0, 'scale': 100.0, 'rotation': 0.0}, {}
+                to_splice = {'scale': lambda v: round(v / compensation / fit, 4), 'rotation': lambda v: v}
                 for parameter_id, field in (('scale', 'scale'), ('rotation', 'rotation')):
                     param = _param(effect, parameter_id)
                     if param is not None:
-                        transform[field] = _float(param.findtext('value'), transform[field])
+                        value = _float(param.findtext('value'))
+                        transform[field] = to_splice[field](value) if value is not None else transform[field]
                         points = [(_int(k, 'when', 0), _float(k.findtext('value'))) for k in param.iterfind('keyframe')]
-                        points = [{'time': float(Fraction(w - origin) / self.rate), 'value': v} for w, v in points if v is not None]
+                        points = [{'time': float(Fraction(w - origin) / self.rate), 'value': to_splice[field](v)}
+                                  for w, v in points if v is not None]
                         if points:
                             keys[field] = points[:2000]
                 center = _param(effect, 'center')
+                # centre fraction of the media frame -> percent of the sequence frame
+                to_x = lambda h: round(h * width / self.width * 100, 4)
+                to_y = lambda v: round(v * height / self.height * 100, 4)
                 if center is not None:
-                    transform['x'] = (_float(center.findtext('value/horiz'), 0) or 0) * 100
-                    transform['y'] = (_float(center.findtext('value/vert'), 0) or 0) * 100
+                    transform['x'] = to_x(_float(center.findtext('value/horiz'), 0) or 0)
+                    transform['y'] = to_y(_float(center.findtext('value/vert'), 0) or 0)
                     xs, ys = [], []
                     for key in center.iterfind('keyframe'):
                         when = float(Fraction(_int(key, 'when', 0) - origin) / self.rate)
                         horiz, vert = _float(key.findtext('value/horiz')), _float(key.findtext('value/vert'))
                         if horiz is not None and vert is not None:
-                            xs.append({'time': when, 'value': horiz * 100})
-                            ys.append({'time': when, 'value': vert * 100})
+                            xs.append({'time': when, 'value': to_x(horiz)})
+                            ys.append({'time': when, 'value': to_y(vert)})
                     if xs:
                         keys['x'], keys['y'] = xs[:2000], ys[:2000]
                 clip['transform'] = transform
                 if keys:
                     clip.setdefault('keyframes', {}).update(keys)
+            elif effect_id == 'deformation' and aspect is not None and compensation != 1.0:
+                continue
             elif effect_id == 'opacity':
                 param = _param(effect, 'opacity')
                 if param is not None:
@@ -893,11 +1007,39 @@ class _Reader:
                 'enabled': (item.findtext('enabled') or 'TRUE').strip().upper() != 'FALSE'}
         self.clips.append(clip)
 
+    def graphic(self, item, effect, name, start, end, number):
+        """A Premiere graphic (Essential Graphics text) as a Splice title. Premiere stores the text
+        in a binary "Source Text" value; when it cannot be read the title shows the graphic's name."""
+        text = ''
+        if effect is not None:
+            for param in effect.iterfind('parameter'):
+                if (param.findtext('name') or '').strip() == 'Source Text':
+                    text = graphic_text(param.findtext('value') or '')
+            name = clean(effect.findtext('name') or name) or name
+        if not text:
+            self.warnings.append(f'Premiere graphic "{name}": its text could not be read from the file, so it was imported '
+                                 'as a title showing the graphic\'s name. Retype the text.')
+        else:
+            self.warnings.append(f'Premiere graphic "{name}" was imported as a Splice title with its text; its font, '
+                                 'style and position were not imported.')
+        clip = {'kind': 'title', 'name': name, 'text': text or name, 'start': Fraction(start) / self.rate,
+                'duration': Fraction(end - start) / self.rate, 'track': number,
+                'enabled': (item.findtext('enabled') or 'TRUE').strip().upper() != 'FALSE'}
+        self.clips.append(clip)
+        return None
+
     def merge_sound(self):
-        """Stereo arrives as one clipitem per channel; a picture clip's own sound as linked clipitems
-        with the same file and range. Both collapse back into Splice's single clips."""
+        """Stereo arrives as one clipitem per channel, and Splice's own export writes a picture
+        clip's embedded sound on that picture track's "V<n> sound" tracks. Those collapse back
+        into Splice's single clips; every other sound clip, linked or not, stays a sound clip (in
+        the picture's link group), so its gain, fades and keyframes are kept."""
         by_id = {c['_id']: c for c in self.clips if c.get('_id')}
+        pictures = {}
+        for clip in self.clips:
+            if clip['kind'] == 'video':
+                pictures.setdefault((clip['track'], clip['media'], clip['start'], clip['duration'], clip['in']), clip)
         keep, groups = [], 0
+        levels = lambda c: (c.get('volume', 100), repr(c.get('keyframes', {}).get('volume')))
         for clip in self.clips:
             if clip['kind'] != 'audio':
                 keep.append(clip)
@@ -905,11 +1047,26 @@ class _Reader:
             partners = [by_id[ref] for ref in clip['_links'] if ref in by_id and by_id[ref] is not clip]
             same = lambda other: (other['media'], other['start'], other['duration'], other['in']) == \
                 (clip['media'], clip['start'], clip['duration'], clip['in'])
-            picture = next((p for p in partners if p['kind'] == 'video' and same(p)), None)
-            if picture is not None:
-                picture['embeddedAudio'] = True
+            own = re.fullmatch(r'V(\d+) sound', clip.get('_trackname') or '')
+            picture = None
+            if own:
+                key = (int(own.group(1)), clip['media'], clip['start'], clip['duration'], clip['in'])
+                linked = next((p for p in partners if p['kind'] == 'video' and same(p)), None)
+                # Premiere drops the link of a reversed picture/sound pair; the track still says whose sound it is
+                picture = linked or (pictures.get(key) if not any(p['kind'] == 'video' for p in partners) else None)
+                if picture is not None and picture['track'] != int(own.group(1)):
+                    picture = None
+            if picture is not None and picture.get('_sound') in (None, levels(clip)) and picture.get('enabled') == clip.get('enabled'):
+                if picture.get('_sound') is None:
+                    picture['_sound'] = levels(clip)
+                    picture['embeddedAudio'] = True
+                    if clip.get('volume', 100) != 100:
+                        picture['volume'] = clip['volume']
+                    if clip.get('keyframes', {}).get('volume'):
+                        picture.setdefault('keyframes', {})['volume'] = clip['keyframes']['volume']
                 continue
-            twin = next((p for p in partners if p['kind'] == 'audio' and same(p) and p.get('_kept')), None)
+            twin = next((p for p in partners if p['kind'] == 'audio' and same(p) and p.get('_kept')
+                         and levels(p) == levels(clip)), None)
             if twin is not None:
                 continue
             clip['_kept'] = True
@@ -923,6 +1080,58 @@ class _Reader:
                 for member in [clip, *linked]:
                     member.setdefault('linkGroup', group)
         self.clips = keep
+
+
+def pixel_aspect(name, anamorphic: bool, width: int, height: int) -> Fraction:
+    """The pixel aspect ratio an FCP 7 XML ``pixelaspectratio`` name stands for."""
+    key = (name or 'square').strip()
+    table = {'NTSC-601': Fraction(10, 11), 'PAL-601': Fraction(12, 11), 'HD-(960x720)': Fraction(4, 3),
+             'HD-(1280x1080)': Fraction(3, 2), 'HD-(1440x1080)': Fraction(4, 3), 'DVCPROHD-720p': Fraction(4, 3),
+             'DVCPROHD-1080i50': Fraction(4, 3), 'DVCPROHD-1080i60': Fraction(3, 2)}
+    par = table.get(key, Fraction(1))
+    if anamorphic and key in ('NTSC-601', 'PAL-601'):
+        par = par * 4 / 3
+    return par
+
+
+def pixel_aspect_name(sar: Fraction | None, width: int | None, height: int | None):
+    """``(pixelaspectratio, anamorphic, exact)`` for a sample aspect ratio. ``exact`` is False when
+    FCP 7 XML has no name for it and "square" was chosen."""
+    if not sar or abs(sar - 1) < Fraction(1, 100):
+        return 'square', False, True
+    for name, value, anamorphic, sizes in (
+            ('HD-(1440x1080)', Fraction(4, 3), False, {(1440, 1080)}), ('HD-(1280x1080)', Fraction(3, 2), False, {(1280, 1080)}),
+            ('HD-(960x720)', Fraction(4, 3), False, {(960, 720)}),
+            ('NTSC-601', Fraction(10, 11), False, {(720, 480), (720, 486)}), ('NTSC-601', Fraction(40, 33), True, {(720, 480), (720, 486)}),
+            ('PAL-601', Fraction(12, 11), False, {(720, 576)}), ('PAL-601', Fraction(16, 11), True, {(720, 576)})):
+        if (width, height) in sizes and abs(sar - value) < Fraction(1, 50):
+            return name, anamorphic, True
+    return 'square', False, False
+
+
+def graphic_text(value: str) -> str:
+    """The text of a Premiere "Source Text" value (base64 of a binary record in which each string
+    is a little-endian 32-bit length and UTF-8 bytes, zero padded): the last string in it, as the
+    font name comes before the text. '' when nothing readable is there."""
+    import base64
+    import binascii
+    try:
+        data = base64.b64decode(re.sub(r'\s+', '', value)[:400_000], validate=True)
+    except (binascii.Error, ValueError):
+        return ''
+    found = ''
+    for offset in range(0, max(0, len(data) - 4)):
+        length = int.from_bytes(data[offset:offset + 4], 'little')
+        end = offset + 4 + length
+        if not 1 <= length <= 4000 or end > len(data) or (end < len(data) and data[end] != 0):
+            continue
+        try:
+            text = data[offset + 4:end].decode('utf-8')
+        except UnicodeDecodeError:
+            continue
+        if text.strip() and all(ch.isprintable() or ch in '\r\n\t' for ch in text):
+            found = text
+    return clean(found.replace('\r\n', '\n').replace('\r', '\n'), 2000).strip() if found else ''
 
 
 def read(data: bytes, budget: Budget | None = None) -> dict:

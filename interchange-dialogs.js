@@ -66,7 +66,7 @@ window.SpliceInterchange = (() => {
       <label>Unreadable source timecode<select name="unknownTimecode"><option value="refuse">Stop and list the sources</option><option value="zero">Write 00:00:00:00 and flag each clip</option></select></label>
       <label class="interchange-check"><input type="checkbox" name="package"> Turnover package (.zip with a report of what each format cannot carry)</label>
       <details class="interchange-advanced"><summary>Path mapping (optional)</summary>
-        <p class="interchange-note">When the receiving machine sees the media under another path, write one rule per line as <code>this machine's folder =&gt; their folder</code>, for example <code>/mnt/shoot =&gt; X:\Shoot</code>. Every media path in the exported files is rewritten; the report lists the rules.</p>
+        <p class="interchange-note">When the receiving machine sees the media under another path, write one rule per line as <code>this machine's folder =&gt; their folder</code>, for example <code>/mnt/shoot =&gt; X:\Shoot</code>. Every media path in the exported files is rewritten; where several rules match, the longest folder wins (<code>/mnt/shoot/day1</code> before <code>/mnt/shoot</code>, in any order). The report lists the rules and any mapped name the other system cannot hold; the receiving application asks to locate media whose mapped path does not exist there.</p>
         <textarea name="pathMap" rows="3" spellcheck="false" placeholder="/mnt/shoot => X:\Shoot"></textarea>
       </details>
       <p role="status" class="render-state"></p>

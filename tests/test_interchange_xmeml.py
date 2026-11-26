@@ -127,9 +127,11 @@ class Structure(XmemlCase):
         self.assertEqual(opacity.findtext('value'), '50')
         self.assertEqual([(k.findtext('when'), k.findtext('value')) for k in opacity.iterfind('keyframe')], [('5', '20'), ('29', '50')])
         motion = drop.find("filter/effect[effectid='basic']")
-        self.assertEqual(motion.find("parameter[parameterid='scale']").findtext('value'), '80')
+        # 64x36 media fitted to 1920x1080 is enlarged 30x; Premiere's Scale 100 is native size
+        self.assertEqual(motion.find("parameter[parameterid='scale']").findtext('value'), '2400')
+        # 10 % right = 192 px = 3 media widths; 5 % up = -54 px = -1.5 media heights
         self.assertEqual((motion.findtext("parameter[parameterid='center']/value/horiz"),
-                          motion.findtext("parameter[parameterid='center']/value/vert")), ('0.1', '-0.05'))
+                          motion.findtext("parameter[parameterid='center']/value/vert")), ('3', '-1.5'))
         audio_items = {i.get('id'): (index, i) for index, _, i in self.items(root, 'audio') if i.tag == 'clipitem'}
         tone = next(i for _, i in audio_items.values() if i.findtext('name') == 'room_tone.wav' and i.findtext('start') == '0')
         level = tone.find("filter/effect[effectid='audiolevels']/parameter")

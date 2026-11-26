@@ -140,7 +140,8 @@ class MediaContract(Media):
     def test_complete_metadata_is_not_probed_again(self):
         path = str(self.paths['camera_a'])
         details = [{'index': 0, 'channels': 2, 'layout': 'stereo', 'codec': 'pcm_s16le'}]
-        full = item(sourcePath=path, rate='24000/1001', audioStreams=1, audioStreamDetails=details)
+        full = item(sourcePath=path, rate='24000/1001', audioStreams=1, audioStreamDetails=details,
+                    width=64, height=36)  # the frame size decides the FCP 7 XML scale
         with mock.patch.object(media, 'probe_file', side_effect=AssertionError('probed')) as probe:
             self.asset(full)
             self.asset(dict(full, audioStreamDetails=None, audioStreams=0))

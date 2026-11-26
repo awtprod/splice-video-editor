@@ -57,7 +57,10 @@ def report_text(cut, formats, files) -> str:
              '', 'Files:'] + [f'  {name}' for name, _ in files]
     lines += ['', 'Media the timeline files reference:'] + (media_lines(cut) or ['  (no media)'])
     if cut.path_rules:
-        lines += ['', 'Path mapping (applied to every media path in the files above):'] + path_map_lines(cut)
+        lines += ['', 'Path mapping (applied to every media path in the files above; where several rules match a '
+                      'path, the longest "from" folder wins, whatever the order):'] + path_map_lines(cut)
+        lines += ['  The receiving application will ask to locate media if the mapped paths do not exist there '
+                  '(Premiere Pro: its Link Media dialog; Resolve: offline clips to relink).']
     lines += ['', 'Not carried by any format (all formats):']
     lines += [f'  - {entry}' for entry in report.general] or ['  (nothing)']
     for fmt in formats:

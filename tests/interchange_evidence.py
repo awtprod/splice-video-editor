@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from interchange_fixtures import DF, alpine_project, make_media, synthetic_project  # noqa: E402
+from interchange_fixtures import DF, at, alpine_project, make_media, synthetic_project  # noqa: E402
 
 NOTES = """Splice timeline interchange evidence
 =====================================
@@ -52,6 +52,8 @@ Which file to give which application:
        text, which Resolve still calls "Text" and puts on V2 because it drops the empty V2/V3;
        XML: Text generator; OTIO: placeholder clip "ALPINE PASSAGE"; not in EDLs).
    A1: Ambient score for 32 s at -5.19 dB (55 %).
+   The clips are 960 x 540 and Splice fits them to the frame, so the XML gives each Scale 200:
+   in Premiere they fill the 1920 x 1080 frame, centred (Position 960, 540).
    Sources have no embedded timecode, so every asset starts at 00:00:00:00 and an EDL conform
    in Resolve links all four events to one file (the report says so).
 
@@ -74,6 +76,8 @@ Which file to give which application:
                                 source timecode counts at 23.976: 01:00:00:03-01:00:02:03
                                 (start label 00:59:59;28 read as 00:59:59:22, plus 5 frames).
        01:00:03:08-01:00:04:04  plain_25 DISABLED (FCPXML enabled="0"; left out of EDLs)
+       01:00:05:00-01:00:07:00  A001_C002 from 02:00:02:00 at half the fitted size, moved
+                                25 % of the width left and 20 % of the height down
    V3  01:00:09:00-01:00:11:00  A001_C001 picture from 01:00:02:00 with its sound starting
                                 12 frames earlier on A1 (J-cut; FCPXML audioStart; XML: linked
                                 picture and two sound clipitems)
@@ -95,6 +99,16 @@ Which file to give which application:
    file://localhost/X%3a/Turnover/media/..., the EDLs "* SOURCE FILE: X:\\Turnover\\media\\...".
    REPORT.txt records the rule and, per source, the local path and the path written.
 
+Position and scale (FCP 7 XML, Premiere Pro Effect Controls > Motion, 1920 x 1080 sequence):
+the generated clips are 64 x 36 pixels and Splice fits them to the frame (30x), so Premiere's
+Scale is 30 x Splice's scale and the Basic Motion centre is the offset in media widths/heights.
+   V2 B001_C001 at 01:00:01:00: Scale 2400 (a 1536 x 864 picture), Position 1152, 486
+       (192 px right of centre, 54 px up; XML centre 3, -1.5).
+   V2 A001_C002 at 01:00:05:00: Scale 1500 (a 960 x 540 picture), Position 480, 756
+       (480 px left of centre, 216 px down; XML centre -7.5, 6), so the picture spans
+       x 0-960, y 486-1026.
+   Every other picture clip: Scale 3000 (fills the frame), Position 960, 540.
+
 Known importer behaviour to check (see each REPORT.txt):
 - Resolve ignores FCPXML srcEnable; audio-only uses of A/V files may also bring picture.
 - Resolve imports FCPXML fades as volume keyframes and few or no FCPXML markers.
@@ -103,13 +117,31 @@ Known importer behaviour to check (see each REPORT.txt):
   the record mode. M2 timecode uses colons only. Reel names longer than eight characters are
   mapped in a "* REEL" comment inside the first event that uses them.
 - XML: stereo sound is two mono tracks per Splice track (Premiere recombines them); a clip next
-  to a transition has start or end -1; pproTicksIn/Out give the exact source position.
+  to a transition has start or end -1; pproTicksIn/Out give the exact source position, but
+  Premiere uses the whole-frame <in>: REPORT.txt lists each clip whose in point that rounds
+  (B001 at 01:00:01:00 starts 0.25 source frames later in Premiere).
+- XML: Premiere imports the reversed V1 clip at 01:00:08:00 unlinked from its sound (its own XML
+  export writes that pair unlinked too); every other link holds. Titles arrive as Premiere
+  graphics named after their text.
+- XML, path-mapped folder: the media is not at X:\\Turnover\\media here, so Premiere shows its
+  Link Media dialog; that is expected (REPORT.txt says so).
 - OTIO: written exactly as OpenTimelineIO 0.18 writes it (Clip.2, media_references); the
   top-level stack carries the timeline name, which Premiere uses for the sequence.
 """
 
 
 MAPPED_TO = 'X:\\Turnover\\media'
+
+
+def evidence_synthetic(paths):
+    """The synthetic timeline plus one clip that checks position and scale on media smaller than
+    the sequence: A001_C002 (64 x 36) on V2 at half the fitted size, moved left and down."""
+    project = synthetic_project(paths)
+    project['clips'].append({'id': 'v2-moved', 'mediaId': 'camera_b', 'type': 'video', 'track': 2, 'start': at(120),
+                             'duration': at(168) - at(120), 'in': at(48), 'title': '', 'volume': 100,
+                             'color': {'brightness': 100, 'contrast': 100, 'saturation': 100}, 'transition': 'none',
+                             'embeddedAudio': False, 'transform': {'x': -25, 'y': 20, 'scale': 50, 'rotation': 0}})
+    return project
 
 
 def drop_project(paths):
@@ -181,7 +213,7 @@ def main(output: Path):
     with tempfile.TemporaryDirectory(prefix='splice-evidence-') as data:
         splice = Splice(Path(data))
         try:
-            synthetic = splice.link(synthetic_project(paths))
+            synthetic = splice.link(evidence_synthetic(paths))
             written = {
                 'alpine-passage': write(splice, output / 'alpine-passage', splice.link(alpine), {}),
                 'synthetic-23976': write(splice, output / 'synthetic-23976', synthetic, {}),

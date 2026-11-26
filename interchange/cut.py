@@ -12,7 +12,8 @@ import math
 from dataclasses import dataclass, field
 from fractions import Fraction
 
-from .media import MAX_PROBES, PROBE_SECONDS, ProbeBudget, Source, clean, map_path, path_rules, resolve_source
+from .media import (MAX_PROBES, PROBE_SECONDS, ProbeBudget, Source, clean, invalid_on_target, map_path, path_rules,
+                    resolve_source)
 from .timecode import frames_timecode, seconds_frames, sequence_rate, timecode_frames
 
 MAX_CLIPS = 20_000
@@ -165,6 +166,10 @@ def build_cut(project: dict, options: dict | None = None) -> Cut:
             if source.path and rules:
                 source.original_path = source.path
                 source.path, source.path_rule = map_path(source.path, rules)
+                problem = invalid_on_target(source.original_path, rules[source.path_rule] if source.path_rule is not None else None)
+                if problem:
+                    report.note(f'Path mapping: source {source.name} maps to {source.path}, but {problem}; the receiving '
+                                'machine cannot find it there. Rename the file (or map it to a POSIX path) and export again.')
     if budget.skipped:
         shown = ', '.join(budget.skipped[:20]) + (f' and {len(budget.skipped) - 20} more' if len(budget.skipped) > 20 else '')
         report.note(f'Probing stopped after {budget.seconds:g} s or {MAX_PROBES} files; not probed: {shown}. '

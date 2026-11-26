@@ -12,6 +12,7 @@ right on its own and never stalls a request. A list in ``audioStreams`` (an earl
 from __future__ import annotations
 
 import json
+import math
 import re
 import subprocess
 from dataclasses import dataclass, field
@@ -96,6 +97,7 @@ class Probe:
     duration: Fraction | None = None
     width: int | None = None
     height: int | None = None
+    sar: Fraction | None = None          # sample (pixel) aspect ratio
     has_video: bool = False
     has_audio: bool = False
     audio_streams: list = field(default_factory=list)
@@ -113,6 +115,20 @@ def _tag(tags, *names):
     return None
 
 
+def parse_sar(value) -> Fraction | None:
+    """``'N:D'`` (ffprobe), ``'N/D'`` or a number as a pixel aspect ratio; None when unknown."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = Fraction(repr(float(value))) if math.isfinite(value) else None
+    elif isinstance(value, str) and re.fullmatch(r'\s*\d{1,6}\s*[:/]\s*\d{1,6}\s*', value):
+        top, bottom = (int(x) for x in re.split(r'[:/]', value))
+        number = Fraction(top, bottom) if top and bottom else None
+    else:
+        return None
+    return number if number is not None and Fraction(1, 10) <= number <= 10 else None
+
+
 def parse_probe(data: dict) -> Probe:
     streams = [s for s in data.get('streams') or [] if isinstance(s, dict)]
     fmt = data.get('format') or {}
@@ -126,6 +142,7 @@ def parse_probe(data: dict) -> Probe:
         result.rate = snap_rate(average) or snap_rate(base)
         result.vfr = bool(average and base and abs(average - base) > base / 1000) or result.rate is None
         result.width, result.height = video.get('width'), video.get('height')
+        result.sar = parse_sar(video.get('sample_aspect_ratio'))
     timecodes = [_tag(video.get('tags') if video else None, 'timecode')]
     timecodes += [_tag(s.get('tags'), 'timecode') for s in streams if s is not video]
     timecodes.append(_tag(fmt.get('tags'), 'timecode'))
@@ -213,6 +230,7 @@ class Source:
     duration: Fraction = Fraction(0)
     width: int | None = None
     height: int | None = None
+    sar: Fraction | None = None         # sample aspect ratio; None = square / unknown
     has_video: bool = True
     has_audio: bool = False
     audio_streams: list = field(default_factory=list)
@@ -375,12 +393,16 @@ def resolve_source(item: dict, sequence_rate: Fraction, budget: ProbeBudget) -> 
     audio_known = details is not None or count == 0
     rate_known = bool(snap_rate(item.get('rate'))) or source.kind == 'audio' or source.still
     timecode_known = 'timecode' in item
+    # the pixel shape decides the scale that reproduces Splice's fitted picture in FCP 7 XML
+    # (a record with a frame size and no sampleAspectRatio is Splice's own: square pixels)
+    shape_known = source.kind != 'video' or source.still or parse_sar(item.get('sampleAspectRatio')) is not None or \
+        bool(_dimension(item.get('width')) and _dimension(item.get('height')))
     probe = None
     sample_rate = _sample_rate(item)
     # describe() records neither the sample rate nor a Broadcast WAV time reference, so a sound
     # file (music, location sound) is probed for them; picture sources need no probe for these
     sound_known = sample_rate is not None or source.kind != 'audio'
-    needs_probe = not (rate_known and audio_known and timecode_known and sound_known)
+    needs_probe = not (rate_known and audio_known and timecode_known and sound_known and shape_known)
     if needs_probe and local is not None:
         timeout = budget.take()
         if timeout is None:
@@ -421,6 +443,7 @@ def resolve_source(item: dict, sequence_rate: Fraction, budget: ProbeBudget) -> 
     # size and length
     source.width = _dimension(item.get('width')) or (_dimension(probe.width) if probe else None)
     source.height = _dimension(item.get('height')) or (_dimension(probe.height) if probe else None)
+    source.sar = parse_sar(item.get('sampleAspectRatio')) or (probe.sar if probe else None)
     duration = (probe.duration if probe else None) or Fraction(repr(float(item.get('duration') or 0)))
     source.duration = duration
     source.reel = clean((item.get('reel') if isinstance(item.get('reel'), str) else None) or (probe.reel if probe else None) or '', 64) or None
@@ -499,17 +522,37 @@ def _join(style: str, parts: list) -> str:
     return '/' + '/'.join(parts)
 
 
+WINDOWS_RESERVED = re.compile(r'[\\:?*"<>|]')
+
+
 def map_path(path: str, rules: list):
-    """``(new path, rule index)`` for the first rule whose ``from`` is a whole-component prefix of
-    ``path``, else ``(path, None)``. Windows prefixes compare case-insensitively with either slash;
-    the rest of the path is written in the ``to`` side's style (backslashes for X:\\ and UNC)."""
+    """``(new path, rule index)`` for the rule whose ``from`` is the LONGEST whole-component
+    prefix of ``path`` (the most specific folder wins, whatever the rule order; on a tie, the
+    earlier rule), else ``(path, None)``. Windows prefixes compare case-insensitively with either
+    slash; the rest of the path is written in the ``to`` side's style (backslashes for X:\\ and UNC)."""
     style, parts = _components(path)
+    best = None
     for index, (source, target) in enumerate(rules):
         source_style, head = _components(source)
         if source_style != style or len(head) > len(parts):
             continue
         same = (lambda a, b: a.lower() == b.lower()) if style != 'posix' else (lambda a, b: a == b)
-        if all(same(a, b) for a, b in zip(head, parts)):
-            target_style, base = _components(target)
-            return _join(target_style, base + parts[len(head):]), index
-    return path, None
+        if all(same(a, b) for a, b in zip(head, parts)) and (best is None or len(head) > best[0]):
+            best = (len(head), index, target)
+    if best is None:
+        return path, None
+    length, index, target = best
+    target_style, base = _components(target)
+    return _join(target_style, base + parts[length:]), index
+
+
+def invalid_on_target(path: str, rule) -> str | None:
+    """Why the mapped form of ``path`` cannot exist on the target system, or None. ``rule`` is
+    the ``(from, to)`` that applied. A POSIX name may hold characters Windows refuses
+    (``\\ : ? * " < > |``); carried under a drive or UNC folder it names a file that cannot exist."""
+    if rule is None or not _windows_style(rule[1]) or _windows_style(path):
+        return None
+    _style, parts = _components(path)
+    _source_style, head = _components(rule[0])
+    bad = sorted({ch for part in parts[len(head):] for ch in part if WINDOWS_RESERVED.match(ch)})
+    return ('its name contains ' + ' '.join(bad) + ', which Windows does not allow in a path') if bad else None

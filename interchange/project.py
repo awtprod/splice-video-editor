@@ -11,7 +11,9 @@ warning becomes a ``compatibilityWarnings`` entry, shown in the Project compatib
 from __future__ import annotations
 
 import math
+import os
 import re
+import threading
 from fractions import Fraction
 from pathlib import Path
 
@@ -19,6 +21,8 @@ from .media import base_name, clean as text, is_absolute_path
 
 MAX_IMPORT_CLIPS = 20_000
 MAX_TRACKS = 64
+MAX_TIMELINE_SECONDS = 24 * 3600     # a clip must end within 24 hours of the timeline start
+MAX_SOURCE_SECONDS = 7 * 24 * 3600   # and start within a week of its source's first frame
 
 
 def _seconds(value) -> float:
@@ -29,13 +33,41 @@ def _seconds(value) -> float:
 
 
 def _playable(path: str | None) -> str:
+    """The Splice URL of a source inside Splice's own media folders, else ''. Only a path that
+    names one of those folders is resolved, so a path on a slow or hung mount is never touched
+    here (:func:`link_local_media` checks those under its time budget)."""
     if not path or not is_absolute_path(path) or path.startswith('\\\\') or ':' in path[:3]:
         return ''
     try:
-        from premiere import _playback_url
-        return _playback_url(Path(path))
-    except (OSError, ValueError):
+        from premiere import MEDIA_ROOT, ROOT, _playback_url
+        inside = any(os.path.normpath(path).startswith(str(base) + os.sep) for base in (ROOT / 'assets', MEDIA_ROOT))
+        return _playback_url(Path(path)) if inside else ''
+    except (ImportError, OSError, ValueError):
         return ''
+
+
+def _bounded(work, budget):
+    """``work()`` on a helper thread, waited for until ``budget`` runs out or is cancelled. A file
+    system call on a hung network mount cannot be interrupted, so a call that does not return in
+    time is abandoned (its thread is a daemon) and :class:`BudgetExceeded` is raised here."""
+    from .budget import BudgetExceeded
+    result = {}
+
+    def run():
+        try:
+            result['value'] = work()
+        except BaseException as error:  # handed to the waiting thread
+            result['error'] = error
+    thread = threading.Thread(target=run, daemon=True, name='splice-import-path-check')
+    thread.start()
+    while thread.is_alive():
+        budget.check()
+        thread.join(min(0.1, max(0.01, budget.remaining())))
+        if thread.is_alive() and budget.remaining() <= 0:
+            raise BudgetExceeded(f'{budget.what} took longer than {budget.seconds:g} seconds and was stopped.')
+    if 'error' in result:
+        raise result['error']
+    return result.get('value')
 
 
 KEYFRAME_KEYS = ('opacity', 'x', 'y', 'scale', 'rotation', 'volume')
@@ -137,6 +169,11 @@ def build_project(name: str, rate: Fraction, width: int, height: int, media: lis
         if duration <= 0 or start < 0:
             warnings.append(f'{clip.get("name") or "A clip"} has no length or starts before the timeline and was skipped.')
             continue
+        source_in = _seconds(clip.get('in', 0) or 0) if clip['kind'] != 'title' else 0.0
+        if start + duration > MAX_TIMELINE_SECONDS or source_in > MAX_SOURCE_SECONDS:
+            warnings.append(f'{clip.get("name") or "A clip"} ends more than 24 hours into the timeline or starts more than a '
+                            'week into its source, which no real timeline does, and was skipped.')
+            continue
         side = -1 if clip['kind'] == 'audio' else 1
         track = clip.get('track')
         if track == 'audio-auto' or not isinstance(track, int) or track == 0 or (track < 0) != (side < 0):
@@ -184,6 +221,13 @@ def build_project(name: str, rate: Fraction, width: int, height: int, media: lis
             else:
                 warnings.append(f'{clip.get("name") or "A clip"}: its transition has an invalid length and was imported as a cut.')
         out.append(data)
+    # a source no imported clip uses is not part of the project (nor linked from this machine)
+    used = {c['mediaId'] for c in out if c.get('mediaId')}
+    unused = [item for item in items if item['id'] not in used]
+    if unused:
+        warnings.append(f'{len(unused)} source{"s" if len(unused) != 1 else ""} the file lists but no imported clip uses '
+                        f'{"were" if len(unused) != 1 else "was"} left out.')
+        items = [item for item in items if item['id'] in used]
     total = max((c['start'] + c['duration'] for c in out), default=0)
     video_tracks = max([4] + [c['track'] for c in out if c['type'] != 'audio'])
     audio_tracks = max([3] + [-c['track'] for c in out if c['type'] == 'audio'])
@@ -195,48 +239,105 @@ def build_project(name: str, rate: Fraction, width: int, height: int, media: lis
             'duration': total, 'compatibilityWarnings': [text(w, 1000) for w in dict.fromkeys(warnings)][:500]}
 
 
+LINKED_LIST = 10
+
+
 def link_local_media(project: dict, budget, limit: int = 2000) -> None:
     """Link offline sources whose recorded path is a file on this machine through the server's
     link-in-place registry: no bytes are copied, and only files FFmpeg decodes as audio or video
     are registered (the same check as File > Link media in place), so a timeline cannot expose a
     text file, a key or any other non-media file through ``/media/linked/``. Files that fail the
-    check, or that the time budget does not reach, stay offline with a compatibility warning."""
-    import os
+    check, or that the time budget does not reach, stay offline with a compatibility warning.
+
+    Every file-system call runs under ``budget`` (:func:`_bounded`): a path on a hung mount costs
+    at most the budget, and Cancel stops the import between paths. What was linked is listed in
+    a compatibility entry, because the timeline file, not the user, chose those paths and names."""
+    from .budget import BudgetExceeded
     try:
         import media_links
         from media_proxy import decodable
     except ImportError:
         return
     warnings = project['compatibilityWarnings']
-    wanted = []
-    for item in project['media']:
-        path = item.get('sourcePath')
-        if not item.get('offline') or not isinstance(path, str) or not os.path.isabs(path) or path.startswith('\\\\'):
-            continue
+    candidates = [item for item in project['media'] if item.get('offline') and isinstance(item.get('sourcePath'), str)
+                  and os.path.isabs(item['sourcePath']) and not item['sourcePath'].startswith('\\\\')]
+    if len(candidates) > limit:
+        warnings.append(f'{len(candidates) - limit} sources beyond the first {limit} were not looked for on this computer; '
+                        'relink them by folder.')
+        candidates = candidates[:limit]
+
+    def precheck(path):
+        """The file's identity once it passed the media check: (resolved path, size, mtime)."""
+        resolved = Path(path).resolve(strict=True)
+        if not resolved.is_file():
+            raise FileNotFoundError(path)
+        decodable(resolved, resolved.name)
+        stat = resolved.stat()
+        return str(resolved), stat.st_size, stat.st_mtime_ns
+
+    checked, unchecked = {}, 0
+    for index, item in enumerate(candidates):
+        if budget.cancelled.is_set():
+            raise BudgetExceeded(f'{budget.what} was cancelled.')
+        if budget.remaining() <= 0:
+            unchecked = len(candidates) - index
+            break
         try:
-            if Path(path).is_file():
-                wanted.append(item)
-        except (OSError, ValueError):
-            continue
+            checked[id(item)] = _bounded(lambda: precheck(item['sourcePath']), budget)
+        except BudgetExceeded:
+            if budget.cancelled.is_set():
+                raise
+            unchecked = len(candidates) - index
+            break
+        except (OSError, ValueError) as error:
+            if not isinstance(error, OSError):
+                warnings.append(text(f'{item["name"]} at its recorded path was not linked ({error}); it stays offline '
+                                     'for relinking.', 1000))
+    if unchecked:
+        warnings.append(f'{unchecked} source{"s" if unchecked != 1 else ""} could not be looked for on this computer within '
+                        f'the import\'s {budget.seconds:g}-second limit (a drive may be slow or disconnected); '
+                        f'{"they stay" if unchecked != 1 else "it stays"} offline for relinking.')
+    wanted = [item for item in candidates if id(item) in checked]
     if not wanted:
         return
-    if len(wanted) > limit:
-        warnings.append(f'{len(wanted) - limit} sources beyond the first {limit} found on this computer were left '
-                        'offline; relink them by folder.')
-        wanted = wanted[:limit]
+    identity = {checked[id(item)][0]: checked[id(item)][1:] for item in wanted}
 
-    def check(path, name):
-        budget.check()
-        if budget.remaining() < 1:
-            raise ValueError('not checked before the import\'s time limit')
-        decodable(path, name)
+    def unchanged(path, _name):
+        # the file registered is the one that passed the media check above
+        stat = Path(path).stat()
+        if identity.get(str(path)) != (stat.st_size, stat.st_mtime_ns):
+            raise ValueError('it changed while the import was checking it')
 
-    results = media_links.link_many([item['sourcePath'] for item in wanted], validate=check)
+    try:
+        results = _bounded(lambda: media_links.link_many([checked[id(item)][0] for item in wanted], validate=unchanged), budget)
+    except BudgetExceeded:
+        if budget.cancelled.is_set():
+            raise
+        warnings.append(f'Linking {len(wanted)} sources found on this computer did not finish within the import\'s '
+                        f'{budget.seconds:g}-second limit; they stay offline for relinking.')
+        return
+    linked = []
     for item, result in zip(wanted, results):
         if 'src' in result:
             item.update(src=result['src'], originalSrc=result['src'], path=result['sourcePath'],
                         sourcePath=result['sourcePath'], linked=True, sourceFingerprint=result['fingerprint'],
                         offline=False)
+            linked.append(result['sourcePath'])
         else:
             warnings.append(text(f'{item["name"]} at its recorded path was not linked ({result.get("error")}); '
                                  'it stays offline for relinking.', 1000))
+    sources = len(linked)
+    linked = list(dict.fromkeys(linked))
+    if linked:
+        shown, room = [], 900
+        for path in linked[:LINKED_LIST]:
+            if len(path) + 2 > room:
+                break
+            shown.append(path)
+            room -= len(path) + 2
+        more = len(linked) - len(shown)
+        used_by = f' (used by {sources} sources)' if sources != len(linked) else ''
+        warnings.insert(0, f'Linked {len(linked)} file{"s" if len(linked) != 1 else ""}{used_by} from this computer in place, '
+                           f'as the timeline file names {"them" if len(linked) != 1 else "it"} (nothing was copied): '
+                           + '; '.join(shown) + (f'; and {more} more' if more else '') + '. Check that these are the media '
+                           'you expect before you edit or share the project.')
