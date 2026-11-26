@@ -300,7 +300,9 @@ async function persistence(page) {
   assert.equal('enabled' in saved.clips.find(c => c.id === 'v'), false, 'enabled clips carry no flag');
   await page.locator('#project-input').setInputFiles(file);
   await page.waitForFunction(() => Editor.get().project.clips.find(c => c.id === 'w')?.enabled === false);
-  // Recovery: change the flag, let the draft save, reload.
+  // Recovery: once the file has finished opening (its own recovery slot is written), change the
+  // flag, let the draft save, reload.
+  await page.waitForFunction(() => !document.getElementById('project-loading') && document.getElementById('session-status').textContent === 'Saved');
   await state(page, () => Editor.toggleEnabled(['v']));
   await page.waitForFunction(() => document.getElementById('session-status').textContent === 'Draft saved locally');
   await page.reload();
