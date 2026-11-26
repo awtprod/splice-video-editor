@@ -1,8 +1,10 @@
 """Synthetic DaVinci Resolve projects for tests: the same invented project as a .drp archive and
 as a disk-library Project.db, laid out the way Resolve writes them. Run as a script to write one:
 
-    python3 tests/resolve_fixtures.py drp OUT.drp VIDEO_PATH AUDIO_PATH [--no-generator]
-    python3 tests/resolve_fixtures.py library LIBRARY_FOLDER VIDEO_PATH AUDIO_PATH [--no-generator]
+    python3 tests/resolve_fixtures.py drp OUT.drp VIDEO_PATH AUDIO_PATH [--no-generator] [--states]
+    python3 tests/resolve_fixtures.py library LIBRARY_FOLDER VIDEO_PATH AUDIO_PATH [--no-generator] [--states]
+
+``--states`` disables and locks the first timeline's second video track (Flags 3, as Resolve 21.1 writes).
 """
 import io
 import sqlite3
@@ -438,6 +440,8 @@ def write_library(spec, folder, user='guest'):
 if __name__ == '__main__':
     mode, out, video, audio = sys.argv[1:5]
     spec = sample(video, audio, generator='--no-generator' not in sys.argv[5:])
+    if '--states' in sys.argv[5:]:
+        spec['timelines'][0]['tracks'][1]['flags'] = 3
     if '--reverse' in sys.argv[5:]:  # Resolve reordered the timelines and saved again
         spec['timelines'].reverse()
         spec['saved'] += 60

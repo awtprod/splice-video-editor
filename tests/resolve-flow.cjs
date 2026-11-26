@@ -73,7 +73,7 @@ async function main() {
   const windowsAudio = 'E:\\Shoot\\Day 1\\A002.wav';
   const drp = path.join(temp, 'Harbor Lights.drp');
   const fixtures = path.join(root, 'tests/resolve_fixtures.py');
-  execFileSync('python3', [fixtures, 'drp', drp, path.join(footage, 'A001.mp4'), windowsAudio, '--no-generator']);
+  execFileSync('python3', [fixtures, 'drp', drp, path.join(footage, 'A001.mp4'), windowsAudio, '--no-generator', '--states']);
   const library = path.join(temp, 'Resolve library');
   execFileSync('python3', [fixtures, 'library', library, path.join(footage, 'A001.mp4'), windowsAudio, '--no-generator']);
   const libraryBefore = treeState(library);
@@ -135,6 +135,12 @@ async function main() {
              'A002.wav':{offline:true, path:windowsAudio, linked:false}},
       selector:['Harbor cut', 'Harbor alt'], keptOutside:true});
     await page.locator('.timeline-clip').first().waitFor();
+    // Video 2 was disabled and locked in Resolve: the editor has it hidden and locked, and the open notice says so,
+    // with where the linked media is.
+    assert.deepEqual(await page.evaluate(() => Editor.get().project.trackState), {'video:2': {locked:true, hidden:true}});
+    const notice = await page.locator('.toast', {hasText:'From Resolve'}).textContent();
+    assert.ok(notice.includes('From Resolve: 1 hidden track, 1 locked track. 1 local file(s) linked in place from ' +
+      '/' + path.dirname(fs.realpathSync(path.join(footage, 'A001.mp4'))).split(path.sep).slice(1, 3).join('/') + '.'), notice);
     // Linked in place: a registry link to the original, no copy or hard link in Splice's media folder.
     const footageSrc = await page.evaluate(() => Editor.get().project.media.find(m => m.name === 'A001.mp4').src);
     assert.match(footageSrc, /^\/media\/linked\/[a-f0-9]{32}\/A001\.mp4$/);
@@ -149,7 +155,7 @@ async function main() {
     const report = await page.locator('.studio-dialog li').allTextContents();
     assert.ok(report.some(t => t.startsWith('Harbor cut · Picture · A001.mp4') && t.includes('Color page grade')), report.join('\n'));
     assert.ok(report.some(t => t.includes('Fusion composition')), report.join('\n'));
-    assert.ok(report.some(t => t.includes('offline on this computer')), report.join('\n'));
+    assert.ok(report.some(t => t.includes('offline on this computer') && t.includes('File → Link media in place → Relink offline from folder')), report.join('\n'));
     await page.getByRole('button', {name:'Close'}).click();
 
     // Relink the Windows path from a folder: matched by directory suffix and file name.
@@ -212,10 +218,35 @@ async function main() {
     console.log('Undo/redo, then saved and reopened the working project; the linked footage stayed online and played.');
 
     // Switch timelines with the sequence selector: each timeline keeps its own edits (and the relink).
+    // The first switch reads "Harbor alt" from Resolve, delayed 3 s here: meanwhile the selector shows the
+    // timeline that is open and is disabled, a second choice is refused aloud, and an edit made during the
+    // wait is kept with the rest.
     dialogs.length = 0;
     const edited = await page.evaluate(() => { const c = Editor.get().project.clips.find(c => c.type === 'video'); Editor.updateClip(c.id, {volume:37}); return c.resolveItemId; });
+    const slow = /\/api\/resolve\/open\?timelineId=/;
+    await page.route(slow, async route => { await new Promise(done => setTimeout(done, 3000)); await route.continue(); });
+    await page.evaluate(() => {
+      window.selectorWrong = [];
+      const check = () => { const p = Editor.get().project, s = document.querySelector('#sequence-select');
+        if (s.value !== String(p.resolveTimeline)) window.selectorWrong.push([s.value, p.resolveTimeline]); };
+      window.selectorWatch = setInterval(check, 5);
+      new MutationObserver(check).observe(document.querySelector('#sequence-select'), {attributes:true, childList:true, subtree:true});
+    });
+    const began = Date.now();
     await page.locator('#sequence-select').selectOption('1');
+    assert.deepEqual(await page.evaluate(() => [document.querySelector('#sequence-select').value, document.querySelector('#sequence-select').disabled]),
+      ['0', true]);
+    await page.locator('.toast', {hasText:'Opening “Harbor alt”'}).waitFor();
+    const during = await page.evaluate(() => { const c = Editor.get().project.clips.find(c => c.type === 'audio'); Editor.updateClip(c.id, {volume:44}); return c.resolveItemId; });
+    // A second choice while the first is pending (the selector is disabled; a script can still change it).
+    await page.evaluate(() => { const s = document.querySelector('#sequence-select'); s.value = '1'; s.dispatchEvent(new Event('change')); });
+    assert.equal(await page.evaluate(() => document.querySelector('#sequence-select').value), '0');
+    assert.equal(await page.evaluate(() => Editor.get().project.name), 'Harbor cut');
     await switched('Harbor alt');
+    assert.ok(Date.now() - began >= 3000, 'the switch was not delayed');
+    await page.unroute(slow);
+    assert.deepEqual(await page.evaluate(() => { clearInterval(window.selectorWatch); return window.selectorWrong; }), []);
+    assert.equal(await page.evaluate(() => document.querySelector('#sequence-select').disabled), false);
     assert.deepEqual(await page.evaluate(() => { const c = Editor.get().project.clips[0]; return [Editor.get().project.fps, c.reverse]; }),
       [30000 / 1001, true]);
     await page.evaluate(() => Editor.updateClip(Editor.get().project.clips[0].id, {volume:55}));
@@ -223,6 +254,8 @@ async function main() {
     await switched('Harbor cut');
     await waitState(() => Editor.get().project.media.every(m => !m.offline));
     assert.equal(await page.evaluate(id => Editor.get().project.clips.find(c => c.resolveItemId === id).volume, edited), 37);
+    assert.equal(await page.evaluate(id => Editor.get().project.clips.find(c => c.resolveItemId === id).volume, during), 44,
+      'the edit made while the switch was pending was lost');
     await page.locator('#sequence-select').selectOption('1');
     await switched('Harbor alt');
     assert.equal(await page.evaluate(() => Editor.get().project.clips[0].volume), 55);

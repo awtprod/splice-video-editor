@@ -945,7 +945,12 @@
   $("versions").onclick=()=>busy(()=>SpliceSession.history());
   $("save-as").onclick=()=>busy(()=>SpliceSession.saveAs("prproj"));
   $("sequence-settings").onclick=()=>sequenceSettings();
-  $("sequence-select").onchange=e=>busy(()=>editor.get().project.resolveTimelines?SpliceResolve.timeline(Number(e.target.value)):SpliceSession.sequence(Number(e.target.value)));
+  $("sequence-select").onchange=e=>{
+    const project=editor.get().project;
+    // Another task holds the workspace: say so and show the open timeline again, instead of a choice that is ignored.
+    if(pending){e.target.value=String(project.resolveTimelines?project.resolveTimeline:project.premiereSequence);notify("Wait for the current task to finish, then choose the timeline again.");return;}
+    busy(()=>project.resolveTimelines?SpliceResolve.timeline(Number(e.target.value)):SpliceSession.sequence(Number(e.target.value)));
+  };
   $("fullscreen-monitor").onclick = () => {
     if (document.fullscreenElement) document.exitFullscreen();
     else $("monitor-frame").requestFullscreen?.();
