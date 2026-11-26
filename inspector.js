@@ -15,7 +15,11 @@
   const option = (key, title, selected) => `<option value="${escape(key)}" ${key === selected ? 'selected' : ''}>${escape(title)}</option>`;
   let automationProperty = 'opacity';
   let showSafeArea = false;
-  const automation = {opacity:['Opacity',0,100,1],x:['Horizontal',-100,100,1],y:['Vertical',-100,100,1],scale:['Scale',10,400,1],rotation:['Rotation',-180,180,1],volume:['Audio gain',0,200,1]};
+  const automation = {opacity:['Opacity',0,100,1],x:['Horizontal',-100,100,1],y:['Vertical',-100,100,1],scale:['Scale',10,400,1],rotation:['Rotation',-180,180,1],volume:['Audio gain',0,200,1],
+    // Grade keyframes (color-grade.js ANIMATED): the grade at each keyframe is mixed over time.
+    exposure:['Exposure (EV)',-4,4,.1],temperature:['Temperature',-100,100,1],tint:['Tint',-100,100,1],
+    brightness:['Brightness',0,200,1],contrast:['Contrast',0,200,1],saturation:['Saturation',0,200,1]};
+  const gradeKeys = ['exposure','temperature','tint','brightness','contrast','saturation'];
   function atKeyframe(points,time,base) {
     if(!points.length)return base;
     if(time<=points[0].time)return points[0].value;
@@ -77,6 +81,7 @@
         lutNote(color.lut) +
         (color.lut ? label('LUT intensity', 'lutIntensity', number(color.lutIntensity, 100), 0, 100, 1, '%', 'color') : '') +
         '<input type="file" class="splice-lut-input" accept=".cube" hidden>' +
+        (window.SpliceColorUI ? window.SpliceColorUI.markup(clip, source) : '') +
         window.SpliceScopes.markup());
       html += section('Incoming transition',
         `<label class="splice-number"><span>Style</span><select aria-label="Transition style" data-field="transition">${clip.transition==='native'?option('native','Imported: '+(clip.transitionMatchName||'Premiere effect'),'native'):''}${option('none','Cut',clip.transition || 'none')}${option('dissolve','Cross dissolve',clip.transition || 'none')}${option('fade','Fade through black',clip.transition || 'none')}${option('wipe','Wipe left to right',clip.transition || 'none')}</select></label>` +
@@ -118,11 +123,13 @@
     }
     if (['video','audio','title'].includes(clip.type)) {
       const available=clip.type==='audio' ? ['volume'] : clip.type==='title' ? ['opacity'] :
-        ['opacity','x','y','scale','rotation',...(clip.embeddedAudio===false?[]:['volume'])];
+        ['opacity','x','y','scale','rotation',...(clip.embeddedAudio===false?[]:['volume']),...gradeKeys];
       if(!available.includes(automationProperty))automationProperty=available[0];
       const spec=automation[automationProperty], local=Math.max(0,Math.min(clip.duration,number(state.time,clip.start)-clip.start));
       const points=(clip.keyframes?.[automationProperty] || []).slice().sort((a,b)=>a.time-b.time);
-      const base=automationProperty==='opacity' ? number(clip.opacity,100) : automationProperty==='volume' ? number(clip.volume,100) : number(transform[automationProperty],automationProperty==='scale'?100:0);
+      const base=automationProperty==='opacity' ? number(clip.opacity,100) : automationProperty==='volume' ? number(clip.volume,100) :
+        gradeKeys.includes(automationProperty) ? number(color[automationProperty],['brightness','contrast','saturation'].includes(automationProperty)?100:0) :
+        number(transform[automationProperty],automationProperty==='scale'?100:0);
       const current=atKeyframe(points,local,base);
       html += section('Keyframes',
         `<label class="splice-number"><span>Property</span><select aria-label="Keyframe property" data-key-property>${available.map(key=>option(key,automation[key][0],automationProperty)).join('')}</select></label>` +
@@ -158,7 +165,7 @@
       previousScope.style.height = freshScope.style.height;
       freshScope.replaceWith(previousScope);
     }
-    for(const key of ['scale','x','y','rotation','opacity','volume'])
+    for(const key of ['scale','x','y','rotation','opacity','volume',...gradeKeys])
       if(clip.keyframes?.[key]?.length) element.querySelector(`[data-field="${key}"]:not([data-group="trackMix"])`)?.setAttribute('disabled','');
     if(clip.transition==='native') element.querySelector('[data-field="transitionDuration"]')?.setAttribute('disabled','');
     if(locked) for(const input of element.querySelectorAll('[data-field]:not([data-group="trackMix"]),[data-key-add],[data-key-delete],[data-key-property],.splice-key-value,[data-action="import-lut"],[data-action="remove-lut"]')) input.disabled=true;
@@ -245,6 +252,7 @@
       editor.seek(clip.start+Number(button.dataset.keyTime));
       render(editor.get(),element,editor);
     });
+    if (clip.type === 'video') window.SpliceColorUI?.bind(element, clip, editor, () => render(editor.get(), element, editor));
     window.SpliceScopes.bind(element);
     // Never forced here: the scopes' own throttle and unchanged-frame check decide (the preview
     // loop paints them too). A new canvas gets one paint on the next animation frame.
@@ -261,7 +269,9 @@
     if(input && clip && document.activeElement!==input){
       const local=Math.max(0,Math.min(clip.duration,number(state.time,clip.start)-clip.start));
       const points=(clip.keyframes?.[automationProperty]||[]).slice().sort((a,b)=>a.time-b.time);
-      const base=automationProperty==='opacity'?number(clip.opacity,100):automationProperty==='volume'?number(clip.volume,100):number(clip.transform?.[automationProperty],automationProperty==='scale'?100:0);
+      const base=automationProperty==='opacity'?number(clip.opacity,100):automationProperty==='volume'?number(clip.volume,100):
+        gradeKeys.includes(automationProperty)?number(clip.color?.[automationProperty],['brightness','contrast','saturation'].includes(automationProperty)?100:0):
+        number(clip.transform?.[automationProperty],automationProperty==='scale'?100:0);
       input.value=String(atKeyframe(points,local,base));
       const label=document.querySelector('.splice-key-time');
       if(label)label.textContent=`Value at ${local.toFixed(2)} s`;

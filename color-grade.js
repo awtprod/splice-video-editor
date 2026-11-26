@@ -322,7 +322,7 @@
       rows:[[ys, 0, 2*(1-kr)*cs], [ys, -2*(1-kb)*kb/kg*cs, -2*(1-kr)*kr/kg*cs], [ys, 2*(1-kb)*cs, 0]],
     };
   }
-  window.SpliceGrade = {validateGrade, gradeActive, tables, prepare, evaluate, stages, gains, signature, curveFunction, hueOf,
+  window.SpliceGrade = {validateGrade, gradeActive, tables, prepare, evaluate, stages, gains, signature, curveFunction, hueSatFunction, hueOf,
     keyTimes, colorAt, keySegment, cubeText, matrixName, inputMatrix, lookup1D, trilinear, applyLook,
     limits:{table:TABLE, hueSat:HUE_SAT_SIZE, points:MAX_POINTS, keyTimes:MAX_KEY_TIMES}, animated:ANIMATED, wheels:WHEELS, curves:CURVES};
 })();

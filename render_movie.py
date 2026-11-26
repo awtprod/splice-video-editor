@@ -628,10 +628,7 @@ def _picture_grade(clip, item, directory, name, profile, *, fps, zero, frames, r
                              clock=_grade_clock(clip, fps, zero, frames, reverse))
         return (f',setparams=colorspace=bt709:range=tv,zscale,format={WORKING_FORMAT}{chain},'
                 f'zscale=m={ZSCALE_MATRIX[output_matrix(profile)]}:r=limited')
-    legacy = any(color.get(key) not in (None, default) for key, default in
-                 (('brightness',100),('contrast',100),('saturation',100),('exposure',0),('temperature',0),('tint',0)))
-    look = color.get('lut') and color.get('lutIntensity', 100) not in (0, None)
-    if not (legacy or look or new_tools or input_lut):
+    if not _has_color_work(clip, item):
         return None
     if hdr_master:
         raise ValueError('Color grading of SDR clips in an HDR master is not supported. Export this timeline as Rec. 709.')
@@ -649,6 +646,34 @@ def _picture_grade(clip, item, directory, name, profile, *, fps, zero, frames, r
             f'[{label}_g][{label}_alpha]alphamerge')
 
 
+def _adjustment_layer(filters, active, number, clip, directory, profile, fps, alpha_format, full_alpha, overlay, *, hdr_master):
+    """An adjustment clip grades the composite beneath it for its duration, mixed in by its
+    opacity (and opacity keyframes), as the monitor's adjust pass does. Returns the new label."""
+    from color_grade import SETPARAMS_MATRIX, WORKING_FORMAT, ZSCALE_MATRIX, grade_filter, output_matrix
+    if not _has_color_work(clip, None):
+        return active
+    if hdr_master:
+        raise ValueError('Adjustment clips are graded in Rec. 709 SDR. Export this timeline as Rec. 709.')
+    matrix = output_matrix(profile)
+    start = float(clip['start'])
+    end = start+float(clip['duration'])
+    chain = grade_filter(clip, directory, f'adjust-{number}', clock=_grade_clock(clip, fps, start, 1, False))
+    opacity = _number(clip.get('opacity', 100), 'opacity', 0, 100)/100
+    opacity_keys = (clip.get('keyframes') or {}).get('opacity')
+    mask = ''
+    if opacity_keys:
+        mask = _mask_alpha(f"({_keyframe_expr(clip,'opacity',opacity*100,0,100,_keyframe_clock(clip,fps,'T',start))})/100", alpha_format, full_alpha)
+    elif opacity != 1:
+        mask = _mask_alpha(f'{opacity:.6f}', alpha_format, full_alpha)
+    filters.append(f'[{active}]split[adjust{number}_under][adjust{number}_in]')
+    filters.append(f'[adjust{number}_in]setparams=colorspace={SETPARAMS_MATRIX[matrix]}:range=tv,zscale,format={WORKING_FORMAT}{chain},'
+                   f'zscale=m={ZSCALE_MATRIX[matrix]}:r=limited,format={alpha_format}{mask}[adjust{number}_graded]')
+    # The frames from the clip's first to its last, with 1 us of slack as the wipe mask uses.
+    enable = f'gte(t,{start-1e-6:.9f})*lt(t,{end-1e-6:.9f})'
+    filters.append(f"[adjust{number}_under][adjust{number}_graded]overlay=x=0:y=0:{overlay}:enable='{enable}'[base{number+1}]")
+    return f'base{number+1}'
+
+
 def _grade_key_times(clip):
     from color_grade import key_times
     return key_times(clip)
@@ -657,6 +682,20 @@ def _grade_key_times(clip):
 def _grade_color_at(clip, local):
     from color_grade import color_at
     return color_at(clip, local)
+
+
+def _has_color_work(clip, item):
+    """Whether a clip's picture is graded at all (else it passes through untouched)."""
+    from color_grade import grade_active, key_times, validate_grade
+    color = clip.get('color') or {}
+    if not isinstance(color, dict):
+        raise ValueError('Invalid clip color')
+    grade = validate_grade(color.get('grade'))
+    legacy = any(color.get(key) not in (None, default) for key, default in
+                 (('brightness',100),('contrast',100),('saturation',100),('exposure',0),('temperature',0),('tint',0)))
+    look = color.get('lut') and color.get('lutIntensity', 100) not in (0, None)
+    return bool(legacy or look or grade_active(grade) or key_times(clip) or (grade and grade.get('bypass'))
+                or (item and item.get('inputLut')))
 
 
 def _validate_project_lut(lut, label):
@@ -1284,6 +1323,10 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
             active = _draw_title(filters,active,number,clip,height,fps,directory,hdr_profile)
             continue
         item = media_by_id[clip['mediaId']]
+        if item.get('adjustment') and item.get('nativeGenerator')==1414680150:
+            active = _adjustment_layer(filters, active, number, clip, directory, profile, fps, alpha_format, full_alpha,
+                                       overlay, hdr_master=bool(hdr_profile) or conform_pq)
+            continue
         if item.get('nativeGenerator')==1414680150: continue
         plan = plans[number]
         start, length, speed, before = plan['start'], plan['length'], plan['speed'], plan['before']

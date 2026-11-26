@@ -93,8 +93,17 @@ window.SpliceSession = (() => {
       });
     }
     let media = source.media;
-    if (media?.some(item => item.nestedProject)) {
-      media = media.map(item => item.nestedProject ? {...item, nestedProject: draftOf(item.nestedProject, payloads)} : item);
+    if (media?.some(item => item.nestedProject || item.inputLut)) {
+      media = media.map(item => {
+        let next = item.nestedProject ? {...item, nestedProject: draftOf(item.nestedProject, payloads)} : item;
+        // A source's input LUT is stored once, like clip LUTs.
+        if (item.inputLut && typeof item.inputLut === 'object' && Array.isArray(item.inputLut.data)) {
+          const key = contentKey(item.inputLut);
+          payloads.set(key, item.inputLut);
+          next = {...next, inputLut: {payload: key}};
+        }
+        return next;
+      });
     }
     const {premiereOriginal, ...rest} = source;
     return {...rest, clips, media};
@@ -105,7 +114,10 @@ window.SpliceSession = (() => {
     const keys = new Set();
     const collect = project => {
       for (const clip of project?.clips || []) if (typeof clip.color?.lut?.payload === 'string') keys.add(clip.color.lut.payload);
-      for (const item of project?.media || []) if (item.nestedProject) collect(item.nestedProject);
+      for (const item of project?.media || []) {
+        if (item.nestedProject) collect(item.nestedProject);
+        if (typeof item.inputLut?.payload === 'string') keys.add(item.inputLut.payload);
+      }
     };
     collect(data);
     if (!keys.size) return data;
@@ -120,7 +132,11 @@ window.SpliceSession = (() => {
     const restore = project => ({...project,
       clips: (project.clips || []).map(clip => typeof clip.color?.lut?.payload === 'string' ?
         {...clip, color: {...clip.color, lut: tables.get(clip.color.lut.payload)}} : clip),
-      media: (project.media || []).map(item => item.nestedProject ? {...item, nestedProject: restore(item.nestedProject)} : item)});
+      media: (project.media || []).map(item => {
+        let next = item.nestedProject ? {...item, nestedProject: restore(item.nestedProject)} : item;
+        if (typeof item.inputLut?.payload === 'string') next = {...next, inputLut: tables.get(item.inputLut.payload)};
+        return next;
+      })});
     return restore(data);
   }
   function status(message) {

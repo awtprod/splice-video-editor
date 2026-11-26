@@ -22,7 +22,9 @@
   const MAX_FRAME = {width:3840, height:2160};
   // GPU memory the LUT and table textures may hold before the least recently used are released.
   const TEXTURE_BUDGET = 192*1024*1024;
-  const stats = {renderer:'none', frameMs:0, gradeMs:0, exactDecode:true, textureBytes:0, textures:0, lost:0, restored:0, frames:0};
+  // stale: layers of the last frame drawn without the exact planes of the frame on screen (a copy
+  // was still in flight); 0 means the monitor shows exactly the current frames.
+  const stats = {renderer:'none', frameMs:0, exactDecode:true, stale:0, textureBytes:0, textures:0, lost:0, restored:0, frames:0};
   let forceCanvas = false, onReady = () => {};
 
   // ---------------------------------------------------------------- decoded planes (shared)
@@ -391,6 +393,7 @@ void main() {
       let state = this.planeTextures.get(element);
       if (!state) { state = {y:gl.createTexture(), u:gl.createTexture(), v:gl.createTexture(), a:gl.createTexture(), key:''}; this.planeTextures.set(element, state); this.frameTextures.set(state, element); }
       const frame = op.exact === false ? null : requestPlanes(element);
+      if (op.exact !== false && element instanceof HTMLVideoElement && frame?.key !== frameKey(element)) stats.stale++;
       const linear = texture => { gl.bindTexture(gl.TEXTURE_2D, texture); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE); };
       gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
       if (frame) {
@@ -603,6 +606,7 @@ void main() {
     sourceCanvas(op) {
       const element = op.element;
       const frame = op.exact === false ? null : requestPlanes(element);
+      if (op.exact !== false && element instanceof HTMLVideoElement && frame?.key !== frameKey(element)) stats.stale++;
       if (!frame) { if (element instanceof HTMLVideoElement) stats.exactDecode = false; return element; }
       let entry = this.sources.get(element);
       if (!entry) { entry = {canvas:document.createElement('canvas'), key:''}; this.sources.set(element, entry); }
@@ -731,7 +735,7 @@ void main() {
   // Draw `plan` into the visible 2D canvas `target`.
   function render(target, plan) {
     const started = performance.now();
-    stats.exactDecode = true;
+    stats.exactDecode = true; stats.stale = 0;
     let chosen = renderer(), picture;
     try { picture = chosen.render(plan); }
     catch (error) {

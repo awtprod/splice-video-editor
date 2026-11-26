@@ -298,7 +298,7 @@
   // original) are immutable. Everything else is copied so drafts never alias.
   function cloneState(value, key) {
     if (value === null || typeof value !== "object") return value;
-    if (key === "lut") return value;
+    if (key === "lut" || key === "inputLut") return value;
     if (Array.isArray(value)) return value.map((item) => cloneState(item));
     const copy = {};
     for (const name of Object.keys(value)) copy[name] = cloneState(value[name], name);
@@ -1271,6 +1271,15 @@
         throw new Error("This project file has invalid media.");
       if (Number.isInteger(item.nestedSequence) && item.nestedProject != null)
         validateProject(item.nestedProject, depth + 1);
+      // Source colour settings: untagged matrix choice, technical input LUT, adjustment marker.
+      if (item.colorMatrix !== undefined && !['bt709','bt601'].includes(item.colorMatrix))
+        throw new Error("This project file has an invalid source colour setting.");
+      if (item.adjustment !== undefined && typeof item.adjustment !== 'boolean')
+        throw new Error("This project file has invalid media.");
+      if (item.inputLut != null && !validatedLuts.has(item.inputLut)) {
+        window.SpliceLUT.validate(item.inputLut,100);
+        validatedLuts.add(item.inputLut);
+      }
       mediaIds.add(item.id);
     }
     const clipIds = new Set();
@@ -1297,6 +1306,7 @@
           Object.values(clip.keyframes).some(points => !Array.isArray(points) ||
             points.some(point => !point || !Number.isFinite(point.time) || !Number.isFinite(point.value)))))
         throw new Error("This project file has invalid keyframes.");
+      if (clip.color?.grade !== undefined) window.SpliceGrade.validateGrade(clip.color.grade);
       if (clip.color?.lut) {
         const intensity = clip.color.lutIntensity ?? 100;
         if (!Number.isFinite(intensity) || intensity < 0 || intensity > 100) throw new Error('Invalid LUT intensity.');
