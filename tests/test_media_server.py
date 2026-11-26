@@ -835,7 +835,16 @@ class LinkRegistry(IsolatedRegistry):
         self.assertEqual(len(swapped), len(text))
         with open(self.ml.REGISTRY, 'r+', encoding='utf-8') as sink:  # In place: same inode.
             sink.write(swapped)
-        os.utime(self.ml.REGISTRY, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        # Restoring the mtime changes the ctime, but only by the filesystem's timestamp
+        # granularity (a ZFS tick is milliseconds; tmpfs is nanoseconds): repeat until it shows.
+        deadline = time.monotonic() + 5
+        while True:
+            os.utime(self.ml.REGISTRY, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+            if self.ml.REGISTRY.stat().st_ctime_ns != stat.st_ctime_ns or time.monotonic() > deadline:
+                break
+            time.sleep(.01)
+        after = self.ml.REGISTRY.stat()
+        self.assertEqual((after.st_ino, after.st_size, after.st_mtime_ns), (stat.st_ino, stat.st_size, stat.st_mtime_ns))
         self.assertEqual(self.ml._links()[identifier]['path'], str(second))
 
     def test_link_ids_are_random_and_stable_for_a_path(self):
@@ -928,6 +937,9 @@ class LinkRegistry(IsolatedRegistry):
         path, = self.files(1)
         impostor = self.root / 'impostor.wav'
         impostor.write_bytes(b'Z' * path.stat().st_size)
+        # Another file: same size, but not the recorded modification time. Written a moment after
+        # the original, it could share its mtime on a filesystem with coarse timestamps (ZFS).
+        os.utime(impostor, ns=(time.time_ns(), path.stat().st_mtime_ns + 5_000_000_000))
         entry = self.ml.link(str(path))
         with self.ml.open_media(entry['src']) as source:
             self.assertEqual(source.read(4), b'RIFF')
@@ -938,6 +950,98 @@ class LinkRegistry(IsolatedRegistry):
                 self.ml.open_media(entry['src'])
         finally:
             self.ml.resolve_media = original
+
+    def test_a_writer_killed_mid_save_leaves_no_registry_copy_behind(self):
+        import signal
+        first, second = self.files(2)
+        script = ('import sys, time; sys.path.insert(0, sys.argv[1]); import media_links\n'
+                  'media_links.os.replace = lambda *a: time.sleep(60)\n'
+                  'media_links.link(sys.argv[2])\n')
+        env = {**os.environ, 'SPLICE_DATA_DIR': str(self.data)}
+        writer = subprocess.Popen([sys.executable, '-c', script, str(ROOT), str(first)], env=env)
+        temporaries = lambda: sorted(p.name for p in self.data.iterdir() if p.name.startswith('.linked-media-'))
+        deadline = time.monotonic() + 30
+        while not temporaries() and time.monotonic() < deadline:
+            time.sleep(.05)
+        writer.send_signal(signal.SIGKILL if hasattr(signal, 'SIGKILL') else signal.SIGTERM)
+        writer.wait(10)
+        left = temporaries()
+        self.assertEqual(len(left), 1, 'the killed writer left its copy')
+        outside = self.root / 'outside.json'
+        outside.write_text('keep')
+        os.symlink(outside, self.data / '.linked-media-symlink.json')
+        (self.data / '.linked-media-notes.txt').write_text('not ours')
+        self.ml.link(str(second))
+        self.assertEqual(temporaries(), ['.linked-media-notes.txt', '.linked-media-symlink.json'])
+        self.assertEqual(outside.read_text(), 'keep')
+
+    def hold_the_registry_lock(self):
+        """Another process that took the registry lock and stalled."""
+        script = ('import fcntl, sys, time\n'
+                  'handle = open(sys.argv[1], "a+b"); fcntl.flock(handle.fileno(), fcntl.LOCK_EX)\n'
+                  'print("locked", flush=True); time.sleep(60)\n')
+        holder = subprocess.Popen([sys.executable, '-c', script, str(self.data / 'linked-media.lock')],
+                                  stdout=subprocess.PIPE)
+        self.addCleanup(lambda: (holder.kill(), holder.wait(), holder.stdout.close()))
+        self.assertEqual(holder.stdout.readline().strip(), b'locked')
+        return holder
+
+    @unittest.skipUnless(os.name == 'posix', 'the stalled holder uses flock')
+    def test_serving_registered_media_does_not_wait_on_a_stalled_writer(self):
+        import threading
+        first, second = self.files(2)
+        entry = self.ml.link(str(first))
+        self.ml._cache.update(stamp=None, links={})  # As in a process that has not read it yet.
+        holder = self.hold_the_registry_lock()
+        writer = threading.Thread(target=lambda: results.append(self.ml.link(str(second))), daemon=True)
+        results = []
+        writer.start()  # Queued behind the stalled holder.
+        time.sleep(.2)
+        started = time.monotonic()
+        self.assertEqual(self.ml.resolve_media(entry['src']), first.resolve())
+        with self.ml.open_media(entry['src']) as source:
+            self.assertEqual(source.read(4), b'RIFF')
+        self.assertEqual(self.ml.cache_report()['linkedFiles'], 1)
+        self.ml.browse()
+        self.assertLess(time.monotonic() - started, 1.5, 'readers wait on neither the file lock nor the queued writer')
+        # A damaged registry needs the lock to be set aside; until then the last good list is served.
+        good = self.ml.REGISTRY.read_text()
+        temporary = self.ml.REGISTRY.with_name('damaged.tmp')
+        temporary.write_text('{"links": ')
+        os.replace(temporary, self.ml.REGISTRY)
+        started = time.monotonic()
+        self.assertEqual(self.ml.resolve_media(entry['src']), first.resolve())
+        self.assertLess(time.monotonic() - started, self.ml.READ_LOCK_SECONDS + 1)
+        temporary.write_text(good)
+        os.replace(temporary, self.ml.REGISTRY)
+        holder.kill()
+        holder.wait()
+        writer.join(30)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(sorted(e['path'] for e in self.ml._links().values()), sorted([str(first), str(second)]))
+
+    def test_premiere_resolves_linked_media_without_a_patch(self):
+        path, = self.files(1)
+        entry = self.ml.link(str(path))
+        env = {**os.environ, 'SPLICE_DATA_DIR': str(self.data)}
+        # premiere alone: nothing imported media_links to patch it.
+        script = ('import sys; sys.path.insert(0, sys.argv[1]); import premiere\n'
+                  'assert "media_links" not in sys.modules\n'
+                  'print(premiere._media_path(sys.argv[2]))\n')
+        result = subprocess.run([sys.executable, '-c', script, str(ROOT), entry['src']], env=env, capture_output=True,
+                                text=True, timeout=60)
+        self.assertEqual((result.returncode, result.stdout.strip()), (0, str(path.resolve())), result.stderr)
+        script = ('import sys; sys.path.insert(0, sys.argv[1]); import render_movie, media_links, premiere\n'
+                  'assert render_movie._media_path is media_links.resolve_media, "install() rebinds render_movie"\n'
+                  'assert premiere._media_path is not media_links.resolve_media, "premiere is not patched"\n'
+                  'print(render_movie._render_source({"src": sys.argv[2]}))\n')
+        result = subprocess.run([sys.executable, '-c', script, str(ROOT), entry['src']], env=env, capture_output=True,
+                                text=True, timeout=60)
+        self.assertEqual((result.returncode, result.stdout.strip()), (0, str(path.resolve())), result.stderr)
+        import premiere
+        self.assertEqual(premiere.managed_media_path('/assets/score.wav'), ROOT / 'assets' / 'score.wav')
+        with self.assertRaises(ValueError):
+            premiere.managed_media_path(entry['src'])
 
     def test_folder_walk_and_listing_are_bounded(self):
         deep = self.root / 'card'
@@ -1018,6 +1122,58 @@ class MediaCache(IsolatedRegistry):
         self.assertEqual(sorted(result['deleted']), sorted([legacy_proxy, proxy]))
         left = sorted(p.name for p in self.ml.MEDIA_ROOT.iterdir())
         self.assertEqual(left, sorted([imported, legacy_import, used_proxy, fresh_proxy]))
+
+    def test_an_unmarked_folder_of_identical_generated_names_is_an_import(self):
+        import hashlib
+        content = b'the same take imported twice'
+        directory = self.ml.MEDIA_ROOT / hashlib.sha256(content).hexdigest()[:32]
+        directory.mkdir()
+        for name in ('a-audio.wav', 'b-audio.wav'):
+            (directory / name).write_bytes(content)
+        stale = time.time() - 3600
+        os.utime(directory, (stale, stale))
+        legacy_proxies = self.ml.MEDIA_ROOT / ('c' * 32)
+        legacy_proxies.mkdir()
+        for name, data in (('edit.mp4', b'edit'), ('seek.mp4', b'seek')):
+            (legacy_proxies / name).write_bytes(data)
+        os.utime(legacy_proxies, (stale, stale))
+        kinds = {e['id']: e['kind'] for e in self.ml.cache_report()['entries']}
+        self.assertEqual(kinds, {directory.name: 'import', legacy_proxies.name: 'proxy'})
+        self.assertEqual(self.ml.prune([])['deleted'], [legacy_proxies.name])
+        self.assertTrue(directory.exists())
+
+    def test_legacy_classification_hashes_a_bounded_amount_per_report(self):
+        identifiers = [self.entry('edit.mp4', None, bytes([i]) * 1000, identifier=f'{i:x}' * 32) for i in range(1, 6)]
+        hashed = []
+        original = self.ml._content_id
+        self.ml._content_id = lambda path: (hashed.append(path), original(path))[1]
+        saved = self.ml.HASH_BYTES_PER_REPORT
+        self.ml.HASH_BYTES_PER_REPORT = 2500
+        self.ml._kinds.clear()
+        try:
+            report = self.ml.cache_report()
+            self.assertEqual(len(hashed), 2)
+            self.assertEqual(report['unclassified'], 3)
+            provisional = [e['id'] for e in report['entries'] if e['provisional']]
+            self.assertEqual(len(provisional), 3)
+            self.assertTrue(all(e['kind'] == 'import' for e in report['entries'] if e['provisional']))
+            # The prune's own report classifies the next two; the last stays unclassified and is kept.
+            deleted = self.ml.prune([])['deleted']
+            self.assertEqual(len(hashed), 4)
+            self.assertEqual(len(deleted), 4)
+            left, = [p.name for p in self.ml.MEDIA_ROOT.iterdir()]
+            self.assertIn(left, provisional)
+            report = self.ml.cache_report()
+            self.assertEqual((len(hashed), report['unclassified'], [e['kind'] for e in report['entries']]),
+                             (5, 0, ['proxy']))
+            big = self.entry('edit.mp4', None, b'x' * 3000, identifier='9' * 32)
+            self.assertEqual({e['id']: e['kind'] for e in self.ml.cache_report()['entries']}[big], 'import',
+                             'a file too large to hash is kept as an import')
+        finally:
+            self.ml._content_id = original
+            self.ml.HASH_BYTES_PER_REPORT = saved
+            self.ml._kinds.clear()
+        self.assertTrue(set(identifiers))
 
     def test_imports_are_deleted_only_when_selected(self):
         imported = self.entry('interview.mp4', 'import', b'interview')
@@ -1208,6 +1364,50 @@ class ProbeDetails(unittest.TestCase):
         playlist.write_text(f"ffconcat version 1.0\nfile '{clip.name}'\n")
         with self.assertRaisesRegex(ValueError, 'cannot decode'):
             decodable(playlist, playlist.name)
+
+    def test_hls_playlists_are_not_media(self):
+        from media_proxy import TEXT_FORMATS, decodable
+        segment = self.dir / 'segment0.ts'
+        ffmpeg('-f', 'lavfi', '-i', 'testsrc2=s=32x18:r=25:d=0.4', '-c:v', 'mpeg4', '-f', 'mpegts', segment)
+        decodable(segment, segment.name)
+        # A playlist picked under its own name (Link media in place takes any file the user picks).
+        # FFmpeg 8 no longer detects one renamed .mov, older versions do; both must be refused.
+        playlist = self.dir / 'playlist.m3u8'
+        playlist.write_text('#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXTINF:0.4,\n'
+                            f'{segment.name}\n#EXT-X-ENDLIST\n')
+        renamed = self.dir / 'playlist.mov'
+        renamed.write_bytes(playlist.read_bytes())
+        with self.assertRaisesRegex(ValueError, 'cannot decode'):
+            decodable(renamed, renamed.name)
+        # Without the refusal FFmpeg reads it as a video through the playlist.
+        probe = subprocess.run(['ffprobe', '-v', 'error', '-protocol_whitelist', 'file', '-show_entries',
+                                'stream=codec_type:format=format_name', '-of', 'json', str(playlist)],
+                               capture_output=True, text=True, timeout=60)
+        data = json.loads(probe.stdout or '{}')
+        self.assertIn('hls', data.get('format', {}).get('format_name', '').split(','))
+        self.assertIn('video', [s.get('codec_type') for s in data.get('streams', [])])
+        with self.assertRaisesRegex(ValueError, 'cannot decode'):
+            decodable(playlist, playlist.name)
+        self.assertIn('hls', TEXT_FORMATS)
+
+    def test_the_refusal_list_passes_ordinary_media(self):
+        from media_proxy import _ffprobe, _text_art, decodable
+        made = {'clip.mp4': ('-c:v', 'mpeg4'), 'clip.mov': ('-c:v', 'mpeg4'), 'clip.mkv': ('-c:v', 'mpeg4'),
+                'clip.avi': ('-c:v', 'mpeg4'), 'clip.ts': ('-c:v', 'mpeg4'), 'clip.mxf': ('-c:v', 'mpeg2video'),
+                'clip.m4v': ('-c:v', 'mpeg4', '-f', 'mp4'), 'still.png': ('-frames:v', '1')}
+        for name, arguments in made.items():
+            with self.subTest(name=name):
+                target = self.dir / name
+                ffmpeg('-f', 'lavfi', '-i', 'testsrc2=s=32x18:r=25:d=0.2', *arguments, target)
+                decodable(target, name)
+                data = _ffprobe(target, '-show_entries', 'stream=codec_type,codec_name:format=format_name')
+                self.assertFalse(_text_art(data['format'], data['streams']))
+        for name, arguments in {'tone.wav': ('-c:a', 'pcm_s16le'), 'tone.flac': ('-c:a', 'flac'),
+                                'tone.m4a': ('-c:a', 'aac'), 'tone.ogg': ('-c:a', 'flac', '-f', 'ogg')}.items():
+            with self.subTest(name=name):
+                target = self.dir / name
+                ffmpeg('-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=0.2', *arguments, target)
+                decodable(target, name)
 
     def test_a_probe_timeout_is_reported_as_a_timeout(self):
         import media_proxy

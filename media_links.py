@@ -49,10 +49,17 @@ CAMERA_RAW = {
     '.nev': 'Nikon N-RAW (transcode it in the camera vendor\'s RAW tool)',
 }
 
+# _lock guards _cache and is only ever held briefly: readers never wait on a registry writer.
+# _write_lock queues this process's writers before they take the cross-process file lock.
 _lock = threading.RLock()
+_write_lock = threading.Lock()
 _cache = {'stamp': None, 'links': {}, 'recovered': None}
-_managed_path = None
 REGISTRY_VERSION = 1
+# How long a reader waits for the file lock to repair a damaged registry before serving the
+# last good snapshot instead (a stalled writer elsewhere must not stall playback).
+READ_LOCK_SECONDS = 1.0
+# tempfile.mkstemp(prefix='.linked-media-', suffix='.json') names, as _write makes them.
+_TEMPORARY = re.compile(r'\.linked-media-[a-z0-9_]{8}\.json')
 
 
 class RegistryFull(ValueError):
@@ -125,8 +132,8 @@ class _FileLock:
             handle.close()
 
 
-def _registry_lock():
-    return _FileLock(REGISTRY.with_name('linked-media.lock'))
+def _registry_lock(timeout=30):
+    return _FileLock(REGISTRY.with_name('linked-media.lock'), timeout)
 
 
 def _stamp():
@@ -157,24 +164,63 @@ def _set_aside():
     return aside
 
 
+def _parse(text):
+    """(links, recovered) from the registry's text; ValueError when it is damaged."""
+    data = json.loads(text)
+    raw = data.get('links') if isinstance(data, dict) else None
+    if not isinstance(raw, dict):
+        raise ValueError('damaged registry')
+    links = {key: value for key, value in raw.items() if _valid_entry(key, value)}
+    return links, data.get('recovered') if isinstance(data.get('recovered'), dict) else None
+
+
+def _snapshot():
+    """(stamp, links, recovered) read without the file lock, or None when the file is damaged.
+    Every save replaces the file atomically, so whatever one open handle reads is a whole
+    version; the stamp comes from that same handle."""
+    try:
+        with open(REGISTRY, 'rb') as source:
+            stat = os.fstat(source.fileno())
+            text = source.read()
+    except FileNotFoundError:
+        return None, {}, None
+    try:
+        links, recovered = _parse(text.decode('utf-8'))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return None
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns), links, recovered
+
+
+def _remove_stale_temporaries():
+    """Delete registry copies a writer killed mid-save left behind (each is a whole registry).
+    The caller holds the file lock, so no live writer owns one. Only regular files named the
+    way _write names them, never through a symlink."""
+    try:
+        entries = list(os.scandir(REGISTRY.parent))
+    except FileNotFoundError:
+        return
+    for entry in entries:
+        if _TEMPORARY.fullmatch(entry.name) and entry.is_file(follow_symlinks=False):
+            try:
+                os.unlink(entry.path)
+            except FileNotFoundError:
+                pass
+
+
 def _read_locked():
     """Read the registry; the caller holds the file lock. A damaged file is
     set aside and a fresh registry started, recording where it went."""
+    _remove_stale_temporaries()
     stamp = _stamp()
     if stamp is None:
         return stamp, {}, None
     try:
-        data = json.loads(REGISTRY.read_text(encoding='utf-8'))
-        raw = data.get('links') if isinstance(data, dict) else None
-        if not isinstance(raw, dict):
-            raise ValueError
-    except (UnicodeDecodeError, ValueError):
+        links, recovered = _parse(REGISTRY.read_text(encoding='utf-8'))
+    except (UnicodeDecodeError, ValueError, RecursionError):
         aside = _set_aside()
         recovered = dict(file=aside.name, at=int(time.time()))
         _write({}, recovered)
         return _stamp(), {}, recovered
-    links = {key: value for key, value in raw.items() if _valid_entry(key, value)}
-    recovered = data.get('recovered') if isinstance(data.get('recovered'), dict) else None
     return stamp, links, recovered
 
 
@@ -197,34 +243,48 @@ def _write(links, recovered):
 
 def _links():
     """The registry, reloaded when another process (an export worker, the
-    other Splice server) or a previous launch changed the file."""
+    other Splice server) or a previous launch changed the file.
+
+    Reading takes no lock: a writer stalled in another process (or this one) never delays
+    serving media that is already registered. Only a damaged file needs the file lock, to set
+    it aside; if that lock is busy the last good snapshot is served and the repair retried on
+    a later read."""
+    stamp = _stamp()
     with _lock:
-        stamp = _stamp()
-        if stamp is None:
-            _cache.update(stamp=None, links={}, recovered=None)
-        elif stamp != _cache['stamp']:
-            with _registry_lock():
-                stamp, links, recovered = _read_locked()
-            _cache.update(stamp=stamp, links=links, recovered=recovered)
-        return _cache['links']
+        if stamp == _cache['stamp']:
+            return _cache['links']
+    snapshot = _snapshot()
+    if snapshot is None:
+        try:
+            with _registry_lock(READ_LOCK_SECONDS):
+                snapshot = _read_locked()
+        except TimeoutError:
+            with _lock:
+                return _cache['links']
+    stamp, links, recovered = snapshot
+    with _lock:
+        _cache.update(stamp=stamp, links=links, recovered=recovered)
+        return links
 
 
 def _update(change):
     """Read-modify-write under the cross-process lock, always from the file
     itself, then replace it atomically."""
-    with _lock, _registry_lock():
+    with _write_lock, _registry_lock():
         _, links, recovered = _read_locked()
         links = dict(links)
         result = change(links)
         _write(links, recovered)
-        _cache.update(stamp=_stamp(), links=links, recovered=recovered)
+        with _lock:
+            _cache.update(stamp=_stamp(), links=links, recovered=recovered)
         return result
 
 
 def recovery_notice():
     """Set when a damaged registry was set aside, while that file remains."""
     _links()
-    recovered = _cache['recovered']
+    with _lock:
+        recovered = _cache['recovered']
     if not recovered or not isinstance(recovered.get('file'), str):
         return None
     aside = REGISTRY.with_name(Path(recovered['file']).name)
@@ -378,12 +438,17 @@ def stat_is_file(stat):
 
 
 def resolve_media(src):
-    """Resolve a media URL to a local path: a registered linked original
-    (``/media/linked/<id>/<name>``) or, through premiere's resolver, a
-    managed copy, proxy or bundled asset. Raises ValueError otherwise."""
+    """The public resolver for every media URL Splice serves, renders or saves.
+
+    Returns the local path of a registered linked original (``/media/linked/<id>/<name>``,
+    while the file keeps the size and modification time it was linked with) or of a managed
+    copy, proxy or bundled asset (``/media/...``, ``/assets/...``, through
+    ``premiere.managed_media_path``). Raises ValueError for anything else. premiere.py,
+    media_proxy.py and media_peaks.py call it; render_movie.py still reaches it through
+    :func:`install`."""
     identifier, entry = _entry(src)
     if entry is None:
-        return _managed_path(src)
+        return premiere.managed_media_path(src)
     path = Path(entry['path'])
     try:
         stat = path.stat()
@@ -413,26 +478,23 @@ def is_linked(src):
 
 
 def install():
-    """Route every _media_path lookup through resolve_media.
+    """Point render_movie's own binding at resolve_media.
 
-    premiere.py owns _media_path and render_movie.py binds it by name at
-    import. media_proxy imports this module, and render_movie imports
-    media_proxy immediately after binding, so this runs in the server and
-    in every spawned export worker before any media is resolved."""
-    global _managed_path
-    current = premiere._media_path
-    if current is resolve_media:
-        return
-    _managed_path = current
-    premiere._media_path = resolve_media
+    render_movie.py binds ``premiere._media_path`` by name at import, then imports media_proxy
+    (which imports this module), so this runs in the server and in every export worker before
+    any media is resolved. premiere._media_path already delegates to resolve_media, so the
+    binding works either way; this keeps render_movie on the public resolver until it imports
+    ``resolve_media`` itself. premiere.py is never patched."""
     module = sys.modules.get('render_movie')
-    if module is not None and getattr(module, '_media_path', None) is current:
+    if module is not None and getattr(module, '_media_path', None) in (premiere._media_path,
+                                                                        premiere.managed_media_path):
         module._media_path = resolve_media
 
 
 PLACES_TIMEOUT = 2
 PLACES_TTL = 30
 _places_state = {'at': 0, 'value': None, 'worker': None}
+_places_lock = threading.Lock()  # not _lock: a volume scan never touches the registry
 
 
 def _windows_drives():
@@ -472,7 +534,7 @@ def _places():
     browse: the last known list (or Home alone) is returned meanwhile."""
     state = _places_state
     started = None
-    with _lock:
+    with _places_lock:
         fresh = state['value'] is not None and time.monotonic() - state['at'] < PLACES_TTL
         if not fresh and (state['worker'] is None or not state['worker'].is_alive()):
             def scan():
@@ -480,13 +542,13 @@ def _places():
                     value = _scan_places()
                 except OSError:
                     value = None
-                with _lock:
+                with _places_lock:
                     state.update(value=value or state['value'], at=time.monotonic())
             started = state['worker'] = threading.Thread(target=scan, daemon=True, name='splice-places')
             started.start()
     if started is not None:
         started.join(PLACES_TIMEOUT)  # Only the request that started a scan waits for it.
-    with _lock:
+    with _places_lock:
         return state['value'] or [dict(name='Home', path=str(Path.home()))]
 
 
@@ -560,43 +622,69 @@ def _content_id(path):
     return digest.hexdigest()[:32]
 
 
-def _kind(directory, names):
-    """'import' or 'proxy'. Unmarked folders from earlier versions count as
-    imports unless they hold a single generated file whose content does not
-    name the folder (imports are stored under their content hash)."""
+# Legacy folders are classified by hashing their files; one cache report hashes at most this
+# much (the rest stay imports until a later report reaches them), and a file larger than it is
+# never hashed, so it stays an import.
+HASH_BYTES_PER_REPORT = 2 * 1024 ** 3
+
+
+class _HashBudget:
+    def __init__(self, limit):
+        self.left = limit
+        self.deferred = 0
+
+
+def _kind(directory, names, budget=None):
+    """'import' or 'proxy', and whether the answer is provisional (the hash budget ran out).
+
+    Unmarked folders from earlier versions are imports unless every file in them is named like
+    a generated file and NONE holds content that names the folder: imports are stored under
+    their content hash, so the same bytes imported as a-audio.wav and b-audio.wav are still an
+    import. When in doubt (unreadable, too large to hash, budget spent) it is an import, which
+    the bulk prune never deletes."""
     markers = {p.name for p in directory.iterdir() if p.name in (IMPORT_MARKER, DERIVED_MARKER)}
     if IMPORT_MARKER in markers:
-        return 'import'
+        return 'import', False
     if DERIVED_MARKER in markers:
-        return 'proxy'
+        return 'proxy', False
     if not names or not all(n in PROXY_NAMES or n.endswith('-audio.wav') for n in names):
-        return 'import'
-    if len(names) > 1:
-        return 'proxy'
-    target = directory / names[0]
-    stat = target.stat()
-    key = (str(target), stat.st_size, stat.st_mtime_ns)
-    if key not in _kinds:
-        _kinds[key] = 'import' if _content_id(target) == directory.name else 'proxy'
-    return _kinds[key]
+        return 'import', False
+    budget = budget or _HashBudget(HASH_BYTES_PER_REPORT)
+    for name in names:
+        target = directory / name
+        stat = target.stat()
+        key = (str(target), stat.st_size, stat.st_mtime_ns)
+        if key not in _kinds:
+            if stat.st_size > HASH_BYTES_PER_REPORT:
+                return 'import', False  # Too large ever to confirm: kept as an import.
+            if stat.st_size > budget.left:
+                budget.deferred += 1
+                return 'import', True
+            budget.left -= stat.st_size
+            if len(_kinds) >= 100_000:
+                _kinds.clear()  # Bounded; a later report hashes again.
+            _kinds[key] = _content_id(target) == directory.name
+        if _kinds[key]:
+            return 'import', False
+    return 'proxy', False
 
 
 def cache_report():
     """Managed imported copies and derived files under the media directory,
     and the linked originals (which are not copied)."""
-    entries = []
+    entries, budget = [], _HashBudget(HASH_BYTES_PER_REPORT)
     if MEDIA_ROOT.is_dir():
         for directory in MEDIA_ROOT.iterdir():
             if not directory.is_dir() or not _ID.fullmatch(directory.name):
                 continue
             try:
                 names = sorted(p.name for p in directory.iterdir() if p.is_file() and not p.name.startswith('.'))
-                kind = _kind(directory, names)
+                kind, provisional = _kind(directory, names, budget)
                 size, used = _tree_size(directory)
                 modified = directory.stat().st_mtime
             except OSError:
                 continue
-            entries.append(dict(id=directory.name, kind=kind, files=names[:8], bytes=size,
+            entries.append(dict(id=directory.name, kind=kind, provisional=provisional, files=names[:8], bytes=size,
                                 src=f'/media/{directory.name}/{quote(names[0], safe="")}' if names else None,
                                 modified=int(modified), lastUsed=int(max(used, modified))))
     entries.sort(key=lambda e: -e['bytes'])
@@ -609,7 +697,7 @@ def cache_report():
                 linkedFiles=len(links), linkedBytes=sum(e['size'] for e in links.values()),
                 links=[dict(id=key, **_source(key, entry), name=entry['name'], linkedAt=entry.get('linkedAt'))
                        for key, entry in newest],
-                maxLinks=MAX_LINKS, freeBytes=free.free, notice=recovery_notice())
+                maxLinks=MAX_LINKS, freeBytes=free.free, notice=recovery_notice(), unclassified=budget.deferred)
 
 
 MAX_LINKS_SHOWN = 500
