@@ -108,6 +108,16 @@ async function main() {
       '-pix_fmt', 'yuv420p', '-c:a', 'aac', clip]);
     let {page, errors} = await newPage(browser, splice, {width: 1440, height: 900}, ['Client review']);
     await project(page, clip);
+    await page.route('**/api/delivery/capabilities', async route => {
+      const response = await route.fetch();
+      const capabilities = await response.json();
+      const key = Object.keys(capabilities.machine.variants).find(key => key.startsWith('h264|high422|') && key.endsWith('|mp4|'));
+      assert.ok(key);
+      capabilities.machine.variants[key] = 'profile probe failed';
+      const hdr = capabilities.presets.find(item => item.id === 'youtube-uhd-hdr').options.hdr;
+      Object.assign(hdr, {lightLevels: 'manual', maxCll: 600, maxFall: 200});
+      await route.fulfill({response, json: capabilities});
+    });
     await openExport(page);
     await checkFits(page);
     // The original default request is unchanged by the new fields.
@@ -124,6 +134,20 @@ async function main() {
       assert.ok(!option.disabled || /unavailable: \S/.test(option.text), 'a disabled encoder says why: ' + option.text);
     console.log('Encoders: ' + encoders.map(o => o.value + (o.disabled ? ' (unavailable)' : '')).join(', '));
     await shot(page, 'delivery-export-default');
+
+    const unsupported = page.locator(`${dialog} [name=profile] option[value=high422]`);
+    assert.ok(await unsupported.isDisabled());
+    assert.match(await unsupported.textContent(), /profile probe failed/);
+    await page.locator(`${dialog} select[name=preset]`).selectOption('youtube-uhd-hdr');
+    assert.equal(await page.locator(`${dialog} [name=hdrMaxCll]`).inputValue(), '600');
+    assert.equal(await page.locator(`${dialog} [name=hdrMaxFall]`).inputValue(), '200');
+    await page.locator(`${dialog} [name=codec]`).selectOption('wav');
+    for (const format of ['pcm16', 'pcm32f']) {
+      const check = page.waitForRequest(req => req.url().endsWith('/api/delivery/check') &&
+        req.postDataJSON().options.audioCodec === format);
+      await page.locator(`${dialog} [name=audioCodec]`).selectOption(format);
+      assert.equal((await check).postDataJSON().options.codec, 'wav');
+    }
 
     // A preset fills the fields and the size conversion is announced before rendering.
     await page.locator(`${dialog} select[name=preset]`).selectOption('proxy-prores');
@@ -166,6 +190,8 @@ async function main() {
     await page.locator(`${dialog} .export-add-queue`).click();
     await page.locator(queueDialog).waitFor();
     await page.locator(`${queueDialog} footer button`).click();
+    await page.locator(`${dialog} [name=codec]`).selectOption('h264');
+    await page.locator(`${dialog} [name=speed]`).selectOption('fast');
     await page.locator(`${dialog} [name=outputName]`).fill('Film');
     await page.locator(`${dialog} .export-batch`).click();
     for (const name of ['Archive master (ProRes 4444 XQ)', 'Web AV1 (small file)'])

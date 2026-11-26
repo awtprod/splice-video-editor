@@ -29,7 +29,8 @@ window.SpliceDelivery = (() => {
       .catch(error => { loading = null; throw error; });
     return loading;
   }
-  const variantKey = o => [o.codec || '', o.profile || '', o.alpha ?? '', o.container || '', o.encoder || ''].join('|');
+  // Match the capability keys already stored by delivery.variant_key, including Python booleans.
+  const variantKey = o => [o.codec || '', o.profile || '', o.alpha == null ? '' : o.alpha ? 'True' : 'False', o.container || '', o.encoder || ''].join('|');
   function reasonFor(options) {
     if (!table) return '';
     const codec = table.codecs[options.codec];
@@ -252,6 +253,7 @@ window.SpliceDelivery = (() => {
       if (!codecInfo || LEGACY.includes(codec.value) && codec.value !== 'prores') {
         if (codec.value === 'h264' && codecInfo) addVideo(opts, codecInfo);
       } else addVideo(opts, codecInfo);
+      if (codecInfo && audioCodec.value && audioCodec.value !== table.defaultAudio[container.value]) opts.audioCodec = audioCodec.value;
       if (codecInfo && codec.value !== 'wav') {
         if (!timecode.checked && table.containers[container.value]?.timecode) opts.timecode = false;
         if (reel.value.trim()) opts.reel = reel.value.trim();
@@ -282,7 +284,6 @@ window.SpliceDelivery = (() => {
         if (encoder.value === 'software' && speed.value !== DEFAULT_SPEED[codec.value]) opts.speed = speed.value;
       }
       if (alpha.checked) opts.alpha = true;
-      if (audioCodec.value && audioCodec.value !== table.defaultAudio[container.value]) opts.audioCodec = audioCodec.value;
       if (codecInfo.kind === 'images') { opts.startNumber = startNumber.valueAsNumber; opts.padding = padding.valueAsNumber; }
       if (!hdr.hidden) {
         opts.hdr = {display: display.value, maxLuminance: maxLum.valueAsNumber, minLuminance: minLum.valueAsNumber, lightLevels: levels.value};
@@ -300,7 +301,14 @@ window.SpliceDelivery = (() => {
       if (options.audioBitrate && [...form.elements.bitrate.options].some(o => Number(o.value) === options.audioBitrate)) form.elements.bitrate.value = String(options.audioBitrate);
       else if (options.audioBitrate) { form.elements.bitrate.append(new Option(String(options.audioBitrate))); form.elements.bitrate.value = String(options.audioBitrate); }
       timecode.checked = options.timecode !== false;
-      if (options.hdr) { display.value = options.hdr.display || 'p3d65'; maxLum.value = options.hdr.maxLuminance ?? 1000; minLum.value = options.hdr.minLuminance ?? 0.005; levels.value = options.hdr.lightLevels || 'measure'; }
+      if (options.hdr) {
+        display.value = options.hdr.display || 'p3d65';
+        maxLum.value = options.hdr.maxLuminance ?? 1000;
+        minLum.value = options.hdr.minLuminance ?? 0.005;
+        levels.value = options.hdr.lightLevels || 'measure';
+        maxCll.value = options.hdr.maxCll ?? 1000;
+        maxFall.value = options.hdr.maxFall ?? 400;
+      }
       const burn = options.burnIns || {};
       for (const [key, box] of Object.entries(burnChecks)) box.checked = (burn.fields || []).includes(key);
       burnPosition.value = burn.position || 'bottom-center'; namePosition.value = burn.clipNamePosition || 'top-left';
@@ -377,6 +385,7 @@ window.SpliceDelivery = (() => {
         throw error;
       }
     }
+    const sessionOptionKeys = ['range', 'limiter', 'limiterCeiling', 'aacPeakSafe', 'subtitleLanguage'];
     const currentOptions = () => context.requestOptions();
     addQueue.onclick = async () => {
       await check();
@@ -389,8 +398,11 @@ window.SpliceDelivery = (() => {
       } catch (error) { context.status(error.message); }
     };
     batch.onclick = () => batchDialog(async picked => {
+      const current = currentOptions();
+      const shared = {};
+      for (const key of sessionOptionKeys) if (key in current) shared[key] = current[key];
       const entries = picked.map(item => {
-        const resolved = {...context.requestOptions(), ...resolvePreset(item.options)};
+        const resolved = {...resolvePreset(item.options), ...shared};
         return {options: resolved, name: (outName.value.trim() || project.name) + ' - ' + item.name.replace(/[\\/:*?"<>|]/g, '-').slice(0, 60), preset: item.name};
       });
       await queue(entries);
@@ -407,8 +419,7 @@ window.SpliceDelivery = (() => {
       const name = prompt('Name this preset');
       if (!name?.trim()) return;
       const options = currentOptions();
-      delete options.range;
-      for (const key of ['limiter', 'limiterCeiling', 'aacPeakSafe', 'subtitleLanguage']) delete options[key];
+      for (const key of sessionOptionKeys) delete options[key];
       try {
         const saved = await post('/api/delivery/presets', {presets: [...table.userPresets, {name: name.trim(), purpose: 'Saved from the Export dialog.', options}]});
         table.userPresets = saved.userPresets; fillPresets();
