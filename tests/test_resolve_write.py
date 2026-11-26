@@ -1229,3 +1229,263 @@ class HungVolumeTests(unittest.TestCase):
         import time
         answered = media._bounded(work, items_, time.monotonic() + 5, media._volume, 'hung')
         self.assertEqual(answered[0], 'done /mnt/hung/0.mov')
+
+
+class PlaceMutantTests(SaveCase):
+    """Each rule of placing a project, alone (the validator's surviving mutants)."""
+
+    def test_names_fold_after_decomposition_as_a_share_may(self):
+        (self.projects() / unicodedata.normalize('NFD', 'Café')).mkdir()
+        with self.assertRaises(place.PlaceError):
+            place.check_new(self.projects(), 'CAFÉ')
+        with self.assertRaises(place.PlaceError):
+            place.check_new(self.projects(), 'café')
+
+    def test_names_fold_as_windows_upper_cases_them(self):
+        # Windows upper-cases a dotless i to I: “ıı” and “II” are one folder name on a share.
+        (self.projects() / 'Kıyı').mkdir()
+        with self.assertRaises(place.PlaceError):
+            place.check_new(self.projects(), 'KIYI')
+
+    def test_a_linked_library_folder_is_refused_as_a_link(self):
+        root = self.library / 'Resolve Projects'
+        real = self.library / 'Real Resolve Projects'
+        shutil.move(str(root), str(real))
+        root.symlink_to(real, target_is_directory=True)
+        with self.assertRaises(place.PlaceError) as caught:
+            place.library_users(self.library)
+        self.assertIn('is a link', str(caught.exception))
+
+    def test_a_projects_link_inside_the_library_is_refused_too(self):
+        projects = self.projects()
+        real = projects.parent / 'Real projects'
+        shutil.move(str(projects), str(real))
+        projects.symlink_to(real, target_is_directory=True)
+        with self.assertRaises(place.PlaceError) as caught:
+            place.library_users(self.library)
+        self.assertIn('no user', str(caught.exception))
+
+    def test_a_projects_folder_resolving_outside_the_library_is_refused(self):
+        outside = self.dir / 'outside'
+        shutil.move(str(self.projects()), str(outside))
+        self.projects().symlink_to(outside, target_is_directory=True)
+        with mock.patch.object(place, '_no_link', return_value=None):
+            with self.assertRaises(place.PlaceError) as caught:
+                place.library_users(self.library)
+        self.assertIn('outside the library', str(caught.exception))
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'renameat2 is Linux')
+    def test_the_rename_never_replaces_even_an_empty_folder(self):
+        source_dir, target = self.dir / 'src', self.dir / 'target'
+        source_dir.mkdir()
+        (source_dir / 'Project.db').write_bytes(b'x')
+        target.mkdir()
+        with self.assertRaises(FileExistsError):
+            place.move_no_replace(source_dir, target)
+        self.assertTrue((source_dir / 'Project.db').exists())
+
+    def test_a_project_of_a_name_that_folds_alike_appearing_during_the_save_wins(self):
+        staging = place.Staging(self.library, 'Late arrival')
+        try:
+            staging.db.write_bytes(b'x' * 1024)
+            (self.projects() / 'LATE ARRIVAL').mkdir()
+            with self.assertRaises(place.PlaceError) as caught:
+                staging.finish()
+            self.assertIn('already has a project named', str(caught.exception))
+        finally:
+            staging.close()
+        self.assertFalse((self.projects() / 'Late arrival').exists())
+
+    def test_staging_on_another_file_system_is_refused(self):
+        real_stat = os.stat
+        projects = str(self.projects())
+
+        def other_device(path, *args, **kwargs):
+            info = real_stat(path, *args, **kwargs)
+            if str(path) == projects:
+                values = list(info)
+                values[stat.ST_DEV] = info.st_dev + 1
+                return os.stat_result(values)
+            return info
+        with mock.patch('resolve.place.os.stat', side_effect=other_device):
+            with self.assertRaises(place.PlaceError) as caught:
+                place.Staging(self.library, 'Elsewhere')
+        self.assertIn('another file system', str(caught.exception))
+        self.assertFalse((self.library / 'Resolve Projects' / place.STAGING).exists())
+
+    @unittest.skipIf(hasattr(os, 'geteuid') and os.geteuid() == 0, 'root writes anywhere')
+    def test_a_projects_folder_splice_cannot_write_is_refused_before_anything_is_staged(self):
+        mode = stat.S_IMODE(self.projects().stat().st_mode)
+        self.projects().chmod(0o555)
+        try:
+            with self.assertRaises(place.PlaceError) as caught:
+                place.Staging(self.library, 'Read only')
+        finally:
+            self.projects().chmod(mode)
+        self.assertIn('not writable by Splice', str(caught.exception))
+        self.assertFalse((self.library / 'Resolve Projects' / place.STAGING).exists())
+
+
+class SelfCheckMutantTests(SaveCase):
+    """Each self-check, alone: a planted fault after the writer's own changes must stop the save."""
+
+    def planted(self, fault, confirm=True, edit=None):
+        project = self.opened()
+        if edit:
+            edit(project)
+        original = writer.Writer.apply
+
+        def apply(self_, name):
+            new_id = original(self_, name)
+            fault(self_.seed.conn, self_)
+            return new_id
+        before = tree_state(self.library)
+        with mock.patch.object(writer.Writer, 'apply', apply):
+            with self.assertRaises((writer.WriteError, place.PlaceError)) as caught:
+                self.run_save(self.payload(project, confirm=confirm))
+        self.assertEqual(tree_state(self.library), before)
+        return str(caught.exception)
+
+    def trim(self, project):
+        clip = self.clip(project, 'video', 0)
+        clip['duration'] -= 2 / project['fps']
+
+    def test_an_unmeant_row_change_fails_the_self_check(self):
+        message = self.planted(lambda conn, w: conn.execute("UPDATE Sm2MpFolder SET Name = 'Changed'"))
+        self.assertIn('did not mean to change', message)
+
+    def test_an_item_read_back_elsewhere_than_meant_fails_the_self_check(self):
+        item = self.ids['pictures'][0]
+        message = self.planted(lambda conn, w: conn.execute(
+            "UPDATE Sm2TiItem SET Duration = CAST(Duration AS INTEGER) - 1 WHERE Sm2TiItem_id = ?", (item,)),
+            edit=self.trim)
+        self.assertIn('read back as', message)
+
+    def test_a_disabled_flag_read_back_otherwise_fails_the_self_check(self):
+        item = self.ids['pictures'][0]
+        message = self.planted(lambda conn, w: conn.execute(
+            'UPDATE Sm2TiItem SET Flags = Flags | 2 WHERE Sm2TiItem_id = ?', (item,)), edit=self.trim)
+        self.assertIn('disabled is True', message)
+
+    def test_a_lost_journal_mode_fails_the_self_check(self):
+        message = self.planted(lambda conn, w: conn.execute('PRAGMA journal_mode = WAL').fetchall())
+        self.assertIn('journal mode', message)
+
+    def test_a_changed_page_size_fails_the_self_check(self):
+        def resize(conn, w):
+            size = conn.execute('PRAGMA page_size').fetchone()[0]
+            conn.execute(f'PRAGMA page_size = {8192 if size != 8192 else 4096}')
+            conn.execute('VACUUM')
+        message = self.planted(resize)
+        self.assertIn('page size', message)
+
+    def test_a_sidecar_left_beside_the_project_fails_even_a_check(self):
+        def sidecar(conn, w):
+            Path(str(w.seed.path) + '-journal').write_bytes(b'')
+        message = self.planted(sidecar, confirm=False)
+        self.assertIn('Project.db-journal', message)
+
+    def test_a_changed_original_is_not_used_as_the_seed(self):
+        project = self.opened()
+        conn = sqlite3.connect(self.db)
+        conn.execute("UPDATE SM_Project SET ProjectName = 'Saved again in Resolve'")
+        conn.commit()
+        conn.close()
+        with self.assertRaises(source.ResolveError) as caught:
+            save.run(self.payload(project, confirm=False), originals=lambda kind, sha: None, scratch=self.dir,
+                     resolve_media=lambda src: src[5:])
+        self.assertIn('saved the original project again', str(caught.exception))
+
+
+class WriterMutantTests(SaveCase):
+    def crossfade(self, frames, before):
+        project = self.opened()
+        fps = project['fps']
+        carrier = next(c for c in project['clips'] if c.get('resolveTransitionId'))
+        carrier.update(transitionDuration=frames / fps, transitionBefore=before / fps)
+        result = self.run_save(self.payload(project, confirm=False))
+        return [line for line in result['lines'] if 'crossfade' in line['what'] or 'transitions' in line['what']]
+
+    def test_crossfade_lengths_two_to_sixteen_frames_centred(self):
+        self.assertEqual(self.crossfade(2, 1)[0]['status'], writer.EXACT)
+        self.assertEqual(self.crossfade(16, 8)[0]['status'], writer.EXACT)
+        for frames, before in ((1, 1), (17, 9)):
+            line = self.crossfade(frames, before)[0]
+            self.assertEqual(line['status'], writer.NOT_WRITTEN)
+            self.assertIn('outside the lengths measured', line['what'])
+        line = self.crossfade(8, 2)[0]
+        self.assertEqual(line['status'], writer.NOT_WRITTEN)
+        self.assertIn('not centred', line['what'])
+
+    def test_resolve_centres_an_odd_crossfade_with_the_extra_frame_before_the_cut(self):
+        self.assertEqual([items.frames_before(n) for n in (2, 3, 4, 5, 7, 16)], [1, 2, 2, 3, 4, 8])
+
+    def test_crossfades_only_at_the_measured_rate(self):
+        from fractions import Fraction
+        self.assertIsNone(items.transition_problem('Cross Fade 0 dB', 8, Fraction(30000, 1001)))
+        for rate in (Fraction(24000, 1001), Fraction(25), Fraction(24), Fraction(60000, 1001)):
+            self.assertIn('29.97', items.transition_problem('Cross Fade 0 dB', 8, rate))
+
+    def test_a_deleted_clip_with_markers_is_kept_and_reported(self):
+        item = self.ids['sounds'][2]
+        conn = sqlite3.connect(self.kept)
+        lmap = conn.execute('SELECT BtLockableBlobMap_id FROM BtLockableBlobMap').fetchone()[0]
+        conn.execute('INSERT INTO BtLockableBlob (BtLockableBlob_id, DbType, BtLockableBlobMap_id, FieldsBlob, BlobOwner, '
+                     'DbSavedTime) VALUES (?, ?, ?, ?, ?, ?)', ('00000000-0000-4000-8000-00000000abcd',
+                                                               'Sm2TiItemLockableBlob', lmap,
+                                                               F.markers([(3, 'M', 'note', 1)]), item, 0))
+        conn.commit()
+        conn.close()
+        shutil.copyfile(self.kept, self.db)
+        project = self.opened()
+        project['clips'] = [c for c in project['clips'] if c['resolveItemId'] != item]
+        result = self.run_save(self.payload(project))
+        again = self.opened(Path(result['project']['path']))
+        self.assertIn(item, {c['resolveItemId'] for c in again['clips']})
+        line = next(line for line in result['lines'] if line['what'].startswith('Deleted clips that carry Resolve work'))
+        self.assertIn('markers', line['all'][0])
+
+    def test_a_link_group_links_a_picture_only_with_sounds(self):
+        project = self.opened()
+        fps = project['fps']
+        end = max(c['start'] + c['duration'] for c in project['clips'])
+        pic = next(m['id'] for m in project['media'] if m.get('path') == PIC)
+        snd = next(m['id'] for m in project['media'] if m.get('path') == SND)
+        project['clips'] += [
+            {'id': 'p1', 'type': 'video', 'track': 1, 'start': end, 'duration': 4 / fps, 'in': 0, 'mediaId': pic,
+             'linkGroup': 'g'},
+            {'id': 'p2', 'type': 'video', 'track': 2, 'start': end, 'duration': 4 / fps, 'in': 0, 'mediaId': pic,
+             'linkGroup': 'g'},
+            {'id': 's1', 'type': 'audio', 'track': -1, 'start': end, 'duration': 4 / fps, 'in': 0, 'mediaId': snd,
+             'linkGroup': 'g'}]
+        result = self.run_save(self.payload(project))
+        conn = sqlite3.connect(f'file:{result["project"]["path"]}?mode=ro', uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            start = str(round(end * fps) + project['startFrame'])
+            rows = [dict(r) for r in conn.execute('SELECT * FROM Sm2TiItem WHERE Start = ?', (start,))]
+        finally:
+            conn.close()
+        kinds = {r['Sm2TiItem_id']: r['DbType'] for r in rows}
+        for row in rows:
+            partners = items.links_of(row)
+            self.assertTrue(partners, row['DbType'])
+            self.assertTrue(all(kinds[p] != row['DbType'] for p in partners), (row['DbType'], partners))
+        self.assertTrue(any(line['what'].startswith('Links between two pictures') for line in result['lines']))
+
+
+class SeedAndKindMutantTests(unittest.TestCase):
+    def test_a_drp_seed_waits_for_the_unproven_opt_in(self):
+        from resolve import drp_seed
+        report = writer.Report()
+        with self.assertRaises(writer.WriteError) as caught:
+            drp_seed.make_seed('/nonexistent.drp', '/nonexistent.db', '/nonexistent-target.db', report, False)
+        self.assertIn('Allow unproven changes', str(caught.exception))
+        self.assertEqual(report.needs, {'unproven'})
+
+    def test_sixteen_bit_mono_wav_is_not_a_verified_kind(self):
+        from resolve import mediapool
+        status = mediapool.KINDS.get(mediapool._audio_kind('wav', mediapool._pcm(1, 2, False)))
+        self.assertEqual(status[0], 'unverified')
+        status = mediapool.KINDS.get(mediapool._audio_kind('wav', mediapool._pcm(2, 2, True)))
+        self.assertEqual(status[0], 'verified')
