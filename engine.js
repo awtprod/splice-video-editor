@@ -1453,27 +1453,29 @@
     // pieces and it remain one group; settle() still unlinks whatever the edit moved out of sync.
     const spanning = new Set(source.clips.filter((clip) => touched.has(clip.linkGroup) && !crossing(clip) &&
       clip.start < from - 1e-6 && clip.start + clip.duration > to + 1e-6).map((clip) => clip.linkGroup));
-    const sideOf = (clip, side) => spanning.has(clip.linkGroup) ? "spanning" : side;
     const links = linkSides(source, touched);
     const kept = [];
     for (const clip of source.clips) {
+      // Decided from the clip's group before assign() gives it its side's new group.
+      const spans = spanning.has(clip.linkGroup);
+      const sideOf = (side) => spans ? "spanning" : side;
       if (!crossing(clip)) {
-        kept.push(links.assign(clip, clip, sideOf(clip, clip.start >= to - 1e-6 ? "after" : "before")));
+        kept.push(links.assign(clip, clip, sideOf(clip.start >= to - 1e-6 ? "after" : "before")));
         continue;
       }
       const head = clip.start < from - 1e-6, tail = clip.start + clip.duration > to + 1e-6;
       if (head && tail) {
         const middle = splitClipAt(clip, from, source);
         const right = splitClipAt(middle, to, source);
-        kept.push(links.assign(clip, clip, sideOf(clip, "before")), links.assign(right, clip, sideOf(clip, "after")));
+        kept.push(links.assign(clip, clip, sideOf("before")), links.assign(right, clip, sideOf("after")));
       } else if (head) {
         splitClipAt(clip, from, source);
-        kept.push(links.assign(clip, clip, sideOf(clip, "before")));
+        kept.push(links.assign(clip, clip, sideOf("before")));
       } else if (tail) {
         const right = splitClipAt(clip, to, source);
         const native = {};
         for (const key of ["premiereIndex", "premiereTrack"]) if (key in clip) native[key] = clip[key];
-        kept.push(links.assign({...right, ...native, id: clip.id}, clip, sideOf(clip, "after")));
+        kept.push(links.assign({...right, ...native, id: clip.id}, clip, sideOf("after")));
       }
     }
     source.clips = kept;
