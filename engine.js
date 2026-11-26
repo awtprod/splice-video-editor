@@ -188,7 +188,7 @@
       envelope.gain.setValueAtTime(1,end);
       envelope.gain.linearRampToValueAtTime(0,end+overlap);
     }
-    voice.connect(envelope).connect(routeAudio(element).gain);
+    voice.connect(envelope).connect(routeAudio(element).input);
     voice.onended=()=>{voice.disconnect();envelope.disconnect();state.voices.delete(voice);};
     voice.start(start,offset);
     state.voices.add(voice);
@@ -210,8 +210,9 @@
       const analyser=audioContext.createAnalyser();
       analyser.fftSize=256;
       // The mixer inserts the clip's channel map and effects before `gain` and sends `analyser` to its track bus.
-      source.connect(gain).connect(pan).connect(analyser);
-      route={source,gain,pan,analyser,samples:new Float32Array(analyser.fftSize)};
+      const input = audioContext.createGain();
+      source.connect(input).connect(gain).connect(pan).connect(analyser);
+      route={source,input,gain,pan,analyser,samples:new Float32Array(analyser.fftSize)};
       if (!window.SpliceMixer) analyser.connect(audioContext.destination);
       audioNodes.set(element,route);
     }
@@ -240,7 +241,7 @@
     const route=audioNodes.get(element);
     if(!route)return;
     window.SpliceMixer?.releaseRoute(route);
-    route.source.disconnect();route.gain.disconnect();route.pan.disconnect();route.analyser.disconnect();
+    route.source.disconnect();route.input.disconnect();route.gain.disconnect();route.pan.disconnect();route.analyser.disconnect();
     audioNodes.delete(element);
   }
   function setAudio(element,clip) {
@@ -1951,7 +1952,7 @@
       if (!Array.isArray(items) || !items.length) throw Error('Nothing to sync.');
       if (!['mute','keep'].includes(scratch)) throw Error('Choose mute or keep for the camera sound.');
       const made = [];
-      Editor.editProject(next => {
+      Editor.withoutLinks(() => Editor.editProject(next => {
         for (const {pictureId, mediaId, offset} of items) {
           const picture = next.clips.find(clip => clip.id === pictureId && clip.type === 'video');
           const sound = next.media.find(item => item.id === mediaId);
@@ -1971,12 +1972,16 @@
           const clip = {id: uid(), mediaId, type: 'audio', track, start, duration: length, in: inPoint, title: '', volume: 100,
             transition: 'none', linkGroup: group, ...(speed !== 1 ? {speed} : {})};
           picture.linkGroup = group;
-          if (scratch === 'mute') picture.embeddedAudio = false;
+          if (scratch === 'mute') {
+            picture.embeddedAudio = false;
+            for (const member of groupMembers(picture, next)) {
+              if (member.type === 'audio' && member.mediaId === picture.mediaId) member.enabled = false;
+            }
+          }
           next.clips.push(clip);
           made.push(clip.id);
         }
-      });
-      notify();
+      }));
       return made;
     },
     // Master bus EQ and compressor (null removes them).

@@ -75,7 +75,7 @@
     node.connect(bus.output);
   }
   function dynamicsNode(bus, settings) {
-    const node = new AudioWorkletNode(context, 'splice-dynamics', {numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [2],
+    const node = new AudioWorkletNode(context, 'splice-dynamics', {numberOfInputs: 1, numberOfOutputs: 1, channelCount: 2, channelCountMode: 'clamped-max',
       processorOptions: settings});
     node.port.onmessage = ({data}) => {
       if (data?.type !== 'reduction') return;
@@ -116,7 +116,7 @@
     const key = fxKey(clip.audioFx) + map + (mono ? ':mono' : '') + (workletLoaded ? ':w' : '');
     if (route.mixKey !== key) {
       route.mixKey = key;
-      route.source.disconnect();
+      route.input.disconnect();
       if (route.mapNodes) for (const node of route.mapNodes) node.disconnect();
       route.mapNodes = [];
       if (!route.fxBus) {
@@ -126,7 +126,7 @@
       route.fxBus.owner = 'clip:' + clip.id;
       if (MAPS[map]) {
         const split = context.createChannelSplitter(2), merge = context.createChannelMerger(2);
-        route.source.connect(split);
+        route.input.connect(split);
         MAPS[map].forEach((row, out) => row.forEach((weight, input) => {
           if (!weight) return;
           const gain = context.createGain(); gain.gain.value = weight;
@@ -135,7 +135,7 @@
         }));
         merge.connect(route.fxBus.input);
         route.mapNodes.push(split, merge);
-      } else route.source.connect(route.fxBus.input);
+      } else route.input.connect(route.fxBus.input);
       build(route.fxBus, clip.audioFx);
       // A mono track sums the clip to one channel and pans it with the mono law (as the renderer does).
       route.pan.channelCount = mono ? 1 : 2;

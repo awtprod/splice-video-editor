@@ -251,23 +251,28 @@ async function syncCommand(splice) {
     await state(page, () => Editor.editProject(project => {
       const camera = project.media.find(item => item.type === 'video');
       project.clips.push({id: 'pic', mediaId: camera.id, type: 'video', track: 1, start: 2, duration: 12, in: 1, color: {}, volume: 100,
-        transition: 'none', title: ''});
+        transition: 'none', title: '', embeddedAudio:false, linkGroup:'camera-pair'});
+      project.clips.push({id:'scratch', mediaId:camera.id, type:'audio', track:-1, start:2, duration:12, in:1, linkGroup:'camera-pair'});
     }));
     await state(page, () => Editor.select('pic'));
     await page.locator('.edit-menu summary').click();
     await page.locator('.edit-menu [data-command=syncSound]').click();
     const dialog = page.locator('.audio-sync-dialog');
     await dialog.waitFor();
+    const keep = viewport.width === 1180;
+    await dialog.locator('[name=scratch]').selectOption(keep ? 'keep' : 'mute');
     await dialog.locator('[name=method]').selectOption('waveform');
     await dialog.locator('button[type=submit]').click();
     await waitFor(page, () => /synced and linked/.test(document.querySelector('.audio-sync-dialog .audio-sync-results')?.textContent || ''), null, 120000);
     await shot(page, 'sync-dialog');
     const result = await state(page, () => {
       const project = Editor.get().project, picture = project.clips.find(clip => clip.id === 'pic');
-      const sound = project.clips.find(clip => clip.type === 'audio');
-      return {picture, sound, text: document.querySelector('.audio-sync-results').textContent};
+      const sound = project.clips.find(clip => clip.type === 'audio' && clip.id !== 'scratch');
+      return {scratch:project.clips.find(c => c.id === 'scratch'), picture, sound, text: document.querySelector('.audio-sync-results').textContent};
     });
     assert.ok(result.sound, result.text);
+    assert.equal(result.scratch.enabled !== false, keep);
+    assert.equal(result.scratch.linkGroup, result.picture.linkGroup);
     assert.equal(result.sound.linkGroup, result.picture.linkGroup);
     assert.equal(result.picture.embeddedAudio, false, 'the scratch track is turned off');
     const error = (result.sound.in - (result.picture.in + offset))*48000;
@@ -275,6 +280,10 @@ async function syncCommand(splice) {
     assert.ok(Math.abs(error) <= 48, `sync off by ${error.toFixed(1)} samples`);
     assert.equal(result.sound.start, result.picture.start);
     await dialog.locator('[data-close]').click();
+    await page.evaluate(() => Editor.undo());
+    const restored = await page.evaluate(() => Editor.get().project.clips);
+    assert.deepEqual(restored.map(c => c.id), ['pic', 'scratch']);
+    assert.ok(restored.every(c => c.linkGroup === 'camera-pair' && c.enabled !== false));
     assert.deepEqual(errors, []);
     await page.context().close();
   }
@@ -377,6 +386,52 @@ print(json.dumps(out))`, effects));
   await page.context().close();
 }
 
+// A mono signal stays mono through clip dynamics until it reaches the stereo panner.
+async function monoDynamics(splice) {
+  const {page} = await openPage(splice);
+  await page.goto(new URL('audio-mixer.js', page.url()).href);
+  await page.addScriptTag({url:'audio-dsp.js'});
+  await page.addScriptTag({url:'audio-mixer.js'});
+  const levels = await page.evaluate(async () => {
+    const ctx = new OfflineAudioContext(2, 2048, 48000);
+    await SpliceMixer.attach(ctx);
+    const route = {source:ctx.createGain(), input:ctx.createGain(), gain:ctx.createGain(), pan:ctx.createStereoPanner(), analyser:ctx.createAnalyser()};
+    route.source.connect(route.input);
+    route.gain.connect(route.pan).connect(route.analyser);
+    const clip = {id:'mono', track:-1, audioFx:{comp:{ratio:1, makeup:0}}};
+    const project = {clips:[clip]};
+    SpliceMixer.configure(project);
+    SpliceMixer.routeClip(route, clip, project);
+    const source = ctx.createConstantSource();
+    source.offset.value = .1;
+    source.connect(route.source);
+    source.start();
+    const result = await ctx.startRendering();
+    return [0,1].map(channel => result.getChannelData(channel)[1500]);
+  });
+  for (const level of levels) assert.ok(Math.abs(level - .1*Math.SQRT1_2) < .0001, String(levels));
+  await page.context().close();
+}
+
+async function auditionEffects(splice, media) {
+  const {project, waitFor} = lazy();
+  for (const settings of [{reverse:true}, {speed:.125}]) {
+    const {page} = await openPage(splice);
+    await project(page, media);
+    await page.evaluate(settings => {
+      Editor.editProject(p => {
+        const music = p.media.find(item => item.type === 'audio');
+        p.clips = [{id:'audition', mediaId:music.id, type:'audio', track:-1, start:0, duration:6, in:0,
+          channelMap:'right', audioFx:{comp:{threshold:-50, ratio:10}}, ...settings}];
+      });
+      Editor.seek(.2);
+      Editor.togglePlay();
+    }, settings);
+    await waitFor(page, () => (SpliceMixer.reduction('clip:audition')?.comp ?? 0) < -6, null, 15000);
+    await page.context().close();
+  }
+}
+
 // 12 audio tracks, EQ (four bands) and a compressor on every track: live playback long tasks,
 // and the same graph rendered offline to measure how far ahead of real time it runs.
 async function performance12(splice, media) {
@@ -436,5 +491,5 @@ async function performance12(splice, media) {
 }
 
 exports.cases = (process.env.AUDIO_CASES ? process.env.AUDIO_CASES.split(',') : null) ?
-  [eqParity, dynamicsParity, busEffects, inspectorAudio, automation, exportDialog, syncCommand, performance12].filter(fn => process.env.AUDIO_CASES.split(',').includes(fn.name)) :
-  [eqParity, dynamicsParity, busEffects, inspectorAudio, automation, exportDialog, syncCommand, performance12];
+  [eqParity, dynamicsParity, monoDynamics, auditionEffects, busEffects, inspectorAudio, automation, exportDialog, syncCommand, performance12].filter(fn => process.env.AUDIO_CASES.split(',').includes(fn.name)) :
+  [eqParity, dynamicsParity, monoDynamics, auditionEffects, busEffects, inspectorAudio, automation, exportDialog, syncCommand, performance12];
