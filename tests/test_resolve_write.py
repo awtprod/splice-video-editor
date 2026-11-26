@@ -663,3 +663,92 @@ class SeedPathTests(SaveCase):
         result = save.run(self.payload(project, confirm=False), originals=no_kept, scratch=self.dir,
                           resolve_media=lambda src: src[5:])
         self.assertTrue(result['ok'])
+
+
+class StaleStagingTests(SaveCase):
+    CHILD = ('import sys, time\nsys.path.insert(0, {root!r})\nfrom resolve import place\n'
+             's = place.Staging({library!r}, {name!r})\ns.db.write_bytes(b"x" * 4096)\n'
+             'print("ready", flush=True)\ntime.sleep(60)\n')
+
+    def killed_save(self, name):
+        import subprocess
+        code = self.CHILD.format(root=str(ROOT), library=str(self.library), name=name)
+        child = subprocess.Popen([sys.executable, '-c', code], stdout=subprocess.PIPE, text=True)
+        self.assertEqual(child.stdout.readline().strip(), 'ready')
+        child.stdout.close()
+        return child
+
+    def staging(self):
+        return self.library / 'Resolve Projects' / place.STAGING
+
+    def age(self, seconds):
+        for path in self.staging().iterdir():
+            info = path.lstat()
+            os.utime(path, (info.st_atime - seconds, info.st_mtime - seconds), follow_symlinks=False)
+
+    def test_what_a_killed_save_left_is_removed_by_the_next_save(self):
+        before = tree_state(self.library)
+        root = self.library / 'Resolve Projects'
+        child = self.killed_save('Killed one')
+        try:
+            self.age(3600)
+            # A live save's staging is never removed, however old.
+            self.assertEqual(place.clean_stale(root), [])
+            self.assertEqual(len(list(self.staging().iterdir())), 2)
+        finally:
+            child.kill()
+            child.wait()
+        # Killed: the next save removes the old pair when it starts; a young pair stays until it
+        # is older than the safe age ...
+        child = self.killed_save('Killed two')
+        child.kill()
+        child.wait()
+        self.assertEqual(len(list(self.staging().iterdir())), 2)
+        self.assertEqual(place.clean_stale(root), [])
+        self.assertEqual(len(list(self.staging().iterdir())), 2)
+        # ... a link with Splice's naming pointing out of the library is neither followed nor removed.
+        outside = self.dir / 'outside'
+        (outside / 'keep').mkdir(parents=True)
+        (self.staging() / ('build-' + 'a' * 16)).symlink_to(outside, target_is_directory=True)
+        self.age(place.STALE_SECONDS + 1)
+        result = self.run_save(self.payload(self.opened(), name='After the kills'))
+        self.assertTrue(result['written'])
+        self.assertTrue((outside / 'keep').is_dir())
+        self.assertEqual(sorted(p.name for p in self.staging().iterdir()), ['build-' + 'a' * 16])
+        (self.staging() / ('build-' + 'a' * 16)).unlink()
+        place.clean_stale(root)
+        self.assertFalse(self.staging().exists())
+        after = tree_state(self.library)
+        added = sorted(set(after) - set(before))
+        self.assertEqual(added, ['Resolve Projects/Users/guest/Projects/After the kills',
+                                 'Resolve Projects/Users/guest/Projects/After the kills/Project.db'])
+        self.assertEqual({k: after[k] for k in before if not k.endswith('Resolve Projects')},
+                         {k: before[k] for k in before if not k.endswith('Resolve Projects')})
+        self.assertTrue(any('interrupted save' in note for note in result['notes']))
+
+    def test_a_second_save_of_the_same_name_waits_for_a_live_one(self):
+        child = self.killed_save('Same name')
+        try:
+            self.age(3600)
+            with self.assertRaises(place.PlaceError) as caught:
+                place.Staging(self.library, 'Same name')
+            self.assertIn('is running', str(caught.exception))
+        finally:
+            child.kill()
+            child.wait()
+        self.age(3600)
+        staging = place.Staging(self.library, 'Same name')
+        staging.close()
+        self.assertFalse(self.staging().exists())
+
+    def test_the_server_cleans_the_libraries_it_saved_into_when_it_starts(self):
+        from resolve import http as resolve_http
+        child = self.killed_save('Killed')
+        child.kill()
+        child.wait()
+        self.age(3600)
+        with mock.patch('resolve.http._remembered_file', return_value=self.dir / 'known.json'):
+            resolve_http.remember_library(self.library / 'Resolve Projects')
+            resolve_http.remember_library(self.dir / 'gone' / 'Resolve Projects')
+            resolve_http.clean_staging_at_start().join(10)
+        self.assertFalse(self.staging().exists())

@@ -699,6 +699,7 @@ if __name__ == '__main__':
     parser.add_argument('--port', type=int, default=8765)
     args = parser.parse_args()
     server = create_server(args.port)
+    resolve_http.clean_staging_at_start()
     with server:
         signal.signal(signal.SIGTERM,_exit_on_terminate)
         # The first stdout line is the one-time launch link (tests read it).

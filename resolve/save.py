@@ -247,13 +247,14 @@ def _copy_seed(source, target):
     shutil.copyfile(source, target)
 
 
-def run(payload, *, originals, scratch, resolve_media, drp_seed=None):
+def run(payload, *, originals, scratch, resolve_media, drp_seed=None, remember=None):
     """Check (``confirm`` false) or save one request; returns the report as a dict.
 
     ``originals(kind, sha256)`` gives the path of a kept original (a ``Project.db`` copy, or a
     ``.drp``), ``scratch`` is Splice's private folder, ``resolve_media(src)`` the local file of a
     Splice media URL, ``drp_seed(drp path, schema donor, target)`` makes a ``Project.db`` of a
-    ``.drp``."""
+    ``.drp``; ``remember(Resolve Projects folder)`` notes a library a save stages in (so
+    the server can clean up after a killed save when it starts again)."""
     request = Request(payload)
     report = Report()
     library, _root, users = library_users(request.library)
@@ -263,6 +264,8 @@ def run(payload, *, originals, scratch, resolve_media, drp_seed=None):
     private = None
     try:
         if request.confirm:
+            if remember is not None:
+                remember(_root)
             staging = Staging(library, request.name, user)
             target = staging.db
         else:
@@ -274,6 +277,9 @@ def run(payload, *, originals, scratch, resolve_media, drp_seed=None):
         result['library'] = str(library)
         result['user'] = user
         if request.confirm:
+            if staging.cleaned:
+                report.notes.append(f'Removed {len(staging.cleaned)} item(s) an interrupted save had left in the '
+                                    'library\'s staging folder.')
             placed = staging.finish()
             result['notes'] = result.get('notes', []) + staging.notes
             result['written'] = True

@@ -18,20 +18,33 @@ opened:
   which cannot replace a project folder that holds a file). Two saves of names that fold alike
   are serialised by an exclusive lock file; the second fails cleanly.
 * On every failure path the build folder and the lock are removed, so nothing is left in the
-  library; what cannot be removed is named in the error.
+  library; what cannot be removed is named in the error. A save that is killed cannot clean up,
+  so every save first removes what interrupted saves left (:func:`clean_stale`): only Splice's
+  own ``build-*`` folders and ``lock-*`` files, only once they are older than
+  :data:`STALE_SECONDS` and no live save holds their lock (each save holds an ``flock`` on its
+  lock file, which names its build folder), never following a link; the staging folder itself
+  goes when it is empty. The server does the same at start for the libraries it saved into.
 """
 import errno
 import os
+import re
 import secrets
 import shutil
 import stat
 import sys
+import time
 import unicodedata
 from pathlib import Path
 
 from .source import ResolveError
 
 STAGING = '.splice-staging'
+#: Staging entries left by an interrupted save are removed once they are this old and no live
+#: save holds their lock (where the file system has no working ``flock``, only after a day).
+STALE_SECONDS = 30
+STALE_SECONDS_UNLOCKABLE = 24 * 3600
+_BUILD = re.compile(r'build-[0-9a-f]{16}\Z')
+_LOCK = re.compile(r'lock-[0-9a-f]{32}\Z')
 MAX_NAME = 200
 _FORBIDDEN = set('\\/:*?"<>|')
 _RESERVED = {'CON', 'PRN', 'AUX', 'NUL', 'CONIN$', 'CONOUT$'} | {f'{p}{n}' for p in ('COM', 'LPT') for n in
@@ -274,6 +287,103 @@ def move_no_replace(folder, target):
     os.rename(folder, target)
 
 
+def _held(path):
+    """Whether a live process holds the ``flock`` of the lock file ``path``: True, False, or None
+    where the file system cannot tell (no ``fcntl``, or ``flock`` refused)."""
+    try:
+        import fcntl
+    except ImportError:
+        return None
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
+    except OSError:
+        return None
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        except OSError:
+            return None
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
+def _read_lock(path):
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
+    except OSError:
+        return ''
+    try:
+        return os.read(fd, 256).decode('ascii', 'replace').strip()
+    finally:
+        os.close(fd)
+
+
+def clean_stale(root, *, now=None, age=None):
+    """Remove what interrupted saves left in ``<Resolve Projects>/.splice-staging`` (see the module
+    notes); returns the names removed. Never raises for an entry it cannot remove."""
+    staging = Path(root) / STAGING
+    removed = []
+    try:
+        info = os.lstat(staging)
+    except OSError:
+        return removed
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or \
+            (hasattr(os, 'getuid') and info.st_uid != os.getuid()):
+        return removed
+    now = time.time() if now is None else now
+    try:
+        # Build folders are listed before the locks are read: a save makes (and holds) its lock,
+        # naming its build folder, before it makes the folder, so a folder listed here whose save
+        # is alive is named by a held lock below.
+        builds = [e for e in os.scandir(staging) if _BUILD.match(e.name)]
+        locks = [e for e in os.scandir(staging) if _LOCK.match(e.name)]
+    except OSError:
+        return removed
+    live = set()
+    for entry in locks:
+        try:
+            st = os.lstat(entry.path)
+        except OSError:
+            continue
+        if not stat.S_ISREG(st.st_mode) or (hasattr(os, 'getuid') and st.st_uid != os.getuid()):
+            continue
+        held = _held(entry.path)
+        limit = STALE_SECONDS_UNLOCKABLE if held is None else (STALE_SECONDS if age is None else age)
+        if held or now - st.st_mtime < limit:
+            live.add(_read_lock(entry.path))
+            continue
+        try:
+            os.unlink(entry.path)
+            removed.append(entry.name)
+        except OSError:
+            live.add(_read_lock(entry.path))
+    unlockable = any(_held(e.path) is None for e in locks if os.path.lexists(e.path))
+    for entry in builds:
+        try:
+            st = os.lstat(entry.path)
+        except OSError:
+            continue
+        if not stat.S_ISDIR(st.st_mode) or (hasattr(os, 'getuid') and st.st_uid != os.getuid()):
+            continue  # a link or anything not Splice's own: left alone
+        limit = STALE_SECONDS_UNLOCKABLE if unlockable else (STALE_SECONDS if age is None else age)
+        if entry.name in live or now - st.st_mtime < limit:
+            continue
+        try:
+            shutil.rmtree(entry.path)  # removes links inside, never follows them
+            removed.append(entry.name)
+        except OSError:
+            continue
+    try:
+        os.rmdir(staging)
+    except OSError:
+        pass
+    return removed
+
+
 class Staging:
     """A build folder in the library's staging folder, holding the project folder under its new
     name, and the lock of the name; removed on every path by :meth:`close`."""
@@ -287,11 +397,13 @@ class Staging:
         if not os.access(self.projects, os.W_OK | os.X_OK) or not os.access(self.root, os.W_OK | os.X_OK):
             raise PlaceError('The library is not writable by Splice (no permission to add a project).')
         self.staging = self.root / STAGING
-        self.lock = self.work = None
+        self.lock = self.work = self.lock_fd = None
         self.placed = None
+        self.cleaned = clean_stale(self.root)
         try:
-            self._lock()
-            self.work = self.staging / ('build-' + secrets.token_hex(8))
+            build = 'build-' + secrets.token_hex(8)
+            self._lock(build)
+            self.work = self.staging / build
             os.mkdir(self.work, 0o700)
             if os.stat(self.work).st_dev != os.stat(self.projects).st_dev:
                 raise PlaceError('The staging folder is on another file system than the projects, so the project '
@@ -305,9 +417,11 @@ class Staging:
             self.close()
             raise
 
-    def _lock(self):
-        """Make (or use) the staging folder and take the lock of the name. Another save that
-        removes the empty staging folder meanwhile is answered by making it again."""
+    def _lock(self, build):
+        """Make (or use) the staging folder and take the lock of the name: a new file, held with
+        ``flock`` for as long as this save runs and naming its build folder (so a later save can
+        tell a live save's staging from what a killed one left). Another save that removes the
+        empty staging folder meanwhile is answered by making it again."""
         import hashlib
         lock = self.staging / ('lock-' + hashlib.sha256(fold_name(self.name).encode()).hexdigest()[:32])
         for _attempt in range(8):
@@ -321,13 +435,18 @@ class Staging:
             try:
                 fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o600)
             except FileExistsError:
-                raise PlaceError(f'Another save of a project named “{self.name}” is running (or one was interrupted: '
-                                 'if no save is running, remove the lock file in “Resolve Projects/.splice-staging”).'
-                                 ) from None
+                raise PlaceError(f'Another save of a project named “{self.name}” is running. Try again when it has '
+                                 'finished (what an interrupted save left is removed after '
+                                 f'{STALE_SECONDS} seconds).') from None
             except FileNotFoundError:
                 continue  # the staging folder was removed by a save that just finished
-            os.close(fd)
-            self.lock = lock
+            self.lock, self.lock_fd = lock, fd
+            try:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (ImportError, OSError):
+                pass  # no flock here: stale entries are then removed by age only
+            os.write(fd, build.encode('ascii'))
             return
         raise PlaceError('The library\'s staging folder keeps disappearing; try the save again.')
 
@@ -384,6 +503,9 @@ class Staging:
                 pass
             except OSError:
                 left.append(str(self.lock))
+        if self.lock_fd is not None:
+            os.close(self.lock_fd)  # releases the flock
+            self.lock_fd = None
         try:
             os.rmdir(self.staging)
         except OSError:
