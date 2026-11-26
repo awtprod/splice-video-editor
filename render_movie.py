@@ -33,12 +33,13 @@ MAX_CAPTIONS = 50_000
 MAX_KEYFRAMES = 100
 AUDIO_RATE = 48000
 # Audio is mixed in bounded chunks: each FFmpeg run reads only the source
-# ranges its chunk needs. The preroll lets stateful filters (the limiter,
-# tempo, resampling) settle before the chunk's first kept sample.
+# ranges its chunk needs. Events with state (tempo, resampling, effects) are
+# pre-rendered whole, so the chunks themselves only trim, gain, pan and sum;
+# the program is limited and normalized as a whole afterwards (audio_loudness).
 AUDIO_CHUNK_SECONDS = 60
 AUDIO_CHUNK_EVENTS = 32
-AUDIO_PREROLL_SECONDS = 0.5   # 10x the limiter's release time
-AUDIO_POSTROLL_SECONDS = 0.1  # the limiter looks ahead past the chunk's last sample
+AUDIO_PREROLL_SECONDS = 0.5   # a chunk starts this early (a range export's first events)
+AUDIO_POSTROLL_SECONDS = 0.1  # and reads this far past its last sample
 AUDIO_SHARED_INPUT_SECONDS = 60
 # atempo drops its last fragment; read this much more source (in output seconds).
 TEMPO_TAIL_SECONDS = 0.25
@@ -62,12 +63,11 @@ VIDEO_WINDOW_CUTS = 24
 REVERSE_BUFFER_BYTES = 768 * 1024 * 1024
 DEFAULT_STALL_SECONDS = 300
 DEFAULT_LIMITER_CEILING_DB = -1.0
-# Lossy (AAC) deliveries limit true peak (4x oversampled) before the encoder.
-# The encoder adds overshoot of its own (about 2 dB on some programs): the
-# decoded file is measured once and reported, with a warning when it is over
-# the ceiling. Only the opt-in aacPeakSafe option lowers the whole program to
-# fit, in fixed steps from the measured excess.
-TRUE_PEAK_OVERSAMPLE = 4
+# Every delivery is true-peak limited (4x oversampled, audio_loudness). AAC
+# adds overshoot of its own (about 2 dB on some programs): the decoded file is
+# measured and reported, with a warning when it is over the ceiling. Only the
+# opt-in aacPeakSafe option lowers the whole program to fit, in fixed steps
+# from the measured excess.
 AAC_PEAK_ATTEMPTS = 6
 AAC_PEAK_STEP_DB = .5
 # A disabled clip next to a transition is kept as a transparent stand-in with
