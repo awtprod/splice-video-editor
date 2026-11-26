@@ -13,7 +13,8 @@ window.SpliceDelivery = (() => {
     frame: 'Frame number', watermark: 'Watermark'};
 
   async function json(url, init) {
-    const response = await fetch(url, {signal: AbortSignal.timeout(120000), ...init});
+    const timeout = AbortSignal.timeout(120000);
+    const response = await fetch(url, {...init, signal: init?.signal ? AbortSignal.any([init.signal, timeout]) : timeout});
     let body;
     try {
       body = await response.json();
@@ -23,7 +24,7 @@ window.SpliceDelivery = (() => {
     if (!response.ok) { const error = new Error(body.error || response.statusText); error.status = response.status; error.body = body; throw error; }
     return body;
   }
-  const post = (url, body) => json(url, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+  const post = (url, body, signal) => json(url, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body), signal});
   function capabilities(refresh = false) {
     if (refresh || !loading) loading = json('/api/delivery/capabilities' + (refresh ? '?refresh=1' : '')).then(value => (table = value))
       .catch(error => { loading = null; throw error; });
@@ -110,7 +111,7 @@ window.SpliceDelivery = (() => {
     burnPosition.value = 'bottom-center'; namePosition.value = 'top-left';
     const burnSize = el('input', {name: 'burnSize', type: 'number', min: 2, max: 10, step: 1, value: 4});
     const watermark = el('input', {name: 'watermark', type: 'text', maxLength: 80, placeholder: 'e.g. CONFIDENTIAL · Review copy'});
-    const watermarkOpacity = el('input', {name: 'watermarkOpacity', type: 'number', min: 5, max: 100, step: 1, value: 30});
+    const watermarkOpacity = el('input', {name: 'watermarkOpacity', type: 'number', min: 5, max: 100, step: 1, defaultValue: 30});
     const safeMargins = el('input', {name: 'safeMargins', type: 'checkbox'});
     burnGroup.append(field('Timecode position', burnPosition), field('Clip name position', namePosition), field('Text size (% of height)', burnSize),
       field('Watermark text', watermark), field('Watermark opacity (%)', watermarkOpacity), field('Safe-area guides', safeMargins, {className: 'export-check'}),
@@ -281,6 +282,8 @@ window.SpliceDelivery = (() => {
       if (encoder.value !== 'software') opts.encoder = encoder.value;
       if (codecInfo.rateModes.length) {
         if (rateControl.value !== 'crf') { opts.rateControl = rateControl.value; opts.videoBitrate = videoBitrate.valueAsNumber; }
+        // Custom H.264 qualities use the delivery CRF range, including values outside the legacy dialog's range.
+        else if (codec.value === 'h264' && !QUALITY.h264.some(([value]) => value === form.elements.quality.value)) opts.rateControl = 'crf';
         if (encoder.value === 'software' && speed.value !== DEFAULT_SPEED[codec.value]) opts.speed = speed.value;
       }
       if (alpha.checked) opts.alpha = true;
@@ -318,6 +321,7 @@ window.SpliceDelivery = (() => {
       for (const [key, box] of Object.entries(burnChecks)) box.checked = (burn.fields || []).includes(key);
       burnPosition.value = burn.position || 'bottom-center'; namePosition.value = burn.clipNamePosition || 'top-left';
       burnSize.value = burn.size || 4; watermark.value = burn.watermark || ''; safeMargins.checked = !!burn.safeMargins;
+      watermarkOpacity.value = burn.watermarkOpacity ?? watermarkOpacity.defaultValue;
       if (options.outputSize === 'half') sizeSelect.value = 'half';
       else if (options.outputSize) { sizeSelect.value = 'custom'; outWidth.value = options.outputSize.width; outHeight.value = options.outputSize.height; }
       else sizeSelect.value = '';
@@ -361,21 +365,26 @@ window.SpliceDelivery = (() => {
     form.addEventListener('input', event => { if (event.target.type === 'number' || event.target.type === 'text') sync(); });
 
     /* Announce conversions, unsupported combinations and unavailable encoders before rendering. */
-    let checkTimer = 0, checkSerial = 0, blocking = [];
+    let checkTimer = 0, checkSerial = 0;
     function scheduleCheck() { clearTimeout(checkTimer); checkTimer = setTimeout(check, 150); }
-    async function check() {
+    async function check(request = context.requestOptions(), signal) {
+      clearTimeout(checkTimer);
       const serial = ++checkSerial;
-      const request = {...options(), codec: codec.value};
       let result;
-      try { result = await post('/api/delivery/check', {options: request, sequence: {width: project.width, height: project.height, fps: project.fps}}); }
-      catch (error) { result = {problems: [error.message], conversions: [], unavailable: ''}; }
-      if (serial !== checkSerial) return;
-      blocking = [...result.problems, ...(result.unavailable ? ['Not available on this machine: ' + result.unavailable] : [])];
-      notices.replaceChildren(...blocking.map(text => el('li', {className: 'export-problem', textContent: text})),
-        ...result.conversions.map(text => el('li', {className: 'export-conversion', textContent: text})));
-      notices.hidden = !notices.childElementCount;
+      try { result = await post('/api/delivery/check', {options: request, sequence: {width: project.width, height: project.height, fps: project.fps}}, signal); }
+      catch (error) {
+        if (signal?.aborted) throw error;
+        result = {problems: [error.message], conversions: [], unavailable: ''};
+      }
+      const blocking = [...result.problems, ...(result.unavailable ? ['Not available on this machine: ' + result.unavailable] : [])];
+      if (serial === checkSerial) {
+        notices.replaceChildren(...blocking.map(text => el('li', {className: 'export-problem', textContent: text})),
+          ...result.conversions.map(text => el('li', {className: 'export-conversion', textContent: text})));
+        notices.hidden = !notices.childElementCount;
+      }
+      return blocking[0] || '';
     }
-    context.validate = () => blocking.length ? blocking[0] : '';
+    context.validate = check;
     context.deliveryOptions = options;
     context.queueOnly = () => info()?.kind === 'images' || (codec.value !== 'wav' && context.captionsInRange() &&
       (srt.checked || vtt.checked || container.value === 'mxf'));
@@ -394,11 +403,11 @@ window.SpliceDelivery = (() => {
     const sessionOptionKeys = ['range', 'limiter', 'limiterCeiling', 'aacPeakSafe', 'subtitleLanguage'];
     const currentOptions = () => context.requestOptions();
     addQueue.onclick = async () => {
-      await check();
-      const problem = context.validate() || context.formProblem();
+      const options = currentOptions();
+      const problem = context.formProblem() || await check(options);
       if (problem) { context.status(problem); return; }
       try {
-        await queue([{options: currentOptions(), name: outName.value.trim() || project.name, preset: findPreset(preset.value)?.name || ''}]);
+        await queue([{options, name: outName.value.trim() || project.name, preset: findPreset(preset.value)?.name || ''}]);
         context.status('Added to the render queue.');
         queuePanel();
       } catch (error) { context.status(error.message); }

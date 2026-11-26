@@ -177,8 +177,6 @@ window.SpliceDialogs = (() => {
       e.preventDefault();if(controller)return;
       syncAudio();
       if(!form.checkValidity()){form.reportValidity();return;}
-      const blocked=delivery.validate?.();
-      if(blocked){status.textContent=blocked;return;}
       controller=new AbortController();renderWarnings=[];renderReport={};showReport(null,[]);render.disabled=true;cancel.textContent='Cancel render';progress.hidden=false;
       const settings=[form.elements.codec,form.elements.colorSpace,form.elements.quality,form.elements.rangeMode,...rangeFields,audioGroup,
         ...form.querySelectorAll('.export-format,.export-group,.export-preset-row,.export-queue-row')];
@@ -190,6 +188,8 @@ window.SpliceDialogs = (() => {
           // Deliver multi-file exports together in the selected output folder.
           await delivery.renderViaQueue();progress.hidden=true;return;
         }
+        const blocked=await delivery.validate?.(opts,controller.signal);
+        if(blocked){status.textContent=blocked;progress.hidden=true;return;}
         const result=await Editor.exportVideo(opts,job=>{
           renderWarnings=Array.isArray(job.warnings)?job.warnings:[]; renderReport=job.report||{}; progress.value=job.progress;status.textContent='Rendering · '+Math.round(100*job.progress)+'%';
         },controller.signal);

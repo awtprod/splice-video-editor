@@ -180,12 +180,40 @@ async function main() {
     await waitFor(page, () => /DNxHR needs/.test(document.querySelector('.studio-dialog[data-dialog=export] .render-state').textContent));
     await shot(page, 'delivery-export-refused');
     await page.locator(`${dialog} select[name=outputSize]`).selectOption('');
-    // Saving the current settings as a preset (named through prompt()).
-    await page.locator(`${dialog} select[name=preset]`).selectOption('youtube-1080');
-    await page.locator(`${dialog} select[name=preset]`).selectOption('');
-    await page.locator(`${dialog} select[name=codec]`).selectOption('h264');
+    // An imported custom quality and watermark survive apply, save, direct render and queueing.
+    const imported = {name:'Watermarked master', options:{codec:'h264', profile:'high', crf:10,
+      burnIns:{fields:['watermark'], watermark:'Review', watermarkOpacity:10}}};
+    await page.locator(`${dialog} button`, {hasText:'Manage…'}).click();
+    const manager = page.locator('.studio-dialog[data-dialog=presets]');
+    await manager.locator('input[type=file]').setInputFiles({name:'master.json', mimeType:'application/json',
+      buffer:Buffer.from(JSON.stringify(imported))});
+    await manager.getByText('Imported 1 preset.').waitFor();
+    await manager.getByRole('button', {name:'Close'}).click();
+    const presets = page.locator(`${dialog} select[name=preset]`);
+    await presets.selectOption({label:imported.name});
+    const saving = page.waitForResponse(res => res.url().endsWith('/api/delivery/presets') && res.request().method() === 'POST');
     await page.locator(`${dialog} .export-preset-row button`, {hasText: 'Save preset'}).click();
+    const saved = await saving;
+    const copy = saved.request().postDataJSON().presets.find(item => item.name === 'Client review').options;
+    assert.deepEqual({accepted:saved.ok(), crf:copy.crf, opacity:copy.burnIns.watermarkOpacity},
+      {accepted:true, crf:10, opacity:10});
     await waitFor(page, () => [...document.querySelector('.studio-dialog[data-dialog=export] select[name=preset]').options].some(o => o.textContent === 'Client review'));
+    await presets.selectOption('proxy-prores');
+    const opacity = page.locator(`${dialog} [name=watermarkOpacity]`);
+    assert.equal(await opacity.inputValue(), '30');
+    // Apply the saved preset and render before the old DNxHR validation message refreshes.
+    await page.locator(`${dialog} [name=codec]`).selectOption('dnxhr');
+    await page.locator(`${dialog} select[name=outputSize]`).selectOption('custom');
+    await page.locator(`${dialog} .export-problem`, {hasText:'DNxHR needs'}).waitFor();
+    const [rendered] = await Promise.all([page.waitForEvent('download', {timeout:120000}), (async () => {
+      await presets.selectOption({label:'Client review'});
+      await page.locator(`${dialog} [type=submit]`).click();
+      await waitFor(page, () => !document.querySelector('.studio-dialog[data-dialog=export] [type=submit]').disabled, null, 120000);
+      assert.match(await page.locator(`${dialog} .render-state`).textContent(), /MP4 exported/);
+    })()]);
+    assert.equal(await opacity.inputValue(), '10');
+    await shot(page, 'delivery-restored-preset');
+    if (evidence) await rendered.saveAs(path.join(evidence, 'watermarked-master.mp4'));
 
     // Queue: pause it, add two jobs and a batch of two presets, reorder, hold and cancel.
     await page.locator(`${dialog} .export-open-queue`).click();
