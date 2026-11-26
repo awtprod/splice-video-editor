@@ -2,7 +2,7 @@
   "name": "splice-linux",
   "private": true,
   "scripts": {
-    "test": "python3 -m unittest discover -s tests && node tests/track-lock.cjs && node tests/scopes-flow.cjs && node tests/studio-flow.cjs && node tests/restart-flow.cjs && node tests/media-link-flow.cjs && node tests/media-cache-flow.cjs && node tests/recovery-retention.cjs && node tests/resolve-flow.cjs && node tests/interchange-flow.cjs && node tests/editing-core.cjs && node tests/editing-round1.cjs && node tests/editing-integration.cjs && node tests/editing-scale.cjs && node tests/editor-ux.cjs && node tests/clip-enable.cjs && node tests/disabled-parity.cjs && node tests/editor-followups.cjs && node tests/panel-layout.cjs"
+    "test": "python3 -m unittest discover -s tests && node tests/track-lock.cjs && node tests/scopes-flow.cjs && node tests/studio-flow.cjs && node tests/restart-flow.cjs && node tests/media-link-flow.cjs && node tests/media-cache-flow.cjs && node tests/recovery-retention.cjs && node tests/resolve-flow.cjs && node tests/resolve-save-flow.cjs && node tests/interchange-flow.cjs && node tests/editing-core.cjs && node tests/editing-round1.cjs && node tests/editing-integration.cjs && node tests/editing-scale.cjs && node tests/editor-ux.cjs && node tests/export-audio-dialog.cjs && node tests/clip-enable.cjs && node tests/disabled-parity.cjs && node tests/editor-followups.cjs && node tests/panel-layout.cjs"
   },
   "devDependencies": {"playwright-core":"1.65.1"}
 }

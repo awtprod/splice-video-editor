@@ -65,9 +65,17 @@ window.SpliceResolve = (() => {
     const issues = project.compatibilityWarnings?.length || 0;
     // What came in disabled, hidden, muted or locked, and where linked media is: from the importer.
     const summary = (project.resolveSource?.summary || []).filter(line => typeof line === 'string').slice(0, 4);
-    const parts = [extra, ...summary, issues ? 'Opened from Resolve. ' + issues + ' item' + (issues === 1 ? '' : 's') + ' listed in File → Project compatibility.' : ''];
+    const parts = [extra, ...summary, issues ? 'Opened from Resolve. ' + issues + ' item' + (issues === 1 ? '' : 's') + ' listed in File → Resolve compatibility details.' : ''];
     const notice = parts.filter(Boolean).join(' ');
-    if (notice) toast(notice, extra || summary.length ? 12 : 6);
+    if (notice) {
+      const node = toast(notice, extra || summary.length || issues ? 12 : 6);
+      if (issues) {
+        const more = document.createElement('button');
+        more.type = 'button'; more.textContent = 'Details…'; more.dataset.compatibility = '';
+        more.onclick = () => { node.remove(); showCompatibility(project); };
+        node.append(' ', more);
+      }
+    }
   }
   // A fresh open of a Resolve project: every timeline's working copy belongs to this open.
   function fresh(project) {
@@ -97,6 +105,49 @@ window.SpliceResolve = (() => {
   async function pickFolder(initial = '') {
     if (!window.SpliceLink?.pickFolder) return null;
     return window.SpliceLink.pickFolder({title:'Choose the Resolve library folder', initial});
+  }
+  // A grouped line's places (clips): the first SHOWN, and a button that shows the rest.
+  const SHOWN = 20;
+  function placesList(places, summaryText) {
+    const details = document.createElement('details'), summary = document.createElement('summary');
+    summary.textContent = summaryText;
+    const list = document.createElement('ol');
+    const add = items => { for (const place of items) { const li = document.createElement('li'); li.textContent = place; list.append(li); } };
+    add(places.slice(0, SHOWN));
+    details.append(summary, list);
+    if (places.length > SHOWN) {
+      const more = document.createElement('button');
+      more.type = 'button'; more.dataset.showAll = ''; more.textContent = 'Show all ' + places.length;
+      more.onclick = () => { add(places.slice(SHOWN)); more.remove(); };
+      details.append(more);
+    }
+    return details;
+  }
+  // File → Resolve compatibility details: every grouped line of the open timeline's import, each
+  // with the clips it stands for on demand.
+  function showCompatibility(project = Editor.get().project) {
+    const warnings = (project?.compatibilityWarnings || []).filter(line => typeof line === 'string');
+    const details = project?.compatibilityDetails && typeof project.compatibilityDetails === 'object' ? project.compatibilityDetails : {};
+    if (!project?.resolveSource) { toast('This timeline was not opened from Resolve.'); return null; }
+    const node = document.createElement('dialog');
+    node.className = 'studio-dialog resolve-library resolve-compatibility';
+    node.innerHTML = '<h2>Resolve compatibility details</h2><p class="resolve-note">What Splice did not import from the ' +
+      'Resolve project, one line per kind. Open a line to see the clips it stands for.</p><div class="resolve-report"><ul></ul></div>' +
+      '<footer><button type="button" data-close>Close</button></footer>';
+    const list = node.querySelector('ul');
+    if (!warnings.length) list.innerHTML = '<li>Nothing: everything in this timeline was imported.</li>';
+    for (const line of warnings) {
+      const item = document.createElement('li'), text = document.createElement('span');
+      text.textContent = line; item.append(text);
+      const places = Array.isArray(details[line]) ? details[line].filter(place => typeof place === 'string') : [];
+      if (places.length) item.append(placesList(places, places.length + ' clip' + (places.length === 1 ? '' : 's')));
+      list.append(item);
+    }
+    document.body.append(node);
+    node.addEventListener('close', () => node.remove(), {once:true});
+    node.querySelector('[data-close]').onclick = () => node.close();
+    node.showModal();
+    return node;
   }
   const when = seconds => seconds ? new Date(seconds * 1000).toLocaleString() : 'Unknown';
   function openLibrary() {
@@ -233,10 +284,201 @@ window.SpliceResolve = (() => {
     }
     await load(project, extra);
   }
+  // ---------------------------------------------------------------- save to a Resolve library
+  // File → Save to Resolve library…: the open timeline (and any other timeline of the same Resolve
+  // project edited in this session) written as a NEW project in a disk library. The server checks
+  // and reports first; nothing is written until the report is confirmed. The seed is the Resolve
+  // project the timeline came from (its original, kept since it was opened), or a template
+  // project the user picks in the library.
+  const SAVE_KEYS = {library:'splice.resolveLibrary', map:'splice.resolvePathMap'};
+  function parsePathMap(text) {
+    const rules = [];
+    for (const [index, raw] of String(text || '').split(/\r?\n/).entries()) {
+      const line = raw.trim();
+      if (!line || line.startsWith('#')) continue;
+      const parts = line.split('=>');
+      if (parts.length !== 2 || !parts[0].trim() || !parts[1].trim())
+        throw Error('Path mapping line ' + (index + 1) + ': write it as "from folder => to folder".');
+      rules.push({from:parts[0].trim(), to:parts[1].trim()});
+    }
+    return rules;
+  }
+  async function editedTimelines(current) {
+    // The open timeline first, then other timelines of the same open that have a working copy.
+    const source = current.resolveSource, out = [{project:current, label:current.name, open:true}];
+    if (!source?.openId) return out;
+    const ids = current.resolveTimelineIds || [], labels = current.resolveTimelines || [];
+    for (const [index, id] of ids.entries()) {
+      if (id === source.timelineId) continue;
+      const project = await working(source.openId, id).catch(() => undefined);
+      if (project) out.push({project, label:labels[index] || project.name, open:false});
+    }
+    return out;
+  }
+  async function ensureSeed(source) {
+    if (source.format !== 'drp') return;
+    const blob = await recall(source.sha256).catch(() => undefined);
+    if (!blob) throw Error('Open the .drp file again: this browser no longer holds it, and it is the seed of the save.');
+    const {sha256} = await post('/api/resolve/seed', await blob.arrayBuffer());
+    if (sha256 !== source.sha256) throw Error('The kept .drp does not match the project that was opened.');
+  }
+  function reportTable(result) {
+    const wrap = document.createElement('div');
+    wrap.className = 'resolve-report';
+    const groups = [['written', 'Written'], ['opt-in', 'Needs your permission'], ['not written', 'Not written']];
+    for (const [status, title] of groups) {
+      const lines = (result.lines || []).filter(line => line.status === status);
+      if (!lines.length) continue;
+      const heading = document.createElement('h3'); heading.textContent = title; heading.dataset.status = status;
+      const list = document.createElement('ul');
+      for (const line of lines) {
+        const item = document.createElement('li'); item.dataset.status = status;
+        const what = document.createElement('span'); what.textContent = line.what + (line.count > 1 ? ' — ' + line.count : '');
+        item.append(what);
+        if (line.all?.length)
+          item.append(placesList(line.all, line.examples.join(' · ') + (line.all.length > line.examples.length ? ' …' : '')));
+        list.append(item);
+      }
+      wrap.append(heading, list);
+    }
+    return wrap;
+  }
+  async function saveToLibrary() {
+    const state = Editor.get(), current = state.project, source = current.resolveSource;
+    const timelines = await editedTimelines(current);
+    const node = document.createElement('dialog');
+    node.className = 'studio-dialog resolve-library resolve-save';
+    node.innerHTML = '<h2>Save to Resolve library</h2><form>' +
+      '<div class="resolve-path"><label>Library folder<input name="library" required autocomplete="off" spellcheck="false" ' +
+      'placeholder="Folder that holds “Resolve Projects”"></label><button type="button" data-browse>Browse…</button>' +
+      '<button type="button" data-list>Read library</button></div>' +
+      '<label data-user hidden>Resolve user<select name="user"></select></label>' +
+      '<label>New project name<input name="name" required maxlength="200" autocomplete="off"></label>' +
+      '<fieldset data-seed><legend>Made from</legend></fieldset>' +
+      '<fieldset data-timelines><legend>Timelines</legend></fieldset>' +
+      '<details><summary>Path mapping (optional)</summary><p class="resolve-note">Where the Resolve computer sees your media, ' +
+      'one “from folder => to folder” per line. Where several rules match a path, the longest “from” folder wins, '
+      + 'whatever the order (<code>/mnt/media</code> before <code>/mnt</code>).</p><textarea name="pathMap" rows="3" spellcheck="false" ' +
+      'placeholder="/mnt/shoot => E:\\Shoot"></textarea></details>' +
+      '<label class="resolve-check"><input type="checkbox" name="unverified"> Allow media kinds Resolve has not been ' +
+      'verified to take (they are listed in the report)</label>' +
+      '<label class="resolve-check"><input type="checkbox" name="unproven"> Allow changes whose bytes are not proven ' +
+      '(track lock/mute, position X, a seed made from a .drp)</label>' +
+      '<p role="status" class="resolve-status"></p><div data-report></div>' +
+      '<footer><button type="button" data-close>Close</button><button type="button" data-check>Check</button>' +
+      '<button type="button" class="primary" data-save disabled>Save new project</button></footer></form>';
+    document.body.append(node);
+    node.addEventListener('close', () => node.remove(), {once:true});
+    const form = node.querySelector('form'), status = node.querySelector('[role=status]');
+    const fields = form.elements, reportNode = node.querySelector('[data-report]');
+    const saveButton = node.querySelector('[data-save]'), seedBox = node.querySelector('[data-seed]');
+    fields.library.value = localStorage.getItem(SAVE_KEYS.library) || '';
+    fields.pathMap.value = localStorage.getItem(SAVE_KEYS.map) || '';
+    fields.name.value = ((source?.project || current.name || 'Project') + ' (Splice)').slice(0, 200);
+    if (source?.sha256) {
+      const note = document.createElement('p');
+      note.className = 'resolve-note';
+      note.textContent = 'The Resolve project this timeline came from (' + (source.project || source.name || 'original') +
+        '): everything Splice did not change is carried over from it unchanged.';
+      seedBox.append(note);
+    } else {
+      seedBox.innerHTML = '<p class="resolve-note">This timeline did not come from Resolve. Pick a project in the library ' +
+        'as the template: Resolve settings, color management and bins come from it, and its one timeline holds your cut.</p>' +
+        '<label>Template project<select name="template"><option value="">Read the library first</option></select></label>' +
+        '<label class="resolve-check"><input type="checkbox" name="keepMedia"> Keep the template’s media in the new project</label>';
+    }
+    const timelineBox = node.querySelector('[data-timelines]');
+    for (const [index, entry] of timelines.entries()) {
+      const label = document.createElement('label'), box = document.createElement('input');
+      label.className = 'resolve-check'; box.type = 'checkbox'; box.name = 'timeline'; box.value = String(index);
+      box.checked = entry.open;
+      label.append(box, ' ' + entry.label + (entry.open ? ' (open)' : ' (edited earlier)'));
+      timelineBox.append(label);
+    }
+    if (!source?.sha256) timelineBox.hidden = true;
+    let checked = null, busy = false;
+    const stale = () => { checked = null; saveButton.disabled = true; };
+    form.addEventListener('input', stale);
+    form.addEventListener('change', stale);
+    node.querySelector('[data-close]').onclick = () => node.close();
+    async function readLibrary() {
+      status.textContent = 'Reading the library…';
+      const {projects, users} = await post('/api/resolve/library/list', {path:fields.library.value}, true);
+      localStorage.setItem(SAVE_KEYS.library, fields.library.value);
+      const userBox = node.querySelector('[data-user]');
+      fields.user.replaceChildren(...(users || []).map(user => new Option(user, user)));
+      userBox.hidden = (users || []).length < 2;
+      if (fields.template) {
+        fields.template.replaceChildren(new Option('Choose a project…', ''), ...projects.filter(p => !p.error)
+          .map(p => new Option(p.name + (p.timelines != null ? ' · ' + p.timelines + ' timeline(s)' : ''), p.path)));
+      }
+      status.textContent = projects.length + ' project(s) in the library.';
+    }
+    node.querySelector('[data-browse]').onclick = async () => {
+      const picked = await pickFolder(fields.library.value);
+      if (picked) { fields.library.value = picked; stale(); await readLibrary().catch(error => { status.textContent = error.message; }); }
+    };
+    node.querySelector('[data-list]').onclick = () => readLibrary().catch(error => { status.textContent = error.message; });
+    function request(confirm) {
+      const chosen = [...form.querySelectorAll('input[name=timeline]:checked')].map(box => timelines[Number(box.value)].project);
+      const payload = {library:fields.library.value.trim(), name:fields.name.value.trim(), user:fields.user.value || null,
+        timelines:source?.sha256 ? chosen : [current], pathMap:parsePathMap(fields.pathMap.value),
+        allow:{unverifiedMedia:fields.unverified.checked, unproven:fields.unproven.checked}, confirm};
+      if (source?.sha256) payload.seed = {kind:source.format === 'drp' ? 'drp' : 'library', sha256:source.sha256,
+        path:source.path, project:source.project};
+      else {
+        if (!fields.template.value) throw Error('Choose the template project.');
+        payload.seed = {kind:'template', path:fields.template.value};
+        payload.keepTemplateMedia = fields.keepMedia.checked;
+      }
+      if (!payload.timelines.length) throw Error('Choose at least one timeline.');
+      return payload;
+    }
+    async function send(confirm) {
+      if (busy) return;
+      busy = true; saveButton.disabled = true;
+      status.textContent = confirm ? 'Writing the new project…' : 'Checking what Resolve can take…';
+      try {
+        const payload = request(confirm);
+        localStorage.setItem(SAVE_KEYS.map, fields.pathMap.value);
+        if (source?.sha256) await ensureSeed(source);
+        const result = await post('/api/resolve/library/save', payload, true);
+        reportNode.replaceChildren(reportTable(result));
+        if (confirm) {
+          status.textContent = 'Saved “' + result.project.name + '” in the library. Open it in Resolve’s Project Manager.';
+          const reopen = document.createElement('button');
+          reopen.type = 'button'; reopen.textContent = 'Open the saved project in Splice'; reopen.dataset.reopen = '';
+          reopen.onclick = async () => {
+            const {project} = await post('/api/resolve/library/open', {path:result.project.path, timeline:0}, true);
+            node.close(); await load(fresh(project));
+          };
+          reportNode.prepend(reopen);
+          checked = null;
+        } else {
+          checked = JSON.stringify(payload);
+          status.textContent = 'Checked. Review the report, then save. Nothing has been written yet.';
+          saveButton.disabled = false;
+        }
+      } catch (error) {
+        status.textContent = error.message;
+      } finally { busy = false; if (checked) saveButton.disabled = false; }
+    }
+    node.querySelector('[data-check]').onclick = () => send(false);
+    saveButton.onclick = () => {
+      if (!checked) return;
+      try { if (JSON.stringify(request(false)) !== checked) { stale(); status.textContent = 'The choices changed: check again.'; return; } }
+      catch (error) { status.textContent = error.message; return; }
+      send(true);
+    };
+    node.showModal();
+    if (fields.library.value) readLibrary().catch(error => { status.textContent = error.message; });
+  }
   const input = $('resolve-input');
   const run = action => action().catch(error => toast(error.message || String(error)));
   $('open-resolve').onclick = () => { input.value = ''; input.click(); };
   input.onchange = () => { const file = input.files[0]; if (file) run(() => openDrp(file)); };
   $('open-resolve-library').onclick = () => openLibrary();
-  return {openDrp, openLibrary, timeline, pickFolder};
+  $('save-resolve-library').onclick = () => run(saveToLibrary);
+  $('resolve-compatibility').onclick = () => showCompatibility();
+  return {openDrp, openLibrary, timeline, pickFolder, saveToLibrary, parsePathMap, showCompatibility, placesList};
 })();

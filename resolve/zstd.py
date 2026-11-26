@@ -84,6 +84,45 @@ def decompress(frame, max_output):
     return bytes(out)
 
 
+def raw_frame(payload):
+    """One zstd frame holding ``payload`` in raw (stored) blocks: single segment, the content
+    size declared, no checksum. RFC 8878 section 3.1.1: every conforming decoder reads it, and it
+    needs no compressor, so the bytes written depend on nothing but ``payload``."""
+    payload = bytes(payload)
+    size = len(payload)
+    if size < 256:
+        header = bytes([0x20]) + struct.pack('<B', size)
+    elif size < 65536 + 256:
+        header = bytes([0x60]) + struct.pack('<H', size - 256)
+    elif size <= 0xFFFFFFFF:
+        header = bytes([0xA0]) + struct.pack('<I', size)
+    else:
+        raise ZstdError('payload too large for one zstd frame written here')
+    out = bytearray(MAGIC + header)
+    position = 0
+    while True:
+        chunk = payload[position:position + MAX_BLOCK]
+        position += len(chunk)
+        last = position >= size
+        out += ((len(chunk) << 3) | int(last)).to_bytes(3, 'little') + chunk
+        if last:
+            return bytes(out)
+
+
+def frame_length(frame):
+    """``len(frame)`` when ``frame`` is exactly one complete zstd frame without a dictionary;
+    raises ZstdError otherwise (a second frame or trailing bytes included), walking the block
+    headers only."""
+    frame = bytes(frame)
+    if len(frame) >= 5 and frame[:4] == MAGIC and frame[4] & 0x03:
+        raise ZstdError('zstd frame uses a dictionary')
+    offset, _declared, checksum = _header(frame)
+    end = _frame_end(frame, offset, checksum)
+    if end != len(frame):
+        raise ZstdError(f'{len(frame) - end} byte(s) follow the zstd frame')
+    return end
+
+
 def _frame_end(frame, offset, checksum):
     """Where the frame ends, from its block headers (raises if the frame is cut short)."""
     while True:

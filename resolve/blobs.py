@@ -143,23 +143,38 @@ def _qvariant(data, off, depth):
     raise BlobError(f'keyed dict: unknown value type 0x{vtype:x}')
 
 
-def keyed_dict(data):
-    """Decode a keyed dict strictly into an ordered ``{key: value}`` (raises BlobError)."""
-    if len(data) < 8:
+def keyed_entries(data, *, header=1):
+    """Decode a keyed dict strictly into ``[key, value type, null flag, value]`` lists, in their
+    stored order (what the writer edits and encodes again; raises BlobError). ``header`` is the
+    header word required (every keyed dict seen holds 1); None accepts any."""
+    if not isinstance(data, (bytes, bytearray)) or len(data) < 8:
         raise BlobError('keyed dict too short')
-    _header, count = struct.unpack_from('>II', data, 0)
+    data = bytes(data)
+    found, count = struct.unpack_from('>II', data, 0)
+    if header is not None and found != header:
+        raise BlobError(f'keyed dict header {found}, not {header}')
     if count > len(data):
         raise BlobError('keyed dict: implausible entry count')
     off = 8
-    out = {}
+    out = []
     try:
         for _ in range(count):
             key, off = _qstring(data, off)
-            out[key or ''], off = _qvariant(data, off, 0)
+            vtype, null = struct.unpack_from('>IB', data, off)
+            value, off = _qvariant(data, off, 0)
+            out.append([key or '', vtype, null, value])
     except (struct.error, UnicodeDecodeError):
         raise BlobError('keyed dict is truncated or malformed') from None
     if off != len(data):
         raise BlobError('keyed dict has trailing bytes')
+    return out
+
+
+def keyed_dict(data):
+    """Decode a keyed dict strictly into an ordered ``{key: value}`` (raises BlobError)."""
+    out = {}
+    for key, _vtype, _null, value in keyed_entries(data, header=None):
+        out[key] = value
     return out
 
 

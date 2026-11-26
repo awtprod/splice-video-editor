@@ -353,12 +353,12 @@ class MediaGuardTests(RegistryScratch):
         import resolve.media as media
         self.media = media
         self.probed = []
-        real = media.decodable
+        real = media._probe
 
-        def recording(path, name):
+        def recording(path, deadline):
             self.probed.append(str(path))
-            return real(path, name)
-        patcher = mock.patch.object(media, 'decodable', recording)
+            return real(path, deadline)
+        patcher = mock.patch.object(media, '_probe', recording)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -436,15 +436,89 @@ class MediaGuardTests(RegistryScratch):
         for thread in stuck:
             thread.join(10)
 
+    def fake_ffprobe(self, script):
+        """An ``ffprobe`` first on PATH that runs ``script`` (a shell body); returns its pid file."""
+        folder = self.dir / 'fakebin'
+        folder.mkdir(exist_ok=True)
+        pids = self.dir / 'probe-pids'
+        tool = folder / 'ffprobe'
+        tool.write_text(f'#!/bin/sh\necho $$ >> "{pids}"\n{script}\n')
+        tool.chmod(0o755)
+        patcher = mock.patch.dict(os.environ, {'PATH': f'{folder}{os.pathsep}{os.environ["PATH"]}'})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return pids
+
+    def alive(self, pids):
+        out = []
+        for line in pids.read_text().split() if pids.exists() else []:
+            try:
+                os.kill(int(line), 0)
+            except ProcessLookupError:
+                continue
+            out.append(int(line))
+        return out
+
     def test_a_probe_timeout_is_not_called_unplayable(self):
         clip = wav(self.dir / 'card' / 'A001.wav')
-        from media_proxy import ProbeTimeout
+        pids = self.fake_ffprobe('exec sleep 600')
+        with mock.patch.object(self.media, 'PROBE_SECONDS', 0.5):
+            (result,) = link_local([str(clip)])
+        self.assertEqual(result['offline'], 'unchecked')
+        self.assertIn('timed out', result['message'])
+        self.assertEqual(self.alive(pids), [])
 
-        def slow(path, name):
-            raise ProbeTimeout('Reading A001.wav timed out after 25 s.')
-        with mock.patch.object(self.media, 'decodable', slow):
-            self.assertEqual(link_local([str(clip)]),
-                             [{'offline': 'unchecked', 'message': 'Reading A001.wav timed out after 25 s.'}])
+    def test_probes_still_running_at_the_deadline_are_killed_and_reaped(self):
+        clips = [str(wav(self.dir / 'card' / f'c{n}.wav')) for n in range(3)]
+        pids = self.fake_ffprobe('exec sleep 600')
+        import time
+        began = time.monotonic()
+        results = link_local(clips, seconds=1)
+        self.assertLess(time.monotonic() - began, 6)
+        self.assertEqual({r['offline'] for r in results}, {'unchecked'})
+        self.assertTrue(pids.exists())
+        self.assertEqual(self.alive(pids), [], 'no FFprobe child outlives the open')
+
+    def test_missing_paths_do_not_use_up_the_probe_limit(self):
+        clip = wav(self.dir / 'card' / 'A001.wav')
+        missing = [str(self.dir / 'gone' / f'{n}.wav') for n in range(2500)]
+        results = link_local(missing + [str(clip)], max_files=2)
+        self.assertEqual(results[-1].get('sourcePath'), str(clip.resolve()))
+        self.assertEqual({r['offline'] for r in results[:-1]}, {'missing'})
+        self.assertEqual(len(self.probed), 1)
+
+    def test_a_hung_volume_leaves_workers_for_files_elsewhere(self):
+        import threading
+        release = threading.Event()
+        self.addCleanup(release.set)
+        real = self.media._look
+        hung = lambda path: (release.wait(30), real(path))[1] if 'hung' in str(path) else real(path)
+        clip = wav(self.dir / 'card' / 'A001.wav')
+        paths = [f'/hung/mount/{n}.mov' for n in range(17)]
+        with mock.patch.object(self.media, '_look', hung), mock.patch.object(self.media, 'PROBES', 8), \
+                mock.patch.object(self.media, 'PER_VOLUME', 4):
+            results = link_local(paths + [str(clip)], seconds=3)
+        release.set()
+        self.assertEqual(results[-1].get('sourcePath'), str(clip.resolve()))
+        self.assertEqual({r['offline'] for r in results[:17]}, {'unchecked'})
+
+    def test_nothing_is_fingerprinted_after_the_deadline(self):
+        clip = wav(self.dir / 'card' / 'A001.wav')
+        import time
+        prints = []
+        import media_links
+        real = media_links.fingerprint
+
+        def counted(path, size):
+            prints.append(str(path))
+            return real(path, size)
+
+        def late(path, deadline):
+            time.sleep(max(0.0, deadline - time.monotonic()) + 0.05)
+            return None
+        with mock.patch.object(self.media, '_probe', late), mock.patch.object(media_links, 'fingerprint', counted):
+            (result,) = link_local([str(clip)], seconds=0.3)
+        self.assertEqual((result['offline'], prints), ('unchecked', []))
 
 
 class LibraryListingGuardTests(Scratch):
@@ -1039,7 +1113,8 @@ class MarkerAndFlagTests(Scratch):
                          [('Wide shot', 0.5, 'Green'), ('Pickup', 1.25, 'Red')])
         self.assertIn('Harbor cut · Picture · A001.mp4 at 01:00:00:00: 2 clip marker(s) are not imported. Where '
                       'Resolve places a clip marker is not settled: Resolve 19 stores it as a frame of the source '
-                      'media, and a Resolve 21 project stores twice the frame number the scripting API reports.',
+                      'media, and the one Resolve 21 sample stores a value that fits two readings (twice the frame the '
+                      "scripting API reports, or that frame plus the marker's duration), so it is unresolved.",
                       project['compatibilityWarnings'])
         self.assertIn('Harbor cut: timeline markers are placed as frames from the timeline start, as Resolve 19 '
                       'stores them; this is not yet confirmed for projects saved by later versions of Resolve.',
@@ -1123,10 +1198,13 @@ class ResolveStateTests(Scratch):
                           'not interpret.', warnings)
             self.assertIn('Harbor cut · Picture · A001.mp4 at 01:00:01:00: the clip carries other Resolve clip flags '
                           '(4) that Splice does not interpret.', warnings)
+            grouped = ('2 clips: the clip carries Resolve clip flags (2) that Splice does not interpret (it may be '
+                       'disabled in Resolve; it opens enabled). For example: Harbor cut · Video 2 · Solid Color at '
+                       '01:00:00:00; Harbor cut · Dialogue · A002.wav at 01:00:01:00.')
+            self.assertIn(grouped, warnings)
             self.assertIn('Harbor cut · Dialogue · A002.wav at 01:00:01:00: the clip carries Resolve clip flags (2) '
-                          'that Splice does not interpret (it may be disabled in Resolve; it opens enabled).', warnings)
-            self.assertTrue(any(w.startswith('Harbor cut · Video 2 · Solid Color at 01:00:00:00: the clip carries '
-                                             'Resolve clip flags (2)') for w in warnings))
+                          'that Splice does not interpret (it may be disabled in Resolve; it opens enabled).',
+                          project['compatibilityDetails'][grouped])
             self.assertEqual(project['trackState'], {'video:2': {'hidden': True}})
             self.assertNotIn('trackMix', project)
             self.assertIs(by_title(project, 'i-v2')['enabled'], False)
