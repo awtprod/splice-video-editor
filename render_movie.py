@@ -1978,7 +1978,9 @@ def _encode_aac(audio_list, bitrate, ceiling, peak_safe, directory, cancelled, h
     if ceiling is None:
         return target, None
     peak, loudness = _measure_decoded(target, cancelled, heartbeat)
-    measured = {'ceilingDb': ceiling, 'decodedTruePeakDb': round(peak, 2), 'loudnessLufs': round(loudness, 2),
+    # JSON has no infinities: silence reports null peak and loudness.
+    finite = lambda value: round(value, 2) if math.isfinite(value) else None
+    measured = {'ceilingDb': ceiling, 'decodedTruePeakDb': finite(peak), 'loudnessLufs': finite(loudness),
                 'aacPeakSafe': peak_safe, 'gainDb': 0.0}
     if peak <= ceiling:
         return target, measured
@@ -1998,7 +2000,7 @@ def _encode_aac(audio_list, bitrate, ceiling, peak_safe, directory, cancelled, h
             break
         if attempt+1 < AAC_PEAK_ATTEMPTS:
             gain -= AAC_PEAK_STEP_DB
-    measured.update(decodedTruePeakDb=round(peak, 2), loudnessLufs=round(loudness, 2), gainDb=round(gain, 2))
+    measured.update(decodedTruePeakDb=finite(peak), loudnessLufs=finite(loudness), gainDb=round(gain, 2))
     if peak <= ceiling:
         warnings.warn(f'aacPeakSafe lowered the whole program by {-gain:.1f} dB '
                       f'(now {_db_text(loudness)} LUFS) so the decoded MP4 audio peaks at {_db_text(peak)} dBTP, '

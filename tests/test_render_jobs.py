@@ -408,6 +408,18 @@ class ProgramLoudness(Case):
         self.assertLessEqual(true_peak(movie), ceiling)
         self.assertLess(report['audio']['gainDb'], 0)
 
+    def test_silent_program_reports_null_peak_and_loudness(self):
+        # The export job status is sent as strict JSON: no infinities.
+        silence = self.directory/'silence.wav'
+        ffmpeg('-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo', '-t', '8', '-c:a', 'pcm_f32le', str(silence))
+        for options in ({}, {'aacPeakSafe': True}):
+            with self.subTest(**options):
+                report = {}
+                self.export(silence, 'h264', report=report, **options)
+                # FFmpeg's ebur128 reports silence as -inf dBTP and -70 LUFS (its gate floor).
+                self.assertEqual((report['audio']['decodedTruePeakDb'], report['audio']['gainDb']), (None, 0))
+                json.dumps(report, allow_nan=False)
+
     def test_aac_peak_safe_is_deterministic_and_range_exports_use_the_same_rule(self):
         source = self.program(1.0)
         runs = []
