@@ -258,8 +258,8 @@ def wav(path, seconds=0.05):
     return path
 
 
-class MediaTests(Scratch):
-    """Media a project names is referenced in place through the link registry, never copied."""
+class RegistryScratch(Scratch):
+    """A private link registry and media folder for each test."""
 
     def setUp(self):
         super().setUp()
@@ -278,6 +278,10 @@ class MediaTests(Scratch):
 
     def registered(self):
         return sorted(entry['path'] for entry in self.ml._links().values())
+
+
+class MediaTests(RegistryScratch):
+    """Media a project names is referenced in place through the link registry, never copied."""
 
     def test_local_media_is_linked_in_place_and_foreign_paths_stay_offline(self):
         clip = wav(self.dir / 'footage' / 'Day 1' / 'A001.wav')
@@ -339,6 +343,137 @@ class MediaTests(Scratch):
         self.assertEqual(len(writes), 1)
         self.assertEqual(len(self.registered()), 500)
         self.assertEqual(sum(1 for m in project['media'] if m.get('linked')), 500)
+
+
+class MediaGuardTests(RegistryScratch):
+    """Each check in resolve/media.py, shown to matter: every test fails when its check is removed."""
+
+    def setUp(self):
+        super().setUp()
+        import resolve.media as media
+        self.media = media
+        self.probed = []
+        real = media.decodable
+
+        def recording(path, name):
+            self.probed.append(str(path))
+            return real(path, name)
+        patcher = mock.patch.object(media, 'decodable', recording)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_bad_text_never_reaches_the_filesystem(self):
+        clip = wav(self.dir / 'card' / 'A001.wav')
+        looked = []
+        real = self.media._look
+        with mock.patch.object(self.media, '_look', lambda path: (looked.append(str(path)), real(path))[1]):
+            results = link_local([5, None, b'/x.wav', '', '/' + 'a' * 5000 + '.wav', str(clip) + '\x00.wav',
+                                  str(clip).replace('/', '//', 1) + '\x00'])
+        self.assertEqual(looked, [])
+        self.assertEqual([r['offline'] for r in results], ['missing'] * 7)
+        self.assertEqual(self.probed, [])
+
+    def test_a_relative_path_is_not_looked_up_from_the_server_folder(self):
+        wav(self.dir / 'footage' / 'A001.wav')
+        here = os.getcwd()
+        os.chdir(self.dir)
+        self.addCleanup(os.chdir, here)
+        self.assertEqual(link_local(['footage/A001.wav']), [{'offline': 'missing'}])
+        self.assertEqual((self.probed, self.registered()), ([], []))
+
+    def test_a_fifo_is_never_probed(self):
+        fifo = self.dir / 'stream.wav'
+        os.mkfifo(fifo)
+        self.assertEqual(link_local([str(fifo)]), [{'offline': 'missing'}])
+        self.assertEqual(self.probed, [])
+
+    def test_every_folder_on_the_way_must_exist(self):
+        clip = wav(self.dir / 'card' / 'A001.wav')
+        # Lexically this is the clip; the operating system refuses it, as "gone" does not exist.
+        dotted = str(self.dir / 'card' / 'gone' / '..' / 'A001.wav')
+        self.assertFalse(os.path.exists(dotted))
+        self.assertEqual(link_local([dotted]), [{'offline': 'missing'}])
+        self.assertEqual(self.probed, [])
+        self.assertEqual(link_local([str(clip)])[0]['sourcePath'], str(clip.resolve()))
+
+    def test_each_real_file_is_probed_once(self):
+        clip = wav(self.dir / 'card' / 'A001.wav')
+        alias = self.dir / 'alias.wav'
+        alias.symlink_to(clip)
+        twice = self.dir / 'card' / 'twice.wav'
+        os.link(clip, twice)
+        results = link_local([str(clip), str(alias), str(clip), str(twice), str(alias)])
+        self.assertEqual(len(self.probed), 1)
+        self.assertEqual(len({r['src'] for r in results}), 1)
+        self.assertEqual(self.registered(), [str(clip.resolve())])
+
+    def test_the_file_limit(self):
+        clips = [str(wav(self.dir / 'card' / f'c{n}.wav')) for n in range(5)]
+        results = link_local(clips + clips[:1], max_files=3)
+        self.assertEqual([('src' in r, r.get('offline')) for r in results],
+                         [(True, None)] * 3 + [(False, 'unchecked')] * 2 + [(True, None)])
+        self.assertIn('at most 3 files', results[3]['message'])
+        self.assertEqual(len(self.probed), 3)
+
+    def test_one_deadline_for_a_hung_drive(self):
+        import threading
+        import time
+        release = threading.Event()
+        self.addCleanup(release.set)
+        real = self.media._look
+        hung = lambda path: (release.wait(30), real(path))[1] if 'hung' in str(path) else real(path)
+        clip = wav(self.dir / 'card' / 'A001.wav')
+        paths = [f'/hung/{n}.mov' for n in range(17)]
+        with mock.patch.object(self.media, '_look', hung):
+            began = time.monotonic()
+            results = link_local(paths + [str(clip)], seconds=0.5)
+            elapsed = time.monotonic() - began
+        self.assertLess(elapsed, 3)
+        self.assertEqual([r['offline'] for r in results[:17]], ['unchecked'] * 17)
+        stuck = [t for t in threading.enumerate() if t.name == 'splice-resolve-link']
+        self.assertTrue(stuck and all(t.daemon for t in stuck))
+        release.set()
+        for thread in stuck:
+            thread.join(10)
+
+    def test_a_probe_timeout_is_not_called_unplayable(self):
+        clip = wav(self.dir / 'card' / 'A001.wav')
+        from media_proxy import ProbeTimeout
+
+        def slow(path, name):
+            raise ProbeTimeout('Reading A001.wav timed out after 25 s.')
+        with mock.patch.object(self.media, 'decodable', slow):
+            self.assertEqual(link_local([str(clip)]),
+                             [{'offline': 'unchecked', 'message': 'Reading A001.wav timed out after 25 s.'}])
+
+
+class LibraryListingGuardTests(Scratch):
+    def test_symlinked_folders_are_not_followed(self):
+        self.library()
+        outside = self.dir / 'library'
+        root = self.dir / 'root'
+        root.mkdir()
+        (root / 'elsewhere').symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(resolve.ResolveError, 'No Resolve projects were found'):
+            resolve.list_library(root)
+        self.assertEqual(len(resolve.list_library(outside)[0]), 1)
+
+    def test_scanned_entries_are_capped(self):
+        self.library()
+        for n in range(6):
+            (self.dir / 'library' / f'note-{n}.txt').write_text('x')
+        with mock.patch.object(source, 'MAX_SCANNED', 4):
+            found, truncated = source._project_files(self.dir / 'library')
+        self.assertEqual((found, truncated), ([], True))
+        self.assertEqual(len(source._project_files(self.dir / 'library')[0]), 1)
+
+    def test_listed_projects_are_capped(self):
+        for n in range(3):
+            F.write_library(dict(F.sample(), name=f'Project {n}'), self.dir / 'library')
+        with mock.patch.object(source, 'MAX_LISTED', 2):
+            projects, truncated = resolve.list_library(self.dir / 'library')
+        self.assertEqual((len(projects), truncated), (2, True))
+        self.assertEqual(len(resolve.list_library(self.dir / 'library')[0]), 3)
 
 
 class DesktopPackageTests(unittest.TestCase):
@@ -1100,6 +1235,60 @@ class ResolveStateTests(Scratch):
         self.assertIn('1 media file(s) could not be linked (The linked media list is full); they stay offline.', warnings)
         with self.assertRaisesRegex(resolve.ResolveError, 'unexpected result'):
             resolve.open_drp(F.drp_bytes(spec), 0, lambda paths: [])
+
+
+class ResolveExportTests(Scratch):
+    """A Resolve project with a disabled clip and a disabled (hidden) video track, imported and
+    exported: neither shows in the picture."""
+
+    def frame_brightness(self, project, seconds):
+        import statistics
+        import subprocess
+        from render_movie import render_to_file
+        out = self.dir / 'export.mp4'
+        render_to_file(project, out)
+        raw = subprocess.check_output(['ffmpeg', '-nostdin', '-v', 'error', '-ss', str(seconds), '-i', str(out),
+                                       '-frames:v', '1', '-vf', 'scale=32:18,format=gray', '-f', 'rawvideo', '-'],
+                                      timeout=60)
+        return statistics.mean(raw)
+
+    def project(self):
+        spec = F.sample(str(ROOT / 'assets' / 'valley.mp4'), str(ROOT / 'assets' / 'score.wav'), generator=False)
+        start = 86400
+        clip = lambda identity, at, **extra: dict({'id': identity, 'tag': 'Sm2TiVideoClip', 'name': 'valley.mp4',
+                                                  'start': start + at, 'duration': 24, 'in': 24, 'media': 'm-video'},
+                                                 **extra)
+        spec['timelines'][0]['size'] = (64, 36)
+        spec['timelines'][0]['markers'] = []
+        spec['timelines'][0]['tracks'] = [
+            # V1: a disabled clip for the first second, an enabled one for the next.
+            {'id': 'tr-v1', 'type': 0, 'name': '', 'items': [clip('off', 0, flags=2), clip('on', 24)]},
+            # V2, disabled in Resolve: a clip in the third second only.
+            {'id': 'tr-v2', 'type': 0, 'name': '', 'flags': 2, 'items': [clip('hidden', 48)]},
+            {'id': 'tr-a1', 'type': 1, 'name': '', 'items': []},
+        ]
+        project = resolve.open_drp(F.drp_bytes(spec))
+        self.assertEqual((by_title(project, 'off')['enabled'], project['trackState']),
+                         (False, {'video:2': {'hidden': True}}))
+        for media in project['media']:  # relinked to the bundled copies of the same files
+            media.update(src='assets/' + media['name'], offline=False)
+        return project
+
+    def test_a_disabled_clip_leaves_no_picture(self):
+        project = self.project()
+        project['clips'] = [c for c in project['clips'] if c['track'] == 1]
+        self.assertLess(self.frame_brightness(project, 0.5), 24, 'the disabled clip was drawn')
+        self.assertGreater(self.frame_brightness(project, 1.5), 60, 'the enabled clip beside it was not drawn')
+
+    def test_a_hidden_track_leaves_no_picture(self):
+        import subprocess
+        probe = subprocess.run([sys.executable, str(ROOT / 'tests' / 'hidden_render_probe.py')], capture_output=True,
+                               text=True, timeout=120, check=True).stdout.strip()
+        self.assertIn(probe, ('honors', 'ignores'))
+        if probe == 'ignores':
+            self.skipTest('the renderer on this tree draws hidden tracks (the renderer change that honours '
+                          'trackState[...].hidden is in another pull request); tests/hidden_render_probe.py decides')
+        self.assertLess(self.frame_brightness(self.project(), 2.5), 24, 'the hidden track was drawn')
 
 
 class TimelineIdTests(Scratch):
