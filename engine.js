@@ -135,7 +135,7 @@
     state.voices.clear();
   }
   function auditionAudio(element,clip,target,rate,forceSeek) {
-    const item=mediaOf(clip);
+    const item=resolveClipMedia(clip).item;
     // A chosen source stream is read from the original file; otherwise from what is playing.
     const stream=clipAudioStream(clip,item);
     const chosen=Number.isInteger(stream) ? stream : null;
@@ -256,7 +256,7 @@
   const clipPlaybackRate = clip => clamp((Number(clip.speed)||1)*Math.abs(playbackRate),.0625,16);
   function syncClipPlayback(element, clip, target, forceSeek, audible=true) {
     const rate=clipPlaybackRate(clip);
-    const item=mediaOf(clip), stream=clipAudioStream(clip,item);
+    const item=resolveClipMedia(clip).item, stream=clipAudioStream(clip,item);
     if (item?.still) {
       element.pause();
       element.muted=true;
@@ -370,7 +370,54 @@
       notify();
     }
   }
-  const mediaOf = (clip) => project.media.find((m) => m.id === clip.mediaId);
+  const mediaOf = (clip, source = project) => source.media.find((m) => m.id === clip.mediaId);
+  function resolveSubclipItem(item, source = project) {
+    let cur = item, inShift = 0;
+    const seen = new Set();
+    while (cur && cur.parentMediaId) {
+      if (seen.has(cur.id)) break;
+      seen.add(cur.id);
+      inShift += Number(cur.subclipIn) || 0;
+      const parent = source.media.find((m) => m.id === cur.parentMediaId);
+      if (!parent) break;
+      cur = parent;
+    }
+    return { item: cur, inShift };
+  }
+  function resolveClipMedia(clip, source = project) {
+    const media = clip && mediaOf(clip, source);
+    if (!media) return { item: null, media: null, inShift: 0, angle: null, angleIndex: null, minTime: 0, maxTime: Infinity };
+    if (media.multicam && Array.isArray(media.multicam.angles) && media.multicam.angles.length) {
+      const mc = media.multicam, angles = mc.angles;
+      let idx = Number.isInteger(clip.multicamAngle) ? clip.multicamAngle : 0;
+      if (clip.type === "audio") {
+        if (Number.isInteger(clip.multicamAudioAngle)) idx = clip.multicamAudioAngle;
+        else if (mc.audioMode === "camera1") idx = 0;
+        else if (mc.audioMode === "fixed") idx = Number.isInteger(mc.audioAngle) ? mc.audioAngle : 0;
+      }
+      idx = clamp(idx, 0, angles.length - 1);
+      const angle = angles[idx];
+      const angleMedia = source.media.find((m) => m.id === angle?.mediaId) || null;
+      const sub = resolveSubclipItem(angleMedia, source);
+      const offset = Number(angle?.offset) || 0;
+      const angIn = Number(angle?.in) || 0;
+      const angDur = Number(angle?.duration) || angleMedia?.duration || Infinity;
+      return { item: sub.item, media, inShift: angIn + sub.inShift, angle, angleIndex: idx, minTime: offset, maxTime: offset + angDur };
+    }
+    if (media.parentMediaId) {
+      const sub = resolveSubclipItem(media, source);
+      const maxDur = media.subclipLimits === false
+        ? Math.max(media.duration || 0, (sub.item?.duration || 0) - sub.inShift)
+        : (media.duration || Infinity);
+      return { item: sub.item, media, inShift: sub.inShift, angle: null, angleIndex: null, minTime: 0, maxTime: maxDur };
+    }
+    return { item: media, media, inShift: 0, angle: null, angleIndex: null, minTime: 0, maxTime: media.duration || Infinity };
+  }
+  const mediaDurationOf = (clip, source = project) => {
+    const resolved = resolveClipMedia(clip, source);
+    if (resolved.media?.parentMediaId && resolved.media.subclipLimits === false) return resolved.maxTime;
+    return resolved.media?.duration || Infinity;
+  };
   const titleTrack = () => Math.min(64,Math.max(4,...project.clips.filter(c=>c.type==='video').map(c=>c.track+1)));
   function sourceSelection(item, marks=item.sourceMarks, stream=item.sourceAudioStream) {
     const usedLength=project.clips.find(c=>c.mediaId===item.id)?.duration;
@@ -442,14 +489,14 @@
   }
   const hasEmbeddedAudio = (clip, source = project) => {
     if (clip.type !== "video" || clip.embeddedAudio === false) return false;
-    const item = source.media.find((entry) => entry.id === clip.mediaId);
+    const item = resolveClipMedia(clip, source).item;
     return !!item && !item.still && item.audioChannels > 0;
   };
   const frameSeconds = () => 1 / project.fps;
   // Timeline seconds before the clip's first frame and after its last that the source can still supply.
-  const sourceHead = (clip) => mediaOf(clip)?.still ? Infinity : clip.in / (Number(clip.speed) || 1);
-  const sourceTail = (clip) => mediaOf(clip)?.still ? Infinity :
-    ((mediaOf(clip)?.duration || Infinity) - clip.in) / (Number(clip.speed) || 1) - clip.duration;
+  const sourceHead = (clip) => resolveClipMedia(clip).item?.still ? Infinity : clip.in / (Number(clip.speed) || 1);
+  const sourceTail = (clip) => resolveClipMedia(clip).item?.still ? Infinity :
+    (mediaDurationOf(clip) - clip.in) / (Number(clip.speed) || 1) - clip.duration;
   const roomBefore = (clip) => clip.reverse ? sourceTail(clip) : sourceHead(clip);
   const roomAfter = (clip) => clip.reverse ? sourceHead(clip) : sourceTail(clip);
   // Frames by which a linked clip's picture or sound has drifted from its partner.
@@ -565,10 +612,22 @@
   const requestedTransitionLength = clip => clamp(Number(clip.transitionDuration || .5), 1/project.fps, 7200);
   const transitionBefore = clip => clamp(Number(clip.transitionBefore)||0,0,requestedTransitionLength(clip));
   const transitionLength = clip => Math.min(requestedTransitionLength(clip),clip.duration+transitionBefore(clip));
-  const sourceTime = (clip, atTime) => {
-    if (mediaOf(clip)?.still) return 0;
+  const rawSourceTime = (clip, atTime) => {
     const speed=clamp(Number(clip.speed)||1,.1,16), local=atTime-clip.start;
     return Number(clip.in||0)+(clip.reverse ? clip.duration-local : local)*speed-(clip.reverse?1e-6:0);
+  };
+  const multicamAngleActive = (clip, atTime) => {
+    const resolved = resolveClipMedia(clip);
+    if (!resolved.angle) return true;
+    const t = rawSourceTime(clip, atTime);
+    return t >= resolved.minTime - 1e-6 && t < resolved.maxTime - 1e-6;
+  };
+  const sourceTime = (clip, atTime) => {
+    const resolved = resolveClipMedia(clip);
+    if (resolved.item?.still) return 0;
+    const t = rawSourceTime(clip, atTime);
+    if (resolved.angle) return Math.max(0, t - resolved.minTime + resolved.inShift);
+    return Math.max(0, t + resolved.inShift);
   };
   const trackSettings = track => project.trackMix?.[String(track)] || {};
   const soloActive = () => Object.values(project.trackMix || {}).some(m => m.solo);
@@ -596,6 +655,7 @@
   const soundingAudioClips = () => project.clips.filter(c=>c.type==='audio' && isEnabled(c) && c.start-transitionBefore(c)<=time &&
     time<c.start+c.duration+(followingTransition(c)?transitionLength(followingTransition(c))-transitionBefore(followingTransition(c)):0));
   const audibility = clip => {
+    if (!multicamAngleActive(clip, time)) return 0;
     const mix = trackSettings(clip.track);
     if (mutedTracks.audio || mix.mute || (soloActive() && !mix.solo)) return 0;
     const local = time - clip.start;
@@ -629,7 +689,7 @@
   }
   const clipAudioStream=(clip,item)=>'audioStream' in clip?clip.audioStream:item?.audioStream??null;
   function programSource(clip) {
-    const item=clip && mediaOf(clip);
+    const item=clip && resolveClipMedia(clip).item;
     if (!item?.src) return;
     const stream=clipAudioStream(clip,item);
     if (item.hdr && hasHdrGrade(clip.color||{})) {
@@ -755,7 +815,8 @@
   }
   const presentedSeekTimes = new WeakMap();
   function seekVideo(element, clip, target, forceSeek) {
-    if (element.currentTime===0 && mediaOf(clip)?.still) return;
+    const resolved = resolveClipMedia(clip).item;
+    if (element.currentTime===0 && resolved?.still) return;
     const slow=clipPlaybackRate(clip)<.25;
     const framewise=playing && (playbackRate<0 || clip.reverse || slow);
     if (!forceSeek && framewise) {
@@ -767,7 +828,7 @@
       }
     }
     if (!forceSeek && framewise && slow) {
-      const fps=mediaOf(clip)?.fps||project.fps;
+      const fps=resolved?.fps||project.fps;
       if (Math.floor(element.currentTime*fps+1e-6)===Math.floor(target*fps+1e-6)) return;
     } else if (!forceSeek && Math.abs(element.currentTime-target)<=(framewise?.5/project.fps:seekTolerance(clip))) return;
     try { element.currentTime = Math.max(0,target); }
@@ -781,7 +842,7 @@
     indexTransitions();
     if (window.SpliceMedia?.prepareNested) for (const clip of project.clips) {
       if (clip.type==='title' || !isEnabled(clip) || clip.start-transitionBefore(clip)>time+1.5 || clip.start+clip.duration<time) continue;
-      const item=mediaOf(clip);
+      const item=resolveClipMedia(clip).item;
       if (item?.nestedProject && !item.src) window.SpliceMedia.prepareNested(item);
     }
     const clip = at("video", time);
@@ -793,7 +854,7 @@
       if (tail) standInTails.set(tail.id, tail);
     }
     const audioClips = soundingAudioClips();
-    const mediaItem = clip && mediaOf(clip);
+    const mediaItem = clip && resolveClipMedia(clip).item;
     const source = programSource(clip);
     if (clip && clip.id !== activeVideoId) {
       const preparedLayer=layerVideos.get(clip.id);
@@ -1045,10 +1106,11 @@
   blackGenerator.getContext('2d').fillRect(0,0,16,9);
   function paintVideo(ctx,element,clip,canvas,alpha=1,brightness=1) {
     if (!element || (element instanceof HTMLVideoElement && element.readyState < 2)) return;
+    if (!multicamAngleActive(clip, time)) return;
     const color=clip.color||{}, lut=color.lutIntensity===0?null:color.lut;
     const gains=gradeGains(color);
     const graded=gains.some(g=>Math.abs(g-1)>.0001);
-    const item=mediaOf(clip);
+    const item=resolveClipMedia(clip).item;
     const gradingSource=item?.hdr && window.SpliceMedia?.hdrPreviewStatus(item,clipAudioStream(clip,item))?.src;
     const gradingData=!!gradingSource && element.getAttribute('src')===gradingSource;
     const hdrGrade=item?.hdr && (gradingData || hasHdrGrade(color));
@@ -1095,7 +1157,7 @@
     }
   }
   function videoFor(clip) {
-    if (mediaOf(clip)?.nativeGenerator===1112293707) return blackGenerator;
+    if (resolveClipMedia(clip).item?.nativeGenerator===1112293707) return blackGenerator;
     if (clip.id===activeVideoId) return video;
     if (clip.id===preloadClipId || clip.id===transitionVideoId) return transitionVideo;
     return layerVideos.get(clip.id);
@@ -1132,10 +1194,10 @@
   // A clip inside its own dissolve does not, with or without a clip before it; nor does a clip
   // that a transition is taking out (it may be leaving against a disabled, transparent clip).
   function coversFrame(clip, canvas, outgoingIds) {
-    if (clip.type!=='video' || !isEnabled(clip) || clip.transition==='wipe' || clip.transition==='fade' || outgoingIds.has(clip.id)) return false;
+    if (clip.type!=='video' || !isEnabled(clip) || !multicamAngleActive(clip, time) || clip.transition==='wipe' || clip.transition==='fade' || outgoingIds.has(clip.id)) return false;
     if (clip.transition==='dissolve' && time<clip.start+transitionLength(clip)-transitionBefore(clip)) return false;
     if (time<clip.start || videoDipFollowers.get(clip.id)) return false;
-    const item=mediaOf(clip);
+    const item=resolveClipMedia(clip).item;
     if (!item || item.nativeGenerator===1414680150) return false;
     const element=videoFor(clip);
     if (!(element instanceof HTMLVideoElement) || element.readyState<2 || !element.videoWidth || !element.videoHeight) return false;
@@ -1148,7 +1210,7 @@
   }
   function drawFrame(canvas) {
     const active = at('video', time);
-    if (!mutedTracks.video && active && mediaOf(active)?.src &&
+    if (!mutedTracks.video && active && programSource(active) && multicamAngleActive(active, time) &&
         video?.readyState < 2 && previewProjects.get(canvas) === project) return;
     previewProjects.set(canvas, project);
     const ctx = canvas.getContext("2d");
@@ -1178,7 +1240,7 @@
         paintTitle(ctx,canvas,clip);
         continue;
       }
-      if (outgoingIds.has(clip.id) || mediaOf(clip)?.nativeGenerator===1414680150) continue;
+      if (outgoingIds.has(clip.id) || resolveClipMedia(clip).item?.nativeGenerator===1414680150) continue;
       if (clip.transition==='fade' && time<clip.start) continue;
       const element=videoFor(clip);
       const progress=clamp((time-(clip.start-transitionBefore(clip)))/transitionLength(clip),0,1);
@@ -1282,8 +1344,8 @@
   }
   // LUT tables are immutable once validated; skip re-checking 100k samples on every edit.
   const validatedLuts = new WeakSet();
-  function validateProject(value, depth = 0) {
-    if (depth >= 4) throw new Error("This project nests sequences more than four levels deep.");
+  function validateProject(value, depth = 0, seen = new Set()) {
+    if (depth > 4) throw new Error("This project nests sequences more than four levels deep.");
     if (
       !value ||
       typeof value !== "object" ||
@@ -1336,12 +1398,15 @@
     if (value.captions != null && (!Array.isArray(value.captions) ||
         value.captions.some(cue => !cue || typeof cue.text !== "string" || !Number.isFinite(cue.start) || !Number.isFinite(cue.duration))))
       throw new Error("This project file has invalid captions.");
+    if (value.bins != null && (!Array.isArray(value.bins) || value.bins.some(entry => typeof entry !== "string")))
+      throw new Error("This project file has invalid bins.");
     for (const field of ["premiereSequences", "compatibilityWarnings"]) {
       const entries = value[field];
       if (entries != null && (!Array.isArray(entries) || entries.some(entry => typeof entry !== "string")))
         throw new Error("This project file has invalid Premiere metadata.");
     }
     const mediaIds = new Set();
+    const mediaById = new Map();
     for (const item of value.media) {
       if (
         !item ||
@@ -1354,9 +1419,58 @@
         mediaIds.has(item.id)
       )
         throw new Error("This project file has invalid media.");
-      if (Number.isInteger(item.nestedSequence) && item.nestedProject != null)
-        validateProject(item.nestedProject, depth + 1);
+      if ((Number.isInteger(item.nestedSequence) || (typeof item.nestedSequence === "string" && item.nestedSequence)) && item.nestedProject != null) {
+        const seqKey = typeof item.nestedSequence === "string" ? item.nestedSequence : "p:" + item.nestedSequence;
+        if (seen.has(seqKey)) throw new Error("Circular nested sequence reference.");
+        const nextSeen = new Set(seen);
+        nextSeen.add(seqKey);
+        validateProject(item.nestedProject, depth + 1, nextSeen);
+      }
+      if (item.multicam != null) {
+        const mc = item.multicam;
+        if (!mc || typeof mc !== "object" || !Array.isArray(mc.angles) || mc.angles.length < 1 || mc.angles.length > 9)
+          throw new Error("This project file has an invalid multicam clip.");
+        if (mc.audioMode != null && !["camera1", "follow", "all", "fixed"].includes(mc.audioMode))
+          throw new Error("This project file has an invalid multicam audio mode.");
+        if (mc.audioAngle != null && (!Number.isInteger(mc.audioAngle) || mc.audioAngle < 0 || mc.audioAngle >= mc.angles.length))
+          throw new Error("This project file has an invalid multicam audio angle.");
+        for (const angle of mc.angles) {
+          if (!angle || typeof angle.mediaId !== "string" ||
+              (angle.offset != null && (!Number.isFinite(angle.offset) || angle.offset < 0)) ||
+              (angle.in != null && (!Number.isFinite(angle.in) || angle.in < 0)) ||
+              (angle.duration != null && (!Number.isFinite(angle.duration) || angle.duration <= 0)))
+            throw new Error("This project file has an invalid multicam angle.");
+        }
+      }
+      if (item.parentMediaId != null) {
+        if (typeof item.parentMediaId !== "string" || !item.parentMediaId)
+          throw new Error("This project file has an invalid subclip parent.");
+        if (item.subclipIn != null && (!Number.isFinite(item.subclipIn) || item.subclipIn < 0))
+          throw new Error("This project file has an invalid subclip in point.");
+        if (item.subclipOut != null && (!Number.isFinite(item.subclipOut) || item.subclipOut <= (item.subclipIn || 0)))
+          throw new Error("This project file has an invalid subclip out point.");
+      }
       mediaIds.add(item.id);
+      mediaById.set(item.id, item);
+    }
+    for (const item of value.media) {
+      if (item.parentMediaId) {
+        let cur = item;
+        const chain = new Set();
+        while (cur?.parentMediaId) {
+          if (chain.has(cur.id)) throw new Error("Circular subclip reference.");
+          chain.add(cur.id);
+          if (!mediaById.has(cur.parentMediaId)) throw new Error("Subclip references missing parent media.");
+          cur = mediaById.get(cur.parentMediaId);
+        }
+      }
+      if (item.multicam) {
+        for (const angle of item.multicam.angles) {
+          const target = mediaById.get(angle.mediaId);
+          if (!target) throw new Error("Multicam angle references missing media.");
+          if (target.multicam) throw new Error("Nested multicam clips are not supported.");
+        }
+      }
     }
     const clipIds = new Set();
     for (const clip of value.clips) {
@@ -1374,6 +1488,9 @@
         clip.in < 0 ||
         !Number.isFinite(clip.track)
         || (clip.linkGroup !== undefined && (typeof clip.linkGroup !== "string" || clip.linkGroup.length > 128))
+        || (clip.multicamAngle !== undefined && (!Number.isInteger(clip.multicamAngle) || clip.multicamAngle < 0 || clip.multicamAngle > 8))
+        || (clip.multicamAudioAngle !== undefined && (!Number.isInteger(clip.multicamAudioAngle) || clip.multicamAudioAngle < 0 || clip.multicamAudioAngle > 8))
+        || (clip.colorLabel !== undefined && typeof clip.colorLabel !== "string")
       )
         throw new Error("This project file has an invalid clip.");
       if (clip.type === "title" && clip.title != null && typeof clip.title !== "string")
@@ -1411,7 +1528,19 @@
   }
   // Titles share the picture lane of their track number, as they do in Premiere.
   const laneOf = (clip) => (clip.type === "audio" ? "audio:" : "video:") + clip.track;
-  const hasSound = (item) => item?.type === "video" && !item.still && item.audioChannels > 0;
+  const hasSound = (item, source = project) => {
+    if (!item) return false;
+    if (item.multicam?.angles?.length)
+      return item.multicam.angles.some((a) => {
+        const target = resolveSubclipItem(source.media.find((m) => m.id === a.mediaId), source).item;
+        return !!target && (target.type === "audio" || (!target.still && target.audioChannels > 0));
+      });
+    if (item.parentMediaId) {
+      const parent = resolveSubclipItem(item, source).item;
+      return !!parent && parent.type === "video" && !parent.still && parent.audioChannels > 0;
+    }
+    return item.type === "video" && !item.still && item.audioChannels > 0;
+  };
   const startOfLane = (lane) => ({kind: lane.startsWith("audio") ? "audio" : "video", track: Number(lane.split(":")[1])});
   function freeAudioTrack(source, from, to) {
     for (let track = -1; track >= -64; track--) {
@@ -2074,12 +2203,13 @@
       for (const change of changes) {
         const target=project.clips.find(c=>c.id===change.id);
         const candidate={...target,...change.patch};
-        const source=mediaOf(target);
+        const source=resolveClipMedia(target).item;
+        const maxDur=mediaDurationOf(target);
         if (!Number.isFinite(Number(candidate.start)) || Number(candidate.start)<0 ||
             !Number.isFinite(Number(candidate.in)) || Number(candidate.in)<0 ||
             !Number.isFinite(Number(candidate.duration)) || Number(candidate.duration)<=0 ||
             !Number.isFinite(Number(candidate.speed ?? 1)) || Number(candidate.speed ?? 1)<.1 || Number(candidate.speed ?? 1)>16 ||
-            (!source?.still && source?.duration && Number(candidate.in)+Number(candidate.duration)*Number(candidate.speed ?? 1)>source.duration+.01))
+            (!source?.still && Number.isFinite(maxDur) && Number(candidate.in)+Number(candidate.duration)*Number(candidate.speed ?? 1)>maxDur+.01))
           throw new Error("Clip extends beyond available source footage.");
       }
       Editor.editProject(next=>{
@@ -2110,8 +2240,9 @@
       if(Math.abs(speed-oldSpeed)<1e-6)return;
       const sourceLength=clip.duration*oldSpeed;
       // Nearest whole timeline frame, unless rounding up would read past the end of the source.
-      const item=mediaOf(clip);
-      const available=item?.still || !item?.duration ? Infinity : item.duration-clip.in;
+      const item=resolveClipMedia(clip).item;
+      const maxDur=mediaDurationOf(clip);
+      const available=item?.still || !Number.isFinite(maxDur) ? Infinity : maxDur-clip.in;
       let frames=Math.round(sourceLength*project.fps/speed);
       if(frames*speed/project.fps>available+.01) frames=Math.floor(sourceLength*project.fps/speed+1e-6);
       if(frames<1)throw Error('This speed would make the clip shorter than a timeline frame.');
@@ -2125,8 +2256,8 @@
       const oldStart = clip.start, oldEnd = oldStart + clip.duration;
       const boundary = snap(atTime);
       const speed=Number(clip.speed)||1;
-      const mediaItem = mediaOf(clip);
-      const sourceEnd = mediaItem?.duration || Infinity;
+      const mediaItem = resolveClipMedia(clip).item;
+      const sourceEnd = mediaDurationOf(clip);
       const earliest=mediaItem?.still ? 0 : clip.reverse ? oldStart-(sourceEnd-clip.in-clip.duration*speed)/speed : oldStart-clip.in/speed;
       const latest=mediaItem?.still ? Infinity : clip.reverse ? oldEnd+clip.in/speed : oldStart+(sourceEnd-clip.in)/speed;
       const newStart = edge === "start" ? clamp(boundary, Math.max(0, earliest), oldEnd - 1/project.fps) : oldStart;
@@ -2138,9 +2269,10 @@
       for(const member of project.clips.filter(c=>memberIds.has(c.id))){
         const nextIn=member.in+(edge==="start"&&!member.reverse?shift*(Number(member.speed)||1):edge==="end"&&member.reverse?-shift*(Number(member.speed)||1):0);
         const nextDuration=member.duration+(edge==="start"?-shift:shift);
-        const source=mediaOf(member);
+        const source=resolveClipMedia(member).item;
+        const maxDur=mediaDurationOf(member);
         if(nextDuration<1/project.fps-.001 ||
-           (!source?.still && (nextIn<-.001 || (source?.duration && nextIn+nextDuration*(Number(member.speed)||1)>source.duration+.01))))
+           (!source?.still && (nextIn<-.001 || (Number.isFinite(maxDur) && nextIn+nextDuration*(Number(member.speed)||1)>maxDur+.01))))
           throw new Error("Linked clip cannot be trimmed beyond its source.");
       }
       Editor.editProject(next=>{
@@ -2164,8 +2296,8 @@
       if (incoming.some(clip => leftIds.has(clip.id))) return;
       for (const clip of [...outgoing,...incoming]) ensureEditable(clip);
       const frame = 1/project.fps;
-      const head = clip => mediaOf(clip)?.still ? Infinity : clip.in / (Number(clip.speed) || 1);
-      const tail = clip => mediaOf(clip)?.still ? Infinity : ((mediaOf(clip)?.duration || Infinity) - clip.in) / (Number(clip.speed) || 1) - clip.duration;
+      const head = clip => resolveClipMedia(clip).item?.still ? Infinity : clip.in / (Number(clip.speed) || 1);
+      const tail = clip => resolveClipMedia(clip).item?.still ? Infinity : (mediaDurationOf(clip) - clip.in) / (Number(clip.speed) || 1) - clip.duration;
       const earliest = Math.max(...outgoing.map(clip => frame-clip.duration),
         ...incoming.map(clip => Math.max(-clip.start, -(clip.reverse ? tail(clip) : head(clip)))));
       const latest = Math.min(...outgoing.map(clip => clip.reverse ? head(clip) : tail(clip)),
@@ -2194,19 +2326,19 @@
       });
     },
     slipClip(id, delta) {
-      const clip = project.clips.find(c => c.id === id), source = clip && mediaOf(clip);
-      if (!clip || !source?.duration || source.still) return;
+      const clip = project.clips.find(c => c.id === id), source = clip && resolveClipMedia(clip).item;
+      if (!clip || !Number.isFinite(mediaDurationOf(clip)) || source?.still) return;
       ensureLinkedEditable(clip);
       const members=[clip,...linkedClips(clip)];
       const bounds=members.map(member=>{
-        if(mediaOf(member)?.still) return [-Infinity,Infinity];
+        if(resolveClipMedia(member).item?.still) return [-Infinity,Infinity];
         const following=followingTransition(member);
         const before=transitionBefore(member);
         const after=following ? requestedTransitionLength(following)-transitionBefore(following) : 0;
         const speed=Number(member.speed)||1;
         const sourceHead=(member.reverse?after:before)*speed;
         const sourceTail=(member.duration+(member.reverse?before:after))*speed;
-        return [sourceHead-member.in,(mediaOf(member)?.duration||0)-member.in-sourceTail];
+        return [sourceHead-member.in,(mediaDurationOf(member)||0)-member.in-sourceTail];
       });
       const lower=Math.max(...bounds.map(([start])=>start));
       const upper=Math.min(...bounds.map(([,end])=>end));
@@ -2656,11 +2788,32 @@
       syncMedia(true);
       notify();
     },
+    resolveClipMedia(clip, source = project) {
+      return resolveClipMedia(clip, source);
+    },
+    swapSequence(nextProject, opts = {}) {
+      const candidate = cloneState(nextProject);
+      validateProject(candidate);
+      const previous = { project, history, future, time, selectedId, revision };
+      history = Array.isArray(opts.history) ? opts.history : [];
+      future = Array.isArray(opts.future) ? opts.future : [];
+      gesture = false; gestureBefore = null;
+      project = candidate;
+      project.duration = duration();
+      selectedId = opts.selectedId !== undefined ? opts.selectedId : (project.clips[0]?.id || null);
+      time = clamp(Number.isFinite(opts.time) ? opts.time : 0, 0, project.duration);
+      playing = false;
+      revision += 1;
+      syncMedia(true);
+      notify();
+      return previous;
+    },
     newProject(settings = {}) {
       const name=String(settings.name||"Untitled project").trim();
       const width=Number(settings.width||1920), height=Number(settings.height||1080), fps=Number(settings.fps||25);
       if (!name || !Number.isInteger(width) || !Number.isInteger(height) || width<16 || height<16 || width>3840 || height>2160 ||
           !Number.isFinite(fps) || fps<1 || fps>60) throw new Error("Invalid sequence settings.");
+      window.SpliceNested?.reset?.();
       history=[];future=[];gesture=false;gestureBefore=null;revision++;opened++;
       project = {
         name,
@@ -2699,6 +2852,7 @@
       validateProject(imported);
       mergeTitleTrackStates(imported);
       if (window.SpliceMedia) await window.SpliceMedia.restore(imported);
+      window.SpliceNested?.reset?.();
       history=[];future=[];gesture=false;gestureBefore=null;revision++;opened++;
       project = imported;
       selectedId = project.clips[0]?.id || null;
@@ -2709,13 +2863,14 @@
       notify();
     },
     async saveProject(format = "prproj") {
+      const root = window.SpliceNested?.rootProject?.() || project;
       const safe =
-        project.name.replace(/[^a-z0-9_-]+/gi, "-").replace(/^-|-$/g, "") ||
+        root.name.replace(/[^a-z0-9_-]+/gi, "-").replace(/^-|-$/g, "") ||
         "project";
       if (format === "prproj") {
         const prepared = window.SpliceMedia?.forPremiere
-          ? await window.SpliceMedia.forPremiere(project)
-          : project;
+          ? await window.SpliceMedia.forPremiere(root)
+          : root;
         const response = await fetch("/api/premiere/save", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -2726,7 +2881,7 @@
         download(await response.blob(), `${safe}.prproj`);
       } else
         download(
-          new Blob([JSON.stringify(project, null, 2)], {
+          new Blob([JSON.stringify(root, null, 2)], {
             type: "application/json",
           }),
           `${safe}.splice.json`,
