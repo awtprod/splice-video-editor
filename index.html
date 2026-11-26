@@ -11,6 +11,7 @@
     <link rel="stylesheet" href="studio.css" />
     <link rel="stylesheet" href="inspector.css" />
     <link rel="stylesheet" href="track_controls.css" />
+    <link rel="stylesheet" href="media-link.css" />
   </head>
   <body>
     <div class="app-shell">
@@ -59,6 +60,7 @@
             <button id="new-project">New project…</button>
             <button id="save-as">Save Premiere as…</button>
             <button id="save-working">Save working project…</button>
+            <button id="link-media">Link media in place…</button><button id="media-cache">Media cache…</button>
             <button id="versions">Recent projects &amp; recovery</button>
             <button id="compatibility">Project compatibility…</button>
             <button id="sequence-settings">Sequence settings…</button>
@@ -234,14 +236,14 @@
     <input
       type="file"
       id="media-input"
-      accept="video/*,audio/*,image/jpeg,image/png,.mxf,.mov,.mkv,.aiff,.bmp"
+      accept="video/*,audio/*,image/jpeg,image/png,.mxf,.mov,.mkv,.aiff,.bmp,.mts,.m2ts,.ts,.mpg,.dv,.tif,.tiff,.exr,.dpx,.webp"
       multiple
       hidden
     />
     <input
       type="file"
       id="relink-input"
-      accept="video/*,audio/*,image/jpeg,image/png,.mxf,.mov,.mkv,.aiff,.bmp"
+      accept="video/*,audio/*,image/jpeg,image/png,.mxf,.mov,.mkv,.aiff,.bmp,.mts,.m2ts,.ts,.mpg,.dv,.tif,.tiff,.exr,.dpx,.webp"
       multiple
       hidden
     />
@@ -253,6 +255,7 @@
     />
     <input type="file" id="specific-relink-input" hidden />
     <input type="file" id="folder-relink-input" webkitdirectory multiple hidden />
+    <script src="splice-auth.js"></script>
     <script src="media-store.js"></script>
     <script src="lut.js"></script>
     <script src="engine.js"></script>
@@ -263,5 +266,6 @@
     <script src="captions.js"></script>
     <script src="track_controls.js"></script>
     <script src="workspace.js"></script>
+    <script src="media-link.js"></script>
   </body>
 </html>
