@@ -12,7 +12,10 @@ window.SpliceMedia = (() => {
     /^(?:\.\/|\/)?assets\/(?:ridge|forest|valley|lake)\.(?:mp4|jpg)$|^(?:\.\/|\/)?assets\/score\.wav$/.test(
       src,
     );
-  const localMedia = (src) => /^\/media\/[a-f0-9]{32}\/[^/]+$/.test(src);
+  // Managed copies and proxies, or originals linked in place (desktop and
+  // python3 server.py on this machine): the server resolves those through
+  // its registry of paths the user picked.
+  const localMedia = (src) => /^\/media\/(?:linked\/)?[a-f0-9]{32}\/[^/]+$/.test(src);
   const key = (item) =>
     /^m\d+$/.test(item.id) && item.path ? "path:" + item.path : item.id;
   const open = () => {
@@ -89,6 +92,19 @@ window.SpliceMedia = (() => {
     if (!response.ok || !localMedia(result.src)) throw Error(result.error || 'Import failed.');
     return result.src;
   }
+  // A picked original stays where it is. Picker entries look like Files to
+  // the editor (name, webkitRelativePath) and carry the absolute path.
+  let noticeShown = false;
+  async function link(file) {
+    if (file.spliceLinked) return file.spliceLinked;
+    const response = await fetch('/api/media/link', {method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({paths:[file.splicePath]}),signal:AbortSignal.timeout(120000)});
+    const result = await response.json();
+    const entry = result.files?.[0];
+    if (result.notice && !noticeShown) { noticeShown = true; window.alert(result.notice); }
+    if (!response.ok || !entry || entry.error || !localMedia(entry.src)) throw Error(entry?.error || result.error || 'Could not link '+file.name+'.');
+    return entry;
+  }
   async function exists(src) {
     if (!localMedia(src) && !bundled(src)) return false;
     return (await fetch(src,{method:'HEAD',cache:'no-store',signal:AbortSignal.timeout(15000)})).ok;
@@ -133,10 +149,12 @@ window.SpliceMedia = (() => {
     return job;
   }
   async function importFile(file) {
-    const originalSrc=await upload(file);
+    const linked=typeof file.splicePath==='string'?await link(file):null;
+    const originalSrc=linked?linked.src:await upload(file);
     const info=await probe(originalSrc);
     const src=info.proxyRecommended?await makeProxy(originalSrc):originalSrc;
-    return {...info,src,originalSrc,name:file.name,path:file.name,offline:false,seekOptimized:false,audioStream:null};
+    return {...info,src,originalSrc,name:file.name,path:linked?linked.sourcePath:file.name,linked:!!linked,
+            sourceFingerprint:linked?.fingerprint,offline:false,seekOptimized:false,audioStream:null};
   }
   const nestedRequests=new WeakMap();
   function prepareNested(item,retry=false) {
@@ -168,7 +186,7 @@ window.SpliceMedia = (() => {
     Object.assign(item,metadata,{src,originalSrc:original});
   }
   function needsSourceProbe(item) {
-    return !Number.isInteger(item.audioStreams) || (item.audioStreams>1 && !Array.isArray(item.audioStreamChannels)) ||
+    return !Number.isInteger(item.audioStreams) || !Array.isArray(item.audioStreamDetails) || (item.audioStreams>1 && !Array.isArray(item.audioStreamChannels)) ||
       (item.hdr && item.hdrPreviewVersion!==3) || (item.still && item.stillPreviewVersion!==1);
   }
   async function restore(project) {
