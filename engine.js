@@ -1544,6 +1544,32 @@
       throw new Error("Reset needs room to return the clip to 100% speed, so nothing was reset: " + error.message);
     }
   }
+  // The project format keeps the sequence start timecode as `startTimecode`: a whole number of
+  // frames at the project rate (01:00:00:00 at 24 fps is 86400; 01:00:00;00 drop-frame at 29.97
+  // is 107892), and `dropFrame` (true/false, only for 29.97 and 59.94; absent there means drop).
+  // Projects and drafts written by earlier builds may hold the start as text ("01:00:00:00");
+  // they are converted here when opened, never refused: ";" in the label means drop-frame when
+  // the project does not say.
+  function normalizeTimecodeSettings(value, depth = 0) {
+    if (!value || typeof value !== "object" || depth > 8) return value;
+    const fps = Number(value.fps);
+    if (typeof value.startTimecode === "string") {
+      const label = value.startTimecode.trim();
+      const drop = isDropFrameRate(fps) ? (typeof value.dropFrame === "boolean" ? value.dropFrame : label.includes(";")) : undefined;
+      let frames = 0;
+      try { frames = label ? timecodeToFrames(label, fps, drop === true) : 0; }
+      catch { frames = Number.isInteger(value.startFrame) && value.startFrame >= 0 ? value.startFrame : 0; }
+      value.startTimecode = frames;
+      if (drop !== undefined && value.dropFrame === undefined) value.dropFrame = drop;
+    } else if (typeof value.startTimecode === "number" && Number.isFinite(value.startTimecode) && !Number.isInteger(value.startTimecode))
+      value.startTimecode = Math.max(0, Math.round(value.startTimecode));
+    if (Number.isFinite(fps) && fps > 0 && Number.isInteger(value.startTimecode) &&
+        value.startTimecode >= 24 * 3600 * Math.ceil(fps)) value.startTimecode %= 24 * 3600 * Math.ceil(fps);
+    if (value.startTimecode === null) delete value.startTimecode;
+    for (const item of Array.isArray(value.media) ? value.media : [])
+      if (item?.nestedProject) normalizeTimecodeSettings(item.nestedProject, depth + 1);
+    return value;
+  }
   const defaultStartTimecode = (fps, dropFrame) => timecodeToFrames("01:00:00:00", fps, dropFrame);
   const Editor = {
     formatTimecode(seconds, fps = 30, dropFrame = isDropFrameRate(fps)) {
@@ -2395,6 +2421,7 @@
         if (!response.ok) throw new Error(await response.text());
         imported = (await response.json()).project;
       } else imported = JSON.parse(await file.text());
+      normalizeTimecodeSettings(imported);
       validateProject(imported);
       mergeTitleTrackStates(imported);
       if (window.SpliceMedia) await window.SpliceMedia.restore(imported);
