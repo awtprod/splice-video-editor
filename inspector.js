@@ -27,9 +27,11 @@
     }
     return points.at(-1).value;
   }
-  function render(state, element, editor) {
+  const renderedInspectors = new WeakMap();
+  function render(state, element, editor, reuse = false) {
     const clip = state.selected;
     if (!clip) {
+      renderedInspectors.delete(element);
       element.innerHTML = '<div class="inspector-empty">Select a clip to edit its settings.</div>';
       return;
     }
@@ -153,6 +155,11 @@
       `<p class="splice-compat">${escape(nativeLimits.join(', '))} will not save to Premiere. Save a Splice working copy to keep this edit.</p>`);
     if(clip.transition==='native') html += section('Render compatibility',
       `<p class="splice-compat">This imported Premiere transition (${escape(clip.transitionMatchName||'unknown effect')}) stays in the native project. MP4 export cannot render it yet. Choose a supported transition to export video.</p>`);
+    // Edits elsewhere on the timeline often leave this inspector identical.
+    // Preserve its canvases and listeners when their captured inputs still match.
+    const prior = renderedInspectors.get(element);
+    if (reuse && prior?.clip === clip && prior.source === source && prior.locked === locked && prior.html === html && prior.fps === fps) return;
+    renderedInspectors.set(element, {clip, source, locked, html, fps});
     // The scope canvas survives the re-render: it keeps its picture and the scopes' record of
     // the frame it shows, so an edit does not repaint (or blank) the scope.
     const previousScope = element.querySelector('.splice-scope');

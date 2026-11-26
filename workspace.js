@@ -659,7 +659,7 @@
       (projectChanged &&
         !document.activeElement?.closest?.("#inspector-content"))
     ) {
-      window.SpliceInspector?.render(state, $("inspector-content"), editor);
+      window.SpliceInspector?.render(state, $("inspector-content"), editor, true);
       lastSelection = state.selectedId;
     }
     if (!projectChanged) return;
@@ -715,9 +715,10 @@
   }
   $("play-toggle").dataset.icon = "play";
   // The program monitor's processing size follows the monitor quality setting (color-monitor.js).
+  let monitorWidth = 0;
   function sizePreviewCanvas(project) {
-    const canvas=$('preview-canvas'), frame=$('monitor-frame');
-    const display=Math.round((frame?.clientWidth||0)*(window.devicePixelRatio||1));
+    const canvas=$('preview-canvas');
+    const display=Math.round(monitorWidth*(window.devicePixelRatio||1));
     const size=window.SpliceMonitor?.size(project,display) || {width:960,height:Math.min(2048,Math.max(1,Math.round(960*project.height/project.width)))};
     if(canvas.width!==size.width || canvas.height!==size.height){canvas.width=size.width; canvas.height=size.height; lastPaint='';}
   }
@@ -730,6 +731,7 @@
       1,
       Math.min(area.clientWidth - 24, (area.clientHeight - 24) * ratio),
     );
+    monitorWidth = width;
     frame.style.width = `${width}px`;
     frame.style.height = `${width / ratio}px`;
     sizePreviewCanvas(editor.get().project);

@@ -311,9 +311,14 @@
     if (Array.isArray(left) !== Array.isArray(right)) return false;
     if (Array.isArray(left))
       return left.length === right.length && left.every((item, index) => sameValue(item, right[index]));
-    const keys = Object.keys(left).filter((key) => left[key] !== undefined);
-    if (keys.length !== Object.keys(right).filter((key) => right[key] !== undefined).length) return false;
-    return keys.every((key) => sameValue(left[key], right[key]));
+    let present = 0;
+    for (const key of Object.keys(left)) {
+      if (left[key] === undefined) continue;
+      if (!sameValue(left[key], right[key])) return false;
+      present++;
+    }
+    for (const key of Object.keys(right)) if (right[key] !== undefined) present--;
+    return present === 0;
   }
   // After an edit, point unchanged clips and media back at the previous state's
   // objects so fifty undo steps of a 2,000-clip timeline hold one copy of each.
@@ -650,13 +655,14 @@
       return preceding(clip);
   }
   function transitionShortages(source) {
+    const transitions = source.clips.filter(clip => ['dissolve','wipe','fade'].includes(clip.transition));
+    if (!transitions.length) return new Map();
     const media = new Map(source.media.map(item=>[item.id,item]));
     const boundary = (clip, point) => `${clip.type}:${clip.track}:${Math.round(point*source.fps)}`;
     const ends = new Map(source.clips.filter(clip=>clip.type!=='title' && media.get(clip.mediaId)?.nativeGenerator!==1414680150)
       .map(clip=>[boundary(clip,clip.start+clip.duration),clip]));
     const shortages = new Map();
-    for (const clip of source.clips) {
-      if (!['dissolve','wipe','fade'].includes(clip.transition)) continue;
+    for (const clip of transitions) {
       const before=transitionBefore(clip);
       const after=requestedTransitionLength(clip)-before;
       const prior=ends.get(boundary(clip,clip.start));
