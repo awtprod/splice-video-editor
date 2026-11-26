@@ -364,6 +364,7 @@ class Writer:
         self.clips, skipped = mediapool.clips_from_rows({t: seed.rows(t) for t in mediapool.MEDIA_TABLES})
         self.skipped_clips = skipped
         self.authored = {}       # local path -> AuthoredClip
+        self.refusals = {}       # local path -> how a refused new file is reported
         self.expected = []       # per timeline: (Timeline, {item id: expectation}, transitions)
         self.inserts, self.updates, self.deletes = [], [], []
         self.track_orders = {}   # track id -> [(start, is clip, item id)]
@@ -403,12 +404,16 @@ class Writer:
     def author_media(self, media, where):
         facts, local = self.facts_for(media)
         if facts is None:
-            self.report.add(NOT_WRITTEN, f'Clips whose file could not be measured ({local})', where)
+            self.report.add(NOT_WRITTEN, 'New media files that could not be measured (each file\'s reason is listed; '
+                            'link the file in Splice so it can be read)', f'{where} ({local})')
             return None
         key = facts.path
         if key in self.authored:
+            if self.authored[key] is None:
+                self._media_refused(*self.refusals[key], where)
             return self.authored[key]
         kind = mediapool.kind_of_facts(facts)
+        label = self.short_kind(kind)
         templates = []
         for clip in self.clips.values():
             try:
@@ -417,11 +422,14 @@ class Writer:
             except mediapool.MediaPoolError:
                 continue
         if not templates:
-            status = mediapool.KINDS.get(kind)
-            why = ('no clip of this kind is in the seed\'s media pool to serve as the template' if status else
-                   f'no evidence yet that a {mediapool.kind_label(kind)} can be authored')
-            self.report.add(NOT_WRITTEN, f'Clips of new media Splice cannot add to the Resolve media pool ({why})', where)
-            return None
+            if mediapool.KINDS.get(kind) or mediapool.KINDS.get(mediapool._without_look(kind)):
+                refusal = (NOT_WRITTEN, f'New {label} files not added: the seed\'s media pool holds no {label} to take '
+                           'Resolve\'s own fields from. Import any one such file into this project in Resolve, save, '
+                           'open the project in Splice again and save again', facts.name, None)
+            else:
+                refusal = (NOT_WRITTEN, f'New {label} files not added: no Resolve sample of this kind of file has been '
+                           'checked (import them in Resolve by hand)', facts.name, None)
+            return self._refuse_media(key, refusal, where)
         bin_id = self.timeline_bin()
         index = len(self.seed.rows('Sm2MpFolder_Sm2MpMedia', 'DbOwner = ?', (bin_id,))) + \
             sum(1 for a in self.authored.values() if a)
@@ -435,28 +443,64 @@ class Writer:
                 authored = mediapool.author(facts, mediapool.Template(template, template_facts), placement,
                                             taken=frozenset(self.taken), allow_unverified=self.allow_unverified)
             except mediapool.MediaPoolError as error:
-                last = error
+                last = (error, template_facts)
                 if error.code in ('kind_mismatch', 'bad_template'):
                     continue
                 break
             self.authored[key] = authored
             self.taken |= mediapool.ClipRows.from_tables(authored.rows).ids()
             if authored.status == 'unverified':
-                self.report.add(OPT_IN, 'New media written although its rows are not verified (you allowed it): '
-                                + '; '.join(authored.unverified)[:400], facts.name, need='unverifiedMedia')
+                self.report.add(OPT_IN, f'New {label} files written although their rows are not verified (you allowed '
+                                'it)', f'{facts.name}: ' + '; '.join(authored.unverified)[:400], need='unverifiedMedia')
             else:
                 self.report.add(EXACT, 'New media added to the media pool (rows authored from the file\'s measured '
                                 'facts, a verified kind)', facts.name)
             self.operations.add('add_media')
             return authored
-        if last is not None and last.code == 'unverified':
-            self.report.add(OPT_IN, 'New media not written: its rows would not be verified. Allow unverified media to '
-                            f'write it anyway ({last.message[:300]})', where, need='unverifiedMedia')
+        error, template_facts = last if last else (None, None)
+        if error is not None and error.code == 'unverified':
+            remedy = ('link the seed\'s own media of this kind in Splice so its file can be measured, or allow '
+                      'unverified media to write them anyway' if template_facts is None else
+                      'allow unverified media to write them anyway')
+            refusal = (OPT_IN, f'New {label} files not written: their rows would not be verified ({remedy}; what each '
+                       'file lacks is listed with it)', f'{facts.name}: {error.message[:300]}', 'unverifiedMedia')
+        elif error is not None and error.code == 'kind_mismatch':
+            remedy = ('no Resolve sample with this look has been checked, so import them in Resolve by hand'
+                      if mediapool.KINDS.get(kind) is None else
+                      'import one file with this look into this project in Resolve, save, and save from Splice again')
+            refusal = (NOT_WRITTEN, f'New {label} files not added: the seed\'s media of this kind have another picture '
+                       f'format or colour tags than these files ({remedy})', f'{facts.name}: {self.look(kind)}', None)
+        elif error is not None and error.code == 'unsupported_kind':
+            refusal = (NOT_WRITTEN, f'New {label} files not added: no Resolve sample of this kind of file (its picture '
+                       'format, colour tags or colour range) has been checked; import them in Resolve by hand',
+                       f'{facts.name}: {self.look(kind)}', None)
         else:
-            self.report.add(NOT_WRITTEN, 'Clips of new media Splice cannot author ('
-                            + (last.message[:300] if last else 'no template') + ')', where)
+            refusal = (NOT_WRITTEN, f'New {label} files Splice cannot author (the reason is listed with each file)',
+                       f'{facts.name}: ' + (error.message[:300] if error else 'no template'), None)
+        return self._refuse_media(key, refusal, where)
+
+    def _refuse_media(self, key, refusal, where):
         self.authored[key] = None
+        self.refusals[key] = refusal
+        self._media_refused(*refusal, where)
         return None
+
+    def _media_refused(self, status, what, detail, need, where):
+        self.report.add(status, what, f'{where} — {detail}', need=need)
+
+    @staticmethod
+    def short_kind(kind):
+        """A kind of file in a few words (``.wav sound``, ``.mov picture (apch)``, ``.png still``)."""
+        media, container = kind[0], kind[1]
+        name = {'audio': 'sound', 'video': 'picture', 'still': 'still'}.get(media, media)
+        return f'.{container} {name}' + (f' ({kind[2]})' if kind[2] else '')
+
+    @staticmethod
+    def look(kind):
+        pix, space, transfer, primaries, color_range, rotation = (tuple(kind[7]) + ('-',) * 6)[:6]
+        return (f'pixel format {pix}, colour space {space}, transfer {transfer}, primaries {primaries}, colour range '
+                f'{color_range}' + ('' if color_range != '-' else ' (unset in the file)') +
+                (f', rotated {rotation}°' if rotation not in ('0', '-', 0) else ''))
 
     def facts_for_template(self, clip):
         try:

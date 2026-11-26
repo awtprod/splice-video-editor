@@ -1150,3 +1150,43 @@ class StillRadiometryTests(unittest.TestCase):
         self.assertIn('#14, #15', why)
         self.assertIn('not established', why)
         self.assertIn('cannot be read', mediapool.still_radiometry_variant(mock.Mock(video={'Radiometry': b'\x01'})))
+
+
+class NewMediaReportTests(SaveCase):
+    def add(self, project, name, local, kind, track, at):
+        project['media'].append({'id': name, 'name': Path(local).name, 'src': 'file:' + str(local), 'type': kind})
+        project['clips'].append({'id': 'c-' + name, 'type': 'audio' if kind == 'audio' else 'video', 'track': track,
+                                 'start': at, 'duration': 4 / project['fps'], 'in': 0, 'mediaId': name})
+
+    def test_refused_new_media_gets_one_line_per_kind_saying_what_would_make_it_writable(self):
+        import subprocess
+        project = self.opened()
+        fps = project['fps']
+        # The seed's own WAV is not linked in Splice: its file cannot be measured, so new WAVs are
+        # not verified (one line for both, with the remedy).
+        for media in project['media']:
+            if media.get('path') == SND:
+                media.pop('src', None)
+                media['offline'] = True
+        for n in range(2):
+            wav = self.dir / f'new{n}.wav'
+            shutil.copyfile(self.snd, wav)
+            self.add(project, f'w{n}', wav, 'audio', -2, n * 5 / fps)
+        # A ProRes HQ FFmpeg wrote without a colour range: a kind no sample covers (one line).
+        for n in range(2):
+            mov = self.dir / f'unset{n}.mov'
+            subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i', 'color=c=gray:s=1920x1080:r=30000/1001:d=1',
+                            '-c:v', 'prores_ks', '-profile:v', '3', '-pix_fmt', 'yuv422p10le', '-timecode', '01:00:00:00',
+                            str(mov)], check=True)
+            self.add(project, f'p{n}', mov, 'video', 2, 10 + n * 5 / fps)
+        result = self.run_save(self.payload(project, confirm=False))
+        wav_lines = [line for line in result['lines'] if line['what'].startswith('New .wav sound files')]
+        self.assertEqual(len(wav_lines), 1, [line['what'] for line in result['lines']])
+        self.assertEqual((wav_lines[0]['status'], wav_lines[0]['count']), (writer.OPT_IN, 2))
+        self.assertIn('link the seed\'s own media of this kind', wav_lines[0]['what'])
+        mov_lines = [line for line in result['lines'] if line['what'].startswith('New .mov picture')]
+        self.assertEqual(len(mov_lines), 1, [line['what'] for line in result['lines']])
+        self.assertEqual((mov_lines[0]['status'], mov_lines[0]['count']), (writer.NOT_WRITTEN, 2))
+        self.assertTrue(all('colour range - (unset in the file)' in place for place in mov_lines[0]['all']),
+                        (mov_lines[0]['what'], mov_lines[0]['all']))
+        self.assertIn('unverifiedMedia', result['needs'])
