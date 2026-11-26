@@ -157,9 +157,7 @@ async function main() {
           if (clip.opacity != null) out.opacity = clip.opacity;
           if (clip.keyframes) out.keyframes = clip.keyframes;
           if (clip.transition) { out.transitionDuration = clip.transitionDuration; out.transitionBefore = clip.transitionBefore; }
-          costs.sort((a,b) => a-b);
-      console.log(await page.evaluate(() => SplicePicture.stats.renderer), 'median monitor draw (ms at 640x360):', costs[Math.floor(costs.length/2)]);
-      return out;
+          return out;
         });
         project.media.find(item => item.name === 'override709.mp4').colorMatrix = 'bt709';
         project.media.find(item => item.name === 'flat.mp4').inputLut = inputLut;
