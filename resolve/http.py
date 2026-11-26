@@ -1,4 +1,6 @@
-"""The ``/api/resolve/*`` routes, kept here so server.py needs one dispatch line."""
+"""The ``/api/resolve/*`` routes. server.py registers them in its route table with ``@post``, so
+they pass the same request checks (session cookie, page token, same-origin fetch) as every other
+/api/ route before any of this runs."""
 import json
 
 from . import ResolveError, list_library, open_drp, open_library_project
@@ -7,20 +9,12 @@ from .source import MAX_DRP_BYTES
 
 MAX_JSON = 64 * 1024
 
-
-def _body(handler, limit):
-    length = int(handler.headers.get('Content-Length', '0'))
-    if length <= 0 or length > limit:
-        raise ResolveError('Upload size is invalid')
-    body = handler.rfile.read(length)
-    if len(body) != length:
-        raise ResolveError('Incomplete request')
-    return body
+__all__ = ['MAX_DRP_BYTES', 'MAX_JSON', 'open_route', 'library_list_route', 'library_open_route']
 
 
-def _json_body(handler):
+def _json_body(body):
     try:
-        payload = json.loads(_body(handler, MAX_JSON))
+        payload = json.loads(body)
     except (UnicodeDecodeError, json.JSONDecodeError):
         raise ResolveError('Expected a JSON request') from None
     if not isinstance(payload, dict):
@@ -53,27 +47,40 @@ def _path(payload):
     return value.strip()
 
 
-def handle_post(handler, route, query):
-    """Answer one POST under /api/resolve/ (the caller has already checked the request is local)."""
+def _answer(handler, work):
+    """Run ``work`` and reply; a failure is reported in the body, never a dropped connection."""
     try:
-        if route == '/api/resolve/open':
-            data = _body(handler, MAX_DRP_BYTES)
-            index = _index(query.get('timeline', [None])[0])
-            timeline_id = _timeline_id(query.get('timelineId', [None])[0])
-            handler._json(200, {'project': open_drp(data, index, link_local, timeline_id)})
-        elif route == '/api/resolve/library/list':
-            projects, truncated = list_library(_path(_json_body(handler)))
-            handler._json(200, {'projects': projects, 'truncated': truncated})
-        elif route == '/api/resolve/library/open':
-            payload = _json_body(handler)
-            project = open_library_project(_path(payload), _index(payload.get('timeline')), link_local,
-                                           timeline_id=_timeline_id(payload.get('timelineId')))
-            handler._json(200, {'project': project})
-        else:
-            handler.send_error(404)
+        handler._json(200, work())
     except (ResolveError, ValueError) as error:
         handler._json(400, {'error': str(error)})
     except (BrokenPipeError, ConnectionResetError):
         return
-    except Exception as error:  # reported like server.py's other routes, never a dropped connection
+    except Exception as error:
         handler._json(500, {'error': f'The Resolve project could not be opened ({type(error).__name__}: {error}).'})
+
+
+def open_route(handler, length, query):
+    """POST /api/resolve/open?timeline=N|timelineId=ID with the .drp bytes as the body."""
+    def work():
+        data = handler.rfile.read(length)
+        if len(data) != length:
+            raise ResolveError('Incomplete request')
+        index = _index(query.get('timeline', [None])[0])
+        timeline_id = _timeline_id(query.get('timelineId', [None])[0])
+        return {'project': open_drp(data, index, link_local, timeline_id)}
+    _answer(handler, work)
+
+
+def library_list_route(handler, body):
+    def work():
+        projects, truncated = list_library(_path(_json_body(body)))
+        return {'projects': projects, 'truncated': truncated}
+    _answer(handler, work)
+
+
+def library_open_route(handler, body):
+    def work():
+        payload = _json_body(body)
+        return {'project': open_library_project(_path(payload), _index(payload.get('timeline')), link_local,
+                                                timeline_id=_timeline_id(payload.get('timelineId')))}
+    _answer(handler, work)

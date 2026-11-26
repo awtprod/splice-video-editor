@@ -211,24 +211,105 @@ class LibraryTests(Scratch):
         self.assertGreater(calls['n'], 3)
 
 
+def wav(path, seconds=0.05):
+    """A tiny real WAV (silence) that FFmpeg probes as audio."""
+    import wave
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), 'wb') as sink:
+        sink.setnchannels(1)
+        sink.setsampwidth(2)
+        sink.setframerate(8000)
+        sink.writeframes(b'\0\0' * int(8000 * seconds))
+    return path
+
+
 class MediaTests(Scratch):
-    def test_local_media_links_and_foreign_paths_stay_offline(self):
-        footage = self.dir / 'footage' / 'Day 1'
-        footage.mkdir(parents=True)
-        (footage / 'A001.mp4').write_bytes(b'not really video')
-        media_root = self.dir / 'media'
-        spec = F.sample(str(footage / 'A001.mp4'), 'E:\\Shoot\\Day 1\\A002.wav')
-        project = resolve.open_drp(F.drp_bytes(spec), 0, lambda path: link_local(path, media_root))
+    """Media a project names is referenced in place through the link registry, never copied."""
+
+    def setUp(self):
+        super().setUp()
+        import media_links
+        self.ml = media_links
+        saved = dict(MEDIA_ROOT=media_links.MEDIA_ROOT, REGISTRY=media_links.REGISTRY)
+        media_links.MEDIA_ROOT = self.dir / 'data' / 'media'
+        media_links.REGISTRY = self.dir / 'data' / 'linked-media.json'
+        media_links._cache.update(stamp=None, links={}, recovered=None)
+
+        def restore():
+            for key, value in saved.items():
+                setattr(media_links, key, value)
+            media_links._cache.update(stamp=None, links={}, recovered=None)
+        self.addCleanup(restore)
+
+    def registered(self):
+        return sorted(entry['path'] for entry in self.ml._links().values())
+
+    def test_local_media_is_linked_in_place_and_foreign_paths_stay_offline(self):
+        clip = wav(self.dir / 'footage' / 'Day 1' / 'A001.wav')
+        spec = F.sample(str(clip), 'E:\\Shoot\\Day 1\\A002.wav')
+        project = resolve.open_drp(F.drp_bytes(spec), 0, link_local)
         media = {m['name']: m for m in project['media']}
-        self.assertFalse(media['A001.mp4']['offline'])
-        self.assertRegex(media['A001.mp4']['src'], r'^/media/[a-f0-9]{32}/A001\.mp4$')
-        linked = media_root / media['A001.mp4']['src'].split('/')[2] / 'A001.mp4'
-        self.assertEqual(os.stat(linked).st_ino, os.stat(footage / 'A001.mp4').st_ino)
-        self.assertTrue(media['A002.wav']['offline'])
-        self.assertEqual(link_local('E:\\Shoot\\Day 1\\A002.wav', media_root), '')
-        self.assertEqual(link_local(str(self.dir), media_root), '')
-        (self.dir / 'notes.txt').write_text('x')
-        self.assertEqual(link_local(str(self.dir / 'notes.txt'), media_root), '')
+        found = media['A001.wav']
+        self.assertEqual((found['offline'], found['linked'], found['path']), (False, True, str(clip)))
+        self.assertRegex(found['src'], r'^/media/linked/[a-f0-9]{32}/A001\.wav$')
+        self.assertEqual(self.ml.resolve_media(found['src']), clip.resolve())
+        self.assertTrue(found['sourceFingerprint'])
+        self.assertEqual(self.registered(), [str(clip.resolve())])
+        self.assertFalse((self.dir / 'data' / 'media').exists())  # nothing copied or hard-linked
+        offline = media['A002.wav']
+        self.assertEqual((offline['offline'], offline['src'], offline['path']), (True, '', 'E:\\Shoot\\Day 1\\A002.wav'))
+        self.assertEqual(project['resolveSource']['linkedMedia'], 1)
+        # Opening the project again reuses the same link.
+        again = resolve.open_drp(F.drp_bytes(spec), 0, link_local)
+        self.assertEqual(next(m['src'] for m in again['media'] if m['name'] == 'A001.wav'), found['src'])
+
+    def test_a_crafted_project_registers_only_real_media(self):
+        text = self.dir / 'notes.mp4'
+        text.write_text('ssh-ed25519 AAAA not really video\n' * 20)
+        key = self.dir / 'id_ed25519'
+        key.write_text('-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----\n')
+        notes = self.dir / 'notes.txt'
+        notes.write_text('hello')
+        named = [str(text), str(key), str(notes), '/etc/passwd', str(self.dir / 'gone' / 'A009.mov'),
+                 str(self.dir), 'relative/A001.wav', 'E:\\Shoot\\A002.wav']
+        self.assertEqual(link_local(named), [None] * len(named))
+        spec = F.sample(str(text), str(self.dir / 'gone' / 'A009.wav'))
+        spec['media'] += [dict(spec['media'][1], id=f'm-x{n}', info=f'ai-x{n}', name=Path(path).name,
+                               dir=str(Path(path).parent), file=Path(path).name)
+                          for n, path in enumerate(('/etc/passwd', str(key), str(notes)))]
+        project = resolve.open_drp(F.drp_bytes(spec), 0, link_local)
+        self.assertEqual(self.registered(), [])
+        by_name = {m['name']: m for m in project['media']}
+        for name in ('notes.mp4', 'A009.wav', 'passwd', 'id_ed25519', 'notes.txt'):
+            self.assertEqual((by_name[name]['offline'], by_name[name]['src']), (True, ''), name)
+        self.assertEqual(by_name['A009.wav']['path'], str(self.dir / 'gone' / 'A009.wav'))
+        self.assertFalse(self.ml.REGISTRY.exists())
+
+    def test_a_project_with_500_media_writes_the_registry_once(self):
+        import time
+        clips = [wav(self.dir / 'card' / f'c{n:03}.wav') for n in range(500)]
+        spec = F.sample(str(clips[0]), str(clips[1]))
+        spec['media'] += [dict(spec['media'][1], id=f'm-c{n}', info=f'ai-c{n}', name=clip.name,
+                               dir=str(clip.parent), file=clip.name) for n, clip in enumerate(clips[2:])]
+        writes = []
+        real = self.ml._write
+        with mock.patch.object(self.ml, '_write', lambda *a: (writes.append(1), real(*a))[1]):
+            began = time.monotonic()
+            project = resolve.open_drp(F.drp_bytes(spec), 0, link_local)
+            elapsed = time.monotonic() - began
+        print(f'\n500-media Resolve project: {elapsed:.2f} s, registry writes: {len(writes)}', file=sys.stderr)
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(len(self.registered()), 500)
+        self.assertEqual(sum(1 for m in project['media'] if m.get('linked')), 500)
+
+
+class DesktopPackageTests(unittest.TestCase):
+    def test_the_desktop_archives_carry_the_resolve_package(self):
+        import package_desktop
+        files = {path.as_posix() for path in package_desktop.source_files()}
+        expected = {path.relative_to(ROOT).as_posix() for path in (ROOT / 'resolve').glob('*.py')}
+        self.assertTrue(expected and expected <= files, sorted(expected - files))
+        self.assertTrue({'server.py', 'resolve-dialogs.js', 'resolve-dialogs.css'} <= files)
 
 
 def drp_with(members):
@@ -830,30 +911,47 @@ class TimelineIdTests(Scratch):
 
 
 class ServerTests(Scratch):
+    """The /api/resolve/* routes, through ``python3 server.py`` and its request checks."""
+
+    ROUTES = (('/api/resolve/open?timeline=0', 'drp'), ('/api/resolve/library/list', 'list'),
+              ('/api/resolve/library/open', 'open'))
+
     def setUp(self):
         super().setUp()
-        import threading
-        os.environ['SPLICE_DATA_DIR'] = str(self.dir / 'data')
-        import server
-        self.server = server.create_server(0)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-        self.thread.start()
+        from test_media_server import ServerProcess
+        self.server = ServerProcess(self.dir / 'data')
+        self.addCleanup(self.server.close)
 
-    def tearDown(self):
-        self.server.shutdown()
-        self.server.server_close()
-        os.environ.pop('SPLICE_DATA_DIR', None)
-        super().tearDown()
-
-    def post(self, route, body, kind='application/octet-stream'):
-        import http.client
-        conn = http.client.HTTPConnection('127.0.0.1', self.server.server_port, timeout=30)
+    def post(self, route, body, kind='application/octet-stream', **options):
+        status, _, data = self.server.request('POST', route, body, headers={'Content-Type': kind}, **options)
         try:
-            conn.request('POST', route, body, {'Content-Type': kind})
-            response = conn.getresponse()
-            return response.status, json.loads(response.read())
-        finally:
-            conn.close()
+            return status, json.loads(data or b'{}')
+        except ValueError:
+            return status, {}
+
+    def bodies(self):
+        self.library()
+        project = next((self.dir / 'library').rglob('Project.db'))
+        return {'drp': (F.drp_bytes(self.spec), 'application/octet-stream'),
+                'list': (json.dumps({'path': str(self.dir / 'library')}), 'application/json'),
+                'open': (json.dumps({'path': str(project), 'timeline': 0}), 'application/json')}
+
+    def test_resolve_routes_refuse_requests_without_the_session_or_token(self):
+        bodies = self.bodies()
+        for route, which in self.ROUTES:
+            body, kind = bodies[which]
+            for label, options in (('no cookie', dict(auth=False)), ('no token', dict(token=False)),
+                                   ('cross-site', dict(extra={'Sec-Fetch-Site': 'cross-site'})),
+                                   ('other origin', dict(extra={'Origin': 'http://127.0.0.1:1'})),
+                                   ('wrong token', dict(extra={'X-Splice-Token': 'x' * 43}))):
+                extra = options.pop('extra', {})
+                status, _, data = self.server.request('POST', route, body, headers={'Content-Type': kind, **extra},
+                                                      **options)
+                self.assertEqual(status, 403, (route, label))
+                self.assertNotIn(b'Harbor', data, (route, label))
+            status, data = self.post(route, body, kind)
+            self.assertEqual(status, 200, (route, data))
+        self.assertEqual(list((self.dir / 'data' / 'resolve-snapshots').iterdir()), [])
 
     def test_routes(self):
         status, data = self.post('/api/resolve/open?timeline=1', F.drp_bytes(self.spec))
@@ -866,6 +964,8 @@ class ServerTests(Scratch):
         status, data = self.post('/api/resolve/open', b'junk')
         self.assertEqual(status, 400)
         self.assertIn('not a DaVinci Resolve project', data['error'])
+        status, data = self.post('/api/resolve/open', b'')
+        self.assertEqual(status, 400)
         self.library()
         status, data = self.post('/api/resolve/library/list', json.dumps({'path': str(self.dir / 'library')}),
                                  'application/json')
@@ -876,6 +976,8 @@ class ServerTests(Scratch):
         for payload in ('[]', '{"path": 5}', '{"path": "x", "timeline": -1}', 'not json'):
             status, data = self.post('/api/resolve/library/open', payload, 'application/json')
             self.assertEqual(status, 400, payload)
+        self.assertEqual(self.post('/api/resolve/library/list', json.dumps({'path': 'x' * 70000}),
+                                   'application/json')[0], 400)
         self.assertEqual(list((self.dir / 'data' / 'resolve-snapshots').iterdir()), [])
 
 

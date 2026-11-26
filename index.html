@@ -12,6 +12,7 @@
     <link rel="stylesheet" href="inspector.css" />
     <link rel="stylesheet" href="track_controls.css" />
     <link rel="stylesheet" href="resolve-dialogs.css" />
+    <link rel="stylesheet" href="media-link.css" />
   </head>
   <body>
     <div class="app-shell">
@@ -59,6 +60,7 @@
           <details class="file-menu"><summary>File</summary><div>
             <button id="new-project">New project…</button><button id="open-resolve">Open Resolve project (.drp)…</button><button id="open-resolve-library">Open from Resolve library…</button><button id="save-as">Save Premiere as…</button>
             <button id="save-working">Save working project…</button>
+            <button id="link-media">Link media in place…</button><button id="media-cache">Media cache…</button>
             <button id="versions">Recent projects &amp; recovery</button>
             <button id="compatibility">Project compatibility…</button>
             <button id="shortcuts">Keyboard and mouse</button></div></details><button id="import-media" class="menu-button">
@@ -216,14 +218,14 @@
     <input
       type="file"
       id="media-input"
-      accept="video/*,audio/*,image/jpeg,image/png,.mxf,.mov,.mkv,.aiff,.bmp"
+      accept="video/*,audio/*,image/jpeg,image/png,.mxf,.mov,.mkv,.aiff,.bmp,.mts,.m2ts,.ts,.mpg,.dv,.tif,.tiff,.exr,.dpx,.webp"
       multiple
       hidden
     />
     <input
       type="file"
       id="relink-input"
-      accept="video/*,audio/*,image/jpeg,image/png,.mxf,.mov,.mkv,.aiff,.bmp"
+      accept="video/*,audio/*,image/jpeg,image/png,.mxf,.mov,.mkv,.aiff,.bmp,.mts,.m2ts,.ts,.mpg,.dv,.tif,.tiff,.exr,.dpx,.webp"
       multiple
       hidden
     />
@@ -236,6 +238,7 @@
     <input type="file" id="specific-relink-input" hidden />
     <input type="file" id="folder-relink-input" webkitdirectory multiple hidden />
     <input type="file" id="resolve-input" accept=".drp" hidden />
+    <script src="splice-auth.js"></script>
     <script src="media-store.js"></script>
     <script src="lut.js"></script>
     <script src="engine.js"></script>
@@ -246,6 +249,7 @@
     <script src="captions.js"></script>
     <script src="track_controls.js"></script>
     <script src="workspace.js"></script>
+    <script src="media-link.js"></script>
     <script src="resolve-dialogs.js"></script>
   </body>
 </html>

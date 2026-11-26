@@ -1,48 +1,60 @@
 """Bring media a Resolve project names into Splice when the file is on this computer."""
-import hashlib
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from urllib.parse import quote
 
-from premiere import MEDIA_ROOT
+import media_links
+from media_proxy import decodable
 
-# The extensions Splice's media upload accepts.
-MEDIA_SUFFIXES = frozenset({'.mp4', '.mov', '.mkv', '.webm', '.wav', '.mp3', '.m4a', '.jpg', '.jpeg', '.png',
-                            '.aac', '.ogg', '.flac', '.avi', '.mxf', '.aiff', '.m4v', '.bmp'})
+PROBES = max(1, min(8, os.cpu_count() or 1))
 
 
-def link_local(path_text, media_root=None):
-    """A playback URL for ``path_text`` if it is a media file on this computer, else ''.
+def link_local(paths):
+    """Reference in place the files in ``paths`` that are media on this computer.
 
-    The file is hard-linked into Splice's media folder (no copy, nothing written beside the
-    original). A path from another machine (``E:\\Shoot\\A001.mov`` on a Mac), a file on another
-    volume than Splice's media folder, or anything that is not a regular media file stays offline
-    and is relinked by the person editing.
+    Returns one result per path: ``media_links``' source description (``src``,
+    ``sourcePath``, ``fingerprint``, ...) for a file that was linked, else ``None``.
+    Nothing is copied and nothing is written beside the original. A file is
+    registered only when it is an absolute path to a regular file with a media
+    extension and the registry's own FFmpeg probe (``decodable``) accepts it, so a
+    project naming ``/etc/passwd`` or a key file registers nothing. A path from
+    another machine (``E:\\Shoot\\A001.mov`` on Linux), a missing file or anything
+    else stays offline and is relinked by the person editing. The registry is
+    written once for the whole project.
     """
-    root = Path(media_root) if media_root is not None else MEDIA_ROOT
-    try:
-        path = Path(path_text)
-        if not path.is_absolute() or path.suffix.lower() not in MEDIA_SUFFIXES:
-            return ''
-        resolved = path.resolve(strict=True)
-        if not resolved.is_file() or resolved.suffix.lower() not in MEDIA_SUFFIXES:
-            return ''
-        info = resolved.stat()
-        key = hashlib.sha256(f'{resolved}|{info.st_size}|{info.st_mtime_ns}'.encode('utf-8', 'surrogatepass'))
-        directory = root / key.hexdigest()[:32]
-        destination = directory / resolved.name
-        if not destination.is_file():
-            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    candidates = []
+    for index, text in enumerate(paths):
+        try:
+            if not isinstance(text, str) or not text or len(text) > 4096 or '\x00' in text:
+                continue
+            path = Path(text)
+            if not os.path.isabs(text) or path.suffix.lower() not in media_links.MEDIA_EXTENSIONS:
+                continue
+            resolved = path.resolve(strict=True)
+            if resolved.suffix.lower() not in media_links.MEDIA_EXTENSIONS or not resolved.is_file():
+                continue
+        except (OSError, ValueError, RuntimeError):
+            continue
+        candidates.append((index, str(resolved)))
+    results = [None] * len(paths)
+    if candidates:
+        # The registry's FFmpeg check, run for the whole project a few probes at a time; link_many
+        # then consults the outcome per file and writes the registry once.
+        def probe(path):
             try:
-                os.link(resolved, destination)
-            except FileExistsError:
-                pass
-            except OSError:
-                try:
-                    directory.rmdir()
-                except OSError:
-                    pass
-                return ''
-        return '/media/' + directory.name + '/' + quote(destination.name)
-    except (OSError, ValueError, RuntimeError):
-        return ''
+                decodable(Path(path), Path(path).name)
+            except Exception as error:  # noqa: BLE001 - reported per file by link_many
+                return error
+            return None
+        with ThreadPoolExecutor(max_workers=min(PROBES, len(candidates))) as pool:
+            outcome = dict(zip((path for _, path in candidates), pool.map(probe, (path for _, path in candidates))))
+
+        def validate(path, name):
+            error = outcome.get(str(path), ValueError(f'{name} was not checked'))
+            if error is not None:
+                raise error if isinstance(error, (ValueError, OSError)) else ValueError(str(error))
+        linked = media_links.link_many([path for _, path in candidates], validate=validate)
+        for (index, _), result in zip(candidates, linked):
+            if 'src' in result:
+                results[index] = result
+    return results

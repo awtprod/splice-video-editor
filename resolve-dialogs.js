@@ -89,10 +89,11 @@ window.SpliceResolve = (() => {
     }
     await load(fresh(project), extra);
   }
-  // The one place that asks for a folder path: swap in the server-side picker when it exists.
+  // The one place that asks for a folder: Splice's in-app folder browser (media-link.js). The typed
+  // path in the dialog stays as the fallback; a cancelled pick keeps it.
   async function pickFolder(initial = '') {
-    if (window.SplicePicker?.pickFolder) return window.SplicePicker.pickFolder({title:'Resolve library folder', initial});
-    return initial;
+    if (!window.SpliceLink?.pickFolder) return null;
+    return window.SpliceLink.pickFolder({title:'Choose the Resolve library folder', initial});
   }
   const when = seconds => seconds ? new Date(seconds * 1000).toLocaleString() : 'Unknown';
   function openLibrary() {
@@ -110,7 +111,10 @@ window.SpliceResolve = (() => {
     const field = form.elements.path;
     field.value = localStorage.getItem('splice.resolveLibrary') || '';
     node.querySelector('[data-close]').onclick = () => node.close();
-    node.querySelector('[data-browse]').onclick = async () => { field.value = await pickFolder(field.value) || field.value; };
+    node.querySelector('[data-browse]').onclick = async () => {
+      const picked = await pickFolder(field.value);
+      if (picked) { field.value = picked; form.requestSubmit(); }
+    };
     let busy = false;
     form.onsubmit = async event => {
       event.preventDefault();

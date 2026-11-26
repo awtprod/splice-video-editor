@@ -468,7 +468,12 @@ def timeline_index(model, timeline_id):
 
 
 def to_splice(model, index=0, link_media=None, source_ref=None):
-    """Splice's project for timeline ``index`` of ``model``."""
+    """Splice's project for timeline ``index`` of ``model``.
+
+    ``link_media(paths)`` is called once with every media path the timeline names and returns one
+    result per path: a dict with ``src`` (and ``fingerprint``) when the file was found here, else a
+    falsy value; that media stays offline with its original path for relinking.
+    """
     if not model.timelines:
         raise ResolveError('This Resolve project has no timelines.')
     if not isinstance(index, int) or not 0 <= index < len(model.timelines):
@@ -558,9 +563,7 @@ def to_splice(model, index=0, link_media=None, source_ref=None):
             entry['name'] = info.get('name') or entry['name']
         elif path:
             entry['path'] = path
-            src = link_media(path) if link_media else ''
-            entry['src'] = src or ''
-            entry['offline'] = not src
+            entry['offline'] = True  # until the batch below finds it on this computer
         else:
             entry['nativeUnsupported'] = 'Resolve media without a file path'
         media_out.append(entry)
@@ -652,6 +655,13 @@ def to_splice(model, index=0, link_media=None, source_ref=None):
         if entry['kind'] in ('video', 'audio', 'still') and entry['id'] not in media_ids and entry.get('path'):
             media_for(entry['id'], None, entry['kind'], entry['name'])
 
+    # One call for the whole project, so the link registry is written once.
+    pending = [m for m in media_out if m.get('path')]
+    found = link_media([m['path'] for m in pending]) if link_media and pending else []
+    for entry, result in zip(pending, found):
+        if result:
+            entry.update(src=result['src'], offline=False, linked=True, sourcePath=result.get('sourcePath'),
+                         sourceFingerprint=result.get('fingerprint'))
     linked = sum(1 for m in media_out if m.get('path') and not m.get('offline'))
     offline = [m for m in media_out if m.get('offline')]
     if offline:
