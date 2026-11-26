@@ -1014,6 +1014,8 @@ def _check_clip(clip, media_by_id, probes, heartbeat=None):
     if required > item['_actualDuration'] + .05:
         raise ValueError(f"{item.get('name', 'Media')} ends before this clip's out point")
     if clip['type'] not in item['_kinds']:
+        if clip.get('_optionalAudio') and clip['type'] == 'audio':
+            return item
         raise ValueError(f"{item.get('name', 'Media')} lacks a {clip['type']} stream")
     return item
 
@@ -1663,9 +1665,174 @@ def _concat_list(directory, name, paths):
     return manifest
 
 
+def _resolve_subclip(media_id, media_by_id):
+    """Walk parentMediaId links for a subclip, returning (root_media_id, total_in_offset)."""
+    total_in = 0.0
+    seen = set()
+    current_id = media_id
+    while True:
+        if current_id in seen:
+            raise ValueError('Circular subclip reference')
+        seen.add(current_id)
+        item = media_by_id.get(current_id)
+        if not isinstance(item, dict) or not item.get('parentMediaId'):
+            return current_id, total_in
+        sub_in = _number(item.get('subclipIn', 0), 'subclip in', 0, MAX_SOURCE_SECONDS)
+        if item.get('subclipOut') is not None:
+            sub_out = _number(item.get('subclipOut'), 'subclip out', 0, MAX_SOURCE_SECONDS)
+            if sub_out <= sub_in:
+                raise ValueError('Subclip out point must be after its in point')
+        parent_id = item.get('parentMediaId')
+        if not isinstance(parent_id, str) or parent_id not in media_by_id:
+            raise ValueError('Subclip references missing parent media')
+        total_in += sub_in
+        current_id = parent_id
+
+
+def _expand_editorial_clips(project):
+    """Expand un-flattened multicam clips and subclips into plain clips referencing underlying media.
+
+    Returns a new project dict when expansion is needed, or the original dict unchanged otherwise.
+    """
+    import copy
+    media = project.get('media')
+    clips = project.get('clips')
+    if not isinstance(media, list) or not isinstance(clips, list):
+        return project
+    has_special = any(
+        isinstance(item, dict) and (item.get('multicam') or item.get('parentMediaId'))
+        for item in media
+    )
+    if not has_special:
+        return project
+    prepared = copy.deepcopy(project)
+    media_by_id = {m['id']: m for m in prepared['media'] if isinstance(m, dict) and isinstance(m.get('id'), str)}
+
+    def angle_clip(base_clip, angle, kind, track, *, embedded_audio=None, optional_audio=False, suffix=''):
+        ang_media_id = angle.get('mediaId')
+        if not isinstance(ang_media_id, str) or ang_media_id not in media_by_id:
+            raise ValueError('Multicam angle references missing media')
+        ang_media = media_by_id[ang_media_id]
+        if ang_media.get('multicam'):
+            raise ValueError('Nested multicam clips inside multicam angles are unsupported')
+        offset = _number(angle.get('offset', 0), 'multicam angle offset', 0, MAX_SOURCE_SECONDS)
+        ang_in = _number(angle.get('in', 0), 'multicam angle in', 0, MAX_SOURCE_SECONDS)
+        raw_dur = angle.get('duration')
+        if raw_dur is None or raw_dur == 0:
+            raw_dur = ang_media.get('duration')
+        ang_dur = _number(raw_dur, 'multicam angle duration', 0.001, MAX_SOURCE_SECONDS) if raw_dur else math.inf
+        speed = _number(base_clip.get('speed', 1), 'speed', 0.1, 16)
+        mc_in = _number(base_clip.get('in', 0), 'source in', 0, MAX_SOURCE_SECONDS)
+        mc_dur = _number(base_clip.get('duration', 0), 'duration', 0.001, MAX_TIMELINE_SECONDS)
+        mc_start = _number(base_clip.get('start', 0), 'start', 0, MAX_TIMELINE_SECONDS)
+        mc_span = mc_dur * speed
+        ov_start = max(mc_in, offset)
+        ov_end = min(mc_in + mc_span, offset + ang_dur)
+        if ov_end <= ov_start + 1e-6:
+            return None
+        out = copy.deepcopy(base_clip)
+        out['id'] = f"{base_clip.get('id', 'mc')}{suffix}"
+        out['type'] = kind
+        out['track'] = track
+        out['mediaId'] = ang_media_id
+        if base_clip.get('reverse'):
+            out['start'] = mc_start + (mc_in + mc_span - ov_end) / speed
+        else:
+            out['start'] = mc_start + (ov_start - mc_in) / speed
+        out['duration'] = (ov_end - ov_start) / speed
+        out['in'] = ang_in + (ov_start - offset)
+        out.pop('multicamAngle', None)
+        out.pop('multicamAudioAngle', None)
+        if embedded_audio is not None:
+            out['embeddedAudio'] = embedded_audio
+        if optional_audio:
+            out['_optionalAudio'] = True
+        return out
+
+    # Step 1: expand un-flattened multicam clips.
+    after_mc = []
+    for clip in prepared['clips']:
+        if not isinstance(clip, dict) or clip.get('type') == 'title':
+            after_mc.append(clip)
+            continue
+        item = media_by_id.get(clip.get('mediaId'))
+        mc = item.get('multicam') if isinstance(item, dict) else None
+        if not mc:
+            after_mc.append(clip)
+            continue
+        if not isinstance(mc, dict) or not isinstance(mc.get('angles'), list) or not (1 <= len(mc['angles']) <= 9):
+            raise ValueError('Invalid multicam clip: must have between 1 and 9 angles')
+        angles = mc['angles']
+        if any(not isinstance(a, dict) for a in angles):
+            raise ValueError('Invalid multicam angle entry')
+        angle_idx = clip.get('multicamAngle', 0)
+        if type(angle_idx) is not int or not (0 <= angle_idx < len(angles)):
+            raise ValueError(f'Invalid multicam angle index: {angle_idx}')
+        audio_mode = mc.get('audioMode', 'camera1')
+        if audio_mode not in ('camera1', 'follow', 'all', 'fixed'):
+            raise ValueError(f'Invalid multicam audio mode: {audio_mode}')
+        audio_angle = mc.get('audioAngle', 0)
+        if type(audio_angle) is not int or not (0 <= audio_angle < len(angles)):
+            raise ValueError(f'Invalid multicam audio angle index: {audio_angle}')
+        clip_audio_override = clip.get('multicamAudioAngle')
+        if clip_audio_override is not None:
+            if type(clip_audio_override) is not int or not (0 <= clip_audio_override < len(angles)):
+                raise ValueError(f'Invalid multicam clip audio angle index: {clip_audio_override}')
+            audio_indices = [clip_audio_override]
+        elif audio_mode == 'follow':
+            audio_indices = [angle_idx]
+        elif audio_mode == 'camera1':
+            audio_indices = [0]
+        elif audio_mode == 'fixed':
+            audio_indices = [audio_angle]
+        else:
+            audio_indices = list(range(len(angles)))
+
+        if clip.get('type') == 'video':
+            if clip.get('embeddedAudio') is False:
+                v_clip = angle_clip(clip, angles[angle_idx], 'video', clip['track'], embedded_audio=False)
+                if v_clip:
+                    after_mc.append(v_clip)
+            elif audio_mode == 'follow' and clip_audio_override is None:
+                v_clip = angle_clip(clip, angles[angle_idx], 'video', clip['track'])
+                if v_clip:
+                    after_mc.append(v_clip)
+            else:
+                v_clip = angle_clip(clip, angles[angle_idx], 'video', clip['track'], embedded_audio=False)
+                if v_clip:
+                    after_mc.append(v_clip)
+                for idx in audio_indices:
+                    a_clip = angle_clip(clip, angles[idx], 'audio', -64, optional_audio=True, suffix=f'-mca{idx}')
+                    if a_clip:
+                        after_mc.append(a_clip)
+        elif clip.get('type') == 'audio':
+            for idx in audio_indices:
+                a_clip = angle_clip(clip, angles[idx], 'audio', clip['track'],
+                                    optional_audio=(len(audio_indices) > 1),
+                                    suffix=(f'-mca{idx}' if len(audio_indices) > 1 else ''))
+                if a_clip:
+                    after_mc.append(a_clip)
+        else:
+            after_mc.append(clip)
+
+    # Step 2: resolve subclips to their parent media + subclipIn offset.
+    for clip in after_mc:
+        if not isinstance(clip, dict) or clip.get('type') == 'title':
+            continue
+        mid = clip.get('mediaId')
+        item = media_by_id.get(mid)
+        if isinstance(item, dict) and item.get('parentMediaId'):
+            root_id, offset = _resolve_subclip(mid, media_by_id)
+            clip['mediaId'] = root_id
+            clip['in'] = _number(clip.get('in', 0), 'source in', 0, MAX_SOURCE_SECONDS) + offset
+
+    prepared['clips'] = after_mc
+    return prepared
+
+
 def render_to_file(project, output_path, *, options=None, progress=None, cancelled=None, heartbeat=None,
-                   work_directory=None, report=None, _nested_depth=0):
-    """Resolve imported nested Premiere sequences, then render the parent timeline.
+                   work_directory=None, report=None, _nested_depth=0, _seen_sequences=frozenset()):
+    """Resolve multicam clips, subclips, and nested sequences, then render the parent timeline.
 
     ``heartbeat`` is called whenever FFmpeg makes progress, so a supervisor
     can tell a long render from a stuck one. ``work_directory`` is where the
@@ -1679,7 +1846,8 @@ def render_to_file(project, output_path, *, options=None, progress=None, cancell
     if options is not None and not isinstance(options, dict): raise ValueError('Invalid export options')
     # Keys with a leading underscore are internal to the renderer.
     options = {key: value for key, value in (options or {}).items() if isinstance(key, str) and not key.startswith('_')}
-    if _nested_depth>4: raise ValueError('Nested Premiere sequences exceed four levels')
+    if _nested_depth>4: raise ValueError('Nested sequences exceed four levels')
+    project = _expand_editorial_clips(project)
     # Nested material used only by disabled clips is not rendered (it would contribute nothing).
     enabled_media = {clip.get('mediaId') for clip in project.get('clips') or [] if isinstance(clip, dict) and clip_enabled(clip)}
     if not any(isinstance(item,dict) and item.get('nestedProject') for item in project['media']):
@@ -1691,13 +1859,17 @@ def render_to_file(project, output_path, *, options=None, progress=None, cancell
         for index,item in enumerate(prepared['media']):
             child=item.get('nestedProject')
             if not child or item.get('id') not in enabled_media: continue
-            if _nested_depth>=4: raise ValueError('Nested Premiere sequences exceed four levels')
+            seq_id = item.get('nestedSequence')
+            if seq_id is not None and seq_id in _seen_sequences:
+                raise ValueError('Circular nested sequence reference')
+            if _nested_depth>=4: raise ValueError('Nested sequences exceed four levels')
+            next_seen = _seen_sequences | ({seq_id} if seq_id is not None else set())
             suffix='.mov' if options.get('codec')=='prores' else '.mp4'
             target=Path(directory)/f'nested-{index}{suffix}'
             child_options={**options,'codec':'prores' if suffix=='.mov' else 'h264'}
             child_options.pop('range',None)
             render_to_file(child,target,options=child_options,cancelled=cancelled,heartbeat=heartbeat,work_directory=work_directory,
-                           _nested_depth=_nested_depth+1)
+                           _nested_depth=_nested_depth+1,_seen_sequences=next_seen)
             item['src']='/media/'+str(target.relative_to(MEDIA_ROOT))
             item['duration']=max((float(c['start'])+float(c['duration']) for c in child['clips']),default=0)
             item.pop('nestedSequence',None)

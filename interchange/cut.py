@@ -170,10 +170,35 @@ def build_cut(project: dict, options: dict | None = None) -> Cut:
         rules = path_rules(options.get('pathMap'))
     except ValueError as error:
         raise InterchangeError(str(error)) from None
+    media_by_id = {str(item['id']): item for item in project['media'] if isinstance(item, dict) and item.get('id') is not None}
+    subclips = {}
+    for mid, item in media_by_id.items():
+        if not item.get('parentMediaId'):
+            continue
+        cur, offset, seen, valid = mid, 0.0, set(), True
+        while True:
+            if cur in seen:
+                valid = False
+                break
+            seen.add(cur)
+            entry = media_by_id.get(cur)
+            if not entry or not entry.get('parentMediaId'):
+                break
+            offset += _number(entry.get('subclipIn'), 0, 0)
+            parent_id = str(entry['parentMediaId'])
+            if parent_id not in media_by_id:
+                valid = False
+                break
+            cur = parent_id
+        if valid:
+            subclips[mid] = (cur, offset, clean(item.get('name') or '') or None)
     sources = {}
     for item in project['media']:
         if isinstance(item, dict) and item.get('id') is not None:
-            source = sources[str(item['id'])] = resolve_source(item, rate, budget)
+            mid = str(item['id'])
+            if mid in subclips:
+                continue
+            source = sources[mid] = resolve_source(item, rate, budget)
             if source.path and rules:
                 source.original_path = source.path
                 source.path, source.path_rule = map_path(source.path, rules)
@@ -203,7 +228,7 @@ def build_cut(project: dict, options: dict | None = None) -> Cut:
         raise InterchangeError('The sequence runs past 24 hours of timecode; choose an earlier start timecode') from None
     raw = [c for c in project['clips'] if isinstance(c, dict)]
     for clip in raw:
-        event = _event(cut, clip)
+        event = _event(cut, clip, subclips)
         if event is not None:
             cut.events.append(event)
     _timecode_policy(cut, options.get('unknownTimecode'))
@@ -229,11 +254,19 @@ def build_cut(project: dict, options: dict | None = None) -> Cut:
     return cut
 
 
-def _event(cut: Cut, clip: dict) -> Event | None:
+def _event(cut: Cut, clip: dict, subclips: dict | None = None) -> Event | None:
     rate, report = cut.rate, cut.report
     kind = clip.get('type') if clip.get('type') in ('video', 'audio', 'title') else None
-    source = cut.sources.get(str(clip.get('mediaId'))) if clip.get('mediaId') is not None else None
-    name = clean(clip.get('title')) if kind == 'title' else (source.name if source else clean(clip.get('name') or 'Clip'))
+    raw_media_id = str(clip.get('mediaId')) if clip.get('mediaId') is not None else None
+    sub_entry = (subclips or {}).get(raw_media_id) if raw_media_id is not None else None
+    sub_offset = 0.0
+    sub_name = None
+    if sub_entry is not None:
+        parent_id, sub_offset, sub_name = sub_entry
+        source = cut.sources.get(parent_id)
+    else:
+        source = cut.sources.get(raw_media_id) if raw_media_id is not None else None
+    name = clean(clip.get('title')) if kind == 'title' else (sub_name or (source.name if source else clean(clip.get('name') or 'Clip')))
     start, end = _span(clip, rate)
     frames = end - start
     track = int(_number(clip.get('track'), 1, -64, 64)) or 1
@@ -246,9 +279,12 @@ def _event(cut: Cut, clip: dict) -> Event | None:
     if kind != 'title' and source is None:
         report.note(f'{label}: not exported because its source is missing from the project.')
         return None
+    if source is not None and source.multicam:
+        report.note(f'{label}: not exported because it is an un-flattened multicam clip; flatten multicam before timeline interchange export.')
+        return None
     if source is not None and (source.nested or source.generator):
         what = 'a nested sequence' if source.nested else 'a Premiere-native generator'
-        report.note(f'{label}: not exported because it is {what}; export that sequence or replace the item.')
+        report.note(f'{label}: not exported because it is {what}; decompose in place or export that sequence.')
         return None
     event = Event(id=str(clip.get('id')), kind=kind, track=track, record_in=start, frames=frames, source=source,
                   name=name, rate=rate)
@@ -261,7 +297,7 @@ def _event(cut: Cut, clip: dict) -> Event | None:
     event.link_group = clip.get('linkGroup') if isinstance(clip.get('linkGroup'), str) else None
     if source is not None:
         grid = source.rate if source.rate and not source.still else rate
-        exact = Fraction(repr(_number(clip.get('in'), 0, 0))) * grid
+        exact = Fraction(repr(_number(clip.get('in'), 0, 0) + sub_offset)) * grid
         frame = math.floor(exact + Fraction(1, 2))
         event.source_in = Fraction(0) if source.still else Fraction(frame) / grid
         if not source.still and abs(exact - frame) > Fraction(1, 1000):

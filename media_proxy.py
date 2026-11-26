@@ -480,15 +480,31 @@ def nested_preview(project):
     if not project['clips']:
         raise ValueError('The nested sequence has no playable clips')
     fingerprint = hashlib.sha256(b'nested-preview-v2')
-    def add_sources(sequence,depth=0):
+    def add_sources(sequence,depth=0,seen=frozenset()):
         if depth>4:
             raise ValueError('Nested sequence exceeds four levels')
-        used = {c.get('mediaId') for c in sequence['clips']}
-        for item in sequence['media']:
-            if item.get('id') not in used:
+        by_id = {m.get('id'): m for m in sequence['media'] if isinstance(m, dict) and isinstance(m.get('id'), str)}
+        queue = [c.get('mediaId') for c in sequence['clips'] if isinstance(c, dict) and c.get('mediaId')]
+        visited = set()
+        while queue:
+            mid = queue.pop()
+            if mid in visited: continue
+            visited.add(mid)
+            item = by_id.get(mid)
+            if not item: continue
+            if item.get('multicam') and isinstance(item['multicam'], dict):
+                for angle in item['multicam'].get('angles') or []:
+                    if isinstance(angle, dict) and angle.get('mediaId'):
+                        queue.append(angle['mediaId'])
+                continue
+            if item.get('parentMediaId'):
+                queue.append(item['parentMediaId'])
                 continue
             if item.get('nestedProject'):
-                add_sources(item['nestedProject'],depth+1)
+                seq_id = item.get('nestedSequence')
+                if seq_id is not None and seq_id in seen:
+                    raise ValueError('Circular nested sequence reference')
+                add_sources(item['nestedProject'],depth+1,seen | ({seq_id} if seq_id is not None else set()))
             elif item.get('src'):
                 path = _media_path(item['src']); stat = path.stat()
                 fingerprint.update(f'{path}:{stat.st_size}:{stat.st_mtime_ns}'.encode())
