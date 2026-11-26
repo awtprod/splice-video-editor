@@ -498,12 +498,22 @@
       if (trackLocked(clip.type, clip.track, after) && !sameValue(clip, oldClips.get(clip.id)))
         throw new Error(`Unlock ${clip.type} track ${Math.abs(clip.track)} before editing.`);
   };
-  // The topmost clip of a kind at a time. Hidden picture tracks never reach the program monitor;
-  // their clips still get media elements (see syncMedia's layers), so embedded camera sound plays.
+  // A disabled clip (`enabled === false`) keeps every property but contributes no picture and
+  // no sound, its own embedded camera sound included; absent or true means enabled. Playback
+  // treats it as if it were not on the timeline. Its transition goes with it (the clip before
+  // simply cuts); a transition on the clip after a disabled clip still plays, mixing from what
+  // is underneath it: lower tracks, or black and silence.
+  const isEnabled = (clip) => clip?.enabled !== false;
+  const enabledFollower = (followers, clip) => {
+    const next = followers.get(clip.id);
+    return next && isEnabled(next) ? next : undefined;
+  };
+  // The topmost enabled clip of a kind at a time. Hidden picture tracks never reach the program
+  // monitor; their clips still get media elements (see syncMedia's layers), so embedded camera sound plays.
   const at = (kind, t) =>
     project.clips
       .filter(
-        (c) => c.type === kind && c.start <= t && t < c.start + c.duration &&
+        (c) => c.type === kind && isEnabled(c) && c.start <= t && t < c.start + c.duration &&
           (kind === "audio" || !trackHidden(kind, c.track)),
       )
       .sort((a, b) => b.track - a.track)[0];
@@ -520,6 +530,9 @@
   let transitionFollowers=new Map();
   let videoDipFollowers=new Map();
   const followingTransition = clip => transitionFollowers.get(clip.id);
+  // The transition that follows a clip in playback: none when the clip that carries it is disabled.
+  const playedFollower = clip => enabledFollower(transitionFollowers, clip);
+  const playedDip = clip => enabledFollower(videoDipFollowers, clip);
   function indexTransitions() {
     duration();
     if (indexedFor===project) return;
@@ -544,7 +557,7 @@
     const fadeOut = clamp(Number(clip.fadeOut)||0,0,clip.duration);
     let fade = Math.min(1, fadeIn ? local/fadeIn : 1, fadeOut ? (clip.duration-local)/fadeOut : 1);
     if(['dissolve','wipe','fade'].includes(clip.transition)) fade*=audioTransitionGain(clip,(time-clip.start+transitionBefore(clip))/transitionLength(clip));
-    const next=followingTransition(clip);
+    const next=playedFollower(clip);
     if(next) fade*=audioTransitionGain(next,1-(time-next.start+transitionBefore(next))/transitionLength(next));
     return clamp(animated(clip,'volume',Number(clip.volume??100))/100,0,2) * clamp((mix.gain??100)/100,0,2) * clamp(fade,0,1);
   };
@@ -643,6 +656,7 @@
         .filter(
           (c) =>
             c.type === "video" &&
+            isEnabled(c) &&
             c.id !== clip.id &&
             source.media.find(m=>m.id===c.mediaId)?.nativeGenerator !== 1414680150 &&
             c.track === clip.track &&
@@ -720,13 +734,13 @@
     for(const state of auditions.values()) state.active=false;
     indexTransitions();
     if (window.SpliceMedia?.prepareNested) for (const clip of project.clips) {
-      if (clip.type==='title' || clip.start-transitionBefore(clip)>time+1.5 || clip.start+clip.duration<time) continue;
+      if (clip.type==='title' || !isEnabled(clip) || clip.start-transitionBefore(clip)>time+1.5 || clip.start+clip.duration<time) continue;
       const item=mediaOf(clip);
       if (item?.nestedProject && !item.src) window.SpliceMedia.prepareNested(item);
     }
     const clip = at("video", time);
-    const audioClips = project.clips.filter(c=>c.type==='audio' && c.start-transitionBefore(c)<=time &&
-      time<c.start+c.duration+(followingTransition(c)?transitionLength(followingTransition(c))-transitionBefore(followingTransition(c)):0));
+    const audioClips = project.clips.filter(c=>c.type==='audio' && isEnabled(c) && c.start-transitionBefore(c)<=time &&
+      time<c.start+c.duration+(playedFollower(c)?transitionLength(playedFollower(c))-transitionBefore(playedFollower(c)):0));
     const mediaItem = clip && mediaOf(clip);
     const source = programSource(clip);
     if (clip && clip.id !== activeVideoId) {
@@ -734,7 +748,7 @@
       const prepared=clip.id===preloadClipId?transitionVideo:preparedLayer;
       if(prepared){
         const outgoing=video, outgoingId=activeVideoId;
-        const staysVisible=project.clips.some(c=>c.id===outgoingId && c.start<=time && time<c.start+c.duration);
+        const staysVisible=project.clips.some(c=>c.id===outgoingId && isEnabled(c) && c.start<=time && time<c.start+c.duration);
         video=prepared;
         activeVideoId=clip.id;
         if(preparedLayer)layerVideos.delete(clip.id);
@@ -794,7 +808,7 @@
     } else transitionVideo.pause();
     if (playing && playbackRate > 0 && clip && !previous) {
       const upcoming = project.clips
-        .filter(c=>c.type==='video' && c.start>=time && c.start<=time+1.5 &&
+        .filter(c=>c.type==='video' && isEnabled(c) && c.start>=time && c.start<=time+1.5 &&
           (c.track>clip.track || c.start>=clip.start+clip.duration-1e-6))
         .sort((a,b)=>a.start-b.start || b.track-a.track)
         .find(c=>at('video',c.start)?.id===c.id);
@@ -820,7 +834,7 @@
         syncClipPlayback(transitionVideo,upcoming,target,forceSeek,transitionBefore(upcoming)>0);
       }
     }
-    const visible = project.clips.filter(c=>c.type==='video' && c.start-transitionBefore(c)<=time && time<c.start+c.duration);
+    const visible = project.clips.filter(c=>c.type==='video' && isEnabled(c) && c.start-transitionBefore(c)<=time && time<c.start+c.duration);
     const layers = new Map(visible.map(layer=>[layer.id,layer]));
     for (const layer of visible) {
       const tail = transitionTail(layer,time);
@@ -830,7 +844,7 @@
     if (playing && playbackRate>0) {
       const waiting = new Map();
       for (const next of project.clips) {
-        if (next.type!=='video' || next.id===preloadClipId || layers.has(next.id)) continue;
+        if (next.type!=='video' || !isEnabled(next) || next.id===preloadClipId || layers.has(next.id)) continue;
         const first = next.start-transitionBefore(next);
         if (first<=time || first>time+.75 || !preceding(next)) continue;
         const prior = waiting.get(next.track);
@@ -1063,7 +1077,7 @@
   // Whether a video layer paints every pixel of the frame with full opacity right now.
   function coversFrame(clip, canvas, dissolvePairs) {
     if (clip.type!=='video' || clip.transition==='wipe' || clip.transition==='fade' || dissolvePairs.has(clip.id)) return false;
-    if (time<clip.start || videoDipFollowers.get(clip.id)) return false;
+    if (time<clip.start || playedDip(clip)) return false;
     const item=mediaOf(clip);
     if (!item || item.nativeGenerator===1414680150) return false;
     const element=videoFor(clip);
@@ -1083,7 +1097,7 @@
     const ctx = canvas.getContext("2d");
     ctx.fillStyle = '#000';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
-    const visible=project.clips.filter(clip=>clip.type!=='audio' && !trackHidden(clip.type,clip.track) && (clip.type==='video' ? !mutedTracks.video &&
+    const visible=project.clips.filter(clip=>clip.type!=='audio' && isEnabled(clip) && !trackHidden(clip.type,clip.track) && (clip.type==='video' ? !mutedTracks.video &&
       clip.start-transitionBefore(clip)<=time && time<clip.start+clip.duration :
       !mutedTracks.title && clip.title && clip.start<=time && time<clip.start+clip.duration));
     visible.sort((a,b)=>(a.track??4)-(b.track??4) || Number(a.type==='title')-Number(b.type==='title') || a.start-b.start);
@@ -1124,7 +1138,7 @@
       let brightness=1;
       const head=transitionLength(clip)-transitionBefore(clip);
       if (clip.transition==='fade' && head>0) brightness=clamp((time-clip.start)/head,0,1);
-      const nextDip=videoDipFollowers.get(clip.id);
+      const nextDip=playedDip(clip);
       if (nextDip && transitionBefore(nextDip)>0) brightness*=clamp((nextDip.start-time)/transitionBefore(nextDip),0,1);
       if (clip.transition==='wipe') {
         const tail=transitionTail(clip,time);
@@ -1434,26 +1448,32 @@
       }
     }
     const touched = new Set(source.clips.filter((clip) => clip.linkGroup && crossing(clip)).map((clip) => clip.linkGroup));
+    // A member on a lane the edit leaves alone that spans the cleared range (the whole sound
+    // under a picture-only overwrite) stays in sync with the pieces on both sides, so those
+    // pieces and it remain one group; settle() still unlinks whatever the edit moved out of sync.
+    const spanning = new Set(source.clips.filter((clip) => touched.has(clip.linkGroup) && !crossing(clip) &&
+      clip.start < from - 1e-6 && clip.start + clip.duration > to + 1e-6).map((clip) => clip.linkGroup));
+    const sideOf = (clip, side) => spanning.has(clip.linkGroup) ? "spanning" : side;
     const links = linkSides(source, touched);
     const kept = [];
     for (const clip of source.clips) {
       if (!crossing(clip)) {
-        kept.push(links.assign(clip, clip, clip.start >= to - 1e-6 ? "after" : "before"));
+        kept.push(links.assign(clip, clip, sideOf(clip, clip.start >= to - 1e-6 ? "after" : "before")));
         continue;
       }
       const head = clip.start < from - 1e-6, tail = clip.start + clip.duration > to + 1e-6;
       if (head && tail) {
         const middle = splitClipAt(clip, from, source);
         const right = splitClipAt(middle, to, source);
-        kept.push(links.assign(clip, clip, "before"), links.assign(right, clip, "after"));
+        kept.push(links.assign(clip, clip, sideOf(clip, "before")), links.assign(right, clip, sideOf(clip, "after")));
       } else if (head) {
         splitClipAt(clip, from, source);
-        kept.push(links.assign(clip, clip, "before"));
+        kept.push(links.assign(clip, clip, sideOf(clip, "before")));
       } else if (tail) {
         const right = splitClipAt(clip, to, source);
         const native = {};
         for (const key of ["premiereIndex", "premiereTrack"]) if (key in clip) native[key] = clip[key];
-        kept.push(links.assign({...right, ...native, id: clip.id}, clip, "after"));
+        kept.push(links.assign({...right, ...native, id: clip.id}, clip, sideOf(clip, "after")));
       }
     }
     source.clips = kept;
@@ -2365,6 +2385,31 @@
       });
       return "linked";
     },
+    // Enable or disable clips (Premiere's Clip > Enable, Shift+E). Each chosen clip flips its own
+    // state, as Premiere does with a mixed selection; with linked selection on, linked partners
+    // are chosen too. One undo step; nothing changes when any chosen clip is on a locked track.
+    // A disabled clip stores `enabled: false`; enabling removes the key, so older projects and
+    // re-enabled clips look the same.
+    toggleEnabled(ids) {
+      const wanted = new Set(ids);
+      const chosen = project.clips.filter((clip) => wanted.has(clip.id));
+      for (const clip of [...chosen]) for (const partner of linkedClips(clip)) if (!wanted.has(partner.id)) {
+        wanted.add(partner.id);
+        chosen.push(partner);
+      }
+      if (!chosen.length) return null;
+      for (const clip of chosen) ensureEditable(clip);
+      Editor.editProject((next) => {
+        for (const clip of next.clips) {
+          if (!wanted.has(clip.id)) continue;
+          if (isEnabled(clip)) clip.enabled = false;
+          else delete clip.enabled;
+        }
+      });
+      const disabled = chosen.filter((clip) => isEnabled(clip)).length;
+      return {disabled, enabled: chosen.length - disabled};
+    },
+    isClipEnabled: (clip) => isEnabled(clip),
     // Give an embedded camera clip a linked audio clip (used before trimming one side).
     detachAudio(id) {
       const clip = project.clips.find((c) => c.id === id);

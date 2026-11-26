@@ -378,6 +378,7 @@
     ctx.fillStyle=kind==="audio"?"#4c8a62":kind==="title"?"#8c6fb8":"#5c7fa8";
     for(const clip of clips){
       const x=px(clip.start)-left;
+      ctx.globalAlpha=clip.enabled===false?.35:1;
       ctx.fillRect(Math.floor(x),0,Math.max(1,Math.ceil(px(clip.duration))),40);
     }
     surface.append(canvas);
@@ -387,16 +388,17 @@
     const media=mediaFor(project,clip),node=document.createElement("button");
     const offset=clip.linkGroup?editor.syncOffset(clip):null;
     const embedded=editor.hasEmbeddedAudio(clip);
-    node.className="timeline-clip "+lane.kind+(clip.id===selectedId?" selected":"")+(group.has(clip.id)?" group-selected":"")+
+    const disabled=clip.enabled===false;
+    node.className="timeline-clip "+lane.kind+(disabled?" disabled":"")+(clip.id===selectedId?" selected":"")+(group.has(clip.id)?" group-selected":"")+
       (clip.linkGroup?" linked":"")+(offset?" out-of-sync":"")+(embedded?" has-audio":"")+
       (selectedEdit?.id===clip.id?" edit-"+selectedEdit.edge:"");
     node.style.left=px(clip.start)+"px";node.style.width=Math.max(tinyClipWidth,px(clip.duration)-1)+"px";
     node.dataset.clip=clip.id;
     const name=clip.title||media?.name||"Title";
-    const state=[clip.linkGroup?"linked":"",embedded?"with camera sound":"",offset?`${Math.abs(offset)} frames ${offset>0?"late":"early"} against its linked partner`:""].filter(Boolean).join(", ");
+    const state=[disabled?"disabled: no picture or sound (Shift+E enables)":"",clip.linkGroup?"linked":"",embedded?"with camera sound":"",offset?`${Math.abs(offset)} frames ${offset>0?"late":"early"} against its linked partner`:""].filter(Boolean).join(", ");
     node.title=name+" · "+tc(clip.start)+(state?" · "+state:"");
     node.innerHTML='<span class="clip-overlay"></span>'+(lane.kind==="audio"?'<canvas class="clip-wave"></canvas>':embedded?'<canvas class="clip-wave camera-wave"></canvas>':"")+
-      '<span class="clip-name">'+(clip.linkGroup?linkIcon:"")+esc(name)+'</span>'+
+      '<span class="clip-name">'+(disabled?'<span class="clip-off" aria-label="Disabled">OFF</span>':"")+(clip.linkGroup?linkIcon:"")+esc(name)+'</span>'+
       (offset?`<span class="sync-badge" role="button" tabindex="-1" data-sync="${esc(clip.id)}" title="Out of sync by ${Math.abs(offset)} frames. Click to move or slip into sync.">${offset>0?"+":"−"}${Math.abs(offset)}</span>`:"")+
       '<span class="trim-handle trim-left" title="Trim in · Alt+drag trims only this side of a linked clip"></span><span class="trim-handle trim-right" title="Trim out · Alt+drag trims only this side of a linked clip"></span>';
     if (thumbOf(media)) {
@@ -925,15 +927,19 @@
         renderTimeline(editor.get());
     });
   });
-  // Out-of-sync badge: offer Premiere's "Move into sync" and "Slip into sync".
-  // One menu at a time; closing it always removes its outside-click listener.
+  // Pop-up menus on the timeline: the out-of-sync badge's "Move into sync" / "Slip into sync"
+  // and a clip's context menu. One menu at a time; closing it always removes its listeners.
   let closeSyncMenu=null;
   function syncMenu(id, box) {
+    popupMenu(box,'.sync-badge[data-sync="'+CSS.escape(id)+'"]',
+      [["Move into sync",()=>safeEdit(()=>editor.bringIntoSync(id,"move"))],["Slip into sync",()=>safeEdit(()=>editor.bringIntoSync(id,"slip"))]]);
+  }
+  function popupMenu(box, anchorSelector, entries) {
     closeSyncMenu?.();
     const menu=document.createElement("div");menu.className="sync-menu";menu.setAttribute("role","menu");
     menu.style.left=clamp(box.left,8,window.innerWidth-190)+"px";
-    // Below the badge when there is room, otherwise above it.
-    const below=box.bottom+4, height=84;
+    // Below the anchor when there is room, otherwise above it.
+    const below=box.bottom+4, height=12+36*entries.length;
     menu.style.top=(below+height<=window.innerHeight-8?below:Math.max(8,box.top-height-4))+"px";
     const dismiss=event=>{if(!menu.contains(event.target))close();};
     // Escape closes it (focus returns to the timeline); a wheel turn or a resize closes it too.
@@ -942,13 +948,13 @@
     // timeline (selecting the clip does) fires scroll events on its containers without moving
     // anything, and must not close the menu it was opened with.
     let scrollCheck=0;
+    const origin=lanes.querySelector(anchorSelector)?.getBoundingClientRect()||box;
     const onScroll=()=>{
       if(scrollCheck)return;
       scrollCheck=requestAnimationFrame(()=>{
         scrollCheck=0;
-        const badge=lanes.querySelector('.sync-badge[data-sync="'+CSS.escape(id)+'"]');
-        const now=badge?.getBoundingClientRect();
-        if(!now||Math.abs(now.left-box.left)>1||Math.abs(now.top-box.top)>1)close();
+        const now=lanes.querySelector(anchorSelector)?.getBoundingClientRect();
+        if(!now||Math.abs(now.left-origin.left)>1||Math.abs(now.top-origin.top)>1)close();
       });
     };
     const close=()=>{
@@ -964,9 +970,9 @@
       if(document.activeElement===document.body||!document.activeElement)lanes.focus?.({preventScroll:true});
     };
     closeSyncMenu=close;
-    for(const [how,label] of [["move","Move into sync"],["slip","Slip into sync"]]){
+    for(const [label,run] of entries){
       const item=document.createElement("button");item.type="button";item.setAttribute("role","menuitem");item.textContent=label;
-      item.onclick=()=>{close();safeEdit(()=>editor.bringIntoSync(id,how));};
+      item.onclick=()=>{close();run();};
       menu.append(item);
     }
     window.addEventListener("pointerdown",dismiss,true);
@@ -977,7 +983,23 @@
     document.body.append(menu);
     menu.querySelector("button").focus();
   }
+  // Right-click a clip: enable or disable it, link or unlink. A clip outside the current
+  // multi-selection becomes the selection first, as in other editors.
+  lanes.addEventListener("contextmenu",e=>{
+    const node=e.target.closest(".timeline-clip");
+    if(!node)return;
+    const clip=editor.get().project.clips.find(c=>c.id===node.dataset.clip);
+    if(!clip)return;
+    e.preventDefault();
+    if(!group.has(clip.id)){group.clear();editor.select(clip.id);}
+    const box={left:e.clientX,top:e.clientY,bottom:e.clientY};
+    const chosen=withLinked(selection());
+    const label=chosen.length>1?(chosen.every(c=>c.enabled===false)?"Enable clips":chosen.some(c=>c.enabled===false)?"Enable · disable clips (each flips)":"Disable clips"):
+      (clip.enabled===false?"Enable clip":"Disable clip");
+    popupMenu(box,'.timeline-clip[data-clip="'+CSS.escape(clip.id)+'"]',[[label+"  (Shift+E)",toggleEnabled],["Link / unlink  (Ctrl+L)",toggleLink]]);
+  });
   lanes.addEventListener("pointerdown",e=>{
+    if(e.button===2)return;
     const badge=e.target.closest(".sync-badge");
     if(badge){
       e.stopPropagation();e.preventDefault();
@@ -1242,6 +1264,17 @@
     const result=safeEdit(()=>editor.toggleLink(ids));
     if(result)notify({linked:"Clips linked",unlinked:"Clips unlinked",separated:"Camera sound separated onto its own audio clip"}[result]);
   }
+  // Shift+E: each selected clip (and, with linked selection on, its partners) flips its enabled state.
+  function toggleEnabled() {
+    const ids=selection().map(c=>c.id);
+    if(!ids.length)return notify("Select clips to enable or disable.");
+    const result=safeEdit(()=>editor.toggleEnabled(ids));
+    if(!result)return;
+    const parts=[];
+    if(result.disabled)parts.push(result.disabled+" clip"+(result.disabled===1?"":"s")+" disabled");
+    if(result.enabled)parts.push(result.enabled+" clip"+(result.enabled===1?"":"s")+" enabled");
+    notify(parts.join(", "));
+  }
   function fromSource(mode) {
     if(!window.SpliceSource?.isOpen?.())return notify("Open a clip in the source monitor first.");
     SpliceSource.place(mode);
@@ -1260,6 +1293,7 @@
   }
   const commands={
     link:toggleLink,
+    enable:toggleEnabled,
     lift:()=>safeEdit(()=>editor.liftRange()),
     extract:()=>safeEdit(()=>editor.liftRange({extract:true})),
     addEditAll:()=>safeEdit(()=>editor.addEditAll()),
@@ -1309,6 +1343,7 @@
     {keys:"A · Shift + A",action:"Select forward · backward on the selected clip's track",test:e=>press("a")(e)||press("a",{shift:true})(e),run:e=>selectOnTrack(!e.shiftKey)},
     {keys:"Delete · Backspace",action:"Delete the selection (ripple when Ripple is on)",test:press(["Delete","Backspace"]),run:()=>deleteSelection(rippleEnabled)},
     {keys:"Shift + Delete · Backspace",action:"Ripple delete the selection",test:press(["Delete","Backspace"],{shift:true}),run:()=>deleteSelection(true)},
+    {keys:"Shift + E",action:"Enable · disable the selected clips (each flips; linked partners too when linked selection is on)",test:press("e",{shift:true}),run:toggleEnabled},
     {keys:"Ctrl/Cmd + L",action:"Link · unlink clips (separates a camera clip's sound)",test:press("l",{ctrl:true}),run:toggleLink},
     {keys:"Ctrl/Cmd + Shift + L",action:"Toggle linked selection",test:press("l",{ctrl:true,shift:true}),run:()=>$("linked-toggle").click()},
     {keys:"= · − · \\",action:"Zoom in · out · fit the whole timeline",test:press(["Equal","Minus","Backslash","NumpadAdd","NumpadSubtract"]),
