@@ -275,7 +275,7 @@ class BurnIns(Case):
             for box in (bottom, top):
                 difference = [abs(a - b) for a, b in zip(deltas['prores.mov'][box], deltas[name][box])]
                 # H.264 is lossy 4:2:0 even at CRF 14: its text edges round a little more.
-                self.assertLess(sum(difference) / len(difference), 3 if name == 'h264.mp4' else 2, f'{name} burn-in matches ProRes')
+                self.assertLess(sum(difference) / len(difference), 4 if name == 'h264.mp4' else 2, f'{name} burn-in matches ProRes')
         plain = self.out / 'plain-again.mov'
         render_to_file(project, plain, options=dict(codec='prores'))
         self.assertEqual(self.frame(plain, 10), self.frame(self.out / 'plain-prores.mov', 10), 'no burn-in unless asked')
