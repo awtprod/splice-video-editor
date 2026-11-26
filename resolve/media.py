@@ -1,20 +1,35 @@
 """Bring media a Resolve project names into Splice when the file is on this computer."""
+import atexit
+import json
 import os
+import subprocess
 import threading
 import time
 from pathlib import Path
 
 import media_links
-from media_proxy import ProbeTimeout, decodable
+from media_proxy import SCAN_LIMIT, _text_art, camera_raw_error
 
 PROBES = max(1, min(8, os.cpu_count() or 1))
 # Linking is bounded as a whole, not per file. 45 s leaves room for FFmpeg's own 25 s probe timeout
 # on one slow file while keeping an open from waiting minutes on a dead drive; 2,000 distinct files
-# is several times the media a feature's timelines use, and probes at about 20 files a second on a
-# local disk (8 at a time), so it fits in the time limit.
+# probed is several times the media a feature's timelines use, and probes at about 20 files a second
+# on a local disk (8 at a time), so it fits in the time limit. Looking a path up is cheap and only
+# bounded by time and MAX_LOOKUPS: a project naming thousands of missing files still has its real
+# ones checked.
 LINK_SECONDS = 45.0
 MAX_LINK_FILES = 2_000
+MAX_LOOKUPS = 50_000
+PROBE_SECONDS = 25.0
 MAX_PATH = 4096
+# Paths on one volume (the first two parts of a path) take at most this share of the workers at a
+# time, so a hung network mount cannot hold every worker while files elsewhere wait.
+PER_VOLUME = max(1, PROBES // 2)
+# Looking paths up may take at most this share of the time, so files found are probed even while
+# lookups on a hung volume never return.
+LOOKUP_SHARE = 1 / 3
+_children = set()
+_children_lock = threading.Lock()
 
 
 def _offline(reason, message=None):
@@ -46,40 +61,116 @@ def _look(path):
     return str(resolved), (info.st_dev, info.st_ino)
 
 
-def _probe(path):
-    """None when FFmpeg can edit the file, else its offline result."""
+def _reap(processes):
+    for process in processes:
+        try:
+            process.kill()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=5)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+
+def stop_probes():
+    """Kill and reap every probe still running (a deadline passed, or the server is exiting)."""
+    with _children_lock:
+        running = list(_children)
+        _children.clear()
+    _reap(running)
+
+
+atexit.register(stop_probes)
+
+
+def _probe(path, deadline):
+    """None when FFmpeg can edit the file, else its offline result. The FFprobe child is ours:
+    killed and reaped when the open's deadline passes (or the server exits), never orphaned. The
+    same check as media_proxy.decodable: camera RAW and text drawn as a picture are refused, and
+    a file needs a picture or sound stream FFmpeg decodes."""
+    name = Path(path).name
+    message = camera_raw_error(name)
+    if message:
+        return _offline('not-media', message)
+    left = min(PROBE_SECONDS, deadline - time.monotonic())
+    if left <= 0:
+        return _offline('unchecked', 'time ran out before it was looked at')
     try:
-        decodable(Path(path), Path(path).name)
-    except ProbeTimeout as error:
-        return _offline('unchecked', str(error))
-    except (ValueError, OSError) as error:
-        return _offline('not-media', str(error))
+        process = subprocess.Popen(['ffprobe', '-v', 'error', '-protocol_whitelist', 'file', '-show_entries',
+                                    'stream=codec_type,codec_name:format=format_name', '-of', 'json', 'file:' + str(path)],
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError as error:
+        return _offline('not-media', f'FFprobe could not run ({error.strerror or error})')
+    with _children_lock:
+        _children.add(process)
+    try:
+        output, _ = process.communicate(timeout=left)
+    except subprocess.TimeoutExpired:
+        _reap([process])
+        return _offline('unchecked', f'reading {name} timed out; its drive may be slow or disconnected')
+    finally:
+        with _children_lock:
+            _children.discard(process)
+    try:
+        data = json.loads(output[:SCAN_LIMIT]) if process.returncode == 0 else {}
+    except ValueError:
+        data = {}
+    streams = [s for s in data.get('streams', []) if isinstance(s, dict)] if isinstance(data, dict) else []
+    fmt = data.get('format') if isinstance(data, dict) and isinstance(data.get('format'), dict) else {}
+    if _text_art(fmt, streams) or not any(s.get('codec_type') in ('video', 'audio') for s in streams):
+        return _offline('not-media', f'The installed FFmpeg cannot decode {name}')
     return None
 
 
-def _bounded(work, items, deadline):
+def _volume(item):
+    text = str(item[0] if isinstance(item, tuple) else item)
+    parts = [p for p in text.replace('\\', '/').split('/') if p]
+    return '/'.join(parts[:2])
+
+
+def _bounded(work, items, deadline, volume=None):
     """``work(item)`` for each item, ``PROBES`` at a time, until ``deadline`` (time.monotonic()).
 
     Returns {index: result} for the items finished in time. The workers are daemon threads, so one
     stuck in a filesystem call that never returns (a hung network mount) neither delays this past
-    the deadline nor keeps the server from exiting."""
+    the deadline nor keeps the server from exiting. With ``volume(item)``, at most
+    :data:`PER_VOLUME` items of one volume run at a time, so files on other volumes are still
+    checked while one volume hangs."""
     results = {}
     if not items:
         return results
     lock = threading.Condition()
     queue = list(enumerate(items))
-    queue.reverse()
+    busy = {}
+
+    def take():
+        for position, (index, item) in enumerate(queue):
+            key = volume(item) if volume else None
+            if key is None or busy.get(key, 0) < PER_VOLUME:
+                del queue[position]
+                if key is not None:
+                    busy[key] = busy.get(key, 0) + 1
+                return index, item, key
+        return None
 
     def worker():
         while True:
             with lock:
-                if not queue or time.monotonic() >= deadline:
-                    lock.notify_all()
-                    return
-                index, item = queue.pop()
+                while True:
+                    if not queue or time.monotonic() >= deadline:
+                        lock.notify_all()
+                        return
+                    taken = take()
+                    if taken is not None:
+                        break
+                    lock.wait(min(0.2, max(0.0, deadline - time.monotonic())))
+                index, item, key = taken
             value = work(item)
             with lock:
                 results[index] = value
+                if key is not None:
+                    busy[key] -= 1
                 lock.notify_all()
     threads = [threading.Thread(target=worker, name='splice-resolve-link', daemon=True)
                for _ in range(min(PROBES, len(items)))]
@@ -112,7 +203,7 @@ def link_local(paths, *, seconds=LINK_SECONDS, max_files=MAX_LINK_FILES):
     """
     deadline = time.monotonic() + seconds
     results = [None] * len(paths)
-    limit = f'Splice looks for at most {max_files:,} files for {seconds:g} s when it opens a project'
+    limit = f'Splice checks at most {max_files:,} files for {seconds:g} s when it opens a project'
     wanted = {}  # path text -> indexes
     for index, text in enumerate(paths):
         path = _usable_text(text)
@@ -123,11 +214,11 @@ def link_local(paths, *, seconds=LINK_SECONDS, max_files=MAX_LINK_FILES):
         else:
             wanted.setdefault(text, []).append(index)
     texts = list(wanted)
-    for text in texts[max_files:]:
+    for text in texts[MAX_LOOKUPS:]:
         for index in wanted[text]:
             results[index] = _offline('unchecked', limit)
-    texts = texts[:max_files]
-    looked = _bounded(lambda text: _look(Path(text)), texts, deadline)
+    texts = texts[:MAX_LOOKUPS]
+    looked = _bounded(lambda text: _look(Path(text)), texts, time.monotonic() + seconds * LOOKUP_SHARE, _volume)
     files = {}  # identity of a real file -> its resolved path
     named = {}  # identity -> the indexes of every path naming it
     for number, text in enumerate(texts):
@@ -140,7 +231,15 @@ def link_local(paths, *, seconds=LINK_SECONDS, max_files=MAX_LINK_FILES):
         files.setdefault(identity, resolved)
         named.setdefault(identity, []).extend(wanted[text])
     identities = list(files)
-    probed = _bounded(lambda identity: _probe(files[identity]), identities, deadline)
+    for identity in identities[max_files:]:
+        for index in named[identity]:
+            results[index] = _offline('unchecked', limit)
+    identities = identities[:max_files]
+    try:
+        probed = _bounded(lambda identity: _probe(files[identity], deadline), identities, deadline,
+                          lambda identity: _volume(files[identity]))
+    finally:
+        stop_probes()
     playable = []
     for number, identity in enumerate(identities):
         if number in probed and probed[number] is None:
@@ -155,9 +254,16 @@ def link_local(paths, *, seconds=LINK_SECONDS, max_files=MAX_LINK_FILES):
         def validate(path, name):
             if str(path) not in accepted:
                 raise ValueError(f'{name} was not checked')
+            if time.monotonic() >= deadline:
+                raise TimeoutError(limit)
         linked = media_links.link_many([files[identity] for identity in playable], validate=validate)
         for identity, result in zip(playable, linked):
-            outcome = result if 'src' in result else _offline('refused', result.get('error'))
+            if 'src' in result:
+                outcome = result
+            elif result.get('error') == limit:
+                outcome = _offline('unchecked', limit)
+            else:
+                outcome = _offline('refused', result.get('error'))
             for index in named[identity]:
                 results[index] = outcome
     return results

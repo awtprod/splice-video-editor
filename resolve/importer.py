@@ -8,6 +8,7 @@ Anything Splice does not represent is listed in ``compatibilityWarnings`` with t
 track and clip it belongs to; nothing is dropped without a line there.
 """
 import math
+import re
 from fractions import Fraction
 from pathlib import PurePath, PureWindowsPath
 
@@ -357,23 +358,62 @@ def read(source):
 
 # --------------------------------------------------------------------------- Splice project
 
+_PLACE = re.compile(r'(?P<where>.+? · .+? at -?[0-9]{2}:[0-9]{2}:[0-9]{2}:[0-9]{2}): (?P<what>.+)\Z', re.S)
+_NUMBER = re.compile(r'[-+]?[0-9]+(?:\.[0-9]+)?')
+MAX_EXAMPLES = 5
+MAX_DETAILS = 2_000
+
+
 class _Warnings:
+    """Compatibility lines. A clip's line (``timeline · track · clip at timecode: what``) is grouped
+    with every other clip's line of the same kind (the same words, numbers aside) into one line with
+    the count and up to five clips; each clip's own line is kept in :meth:`details`."""
+
     def __init__(self, limit=MAX_WARNINGS):
-        self.lines = []
+        self.groups = {}
         self.limit = limit
         self.extra = 0
+        self.kept = 0
 
     def add(self, text):
-        if text in self.lines:
+        match = _PLACE.match(text)
+        where, what = (match.group('where'), match.group('what')) if match else (None, text)
+        key = (where is not None, _NUMBER.sub('#', what) if where is not None else text)
+        group = self.groups.get(key)
+        if group is None:
+            if len(self.groups) >= self.limit:
+                self.extra += 1
+                return
+            group = self.groups[key] = {'what': what, 'texts': [], 'seen': set(), 'variants': set(), 'count': 0}
+        if text in group['seen']:
             return
-        if len(self.lines) < self.limit:
-            self.lines.append(text)
-        else:
-            self.extra += 1
+        group['count'] += 1
+        group['variants'].add(what)
+        if self.kept < MAX_DETAILS * 4:
+            self.kept += 1
+            group['seen'].add(text)
+            group['texts'].append((where, text))
+
+    def _line(self, group):
+        if group['count'] == 1:
+            return group['texts'][0][1]
+        places = [where for where, _text in group['texts'][:MAX_EXAMPLES]]
+        more = group['count'] - len(places)
+        differ = ' (the values differ from clip to clip)' if len(group['variants']) > 1 else ''
+        return (f'{group["count"]} clips: {group["what"].rstrip(".")}{differ}. For example: {"; ".join(places)}'
+                + (f'; and {more} more' if more > 0 else '') + '.')
 
     def result(self):
-        return self.lines + ([f'{self.extra} more items are not imported; they are kept in the Resolve project.']
-                             if self.extra else [])
+        return [self._line(g) for g in self.groups.values()] + (
+            [f'{self.extra} more items are not imported; they are kept in the Resolve project.'] if self.extra else [])
+
+    def details(self):
+        """Every clip's own line of each grouped line (bounded), for the panel to show on demand."""
+        out = {}
+        for group in self.groups.values():
+            if group['count'] > 1:
+                out[self._line(group)] = [text for _where, text in group['texts'][:MAX_DETAILS]]
+        return out
 
 
 def volume_percent(db):
@@ -735,8 +775,9 @@ def to_splice(model, index=0, link_media=None, source_ref=None):
             # source in-points, and every clip cut from one file carries the same ones); a Resolve
             # 21.1 project stores a marker the scripting API put at clip frame 10 as 20.
             warnings.add(f'{clip["_where"]}: {len(found)} clip marker(s) are not imported. Where Resolve places a '
-                         'clip marker is not settled: Resolve 19 stores it as a frame of the source media, and a '
-                         'Resolve 21 project stores twice the frame number the scripting API reports.')
+                         'clip marker is not settled: Resolve 19 stores it as a frame of the source media, and the '
+                         'one Resolve 21 sample stores a value that fits two readings (twice the frame the scripting '
+                         'API reports, or that frame plus the marker\'s duration), so it is unresolved.')
     for clip in clips:
         clip.pop('_where', None)
 
@@ -811,7 +852,7 @@ def to_splice(model, index=0, link_media=None, source_ref=None):
         'trackState': track_state, 'trackCounts': {'video': max(1, min(MAX_TRACKS, counts['video'])),
                                                    'audio': max(1, min(MAX_TRACKS, counts['audio']))},
         'trackNames': track_names,
-        'compatibilityWarnings': warnings.result(),
+        'compatibilityWarnings': warnings.result(), 'compatibilityDetails': warnings.details(),
         'duration': max((c['start'] + c['duration'] for c in clips), default=0),
         'resolveTimelines': model.labels(), 'resolveTimelineIds': [t['id'] for t in model.timelines],
         'resolveTimeline': index, 'resolveTrackFlags': track_flags,
