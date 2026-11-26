@@ -47,7 +47,7 @@
     // Planes of another file are never shown: the browser's RGB stands in until the copy lands.
     const usable = entry.frame && entry.frame.source === source ? entry.frame : null;
     if (entry.key === key || entry.failed) return usable;
-    if (entry.pending !== key) {
+    if (!entry.pending) {
       let frame;
       try { frame = new VideoFrame(element); }
       catch (error) {
@@ -254,7 +254,7 @@ void main() {
       const gl = this.canvas.getContext('webgl2', {alpha:false, antialias:false, depth:false, stencil:false, premultipliedAlpha:false, preserveDrawingBuffer:true});
       if (!gl) throw new Error('WebGL2 is unavailable');
       this.gl = gl;
-      this.setup();
+      try { this.setup(); } catch (error) { this.destroy(); throw error; }
     }
     // One linked program per feature set, kept for the life of the context.
     program(kind, features) {
@@ -277,16 +277,27 @@ void main() {
       this.released();
       const compile = (type, source) => {
         const shader = gl.createShader(type); gl.shaderSource(shader, source); gl.compileShader(shader);
-        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS) && !gl.isContextLost()) throw new Error(gl.getShaderInfoLog(shader));
+        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS) && !gl.isContextLost()) {
+          const message = gl.getShaderInfoLog(shader);
+          gl.deleteShader(shader);
+          throw new Error(message);
+        }
         return shader;
       };
       const link = (vertex, fragment) => {
-        const program = gl.createProgram();
-        const vs = compile(gl.VERTEX_SHADER, vertex), fs = compile(gl.FRAGMENT_SHADER, fragment);
-        gl.attachShader(program, vs); gl.attachShader(program, fs);
-        gl.bindAttribLocation(program, 0, 'a_corner'); gl.linkProgram(program);
-        gl.deleteShader(vs); gl.deleteShader(fs);
-        if (!gl.getProgramParameter(program, gl.LINK_STATUS) && !gl.isContextLost()) throw new Error(gl.getProgramInfoLog(program));
+        const program = gl.createProgram(), shaders = [];
+        try {
+          shaders.push(compile(gl.VERTEX_SHADER, vertex));
+          shaders.push(compile(gl.FRAGMENT_SHADER, fragment));
+          for (const shader of shaders) gl.attachShader(program, shader);
+          gl.bindAttribLocation(program, 0, 'a_corner'); gl.linkProgram(program);
+          if (!gl.getProgramParameter(program, gl.LINK_STATUS) && !gl.isContextLost()) throw new Error(gl.getProgramInfoLog(program));
+        } catch (error) {
+          gl.deleteProgram(program);
+          throw error;
+        } finally {
+          for (const shader of shaders) gl.deleteShader(shader);
+        }
         const uniforms = {};
         const count = gl.getProgramParameter(program, gl.ACTIVE_UNIFORMS) || 0;
         for (let i = 0; i < count; i++) { const info = gl.getActiveUniform(program, i); uniforms[info.name] = gl.getUniformLocation(program, info.name); }
@@ -754,7 +765,7 @@ void main() {
   // Grade timing alone (for the performance report): a synthetic frame through the GL grade.
   function setCanvasOnly(value) { forceCanvas = !!value; }
   function loseContext() { const extension = gl?.gl.getExtension('WEBGL_lose_context'); extension?.loseContext(); return extension; }
-  function reset() { gl?.destroy(); gl = null; glError = ''; canvas2d?.destroy(); canvas2d = null; }
+  function reset() { clearTimeout(retry); retry = 0; gl?.destroy(); gl = null; glError = ''; canvas2d?.destroy(); canvas2d = null; }
   window.SplicePicture = {render, stats, forget, setCanvasOnly, loseContext, reset, maxFrame:MAX_FRAME, views:Object.keys(VIEW),
     onReady:callback => { onReady = callback; }, glError:() => glError, renderer:() => (renderer() === gl ? 'webgl2' : 'canvas'),
     readGL:(x, y, w, h) => gl?.readPixels(x, y, w, h), context:() => gl?.gl || null};

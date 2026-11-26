@@ -628,7 +628,7 @@ def _picture_grade(clip, item, directory, name, profile, *, fps, zero, frames, r
                              clock=_grade_clock(clip, fps, zero, frames, reverse))
         return (f',setparams=colorspace=bt709:range=tv,zscale,format={WORKING_FORMAT}{chain},'
                 f'zscale=m={ZSCALE_MATRIX[output_matrix(profile)]}:r=limited')
-    if not _has_color_work(clip, item):
+    if not _has_color_work(clip, item) and not item.get('colorMatrix'):
         return None
     if hdr_master:
         raise ValueError('Color grading of SDR clips in an HDR master is not supported. Export this timeline as Rec. 709.')
@@ -749,6 +749,11 @@ def _lut_filter(color, destination, *, preserve_headroom=False):
     domain_min = lut.get('domainMin', [0,0,0]) if isinstance(lut, dict) else [0,0,0]
     domain_max = lut.get('domainMax', [1,1,1]) if isinstance(lut, dict) else [1,1,1]
     custom_domain = domain_min != [0,0,0] or domain_max != [1,1,1]
+    if not preserve_headroom and isinstance(lut, dict) and (lut.get('curve') or custom_domain):
+        # A 1D file's full curve, and any domain, exactly as the monitor applies them (float RGB).
+        from color_grade import WORKING_FORMAT, look_filter
+        return (f',zscale,format={WORKING_FORMAT}'+look_filter(lut, intensity, destination.parent, destination.stem)+
+                ',zscale=m=709:r=limited')
     mix_after_lookup = custom_domain or preserve_headroom
     destination.write_text(cube_text(lut,100 if mix_after_lookup else intensity,normalized_domain=custom_domain))
     apply_lut = f'lut3d=file={_filter_path(destination)}:interp=trilinear'
@@ -1185,10 +1190,6 @@ def _sample_origin(render_start, render_length, first, frames, fps, reverse):
     return first/fps-render_start
 
 
-def _alpha_bytes_per_pixel(high_depth):
-    return 6 if high_depth else 2.5
-
-
 def _render_window_inner(project, output_path, directory, *, options=None, cancelled=None):
     if not isinstance(project, dict):
         raise ValueError('Invalid project')
@@ -1214,11 +1215,11 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
     high_depth = codec=='prores'
     rec709 = options.get('colorSpace')=='rec709'
     conform_pq = options.get('colorSpace')=='pq'
-    base_format = 'yuv422p10le' if high_depth else 'yuv420p'
-    alpha_format = 'yuva422p10le' if high_depth else 'yuva420p'
-    full_alpha = 'yuva444p10le' if high_depth else 'yuva444p'
-    dip_rgb = 'gbrap10le' if high_depth else 'gbrap'
-    overlay = 'eof_action=pass:shortest=0:format=' + ('yuv422p10' if high_depth else 'yuv420')
+    # Composite at mastering precision. Quantize and subsample once for H.264 delivery.
+    base_format = 'yuv422p10le'
+    alpha_format = 'yuva422p10le'
+    full_alpha = 'yuva444p10le'
+    overlay = 'eof_action=pass:shortest=0:format=yuv422p10'
     if not isinstance(render_options, dict) or not isinstance(render_options.get('mutedTracks', {}), dict):
         raise ValueError('Invalid render options')
     muted = render_options.get('mutedTracks', {})
@@ -1380,21 +1381,20 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
             # a wipe to a disabled clip, which wipes this clip off).
             filters.append(f'[{active}]split[with{number}][without{next_number}]')
             active = f'with{number}'
-        dipped = False
-        if disabled:
-            pass
-        elif dip_head>0:
-            chain += f',format={dip_rgb},fade=t=in:st=0:d={dip_head:.6f}'
-            dipped = True
-        if following and following.get('transition') == 'fade' and not disabled:
-            dip_tail = float(following.get('transitionBefore',0) or 0)
-            if dip_tail>0:
-                chain += f',format={dip_rgb},fade=t=out:st={max(0,render_length-dip_tail):.6f}:d={dip_tail:.6f}'
-                dipped = True
-        if clip.get('_dipFormat') and not dipped and not disabled:
-            # The rest of a clip that dips elsewhere: take the same RGB round
-            # trip so its pixels match the window that holds the dip.
-            chain += f',format={dip_rgb}'
+        # Fade legal-range YUV toward black, preserving alpha. Use the sequence
+        # timestamp directly so fractional cuts do not round to a whole frame.
+        clock = f'(T+({first_frame/float(fps)-render_start:.12f}))'
+        gains = []
+        if dip_head > 0:
+            gains.append(f'clip({clock}/{dip_head:.9f},0,1)')
+        if following and following.get('transition') == 'fade':
+            tail = float(following.get('transitionBefore', 0) or 0)
+            if tail > 0:
+                gains.append(f'clip(({render_length:.9f}-{clock})/{tail:.9f},0,1)')
+        if gains and not disabled:
+            gain = '*'.join(gains)
+            chain += (f",geq=lum='64+(p(X,Y)-64)*{gain}':cb='512+(p(X,Y)-512)*{gain}':"
+                      f"cr='512+(p(X,Y)-512)*{gain}':a='alpha(X,Y)'")
         overlap_transition = previous is not None and clip.get('transition') in ('dissolve','wipe')
         if overlap_transition:
             prior_item = media_by_id[previous['mediaId']]
@@ -2188,7 +2188,7 @@ def _render_picture(project, picture, first, stop, total_frames, fps, width, hei
     protected.sort()
     reversed_spans.sort()
     import bisect
-    frame_bytes = width*height*_alpha_bytes_per_pixel(codec=='prores')
+    frame_bytes = width*height*6
     reverse_frames = max(1, int(REVERSE_BUFFER_BYTES // frame_bytes))
     frames = [0]
     reversed_active, reversed_next = [], 0
@@ -2212,25 +2212,8 @@ def _render_picture(project, picture, first, stop, total_frames, fps, width, hei
         frames.append(min(total_frames, proposed))
     windows = [(a,b) for a,b in zip(frames,frames[1:]) if b>first and a<stop]
     media_by_id = {item['id']: item for item in project['media']}
-    # A clip's chain takes the same pixel-format round trips in every window
-    # (dips go through RGB, wipes through 4:4:4), or its pixels would change
-    # at a window seam. Record which clips have them in the whole timeline.
-    video = sorted((clip for clip in picture if clip.get('type') == 'video'),
-                   key=lambda clip: (clip.get('track', 0), float(clip['start'])))
-    fps_value = float(fps)
-    _, followers = _picture_transitions(video, media_by_id, fps_value)
-    dip_format, wipe_mask = set(), set()
-    for number, clip in enumerate(video):
-        before = float(clip.get('transitionBefore', 0) or 0)
-        if clip.get('transition') == 'fade':
-            duration = min(float(clip.get('transitionDuration', .5)), float(clip['duration'])+before)
-            if duration-before > 0:
-                dip_format.add(id(clip))
-        if clip.get('transition') == 'wipe':
-            wipe_mask.add(id(clip))
-        following = video[followers[number]] if number in followers else None
-        if following is not None and following.get('transition') == 'fade' and float(following.get('transitionBefore', 0) or 0) > 0:
-            dip_format.add(id(clip))
+    # A wipe passes through 4:4:4 in every window to avoid a visible seam.
+    wipe_mask = {id(clip) for clip in picture if clip.get('type') == 'video' and clip.get('transition') == 'wipe'}
     # Sweep the clips once: each window sees only the clips that overlap it.
     ordered = sorted(picture, key=lambda clip: float(clip['start'])-float(clip.get('transitionBefore',0) or 0))
     active, pointer = [], 0
@@ -2269,7 +2252,6 @@ def _render_picture(project, picture, first, stop, total_frames, fps, width, hei
                 clip['transitionBefore']=0
                 if overlap_start > cut+.5/fps: clip['transition']='none'
                 clip['_keyframeShift']=overlap_start-cut
-            if id(original) in dip_format: clip['_dipFormat'] = True
             if id(original) in wipe_mask: clip['_wipeMask'] = True
             clips.append(clip)
         # Gaps still need a black base track to keep exact segment duration.

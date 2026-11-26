@@ -1306,6 +1306,7 @@
           Object.values(clip.keyframes).some(points => !Array.isArray(points) ||
             points.some(point => !point || !Number.isFinite(point.time) || !Number.isFinite(point.value)))))
         throw new Error("This project file has invalid keyframes.");
+      if (clip.keyframes) window.SpliceGrade.keyTimes(clip);
       if (clip.color?.grade !== undefined) window.SpliceGrade.validateGrade(clip.color.grade);
       if (clip.color?.lut) {
         const intensity = clip.color.lutIntensity ?? 100;

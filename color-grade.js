@@ -258,8 +258,16 @@
   // Times (clip-local seconds) at which any animated grade control has a keyframe.
   function keyTimes(clip) {
     const times = new Set();
-    for (const key of Object.keys(ANIMATED)) for (const point of clip.keyframes?.[key] || []) if (Number.isFinite(point.time) && Number.isFinite(point.value)) times.add(point.time);
-    return [...times].sort((a, b) => a-b).slice(0, MAX_KEY_TIMES);
+    for (const [key, [low, high]] of Object.entries(ANIMATED)) {
+      const points = clip.keyframes?.[key] ?? [];
+      if (!Array.isArray(points) || points.length > MAX_KEY_TIMES) fail('too many ' + key + ' keyframes');
+      for (const point of points) {
+        if (!Number.isFinite(point?.time) || point.time < 0 || !finite(point.value, low, high)) fail(key + ' keyframe');
+        times.add(point.time);
+      }
+    }
+    if (times.size > MAX_KEY_TIMES) fail('at most ' + MAX_KEY_TIMES + ' distinct grade keyframe times');
+    return [...times].sort((a, b) => a-b);
   }
   function valueAt(points, local, base) {
     const ordered = points.filter(point => Number.isFinite(point.time) && Number.isFinite(point.value)).sort((a, b) => a.time-b.time);

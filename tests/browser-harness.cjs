@@ -9,7 +9,7 @@ const {startSplice: startSpliceServer} = require('./splice-server.cjs');
 const root = path.resolve(__dirname, '..');
 
 async function startSplice(prefix) {
-  const temp = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const temp = fs.mkdtempSync(path.join(process.env.SPLICE_TEST_SCRATCH || os.tmpdir(), prefix));
   const server = await startSpliceServer({root, env: {HOME: temp, XDG_DATA_HOME: temp}});
   const executablePath = [process.env.SPLICE_CHROME, '/opt/google/chrome/chrome', '/usr/bin/chromium',
     '/usr/bin/google-chrome', chromium.executablePath()].find(file => file && fs.existsSync(file));

@@ -10,6 +10,7 @@ from pathlib import Path
 
 from lut import MAX_SIZE, cube1d_text, cube_text
 from render_movie import _lut_filter
+from color_grade import look_filter
 
 JS_HELPER = Path(__file__).with_name('lut-js.cjs')
 
@@ -210,16 +211,18 @@ class LargeLUTs(unittest.TestCase):
                                 exact = min(255, max(0, color[channel]*(1-intensity/100)+255*_curve(lut['curve']['data'], count, channel, t)*intensity/100))
                                 self.assertLessEqual(abs(got[channel]-exact), .5+1e-9, f'{color} channel {channel}: exact 1D')
 
-    def test_preview_and_export_agree_on_a_long_1d_lut_today(self):
-        # Until render_movie.py applies the curve, both sides apply the 65-point lattice.
+    def test_preview_and_export_apply_a_long_1d_lut_exactly(self):
+        # The export applies the full curve with lut1d (and its domain); so does the preview.
         count = 4096
         rows = '\n'.join(' '.join([f'{(i/(count-1))**(1/2.4):.8f}']*3) for i in range(count))
-        lut = js({'op':'parse','text':f'LUT_1D_SIZE {count}\n{rows}\n'})['lut']
-        self.assertFalse(js({'op':'limits'}).get('exportApplies1D', False))
+        lut = js({'op':'parse','text':f'LUT_1D_SIZE {count}\nDOMAIN_MIN 0 0 0.05\nDOMAIN_MAX 1 0.9 1\n{rows}\n'})['lut']
+        self.assertTrue(js({'op':'limits'}).get('exportApplies1D', False))
         colors = [(v, v, v) for v in range(0, 256, 3)]
         with tempfile.TemporaryDirectory() as folder:
             for intensity in (100, 40):
-                expected = ffmpeg_pixels(colors, _lut_filter({'lut':lut,'lutIntensity':intensity}, Path(folder)/'clip-0.cube'))
+                expected = ffmpeg_pixels(colors, ',zscale=rin=full:r=full,format=gbrpf32le'+look_filter(lut, intensity, folder, 'clip-0'))
+                # The lattice is far from this curve near black, so agreement means the curve was used.
+                self.assertGreater(js({'op':'error','lut':lut})['curveError'], 3)
                 graded = js({'op':'apply','lut':lut,'intensity':intensity,'pixels':colors})['pixels']
                 for color, want, got in zip(colors, expected, graded):
                     self.assertAlmostEqual(got[0], want[0], delta=1, msg=f'{color} at {intensity}%')

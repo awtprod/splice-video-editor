@@ -7,11 +7,8 @@
   const field = (title, key, value, min, max, step = .04, group = '') =>
     `<label class="splice-number"><span>${title}</span><input aria-label="${title}" type="number" data-field="${key}" data-group="${group}" min="${min}" max="${max}" step="${step}" value="${value}"></label>`;
   const section = (title, body) => `<section class="splice-section"><h3>${title}</h3>${body}</section>`;
-  // A 1D LUT longer than the 65-point lattice is applied as that lattice in preview and export alike.
-  const lutNote = lut => {
-    const error = lut?.curve ? window.SpliceLUT.curveError(lut) : 0;
-    return error >= .5 ? `<p class="splice-lut-note" role="note">This 1D LUT has ${lut.curve.size} entries. Preview and export apply it as a ${lut.size}-point table, up to ${error.toFixed(1)} code values (8-bit) away from the file.</p>` : '';
-  };
+  // 1D LUTs are applied at full length in preview and export (lut1d); only a missing file needs a note.
+  const lutNote = lut => lut && !lut.data?.length ? '<p class="splice-lut-note" role="note">This LUT\'s table is missing. Import the .cube file again.</p>' : '';
   const option = (key, title, selected) => `<option value="${escape(key)}" ${key === selected ? 'selected' : ''}>${escape(title)}</option>`;
   let automationProperty = 'opacity';
   let showSafeArea = false;
@@ -237,7 +234,10 @@
       const time=Math.round(Math.max(0,Math.min(active.duration,editor.get().time-active.start))*fps)/fps;
       const points=(active.keyframes?.[automationProperty]||[]).filter(point=>Math.abs(point.time-time)>=.5/fps);
       points.push({time,value});points.sort((a,b)=>a.time-b.time);
-      editor.updateClip(active.id,{keyframes:{...(active.keyframes||{}),[automationProperty]:points}});
+      const keyframes={...(active.keyframes||{}),[automationProperty]:points};
+      try { window.SpliceGrade.keyTimes({keyframes}); }
+      catch (error) { return window.alert(error.message); }
+      editor.updateClip(active.id,{keyframes});
       render(editor.get(),element,editor);
     });
     element.querySelector('[data-key-delete]')?.addEventListener('click',()=>{

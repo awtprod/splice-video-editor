@@ -278,11 +278,17 @@ def _value_at(points, local, base):
 
 def key_times(clip):
     times = set()
-    for key in ANIMATED:
-        for point in (clip.get('keyframes') or {}).get(key) or []:
-            if isinstance(point, dict) and _finite(point.get('time'), -1e9, 1e9) and _finite(point.get('value'), -1e9, 1e9):
-                times.add(float(point['time']))
-    return sorted(times)[:MAX_KEY_TIMES]
+    for key, (low, high, _) in ANIMATED.items():
+        points = (clip.get('keyframes') or {}).get(key, [])
+        if not isinstance(points, list) or len(points) > MAX_KEY_TIMES:
+            raise ValueError(f'Invalid {key} keyframes')
+        for point in points:
+            if not isinstance(point, dict) or not _finite(point.get('time'), 0, 1e9) or not _finite(point.get('value'), low, high):
+                raise ValueError(f'Invalid {key} keyframe')
+            times.add(point['time'])
+    if len(times) > MAX_KEY_TIMES:
+        raise ValueError(f'A clip supports at most {MAX_KEY_TIMES} distinct grade keyframe times')
+    return sorted(times)
 
 
 def color_at(clip, local):
