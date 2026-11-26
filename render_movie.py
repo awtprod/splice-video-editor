@@ -573,7 +573,7 @@ def _hdr_still_filter(profile):
 
 
 def _fit_picture(width, height, color, lut, alpha_format, high_depth, profile=None, rec709=False,
-                 *, still_frames=0, hdr_profile=None, conform_pq=False, graded=None):
+                 *, still_frames=0, hdr_profile=None, conform_pq=False, graded=None, animate_still=False):
     """``graded``: the table-based grade (color_grade) for this clip, which replaces the CSS-style
     filters and the LUT."""
     if profile and profile[1] in HDR_TRANSFERS:
@@ -595,6 +595,10 @@ def _fit_picture(width, height, color, lut, alpha_format, high_depth, profile=No
             grade += (f',zscale=pin={primaries}:tin={transfer}:min={matrix}:p=bt2020:t=linear,format=gbrpf32le,'
                       'zscale=t=smpte2084:m=bt2020nc:r=limited:npl=203,format=yuv444p10le')
     repeat = f',loop=loop={still_frames-1}:size=1:start=0,setpts=N' if still_frames>1 else ''
+    if animate_still:
+        # The grade and its alpha branch need a frame at each sequence timestamp.
+        grade = repeat + grade
+        repeat = ''
     return (f'scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2'
             f'{grade},format={alpha_format},'
             f'pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black@0{repeat}')
@@ -1381,7 +1385,8 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
         opacity_keys=(clip.get('keyframes') or {}).get('opacity')
         first_frame, frames = _frame_span(render_start, render_length, fps)
         graded = None if item.get('_disabled') else _picture_grade(
-            clip, item, directory, f'clip-{number}', profile, fps=fps, zero=before, frames=frames, reverse=reverse,
+            clip, item, directory, f'clip-{number}', profile, fps=fps, zero=before, frames=frames,
+            reverse=reverse and not item.get('_renderStill'),
             hdr_master=bool(hdr_profile) or conform_pq)
         hdr_source = (item.get('_sourceProfile') or REC709)[1] in HDR_TRANSFERS
         clip_bypass = bool(isinstance(color, dict) and (color.get('grade') or {}).get('bypass'))
@@ -1402,7 +1407,7 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
                                     frames=frames,origin=origin)
             fit = _fit_picture(width,height,fit_color,lut_filter,alpha_format,high_depth,item.get('_sourceProfile'),rec709,
                                still_frames=still_frames,hdr_profile=hdr_profile,conform_pq=conform_pq,
-                               graded=graded)
+                               graded=graded, animate_still=still_frames>1 and not clip_bypass and len(_grade_key_times(clip))>1)
             # Reverse after scaling so the buffered window holds sequence-size frames.
             flip = ',reverse' if reverse and not still_frames and index is not None else ''
             chain = f'{prefix},{fit}{flip}{transform}'

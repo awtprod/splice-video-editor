@@ -72,7 +72,7 @@ async function main() {
   const files = {};
   try {
     const sources = {tag709:{}, untagged:{matrix:'bt601', tags:false}, override709:{tags:false}, tag601:{matrix:'bt601'}, full709:{range:'pc'},
-      hlg:{transfer:'hlg'}, pq:{transfer:'pq'}, flat:{color:[100,180,220]}};
+      hlg:{transfer:'hlg'}, pq:{transfer:'pq'}, flat:{color:[100,180,220]}, headroom:{color:[128,128,128]}};
     for (const [name, spec] of Object.entries(sources)) { files[name] = path.join(splice.temp, name+'.mp4'); patchSource(files[name], spec); }
     const {page, errors} = await openPage(splice, {width:1440, height:900});
     page.setDefaultTimeout(60000);
@@ -118,6 +118,7 @@ async function main() {
         keyframes:{exposure:[{time:0, value:-1}, {time:.48, value:0}, {time:.96, value:1}]}}], times:[0, .48, .96]});
     }
     cases.push({name:'input LUT on the source', source:'flat', inputLut:true, clips:[{track:1, color:{saturation:120}}], times:[.48]});
+    one('extended input LUT before desaturation', {saturation:0}, 'headroom');
     // Keyframed exposure ramp over two seconds: -1 EV to +1 EV, sampled at five points.
     cases.push({name:'exposure ramp keyframes', source:'tag709', length:2, clips:[{track:1, color:{}, keyframes:{exposure:[{time:0, value:-1}, {time:1, value:.2}, {time:2, value:1}]}}],
       times:[0, .48, 1, 1.48, 1.96]});
@@ -164,6 +165,8 @@ async function main() {
         });
         project.media.find(item => item.name === 'override709.mp4').colorMatrix = 'bt709';
         project.media.find(item => item.name === 'flat.mp4').inputLut = inputLut;
+        project.media.find(item => item.name === 'headroom.mp4').inputLut =
+          SpliceLUT.parseCube('LUT_3D_SIZE 2\n' + '-0.5 0.5 1.5\n'.repeat(8), 'Headroom');
       });
     }, {timeline, inputLut:luts.input});
     // ---- Read the monitor at every sample point.
@@ -303,6 +306,30 @@ async function main() {
       }
     }
     assert.deepEqual(failures, [], failures.join('\n'));
+    if (!process.env.SPLICE_PARITY_ONLY) for (const source of ['hlg', 'pq']) {
+      const index = sampleTimes.findIndex(s => s.item.name === source+' source');
+      await page.evaluate(async time => {
+        Editor.seek(time);
+        const {activeClip,project} = Editor.get(), item = project.media.find(m => m.id===activeClip.mediaId);
+        await SpliceMedia.preparePreview(item, item.audioStream ?? null, true).done;
+        Editor.updateClip(activeClip.id,{color:{exposure:1}});
+      }, sampleTimes[index].time);
+      for (const mode of ['bypass', 'split']) {
+        const toggle = page.locator('[data-monitor-'+mode+']');
+        await toggle.click();
+        await page.waitForFunction(({centers, reference, split}) => {
+          const canvas = document.querySelector('#preview-canvas'), ctx = canvas.getContext('2d');
+          const delta = centers.map(([x,y], i) => {
+            const rgb = ctx.getImageData(x,y,1,1).data;
+            return Math.max(...reference[i].map((v,c) => Math.abs(rgb[c]-v)));
+          });
+          const right = delta.filter((v,i) => centers[i][0] > canvas.width/2);
+          const left = delta.filter((v,i) => centers[i][0] < canvas.width/2);
+          return split ? Math.max(...right)<=4 && Math.max(...left)>20 : Math.max(...delta)<=4;
+        }, {centers, reference:gl[index], split:mode==='split'});
+        await toggle.click();
+      }
+    }
     assert.deepEqual(errors, []);
     console.log(`Monitor matches the export: ${rows.length} samples, WebGL2, Canvas and after context loss, ProRes and H.264.`);
   } finally {

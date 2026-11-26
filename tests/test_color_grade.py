@@ -159,6 +159,28 @@ class ColorRenderParityTests(unittest.TestCase):
                 self.assertGreater(late[1] - early[1], 45,
                                    f'{name} ({opts["codec"]}) animated exposure must brighten over time: {early} -> {late}')
 
+    def test_still_exposure_ramp_keeps_transparent_pixels(self):
+        name = 'half-transparent.png'
+        _ffmpeg('-f', 'lavfi', '-i', 'color=gray:s=64x36,format=rgba',
+                '-vf', "geq=r='128':g='128':b='128':a='if(lt(X,W/2),255,0)'", '-frames:v', '1', self.media/name)
+        _ffmpeg('-f', 'lavfi', '-i', 'color=red:s=64x36', '-frames:v', '1', self.media/'red.png')
+        media = [{'id': f, 'name': f, 'src': f'/media/{f}', 'type': 'video', 'duration': 2} for f in (name, 'red.png')]
+        background = {'id': 'bg', 'mediaId': 'red.png', 'type': 'video', 'track': 1, 'in': 0, 'start': 0, 'duration': 1}
+        clip = {**background, 'id': 'c', 'mediaId': name, 'track': 2,
+                'keyframes': {'exposure': [{'time': 0, 'value': -1}, {'time': .96, 'value': 1}]}}
+        for reverse in (False, True):
+            with self.subTest(reverse=reverse):
+                output = Path(self.temp.name)/f'still-{reverse}.mov'
+                render_to_file(self._project(media, [background, {**clip, 'reverse': reverse}]), output, options={'codec': 'prores'})
+                planes = subprocess.check_output(['ffmpeg', '-v', 'error', '-i', str(output), '-f', 'rawvideo',
+                                                  '-pix_fmt', 'rgb24', 'pipe:1'], timeout=30)
+                self.assertEqual(len(planes), 25*64*36*3)
+                def sample(frame, x):
+                    return planes[((frame*36+18)*64+x)*3]
+                self.assertGreater(sample(12, 16)-sample(0, 16), 15)
+                self.assertGreater(sample(24, 16)-sample(12, 16), 15)
+                self.assertGreater(min(sample(frame, 48) for frame in range(25)), 245)
+
     def test_hdr_bypass_preserves_tone_mapping(self):
         for name in ('hlg.mov', 'pq.mov'):
             with self.subTest(source=name):

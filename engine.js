@@ -77,6 +77,7 @@
   let audio = null;
   const audioElements = new Map();
   const layerVideos = new Map();
+  const comparisonVideos = new Map();
   let activeVideoId = null;
   let transitionVideoId = null;
   let preloadClipId = null;
@@ -788,6 +789,18 @@
       if (error.name!=='InvalidStateError') throw error;
     }
   }
+  function layerVideo(cache, id, source) {
+    let element=cache.get(id);
+    if (!element) {
+      element=document.createElement('video');element.muted=true;element.playsInline=true;
+      element.preload='auto';element.style.display='none';document.body.append(element);cache.set(id,element);
+    }
+    if (element.getAttribute('src')!==source) element.src=source;
+    return element;
+  }
+  function releaseLayerVideo(cache,id,element) {
+    element.pause();disconnectAudio(element);element.removeAttribute('src');element.load();element.remove();cache.delete(id);
+  }
   function syncMedia(forceSeek = false) {
     ensureElements();
     for(const state of auditions.values()) state.active=false;
@@ -924,18 +937,13 @@
     }
     const currentVideoIds=new Set(layers.keys());
     for (const [id,element] of layerVideos) if (!currentVideoIds.has(id) || id===activeVideoId || id===preloadClipId) {
-      element.pause();disconnectAudio(element);element.removeAttribute('src');element.load();element.remove();layerVideos.delete(id);
+      releaseLayerVideo(layerVideos,id,element);
     }
     for (const layer of layers.values()) {
       if (layer.id===activeVideoId || layer.id===preloadClipId) continue;
       const layerSource=programSource(layer);
       if (!layerSource) continue;
-      let element=layerVideos.get(layer.id);
-      if(!element) {
-        element=document.createElement('video');element.muted=true;element.playsInline=true;
-        element.preload='auto';element.style.display='none';element.src=layerSource;document.body.append(element);layerVideos.set(layer.id,element);
-      }
-      if (element.getAttribute('src') !== layerSource) element.src = layerSource;
+      const element=layerVideo(layerVideos,layer.id,layerSource);
       const preload = preloading.has(layer.id);
       const target=sourceTime(layer,preload?layer.start-transitionBefore(layer):time);
       seekVideo(element,layer,target,forceSeek);
@@ -944,6 +952,25 @@
         setMediaPlaying(element,false);
       } else syncClipPlayback(element,layer,target,forceSeek);
     }
+    // Bypass and split show the ordinary tone-mapped proxy. Decoding the 8-bit
+    // PQ grading proxy back to a neutral image can change saturated colours.
+    const references=new Set();
+    if ((monitor.bypass || monitor.split!=null) && !mutedTracks.video) {
+      if (previous) layers.set(previous.id,previous);
+      for (const layer of layers.values()) {
+        const item=mediaOf(layer);
+        if (preloading.has(layer.id) || trackHidden('video',layer.track) || !item?.hdr || !hasHdrGrade(layer)) continue;
+        const main=videoFor(layer), gradingSource=window.SpliceMedia?.hdrPreviewStatus(item,clipAudioStream(layer,item))?.src;
+        if (!gradingSource || main?.getAttribute('src')!==gradingSource) continue;
+        const fresh=comparisonVideos.get(layer.id)?.getAttribute('src')!==item.src;
+        const ref=layerVideo(comparisonVideos,layer.id,item.src), target=main.currentTime;
+        const skew=Math.abs(ref.currentTime-target)>1/(item.fps || project.fps);
+        seekVideo(ref,layer,target,forceSeek || fresh || (skew && !ref.seeking));
+        syncClipPlayback(ref,layer,target,forceSeek,false);
+        references.add(layer.id);
+      }
+    }
+    for (const [id,element] of comparisonVideos) if (!references.has(id)) releaseLayerVideo(comparisonVideos,id,element);
     const currentIds = new Set(audioClips.map((c) => c.id));
     for (const [id, element] of audioElements)
       if (!currentIds.has(id)) {
@@ -1079,6 +1106,11 @@
   }
   // Monitor-only switches (not saved, not exported): grade bypass, before/after split, views.
   const monitor={bypass:false,split:null,view:'normal'};
+  let comparing=false;
+  document.addEventListener('splice-monitor-change',()=>{
+    const active=monitor.bypass || monitor.split!=null;
+    if (active!==comparing) { comparing=active;syncMedia(false); }
+  });
   // The grade of one clip at the playhead, for the picture pipeline: one prepared grade, or the two
   // keyframe gradings and their mix (color-grade.js keySegment), plus the source's input LUT.
   function gradeOf(clip,bypass) {
@@ -1177,8 +1209,11 @@
       const gradingSource=item?.hdr ? window.SpliceMedia?.hdrPreviewStatus(item,clipAudioStream(clip,item))?.src : null;
       const gradingData=!!gradingSource && element instanceof HTMLVideoElement && element.getAttribute('src')===gradingSource;
       const hdr=item?.hdr && element instanceof HTMLVideoElement && (clipBypass ? gradingData : hasHdrGrade(clip));
-      const source=hdr?hdrLayer(element,clip,canvas,clipBypass):element;
-      return {type:'video',element:source,clip,exact:!hdr && !(element instanceof HTMLCanvasElement),
+      const ref=clipBypass && gradingData && comparisonVideos.get(clip.id);
+      const ready=ref?.readyState>=2 && ref.currentSrc===ref.src && !ref.seeking &&
+        Math.abs(ref.currentTime-element.currentTime)<1/(item.fps || project.fps);
+      const source=ready ? ref : hdr?hdrLayer(element,clip,canvas,clipBypass):element;
+      return {type:'video',element:source,clip,exact:source instanceof HTMLVideoElement,
         input:{matrix:item?.hdr?'bt709':window.SpliceGrade?.matrixName(item?.colorSpace,item?.colorMatrix)||'bt601',fullRange:false},
         grade:gradeOf(clip,bypass), brightness, wipe, wipeOut,
         alpha:alpha*clamp(animated(clip,"opacity",Number(clip.opacity??100))/100,0,1),

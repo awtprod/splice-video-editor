@@ -186,7 +186,7 @@ void main() {
 #endif
   vec3 x = source.rgb;
 #if INPUT != 0
-  x = clamp(look(INPUT, u_in3, u_in1, u_inSize, u_inWidth, u_inMin, u_inMax, 1.0, x), 0.0, 1.0);
+  x = look(INPUT, u_in3, u_in1, u_inSize, u_inWidth, u_inMin, u_inMax, 1.0, x);
 #endif
 #if SETS == 1
   x = grade(x, u_tab0, u_flags.x, u_mat0);
