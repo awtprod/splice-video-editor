@@ -25,6 +25,8 @@ import math
 import subprocess
 from array import array
 
+from media_exec import run_bounded
+
 DECODE_RATE = 8000
 ENVELOPE_RATE = 200
 BLOCK = DECODE_RATE//ENVELOPE_RATE
@@ -46,12 +48,15 @@ def decode(path, seconds, stream=0, start=0.0):
                *(['-ss', f'{start:.6f}'] if start > 0 else []), '-t', f'{seconds:.6f}', '-i', str(path),
                '-map', f'0:a:{int(stream)}', '-ac', '1', '-af', 'highpass=f=200,lowpass=f=3000',
                '-ar', str(DECODE_RATE), '-f', 'f32le', '-c:a', 'pcm_f32le', 'pipe:1']
-    result = subprocess.run(command, capture_output=True, timeout=DECODE_TIMEOUT)
+    limit = int(seconds*DECODE_RATE+DECODE_RATE)*4
+    try:
+        result = run_bounded(command, timeout=DECODE_TIMEOUT, max_output=limit)
+    except subprocess.TimeoutExpired as error:
+        raise ValueError('The audio decoder timed out during sync') from error
     if result.returncode:
         raise ValueError('Could not decode audio for sync: ' + result.stderr.decode('utf-8', 'replace')[-300:])
-    limit = int(seconds*DECODE_RATE+DECODE_RATE)*4
     samples = array('f')
-    samples.frombytes(result.stdout[:limit - limit % 4])
+    samples.frombytes(result.stdout)
     return samples
 
 

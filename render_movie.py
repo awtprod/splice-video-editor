@@ -2410,7 +2410,7 @@ def _encode_aac(finished, bitrate, ceiling, peak_safe, directory, cancelled, hea
         warnings.warn(f'The MP4 audio peaks at {_db_text(peak)} dBTP once decoded, above the {_db_text(ceiling)} dBTP ceiling: '
                       'the mix is limited to the ceiling, and AAC encoding adds the overshoot. Program loudness was left '
                       f'unchanged ({_db_text(loudness)} LUFS). To deliver under the ceiling, lower the limiter ceiling, export with '
-                      'the aacPeakSafe option (it lowers the whole program until the decoded peak fits), or export WAV or ProRes.',
+                      '“Keep decoded AAC under the ceiling” (it lowers the whole program until the decoded peak fits), or export WAV or ProRes.',
                       stacklevel=2)
         return target, {'measurement': measurement, 'gainDb': gain}
     excess = peak-ceiling
@@ -2424,11 +2424,11 @@ def _encode_aac(finished, bitrate, ceiling, peak_safe, directory, cancelled, hea
         if attempt+1 < AAC_PEAK_ATTEMPTS:
             gain -= AAC_PEAK_STEP_DB
     if peak <= ceiling:
-        warnings.warn(f'aacPeakSafe lowered the whole program by {-gain:.1f} dB '
+        warnings.warn(f'“Keep decoded AAC under the ceiling” lowered the whole program by {-gain:.1f} dB '
                       f'(now {_db_text(loudness)} LUFS) so the decoded MP4 audio peaks at {_db_text(peak)} dBTP, '
                       f'under the {_db_text(ceiling)} dBTP ceiling.', stacklevel=2)
     else:
-        warnings.warn(f'aacPeakSafe lowered the whole program by {-gain:.1f} dB, but the decoded MP4 audio still '
+        warnings.warn(f'“Keep decoded AAC under the ceiling” lowered the whole program by {-gain:.1f} dB, but the decoded MP4 audio still '
                       f'peaks at {_db_text(peak)} dBTP, above the {_db_text(ceiling)} dBTP ceiling.', stacklevel=2)
     return target, {'measurement': measurement, 'gainDb': round(gain, 2)}
 

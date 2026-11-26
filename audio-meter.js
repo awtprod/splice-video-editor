@@ -223,7 +223,7 @@
     if (!audio || typeof audio !== 'object' || !audio.output) return [];
     const lines = [], i = audio.input || {}, o = audio.output || {};
     lines.push(`${audio.container || 'Audio'} · ${audio.layout === '5.1' ? '5.1' : audio.layout === '5.1-downmix' ? 'stereo downmix of 5.1' : 'stereo'}: ` +
-      `${db(o.integratedLufs)} LUFS integrated · ${db(o.truePeakDbtp)} dBTP true peak · ${o.loudnessRangeLu ?? '—'} LU range`);
+      (o.truePeakDbtp == null ? 'silent' : `${db(o.integratedLufs)} LUFS integrated · ${db(o.truePeakDbtp)} dBTP true peak · ${o.loudnessRangeLu ?? '—'} LU range`));
     lines.push(`Mix before finishing: ${db(i.integratedLufs)} LUFS · ${db(i.truePeakDbtp)} dBTP · ${i.loudnessRangeLu ?? '—'} LU · gain applied ${db(audio.gainDb || 0)} dB`);
     if (audio.normalization) lines.push(`Normalization to ${audio.normalization.targetLufs} LUFS (${audio.normalization.mode === 'limit' ? 'gain and limiting' : 'gain only'}): ` +
       (audio.normalization.reached ? 'reached' : 'not reached') + (audio.normalization.note ? ` — ${audio.normalization.note}` : ''));

@@ -385,7 +385,7 @@ class ProgramLoudness(Case):
                     overs += 1
                     self.assertEqual(len(messages), 1, messages)
                     self.assertIn(f"{audio['decodedTruePeakDb']:.1f}".replace('-', '\u2212'), messages[0])
-                    self.assertIn('aacPeakSafe', messages[0])
+                    self.assertIn('Keep decoded AAC under the ceiling', messages[0])
                 else:
                     self.assertEqual(messages, [])
         self.assertGreater(overs, 0, 'no program put AAC overshoot over the ceiling: the warning went untested')

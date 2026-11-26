@@ -399,9 +399,13 @@ def resolve_source(item: dict, sequence_rate: Fraction, budget: ProbeBudget) -> 
         bool(_dimension(item.get('width')) and _dimension(item.get('height')))
     probe = None
     sample_rate = _sample_rate(item)
-    # describe() records neither the sample rate nor a Broadcast WAV time reference, so a sound
-    # file (music, location sound) is probed for them; picture sources need no probe for these
-    sound_known = sample_rate is not None or source.kind != 'audio'
+    time_reference = item.get('timeReference')
+    valid_reference = type(time_reference) is int and 0 <= time_reference < 2**63
+    if not valid_reference:
+        time_reference = None
+    # A null from describe() means no BWF timestamp. Older records need a probe.
+    sound_known = source.kind != 'audio' or (sample_rate is not None and
+                  (valid_reference or ('timeReference' in item and item['timeReference'] is None)))
     needs_probe = not (rate_known and audio_known and timecode_known and sound_known and shape_known)
     if needs_probe and local is not None:
         timeout = budget.take()
@@ -452,6 +456,8 @@ def resolve_source(item: dict, sequence_rate: Fraction, budget: ProbeBudget) -> 
     label = item.get('timecode') if isinstance(item.get('timecode'), str) and item.get('timecode') else None
     if label is None and probe is not None:
         label = probe.timecode
+    if probe and probe.time_reference is not None:
+        time_reference = probe.time_reference
     if label:
         try:
             drop = bool(item.get('dropFrame')) if 'dropFrame' in item and label == item.get('timecode') else is_drop_frame(label)
@@ -461,8 +467,8 @@ def resolve_source(item: dict, sequence_rate: Fraction, budget: ProbeBudget) -> 
             source.timecode_state = 'embedded'
         except ValueError as error:
             source.notes.append(f'start timecode {label!r} is unreadable: {error}')
-    elif probe is not None and probe.time_reference is not None and probe.audio_rate and not source.has_video:
-        source.start = Fraction(probe.time_reference, probe.audio_rate)
+    elif time_reference is not None and source.audio_rate and not source.has_video:
+        source.start = Fraction(time_reference, source.audio_rate)
         source.tc_rate = sequence_rate
         source.tc_frames = int(source.start * sequence_rate)
         source.timecode_state = 'embedded'
