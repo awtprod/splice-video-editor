@@ -168,13 +168,29 @@ async function main() {
     async function readMonitor() {
       const out = [], costs = [];
       for (const sample of sampleTimes) {
-        await page.evaluate(time => Editor.seek(time), sample.frame/FPS+1e-4);
-        await page.waitForFunction(() => {
-          const video = Editor.get().video;
-          return (!video || !video.seeking) && SplicePicture.stats.stale === 0 && document.querySelector('#preview-canvas').width === 640;
-        });
-        await page.waitForTimeout(60);
-        await page.waitForFunction(() => SplicePicture.stats.stale === 0);
+        const previous = await page.evaluate(time => {
+          const before = SplicePicture.stats.frames;
+          Editor.seek(time);
+          return before;
+        }, sample.frame/FPS+1e-4);
+        // A source change can leave the old canvas visible until loadeddata. Its
+        // stale count is also zero. Wait for a new paint and the active decoder.
+        const layers = sample.item.transition ? 1 : sample.item.clips.filter(clip => !clip.adjustment).length;
+        await page.waitForFunction(({before, layers}) => {
+          const {project, activeClip, video} = Editor.get();
+          const source = project.media.find(m => m.id === activeClip?.mediaId);
+          const ready = !source?.src || (video.readyState >= 2 && !video.seeking && video.currentSrc === video.src);
+          const canvas = document.querySelector('#preview-canvas');
+          const videos = Editor.framePlan(canvas).ops.flatMap(op => [op, op.outgoing, op.incoming])
+            .filter(op => op?.element instanceof HTMLVideoElement);
+          if (videos.length < layers || videos.some(op => op.element.readyState < 2 || op.element.seeking)) return false;
+          const stats = SplicePicture.stats;
+          return ready && stats.frames > before && stats.exactDecode && stats.stale === 0 &&
+            document.querySelector('#preview-canvas').width === 640;
+        }, {before:previous, layers});
+        // Sample after the workspace has presented the newly ready composition.
+        await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+        await page.waitForFunction(() => SplicePicture.stats.exactDecode && SplicePicture.stats.stale === 0);
         costs.push(await page.evaluate(() => SplicePicture.stats.frameMs));
         out.push(await page.evaluate(({centers}) => {
           const ctx = document.querySelector('#preview-canvas').getContext('2d');
