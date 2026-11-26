@@ -331,6 +331,38 @@ def _drift_centres(samples, begin, end):
     return early[0], late[0]
 
 
+def _drift_windows(pic, snd, env_pic, env_snd, coarse, begin, end):
+    """Find two correlated windows far enough apart to measure clock drift."""
+    overlap = end-begin
+    max_shift = min(MAX_DRIFT_SEARCH, max(2*REFINE_LAGS/DECODE_RATE, MAX_DRIFT_RATE*overlap))
+
+    def targets():
+        yield from _drift_centres(pic, begin, end)
+        # Hiss can make a quiet end look active. Try the loudest second in each
+        # quarter, visiting the outer quarters first for a longer measurement.
+        quarter = overlap/4
+        for part in (0, 3, 1, 2):
+            yield _loudest(pic, begin+part*quarter, begin+(part+1)*quarter)
+        # A usable passage can start at the very first frame or run to the last.
+        yield begin
+        yield end
+
+    seen, windows = set(), []
+    for target in targets():
+        if target is None or target in seen:
+            continue
+        seen.add(target)
+        seed = windows[0][1] if windows else coarse
+        offset, score, centre = _local_drift_offset(pic, snd, env_pic, env_snd, seed, target, max_shift)
+        if centre is None or score < MIN_LOCAL_CORRELATION:
+            continue
+        windows.append((centre, offset))
+        first, last = min(windows), max(windows)
+        if last[0]-first[0] >= DRIFT_MIN_SEPARATION:
+            return first, last
+    return None
+
+
 def waveform_offset(picture_path, sound_path, *, picture_stream=0, sound_stream=0, picture_seconds=None,
                     search_seconds=DEFAULT_SEARCH_SECONDS, fps=24.0):
     """Offset of the sound file against the picture file's audio: a picture
@@ -361,45 +393,41 @@ def waveform_offset(picture_path, sound_path, *, picture_stream=0, sound_stream=
     begin = max(0.0, -coarse); end = min(len(pic)/DECODE_RATE, len(snd)/DECODE_RATE-coarse)
     overlap = end-begin
     ok_match = confidence >= MIN_CONFIDENCE and ratio >= MIN_PEAK_RATIO
-    check_drift = ok_match and overlap >= DRIFT_MIN_OVERLAP
-    early_target, late_target = (_drift_centres(pic, begin, end) if check_drift
-                                 else (_loudest(pic, begin, begin+min(overlap, 30)), None))
-    max_shift = min(MAX_DRIFT_SEARCH, max(2*REFINE_LAGS/DECODE_RATE, MAX_DRIFT_RATE*overlap))
-    early_env, early_env_score, early_centre = (
-        _local_drift_offset(pic, snd, env_pic, env_snd, coarse, early_target, max_shift)
-        if check_drift else (None, 0.0, None))
-    refine_seed = early_env if early_env is not None else coarse
-    offset, score, _ = _refine(pic, snd, refine_seed, early_target, begin, end)
+    # A drifting recorder can make a nominal 40-second overlap measure slightly shorter.
+    check_drift = ok_match and overlap >= DRIFT_MIN_OVERLAP*(1-MAX_DRIFT_RATE)
+    windows = _drift_windows(pic, snd, env_pic, env_snd, coarse, begin, end) if check_drift else None
+    if windows:
+        centre, refine_seed = windows[0]
+    else:
+        centre, refine_seed = _loudest(pic, begin, end if check_drift else min(end, begin+30)), coarse
+    offset, score, _ = _refine(pic, snd, refine_seed, centre, begin, end)
     result = dict(method='waveform', confidence=round(confidence, 3), peakRatio=round(min(ratio, 99), 2),
                   coarseOffsetSeconds=round(coarse, 4))
     if offset is None:
         offset, score = refine_seed, 0.0
-    if (check_drift and late_target is not None and early_env is not None and early_centre is not None
-            and early_env_score >= MIN_LOCAL_CORRELATION):
-        late_env, late_env_score, late_centre = _local_drift_offset(
-            pic, snd, env_pic, env_snd, early_env, late_target, max_shift)
-        if (late_env is not None and late_centre is not None
-                and late_centre-early_centre >= DRIFT_MIN_SEPARATION
-                and late_env_score >= MIN_LOCAL_CORRELATION):
-            rate = (late_env-early_env)/(late_centre-early_centre)
-            ppm = rate*1e6
-            drift = rate*overlap
-            result['driftSeconds'] = round(drift, 6) or 0.0
-            result['driftPpm'] = round(ppm, 1) or 0.0
-            # Flag a clock difference beyond what two good crystals show (DRIFT_PPM), or one
-            # that would move the sound a quarter frame over the take.
-            if abs(ppm) > DRIFT_PPM or abs(drift) > .25/fps:
-                result['drift'] = True
-                offset = early_env-rate*(early_centre-begin)
+    if windows:
+        (early_centre, early_env), (late_centre, late_env) = windows
+        rate = (late_env-early_env)/(late_centre-early_centre)
+        ppm = rate*1e6
+        drift = rate*overlap
+        result['driftSeconds'] = round(drift, 6) or 0.0
+        result['driftPpm'] = round(ppm, 1) or 0.0
+        # Flag a clock difference beyond what two good crystals show (DRIFT_PPM), or one
+        # that would move the sound a quarter frame over the take.
+        if abs(ppm) > DRIFT_PPM or abs(drift) > .25/fps:
+            result['drift'] = True
+            offset = early_env-rate*(early_centre-begin)
     result.update(offsetSeconds=round(offset, 6) or 0.0, offsetSamples=round(offset*48000),
                   offsetFrames=round(offset*fps, 2) or 0.0, refineCorrelation=round(score, 3))
-    result['ok'] = ok_match and not result.get('drift')
+    result['ok'] = ok_match and (not check_drift or windows is not None) and not result.get('drift')
     if not ok_match:
         result['note'] = (f'Low confidence ({confidence:.2f}, peak ratio {min(ratio, 99):.1f}): these recordings may not be '
                           'the same take. Not synced.')
     elif result.get('drift'):
         result['note'] = (f"The two recordings drift apart by {result['driftSeconds']*1000:.1f} ms over the take "
                           f"({result['driftPpm']:+.0f} ppm, different sample clocks). Synced at the start only if you choose to.")
+    elif check_drift and not windows:
+        result['note'] = 'The waveforms match, but there is too little correlated sound across the take to verify clock drift. Not synced.'
     return result
 
 

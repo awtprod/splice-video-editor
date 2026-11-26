@@ -22,7 +22,7 @@
       <label>Search range<span class="fx-input"><input name="search" type="number" min="1" max="600" step="1" value="60" aria-label="Search range (seconds)"><span class="fx-unit">± s</span></span></label>
       <label>Camera sound<select name="scratch"><option value="mute">Turn off the camera's scratch sound</option><option value="keep">Keep the camera sound playing</option></select></label>
       <div class="audio-sync-results" role="status" aria-live="polite"></div>
-      <footer><button type="button" data-close>Close</button><button type="button" data-apply hidden>Apply low-confidence matches too</button><button type="submit" class="primary" ${pictures.length && sounds.length ? '' : 'disabled'}>Sync</button></footer></form>`;
+      <footer><button type="button" data-close>Close</button><button type="button" data-apply hidden>Apply unconfirmed offsets</button><button type="submit" class="primary" ${pictures.length && sounds.length ? '' : 'disabled'}>Sync</button></footer></form>`;
     document.body.append(dialog);
     const form = dialog.querySelector('form'), out = dialog.querySelector('.audio-sync-results'), applyAll = dialog.querySelector('[data-apply]');
     const close = () => { dialog.close(); dialog.remove(); };
@@ -72,13 +72,13 @@
         out.innerHTML = `<ul>${[...good, ...weak].map(line).concat(unmatched).join('')}</ul>`;
         const scratch = form.elements.scratch.value;
         if (good.length) editor.syncSound(good.map(({picture, sound, result}) => ({pictureId: picture.id, mediaId: sound.id, offset: result.offsetSeconds})), {scratch});
-        out.insertAdjacentHTML('beforeend', `<p>${good.length} synced and linked.${weak.length ? ` ${weak.length} not synced (low confidence or drift).` : ''}</p>`);
+        out.insertAdjacentHTML('beforeend', `<p>${good.length} synced and linked.${weak.length ? ` ${weak.length} left for review.` : ''}</p>`);
         pending = weak.filter(entry => Number.isFinite(entry.result.offsetSeconds));
         applyAll.hidden = !pending.length;
         applyAll.onclick = () => {
           try { editor.syncSound(pending.map(({picture, sound, result}) => ({pictureId: picture.id, mediaId: sound.id, offset: result.offsetSeconds})), {scratch}); }
           catch (error) { out.insertAdjacentHTML('beforeend', `<p>${esc(error.message)}</p>`); return; }
-          out.insertAdjacentHTML('beforeend', `<p>${pending.length} low-confidence match${pending.length === 1 ? '' : 'es'} applied.</p>`);
+          out.insertAdjacentHTML('beforeend', `<p>${pending.length} offset${pending.length === 1 ? '' : 's'} applied manually.</p>`);
           applyAll.hidden = true; pending = [];
         };
       } catch (error) {

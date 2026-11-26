@@ -89,6 +89,49 @@ class WaveformSync(unittest.TestCase):
                 self.assertAlmostEqual(result['offsetSeconds'], expected_start, delta=.004, msg=result)
                 self.assertIn('drift', result['note'])
 
+    def test_drift_with_hiss_around_quiet_leaders_and_tails(self):
+        sound = self.directory/'padded.wav'
+        ffmpeg('-i', str(self.recorder), '-af', 'adelay=20000:all=1,apad=pad_dur=20', str(sound))
+        camera = camera_take(sound, self.directory/'padded-camera.m4a', 0, 85, video=False, gain_db=-30, hiss=.002)
+        for ppm in (0, 400, -400):
+            with self.subTest(ppm=ppm):
+                recorder = self.directory/f'padded-{ppm}.wav'
+                ffmpeg('-i', str(sound), '-af', f'asetrate={48000/(1+ppm*1e-6):.6f},aresample=48000', str(recorder))
+                result = audio_sync.waveform_offset(camera, recorder, search_seconds=6, fps=24)
+                self.assertEqual(result['ok'], ppm == 0, result)
+                self.assertEqual(bool(result.get('drift')), ppm != 0, result)
+                self.assertAlmostEqual(result['driftPpm'], ppm, delta=50)
+                self.assertAlmostEqual(result['offsetSeconds'], 0, delta=.003)
+
+    def test_first_24_seconds_of_dialogue_can_establish_drift_before_a_silent_tail(self):
+        sound = self.directory/'dialogue-tail.wav'
+        ffmpeg('-i', str(self.recorder), '-af', 'atrim=duration=24,apad=whole_dur=55', str(sound))
+        camera = camera_take(sound, self.directory/'dialogue-tail.m4a', 0, 55, video=False)
+        fast = self.directory/'dialogue-tail-fast.wav'
+        ffmpeg('-i', str(sound), '-af', 'asetrate=48019.2,aresample=48000', str(fast))
+        for recorder, ppm in ((sound, 0), (fast, -400)):
+            with self.subTest(ppm=ppm):
+                result = audio_sync.waveform_offset(camera, recorder, search_seconds=6)
+                self.assertEqual(result['ok'], ppm == 0, result)
+                self.assertAlmostEqual(result['driftPpm'], ppm, delta=50, msg=result)
+
+    def test_long_take_with_one_short_shared_passage_needs_confirmation(self):
+        sound = self.directory/'short-passage.wav'
+        ffmpeg('-i', str(self.recorder), '-af', 'atrim=duration=5,adelay=22000:all=1,apad=whole_dur=50', str(sound))
+        result = audio_sync.waveform_offset(sound, sound, search_seconds=6)
+        self.assertGreater(result['confidence'], .9, result)
+        self.assertFalse(result['ok'], result)
+        self.assertNotIn('driftPpm', result)
+        self.assertIn('verify clock drift', result['note'])
+
+    def test_drifting_recorder_at_the_minimum_overlap(self):
+        fast = self.directory/'forty-fast.wav'
+        ffmpeg('-i', str(self.recorder), '-af', 'atrim=duration=40,asetrate=48019.2,aresample=48000', str(fast))
+        result = audio_sync.waveform_offset(self.recorder, fast, picture_seconds=40, search_seconds=6)
+        self.assertFalse(result['ok'], result)
+        self.assertTrue(result.get('drift'), result)
+        self.assertAlmostEqual(result['driftPpm'], -400, delta=60)
+
     def test_short_and_long_unrelated_recordings_are_refused_without_drift(self):
         short = speech_like(self.directory/'short.wav', 1.2, seed=31)
         too_short = audio_sync.waveform_offset(short, self.recorder, search_seconds=6)
