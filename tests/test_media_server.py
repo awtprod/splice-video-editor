@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 import uuid
 from urllib.parse import quote
 
@@ -912,13 +913,15 @@ class IsolatedRegistry(unittest.TestCase):
         saved = dict(MEDIA_ROOT=media_links.MEDIA_ROOT, REGISTRY=media_links.REGISTRY)
         media_links.MEDIA_ROOT = self.data / 'media'
         media_links.REGISTRY = self.data / 'linked-media.json'
-        media_links._cache.update(stamp=None, links={}, recovered=None)
+        media_links._cache.update(stamp=None, links={}, recovered=None, good_at=None)
         media_links._deferred.update(stamp=None, until=0.0)
+        media_links._forgotten.clear()
 
         def restore():
             for key, value in saved.items():
                 setattr(media_links, key, value)
-            media_links._cache.update(stamp=None, links={}, recovered=None)
+            media_links._cache.update(stamp=None, links={}, recovered=None, good_at=None)
+            media_links._forgotten.clear()
         self.addCleanup(restore)
 
     def files(self, count, folder='card'):
@@ -1090,10 +1093,14 @@ class LinkRegistry(IsolatedRegistry):
         self.assertEqual(len(left), 1, 'the killed writer left its copy')
         outside = self.root / 'outside.json'
         outside.write_text('keep')
+        # Named exactly like a writer's copy, but a symlink and a folder: never removed.
         os.symlink(outside, self.data / '.linked-media-symlink.json')
+        os.symlink(outside, self.data / '.linked-media-symlink1.json')
+        (self.data / '.linked-media-folder01.json').mkdir()
         (self.data / '.linked-media-notes.txt').write_text('not ours')
         self.ml.link(str(second))
-        self.assertEqual(temporaries(), ['.linked-media-notes.txt', '.linked-media-symlink.json'])
+        self.assertEqual(temporaries(), ['.linked-media-folder01.json', '.linked-media-notes.txt',
+                                         '.linked-media-symlink.json', '.linked-media-symlink1.json'])
         self.assertEqual(outside.read_text(), 'keep')
 
     def hold_the_registry_lock(self):
@@ -1144,6 +1151,97 @@ class LinkRegistry(IsolatedRegistry):
         writer.join(30)
         self.assertEqual(len(results), 1)
         self.assertEqual(sorted(e['path'] for e in self.ml._links().values()), sorted([str(first), str(second)]))
+
+    def damage_the_registry(self):
+        temporary = self.ml.REGISTRY.with_name('damaged.tmp')
+        temporary.write_text('{"links": ')
+        os.replace(temporary, self.ml.REGISTRY)
+
+    def busy_lock(self):
+        """The registry lock as another process stalled on it would leave it: never free."""
+        def busy(timeout=30):
+            raise TimeoutError('Another Splice window is still updating the linked media list')
+        return mock.patch.object(self.ml, '_registry_lock', busy)
+
+    def test_a_link_forgotten_here_stops_resolving_here_whatever_the_registry_state(self):
+        first, second = self.files(2)
+        kept, dropped = self.ml.link(str(first)), self.ml.link(str(second))
+        good = self.ml.REGISTRY.read_text()
+        self.damage_the_registry()
+        with self.busy_lock():
+            self.assertEqual(self.ml.resolve_media(dropped['src']), second.resolve(), 'the last good list is served')
+            identifier = dropped['src'].split('/')[3]
+            with self.assertRaises(TimeoutError):
+                self.ml.forget([identifier])  # the registry cannot be written now
+            with self.assertRaisesRegex(ValueError, 'unavailable'):
+                self.ml.resolve_media(dropped['src'])
+            self.assertEqual(self.ml.resolve_media(kept['src']), first.resolve())
+        # The registry readable again, and still listing it (the write failed): this process
+        # was asked to forget it, so it does not come back here; a later forget succeeds.
+        temporary = self.ml.REGISTRY.with_name('good.tmp')
+        temporary.write_text(good)
+        os.replace(temporary, self.ml.REGISTRY)
+        with self.assertRaisesRegex(ValueError, 'unavailable'):
+            self.ml.resolve_media(dropped['src'])
+        self.assertEqual(self.ml.forget([identifier]), [identifier])
+        self.assertEqual(self.ml._forgotten, set(), 'trimmed once the registry no longer lists it')
+        self.assertEqual(sorted(self.ml._links()), [kept['src'].split('/')[3]])
+
+    def test_the_last_good_list_stands_in_for_a_damaged_registry_only_briefly(self):
+        first, = self.files(1)
+        entry = self.ml.link(str(first))
+        self.ml._links()
+        self.damage_the_registry()
+        with self.busy_lock(), mock.patch.object(self.ml, 'LAST_GOOD_SECONDS', 0.5):
+            self.assertEqual(self.ml.resolve_media(entry['src']), first.resolve())
+            self.assertEqual(self.ml.resolve_media(entry['src']), first.resolve(), 'within the deferred window too')
+            time.sleep(0.7)
+            with self.assertRaisesRegex(ValueError, 'unavailable'):
+                self.ml.resolve_media(entry['src'])  # fail closed: a link forgotten elsewhere may be in it
+            self.ml._deferred.update(until=0.0)
+            with self.assertRaisesRegex(ValueError, 'unavailable'):
+                self.ml.resolve_media(entry['src'])
+        self.ml._deferred.update(until=0.0)  # the next repair attempt is due
+        self.assertEqual(self.ml._links(), {}, 'repaired once the lock is free: set aside, a new empty list')
+        self.assertIsNotNone(self.ml.recovery_notice())
+
+    def test_a_replace_refused_while_another_process_reads_is_retried(self):
+        first, second = self.files(2)
+        real, calls = os.replace, []
+
+        def refused_twice(source, target):
+            calls.append(target)
+            if len(calls) <= 2:
+                raise PermissionError(13, 'Access is denied')
+            real(source, target)
+        with mock.patch.object(self.ml.os, 'replace', refused_twice):
+            entry = self.ml.link(str(first))
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(self.ml.resolve_media(entry['src']), first.resolve())
+        before = self.ml.REGISTRY.read_bytes()
+        calls.clear()
+
+        def always_refused(source, target):
+            calls.append(target)
+            raise PermissionError(13, 'Access is denied')
+        with mock.patch.object(self.ml.os, 'replace', always_refused), \
+                self.assertRaisesRegex(self.ml.RegistryBusy, 'kept the linked media list open.*Access is denied'):
+            self.ml.link(str(second))
+        self.assertEqual(len(calls), self.ml.REPLACE_ATTEMPTS, 'bounded')
+        self.assertIsInstance(self.ml.RegistryBusy('x'), OSError)
+        self.assertEqual(self.ml.REGISTRY.read_bytes(), before, 'the registry is unchanged')
+        self.assertEqual([p.name for p in self.data.iterdir() if p.name.startswith('.linked-media-')], [],
+                         'no copy left behind')
+        self.ml._cache.update(stamp=None)
+        self.assertEqual(sorted(e['path'] for e in self.ml._links().values()), [str(first.resolve())])
+
+    def test_the_lock_free_reader_opens_the_registry_like_open(self):
+        first, = self.files(1)
+        self.ml.link(str(first))
+        with self.ml._open_for_reading(self.ml.REGISTRY) as source:
+            self.assertEqual(source.read(), self.ml.REGISTRY.read_bytes())
+        with self.assertRaises(FileNotFoundError):
+            self.ml._open_for_reading(self.data / 'missing.json')
 
     def test_premiere_resolves_linked_media_without_a_patch(self):
         path, = self.files(1)
@@ -1262,10 +1360,16 @@ class MediaCache(IsolatedRegistry):
         for name, data in (('edit.mp4', b'edit'), ('seek.mp4', b'seek')):
             (legacy_proxies / name).write_bytes(data)
         os.utime(legacy_proxies, (stale, stale))
+        # The original stored second, after a generated-looking file with other bytes: still an import.
+        second = self.ml.MEDIA_ROOT / hashlib.sha256(b'an original').hexdigest()[:32]
+        second.mkdir()
+        (second / 'a-audio.wav').write_bytes(b'something else')
+        (second / 'b-audio.wav').write_bytes(b'an original')
+        os.utime(second, (stale, stale))
         kinds = {e['id']: e['kind'] for e in self.ml.cache_report()['entries']}
-        self.assertEqual(kinds, {directory.name: 'import', legacy_proxies.name: 'proxy'})
+        self.assertEqual(kinds, {directory.name: 'import', second.name: 'import', legacy_proxies.name: 'proxy'})
         self.assertEqual(self.ml.prune([])['deleted'], [legacy_proxies.name])
-        self.assertTrue(directory.exists())
+        self.assertTrue(directory.exists() and second.exists())
 
     def test_legacy_classification_hashes_a_bounded_amount_per_report(self):
         identifiers = [self.entry('edit.mp4', None, bytes([i]) * 1000, identifier=f'{i:x}' * 32) for i in range(1, 6)]

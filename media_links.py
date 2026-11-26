@@ -53,19 +53,82 @@ CAMERA_RAW = {
 # _write_lock queues this process's writers before they take the cross-process file lock.
 _lock = threading.RLock()
 _write_lock = threading.Lock()
-_cache = {'stamp': None, 'links': {}, 'recovered': None}
+_cache = {'stamp': None, 'links': {}, 'recovered': None, 'good_at': None}
+# Ids this process forgot whose removal the registry file may not show yet (a failed or pending
+# write): never served here. Trimmed on every good read to the ids the file still lists.
+_forgotten = set()
 # A damaged registry whose repair found the lock busy: (stamp, monotonic time to retry).
 _deferred = {'stamp': None, 'until': 0.0}
 REGISTRY_VERSION = 1
 # How long a reader waits for the file lock to repair a damaged registry before serving the
 # last good snapshot instead (a stalled writer elsewhere must not stall playback).
 READ_LOCK_SECONDS = 1.0
+# How long that last good list may stand in for a damaged registry whose repair keeps finding the
+# lock busy. After this, links stop resolving (fail closed) until the registry is readable again:
+# a link forgotten elsewhere meanwhile must not stay reachable for as long as a writer stalls.
+LAST_GOOD_SECONDS = 30.0
+# Windows refuses to replace a file another process holds open (a lock-free reader, a virus
+# scanner): try the replace this many times, waiting a little longer each time.
+REPLACE_ATTEMPTS = 6
+REPLACE_BACKOFF_SECONDS = 0.02
 # tempfile.mkstemp(prefix='.linked-media-', suffix='.json') names, as _write makes them.
 _TEMPORARY = re.compile(r'\.linked-media-[a-z0-9_]{8}\.json')
 
 
 class RegistryFull(ValueError):
     pass
+
+
+class RegistryBusy(OSError):
+    """The registry could not be replaced: another program kept it open through every retry."""
+
+
+def _replace(source, target):
+    """os.replace, retried with a short backoff while the platform refuses because another
+    process has ``target`` (or ``source``) open. Only Windows does; elsewhere it succeeds or
+    fails at once."""
+    for attempt in range(REPLACE_ATTEMPTS):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError as error:
+            if attempt == REPLACE_ATTEMPTS - 1:
+                raise RegistryBusy(f'Another program kept the linked media list open, so Splice could not save it '
+                                   f'({error.strerror or error}). Nothing was changed; try again.') from error
+            time.sleep(REPLACE_BACKOFF_SECONDS * 2 ** attempt)
+
+
+def _open_for_reading(path):
+    """Open ``path`` for a lock-free read. On Windows the handle allows deleting and renaming
+    the file (FILE_SHARE_DELETE), so a writer's replace is not refused while this read runs;
+    Python's own open() does not ask for that. Elsewhere, and if that call is unavailable, it
+    is a plain open()."""
+    if os.name != 'nt':
+        return open(path, 'rb')
+    try:
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        create = kernel32.CreateFileW
+        create.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD,
+                           wintypes.DWORD, wintypes.HANDLE]
+        create.restype = wintypes.HANDLE
+        generic_read, share_all, open_existing, normal = 0x80000000, 0x7, 3, 0x80
+        handle = create(str(path), generic_read, share_all, None, open_existing, normal, None)
+    except (ImportError, AttributeError, OSError):
+        return open(path, 'rb')
+    if handle in (None, wintypes.HANDLE(-1).value):
+        code = ctypes.get_last_error()
+        if code in (2, 3):  # ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND
+            raise FileNotFoundError(2, 'No such file', str(path))
+        return open(path, 'rb')
+    try:
+        descriptor = msvcrt.open_osfhandle(handle, os.O_RDONLY | getattr(os, 'O_BINARY', 0))
+    except OSError:
+        kernel32.CloseHandle(handle)
+        return open(path, 'rb')
+    return open(descriptor, 'rb')
 
 
 def camera_raw_error(name):
@@ -162,7 +225,7 @@ def _set_aside():
     while aside.exists():
         aside = REGISTRY.with_name(time.strftime('linked-media.damaged-%Y%m%d-%H%M%S') + f'-{counter}.json')
         counter += 1
-    os.replace(REGISTRY, aside)
+    _replace(REGISTRY, aside)
     return aside
 
 
@@ -181,7 +244,7 @@ def _snapshot():
     Every save replaces the file atomically, so whatever one open handle reads is a whole
     version; the stamp comes from that same handle."""
     try:
-        with open(REGISTRY, 'rb') as source:
+        with _open_for_reading(REGISTRY) as source:
             stat = os.fstat(source.fileno())
             text = source.read()
     except FileNotFoundError:
@@ -237,10 +300,28 @@ def _write(links, recovered):
             json.dump(payload, sink, separators=(',', ':'))
             sink.flush()
             os.fsync(sink.fileno())
-        os.replace(temporary, REGISTRY)
+        _replace(temporary, REGISTRY)
     except BaseException:
         Path(temporary).unlink(missing_ok=True)
         raise
+
+
+def _store(stamp, links, recovered):
+    """Make ``links`` (just read or written whole) the cached list; the caller holds _lock."""
+    if _forgotten:
+        _forgotten.intersection_update(links)
+        links = {key: value for key, value in links.items() if key not in _forgotten}
+    _cache.update(stamp=stamp, links=links, recovered=recovered, good_at=time.monotonic())
+    return links
+
+
+def _last_good():
+    """The cached list standing in for a damaged registry, for at most LAST_GOOD_SECONDS after it
+    was last read whole; then none. The caller holds _lock."""
+    good_at = _cache['good_at']
+    if good_at is None or time.monotonic() - good_at > LAST_GOOD_SECONDS:
+        return {}
+    return _cache['links']
 
 
 def _links():
@@ -250,11 +331,13 @@ def _links():
     Reading takes no lock: a writer stalled in another process (or this one) never delays
     serving media that is already registered. Only a damaged file needs the file lock, to set
     it aside; if that lock is busy the last good snapshot is served and the repair retried on
-    a later read."""
+    a later read, for at most LAST_GOOD_SECONDS; after that no link resolves until it is repaired."""
     stamp = _stamp()
     with _lock:
-        if stamp == _cache['stamp'] or (stamp == _deferred['stamp'] and time.monotonic() < _deferred['until']):
+        if stamp == _cache['stamp']:
             return _cache['links']
+        if stamp == _deferred['stamp'] and time.monotonic() < _deferred['until']:
+            return _last_good()
     snapshot = _snapshot()
     if snapshot is None:
         try:
@@ -263,11 +346,10 @@ def _links():
         except TimeoutError:
             with _lock:  # Serve the last good list; retry the repair in a few seconds, not every read.
                 _deferred.update(stamp=stamp, until=time.monotonic() + 5)
-                return _cache['links']
+                return _last_good()
     stamp, links, recovered = snapshot
     with _lock:
-        _cache.update(stamp=stamp, links=links, recovered=recovered)
-        return links
+        return _store(stamp, links, recovered)
 
 
 def _update(change):
@@ -279,7 +361,7 @@ def _update(change):
         result = change(links)
         _write(links, recovered)
         with _lock:
-            _cache.update(stamp=_stamp(), links=links, recovered=recovered)
+            _store(_stamp(), links, recovered)
         return result
 
 
@@ -374,6 +456,10 @@ def link(value, validate=None):
 def forget(identifiers):
     """Remove links. The files themselves are never touched."""
     wanted = {i for i in identifiers if isinstance(i, str) and _ID.fullmatch(i)}
+    if wanted:
+        with _lock:  # Stop serving them here now, whatever happens to the registry write below.
+            _forgotten.update(wanted)
+            _cache['links'] = {key: value for key, value in _cache['links'].items() if key not in wanted}
 
     def change(links):
         removed = [key for key in wanted if key in links]
