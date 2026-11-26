@@ -1910,7 +1910,7 @@ def _render_prepared(project, output_path, *, options=None, progress=None, cance
     spec = _export_settings(options)[0]
     for attempt in range(2):
         try:
-            return _render_delivery(project, output_path, options=options, progress=progress, cancelled=cancelled,
+            return _render_delivery(project, output_path, options=dict(options), progress=progress, cancelled=cancelled,
                                     heartbeat=heartbeat, work_directory=work_directory, report=report)
         except HardwareEncoderFailed as error:
             if attempt:
