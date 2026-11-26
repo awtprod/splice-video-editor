@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 import uuid
 from urllib.parse import quote
 
@@ -335,6 +336,328 @@ class RequestProof(ServerTestCase):
         self.assertEqual(self.server.request('GET', f'/api/exports/{fake}/file', token=False)[0], 404)
 
 
+class Relaunch(unittest.TestCase):
+    """Getting back in without a restart, and launch callbacks that fail."""
+
+    navigate = {'Sec-Fetch-Site': 'none', 'Sec-Fetch-Mode': 'navigate', 'Sec-Fetch-Dest': 'document'}
+
+    def test_a_failing_launch_callback_still_issues_the_session(self):
+        import contextlib
+        import io
+        calls = []
+
+        def locked_file():
+            calls.append(1)
+            raise PermissionError('The process cannot access the file because it is being used by another process')
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured), InProcessServer('held-open') as server:
+            server.server.on_launch = locked_file
+            status, cookie, _ = server.get('/?launch=held-open', {'Sec-Fetch-Site': 'cross-site', 'Sec-Fetch-Mode': 'navigate'})
+            self.assertEqual(status, 200)
+            self.assertIn('SameSite=Strict', cookie)
+            status, _, page = server.get('/', {**self.navigate, 'Sec-Fetch-Site': 'same-origin',
+                                               'Cookie': cookie.split(';')[0]})
+            self.assertEqual(status, 200)
+            self.assertIn(b'splice-token', page)
+            self.assertEqual(server.get('/?launch=held-open', self.navigate)[:2], (403, None))
+        self.assertEqual(calls, [1])
+        self.assertEqual(captured.getvalue().count('launch callback failed'), 1)
+        self.assertIn('PermissionError', captured.getvalue())
+
+    def test_stale_launch_files_are_removed_at_start(self):
+        from splice_app import remove_stale_launchers, write_launcher
+        with tempfile.TemporaryDirectory() as temp:
+            profile, outside = Path(temp) / 'browser', Path(temp) / 'outside'
+            profile.mkdir()
+            outside.mkdir()
+            old = time.time() - 3600
+            stale = write_launcher(profile, 'http://127.0.0.1:1/?launch=old')
+            fresh = write_launcher(profile, 'http://127.0.0.1:1/?launch=new')
+            keep = {name: profile / name for name in ('launch-notes.txt', 'launch-ABCDEFGH.html', 'mylaunch-abcdefgh.html',
+                                                      'launch-abcdefghi.html')}
+            target = outside / 'launch-precious.html'
+            target.write_text('not ours')
+            for path in (*keep.values(), target):
+                path.write_text('x')
+            os.utime(stale, (old, old))
+            for path in (*keep.values(), target):
+                os.utime(path, (old, old))
+            link = profile / 'launch-symlink1.html'
+            os.symlink(target, link)
+            os.utime(link, (old, old), follow_symlinks=False)  # an old symlink to an old file: still kept
+            nested = profile / 'launch-folder1.html'
+            nested.mkdir()
+            self.assertEqual(remove_stale_launchers(profile), [stale.name])
+            self.assertFalse(stale.exists())
+            self.assertTrue(fresh.exists(), 'a launch file younger than a minute may belong to a starting window')
+            self.assertTrue(all(path.exists() for path in keep.values()))
+            self.assertTrue(link.is_symlink() and target.read_text() == 'x' and nested.is_dir())
+            linked_profile = Path(temp) / 'linked-profile'
+            os.symlink(outside, linked_profile)
+            (outside / 'launch-abcdefgh.html').write_text('x')
+            os.utime(outside / 'launch-abcdefgh.html', (old, old))
+            self.assertEqual(remove_stale_launchers(linked_profile), [], 'never through a symlinked folder')
+            self.assertTrue((outside / 'launch-abcdefgh.html').exists())
+
+    def test_stale_launch_cleanup_never_stops_a_start(self):
+        import contextlib
+        import io
+        from splice_app import remove_stale_launchers, write_launcher
+        with tempfile.TemporaryDirectory() as temp:
+            profile = Path(temp) / 'browser'
+            profile.mkdir()
+            old = time.time() - 3600
+            stale = [write_launcher(profile, f'http://127.0.0.1:1/?launch={n}') for n in range(3)]
+            for path in stale:
+                os.utime(path, (old, old))
+            # Another Splice starting at the same moment removed them first: nothing to say.
+            captured = io.StringIO()
+            with contextlib.redirect_stderr(captured), \
+                    mock.patch('splice_app.os.unlink', side_effect=FileNotFoundError(2, 'No such file or directory')):
+                self.assertEqual(remove_stale_launchers(profile), [])
+            self.assertEqual(captured.getvalue(), '')
+            # Files it cannot remove: one line, however many.
+            captured = io.StringIO()
+            with contextlib.redirect_stderr(captured), \
+                    mock.patch('splice_app.os.unlink', side_effect=PermissionError(13, 'Permission denied')):
+                self.assertEqual(remove_stale_launchers(profile), [])
+            self.assertEqual(captured.getvalue().count('could not remove an old launch file'), 1, captured.getvalue())
+            # A profile folder it cannot read: start anyway, say so once.
+            captured = io.StringIO()
+            with contextlib.redirect_stderr(captured), \
+                    mock.patch('splice_app.os.scandir', side_effect=PermissionError(13, 'Permission denied')):
+                self.assertEqual(remove_stale_launchers(profile), [])
+            self.assertEqual(captured.getvalue().count('could not look for old launch files'), 1)
+            if os.name == 'posix' and os.geteuid() != 0:
+                profile.chmod(0)
+                try:
+                    with contextlib.redirect_stderr(io.StringIO()) as real:
+                        self.assertEqual(remove_stale_launchers(profile), [])
+                    self.assertIn('Permission denied', real.getvalue())
+                finally:
+                    profile.chmod(0o700)
+            self.assertEqual(sorted(remove_stale_launchers(profile)), sorted(p.name for p in stale))
+
+    def start(self, stdin):
+        import io
+        data = tempfile.TemporaryDirectory(prefix='splice-relaunch-')
+        self.addCleanup(data.cleanup)
+        process = subprocess.Popen([sys.executable, '-u', 'server.py', '--port', '0'], cwd=ROOT, stdin=stdin,
+                                   env={**os.environ, 'SPLICE_DATA_DIR': data.name}, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE)
+
+        def stop():
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+            process.stdout.close()
+            process.stderr.close()
+        self.addCleanup(stop)
+        return process
+
+    def line(self, process, timeout=10):
+        import select
+        ready, _, _ = select.select([process.stdout], [], [], timeout)
+        return process.stdout.readline().decode().strip() if ready else None
+
+    def launch(self, link, cookie=None):
+        match = re.fullmatch(r'http://127\.0\.0\.1:(\d+)/\?launch=([A-Za-z0-9_-]{20,})', link or '')
+        self.assertIsNotNone(match, link)
+        connection = http.client.HTTPConnection('127.0.0.1', int(match.group(1)), timeout=10)
+        try:
+            headers = {'Host': f'127.0.0.1:{match.group(1)}', **self.navigate}
+            if cookie:
+                headers['Cookie'] = cookie
+            connection.request('GET', '/?launch=' + match.group(2), headers=headers)
+            response = connection.getresponse()
+            response.read()
+            return response.status, response.getheader('Set-Cookie')
+        finally:
+            connection.close()
+
+    @unittest.skipUnless(os.name == 'posix', 'a pseudo-terminal and SIGUSR1 are POSIX')
+    def test_the_operator_gets_a_fresh_link_from_the_console_or_usr1(self):
+        import pty
+        import signal
+        controller, terminal = pty.openpty()
+        self.addCleanup(os.close, controller)
+        process = self.start(terminal)
+        os.close(terminal)
+        first = self.line(process)
+        status, cookie = self.launch(first)
+        self.assertEqual(status, 303)
+        # The browser restarted: its session cookie is gone and the printed link is spent.
+        self.assertEqual(self.launch(first)[0], 403)
+        os.write(controller, b'\n')  # Enter on the server's terminal.
+        second = self.line(process)
+        self.assertNotEqual(second, first)
+        self.assertEqual(self.launch(second)[0], 303)
+        self.assertEqual(self.launch(second)[0], 403, 'the new link works once too')
+        process.send_signal(signal.SIGUSR1)
+        third = self.line(process)
+        self.assertEqual(self.launch(first)[0], 403)
+        status, again = self.launch(third)
+        self.assertEqual(status, 303)
+        self.assertEqual(again.split(';')[0], cookie.split(';')[0], 'windows already open keep their session')
+        self.assertEqual(process.poll(), None)
+
+    def test_input_that_is_not_a_terminal_never_mints_a_link(self):
+        # Another program feeding the server's stdin (a pipe) must not be able to ask for a link.
+        process = self.start(subprocess.PIPE)
+        first = self.line(process)
+        process.stdin.write(b'\n' * 50)
+        process.stdin.flush()
+        self.assertIsNone(self.line(process, timeout=1.5), 'a pipe on stdin printed a new link')
+        self.assertEqual(self.launch(first)[0], 303)
+        process.stdin.close()
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'job control on a pseudo-terminal; process state from /proc')
+    def test_a_background_job_on_the_terminal_keeps_serving(self):
+        """``python3 server.py &`` from a shell: the server is a background job of the terminal on
+        its stdin. Reading that terminal would get it stopped (SIGTTIN); it must keep answering,
+        read Enter only once ``fg`` makes it the foreground job, and survive Ctrl-Z then ``bg``."""
+        import pty
+        import select
+        import signal
+        controller, terminal = pty.openpty()
+        self.addCleanup(os.close, controller)
+        commands_read, commands = os.pipe()
+        self.addCleanup(os.close, commands)
+        data = tempfile.TemporaryDirectory(prefix='splice-job-')
+        self.addCleanup(data.cleanup)
+        # A minimal job-control shell: a new session on the pseudo-terminal, the server in its own
+        # process group (a background job), and "fg"/"bg" commands that hand the terminal over.
+        shell = f'''
+import os, signal, sys, fcntl, termios
+os.setsid()
+fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+child = os.fork()
+if child == 0:
+    signal.signal(signal.SIGTTOU, signal.SIG_DFL)
+    os.setpgid(0, 0)
+    os.execv(sys.executable, [sys.executable, '-u', 'server.py', '--port', '0'])
+os.setpgid(child, child)
+print(child, file=sys.stderr, flush=True)
+commands = os.fdopen({commands_read}, 'r')
+for command in commands:
+    command = command.strip()
+    if command == 'fg':
+        os.tcsetpgrp(0, child)
+    elif command == 'stop':
+        os.killpg(child, signal.SIGTSTP)
+        os.waitpid(child, os.WUNTRACED)
+        os.tcsetpgrp(0, os.getpgrp())
+    elif command == 'bg':
+        os.killpg(child, signal.SIGCONT)
+    print('done', file=sys.stderr, flush=True)
+'''
+        wrapper = subprocess.Popen([sys.executable, '-c', shell], cwd=ROOT, stdin=terminal, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, pass_fds=(commands_read,),
+                                   env={**os.environ, 'SPLICE_DATA_DIR': data.name})
+        os.close(terminal)
+        os.close(commands_read)
+        server_pid = int(wrapper.stderr.readline())
+
+        def cleanup():
+            # A server stopped by the kernel would ignore SIGTERM until continued: kill exactly it.
+            for pid in (server_pid, wrapper.pid):
+                for sig in (signal.SIGCONT, signal.SIGKILL):
+                    try:
+                        os.kill(pid, sig)
+                    except ProcessLookupError:
+                        pass
+            wrapper.wait(10)
+            try:
+                os.waitpid(server_pid, os.WNOHANG)
+            except ChildProcessError:
+                pass
+            wrapper.stdout.close()
+            wrapper.stderr.close()
+        self.addCleanup(cleanup)
+
+        def command(name):
+            os.write(commands, name.encode() + b'\n')
+            for _ in range(20):  # the server's own messages share this stream
+                if wrapper.stderr.readline().strip() == b'done':
+                    return
+            self.fail(f'the job-control shell did not finish {name}')
+
+        def state():
+            fields = Path(f'/proc/{server_pid}/stat').read_text().rsplit(')', 1)[1].split()
+            return fields[0], int(fields[11]) + int(fields[12])  # state, CPU ticks (user + system)
+
+        def line(timeout):
+            ready, _, _ = select.select([wrapper.stdout], [], [], timeout)
+            return wrapper.stdout.readline().decode().strip() if ready else None
+
+        first = line(10)
+        self.assertIsNotNone(first)
+        time.sleep(1.5)
+        os.write(controller, b'\n')  # Enter typed while the server runs in the background
+        self.assertIsNone(line(2), 'a background job does not read the terminal')
+        self.assertNotEqual(state()[0], 'T', 'the kernel stopped the background server')
+        self.assertEqual(self.launch(first)[0], 303, 'the background server answers')
+        command('fg')
+        second = line(5)  # the Enter queued while in the background is read once in front
+        self.assertIsNotNone(second, 'fg brought the console back')
+        self.assertNotEqual(second, first)
+        os.write(controller, b'\n')
+        third = line(5)
+        self.assertEqual(self.launch(third)[0], 303, 'Enter in the foreground mints a link')
+        self.assertEqual(self.launch(second)[0], 403)
+        command('stop')  # Ctrl-Z
+        self.assertEqual(state()[0], 'T')
+        command('bg')
+        time.sleep(1.5)
+        ticks = state()[1]
+        os.write(controller, b'\n')
+        self.assertIsNone(line(2), 'back in the background, the terminal is not read')
+        current, later = state()
+        self.assertNotEqual(current, 'T', 'the server was stopped after bg')
+        self.assertLess(later - ticks, 50, 'the background reader must not spin')
+        os.kill(server_pid, signal.SIGUSR1)
+        fourth = line(5)
+        self.assertEqual(self.launch(fourth)[0], 303, 'USR1 still works in the background')
+        self.assertIsNone(wrapper.poll())
+
+    def test_no_request_can_produce_a_fresh_link(self):
+        import inspect
+        import server as server_module
+        process = self.start(subprocess.DEVNULL)
+        first = self.line(process)
+        self.assertEqual(self.launch(first)[0], 303)
+        port = int(first.split(':')[2].split('/')[0])
+        probes = [('GET', '/?launch='), ('GET', '/?launch=new'), ('GET', '/?relaunch=1'), ('GET', '/api/launch'),
+                  ('POST', '/api/launch'), ('POST', '/api/relaunch'), ('POST', '/'), ('GET', '/index.html?launch=1')]
+        for method, path in probes:
+            for headers in ({}, {'Sec-Fetch-Site': 'cross-site'}, {'Origin': 'http://127.0.0.1:1'}, self.navigate):
+                connection = http.client.HTTPConnection('127.0.0.1', port, timeout=10)
+                try:
+                    connection.request(method, path, body=b'{}' if method == 'POST' else None,
+                                       headers={'Host': f'127.0.0.1:{port}', **headers})
+                    response = connection.getresponse()
+                    response.read()
+                    self.assertIsNone(response.getheader('Set-Cookie'), (method, path, headers))
+                finally:
+                    connection.close()
+        self.assertIsNone(self.line(process, timeout=1), 'no request printed a new link')
+        self.assertEqual(self.launch(first)[0], 403)
+        # Only the console reader and the signal handler call it; no route or request handler does.
+        self.assertNotIn('new_launch_url', inspect.getsource(server_module.Handler))
+        self.assertNotIn('print_new_launch', inspect.getsource(server_module.Handler))
+        for function in [*server_module.GET_ROUTES.values(), *(f for f, _, _ in server_module.POST_ROUTES.values())]:
+            self.assertNotIn('launch', inspect.getsource(function), function.__name__)
+        with InProcessServer() as server:
+            page = server.get('/', self.navigate)[2]
+            self.assertIn(b'press Enter in the terminal', page)
+            self.assertIn(b'USR1', page)
+
+
 class LinkInPlace(ServerTestCase):
     def test_linked_file_plays_saves_reopens_and_exports_without_a_copy(self):
         clip = self.outside / 'A001 take 1.mov'
@@ -630,12 +953,15 @@ class IsolatedRegistry(unittest.TestCase):
         saved = dict(MEDIA_ROOT=media_links.MEDIA_ROOT, REGISTRY=media_links.REGISTRY)
         media_links.MEDIA_ROOT = self.data / 'media'
         media_links.REGISTRY = self.data / 'linked-media.json'
-        media_links._cache.update(stamp=None, links={}, recovered=None)
+        media_links._cache.update(stamp=None, links={}, recovered=None, good_at=None)
+        media_links._deferred.update(stamp=None, until=0.0)
+        media_links._forgotten.clear()
 
         def restore():
             for key, value in saved.items():
                 setattr(media_links, key, value)
-            media_links._cache.update(stamp=None, links={}, recovered=None)
+            media_links._cache.update(stamp=None, links={}, recovered=None, good_at=None)
+            media_links._forgotten.clear()
         self.addCleanup(restore)
 
     def files(self, count, folder='card'):
@@ -673,7 +999,16 @@ class LinkRegistry(IsolatedRegistry):
         self.assertEqual(len(swapped), len(text))
         with open(self.ml.REGISTRY, 'r+', encoding='utf-8') as sink:  # In place: same inode.
             sink.write(swapped)
-        os.utime(self.ml.REGISTRY, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        # Restoring the mtime changes the ctime, but only by the filesystem's timestamp
+        # granularity (a ZFS tick is milliseconds; tmpfs is nanoseconds): repeat until it shows.
+        deadline = time.monotonic() + 5
+        while True:
+            os.utime(self.ml.REGISTRY, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+            if self.ml.REGISTRY.stat().st_ctime_ns != stat.st_ctime_ns or time.monotonic() > deadline:
+                break
+            time.sleep(.01)
+        after = self.ml.REGISTRY.stat()
+        self.assertEqual((after.st_ino, after.st_size, after.st_mtime_ns), (stat.st_ino, stat.st_size, stat.st_mtime_ns))
         self.assertEqual(self.ml._links()[identifier]['path'], str(second))
 
     def test_link_ids_are_random_and_stable_for_a_path(self):
@@ -766,6 +1101,9 @@ class LinkRegistry(IsolatedRegistry):
         path, = self.files(1)
         impostor = self.root / 'impostor.wav'
         impostor.write_bytes(b'Z' * path.stat().st_size)
+        # Another file: same size, but not the recorded modification time. Written a moment after
+        # the original, it could share its mtime on a filesystem with coarse timestamps (ZFS).
+        os.utime(impostor, ns=(time.time_ns(), path.stat().st_mtime_ns + 5_000_000_000))
         entry = self.ml.link(str(path))
         with self.ml.open_media(entry['src']) as source:
             self.assertEqual(source.read(4), b'RIFF')
@@ -776,6 +1114,197 @@ class LinkRegistry(IsolatedRegistry):
                 self.ml.open_media(entry['src'])
         finally:
             self.ml.resolve_media = original
+
+    def test_a_writer_killed_mid_save_leaves_no_registry_copy_behind(self):
+        import signal
+        first, second = self.files(2)
+        script = ('import sys, time; sys.path.insert(0, sys.argv[1]); import media_links\n'
+                  'media_links.os.replace = lambda *a: time.sleep(60)\n'
+                  'media_links.link(sys.argv[2])\n')
+        env = {**os.environ, 'SPLICE_DATA_DIR': str(self.data)}
+        writer = subprocess.Popen([sys.executable, '-c', script, str(ROOT), str(first)], env=env)
+        temporaries = lambda: sorted(p.name for p in self.data.iterdir() if p.name.startswith('.linked-media-'))
+        deadline = time.monotonic() + 30
+        while not temporaries() and time.monotonic() < deadline:
+            time.sleep(.05)
+        writer.send_signal(signal.SIGKILL if hasattr(signal, 'SIGKILL') else signal.SIGTERM)
+        writer.wait(10)
+        left = temporaries()
+        self.assertEqual(len(left), 1, 'the killed writer left its copy')
+        outside = self.root / 'outside.json'
+        outside.write_text('keep')
+        # Named exactly like a writer's copy, but a symlink and a folder: never removed.
+        os.symlink(outside, self.data / '.linked-media-symlink.json')
+        os.symlink(outside, self.data / '.linked-media-symlink1.json')
+        (self.data / '.linked-media-folder01.json').mkdir()
+        (self.data / '.linked-media-notes.txt').write_text('not ours')
+        self.ml.link(str(second))
+        self.assertEqual(temporaries(), ['.linked-media-folder01.json', '.linked-media-notes.txt',
+                                         '.linked-media-symlink.json', '.linked-media-symlink1.json'])
+        self.assertEqual(outside.read_text(), 'keep')
+
+    def hold_the_registry_lock(self):
+        """Another process that took the registry lock and stalled."""
+        script = ('import fcntl, sys, time\n'
+                  'handle = open(sys.argv[1], "a+b"); fcntl.flock(handle.fileno(), fcntl.LOCK_EX)\n'
+                  'print("locked", flush=True); time.sleep(60)\n')
+        holder = subprocess.Popen([sys.executable, '-c', script, str(self.data / 'linked-media.lock')],
+                                  stdout=subprocess.PIPE)
+        self.addCleanup(lambda: (holder.kill(), holder.wait(), holder.stdout.close()))
+        self.assertEqual(holder.stdout.readline().strip(), b'locked')
+        return holder
+
+    @unittest.skipUnless(os.name == 'posix', 'the stalled holder uses flock')
+    def test_serving_registered_media_does_not_wait_on_a_stalled_writer(self):
+        import threading
+        first, second = self.files(2)
+        entry = self.ml.link(str(first))
+        self.ml._cache.update(stamp=None, links={})  # As in a process that has not read it yet.
+        holder = self.hold_the_registry_lock()
+        writer = threading.Thread(target=lambda: results.append(self.ml.link(str(second))), daemon=True)
+        results = []
+        writer.start()  # Queued behind the stalled holder.
+        time.sleep(.2)
+        started = time.monotonic()
+        self.assertEqual(self.ml.resolve_media(entry['src']), first.resolve())
+        with self.ml.open_media(entry['src']) as source:
+            self.assertEqual(source.read(4), b'RIFF')
+        self.assertEqual(self.ml.cache_report()['linkedFiles'], 1)
+        self.ml.browse()
+        self.assertLess(time.monotonic() - started, 1.5, 'readers wait on neither the file lock nor the queued writer')
+        # A damaged registry needs the lock to be set aside; until then the last good list is served.
+        good = self.ml.REGISTRY.read_text()
+        temporary = self.ml.REGISTRY.with_name('damaged.tmp')
+        temporary.write_text('{"links": ')
+        os.replace(temporary, self.ml.REGISTRY)
+        started = time.monotonic()
+        self.assertEqual(self.ml.resolve_media(entry['src']), first.resolve())
+        self.assertLess(time.monotonic() - started, self.ml.READ_LOCK_SECONDS + 1)
+        started = time.monotonic()
+        for _ in range(20):
+            self.ml.resolve_media(entry['src'])
+        self.assertLess(time.monotonic() - started, .5, 'the repair is deferred, not retried on every read')
+        temporary.write_text(good)
+        os.replace(temporary, self.ml.REGISTRY)
+        holder.kill()
+        holder.wait()
+        writer.join(30)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(sorted(e['path'] for e in self.ml._links().values()), sorted([str(first), str(second)]))
+
+    def damage_the_registry(self):
+        temporary = self.ml.REGISTRY.with_name('damaged.tmp')
+        temporary.write_text('{"links": ')
+        os.replace(temporary, self.ml.REGISTRY)
+
+    def busy_lock(self):
+        """The registry lock as another process stalled on it would leave it: never free."""
+        def busy(timeout=30):
+            raise TimeoutError('Another Splice window is still updating the linked media list')
+        return mock.patch.object(self.ml, '_registry_lock', busy)
+
+    def test_a_link_forgotten_here_stops_resolving_here_whatever_the_registry_state(self):
+        first, second = self.files(2)
+        kept, dropped = self.ml.link(str(first)), self.ml.link(str(second))
+        good = self.ml.REGISTRY.read_text()
+        self.damage_the_registry()
+        with self.busy_lock():
+            self.assertEqual(self.ml.resolve_media(dropped['src']), second.resolve(), 'the last good list is served')
+            identifier = dropped['src'].split('/')[3]
+            with self.assertRaises(TimeoutError):
+                self.ml.forget([identifier])  # the registry cannot be written now
+            with self.assertRaisesRegex(ValueError, 'unavailable'):
+                self.ml.resolve_media(dropped['src'])
+            self.assertEqual(self.ml.resolve_media(kept['src']), first.resolve())
+        # The registry readable again, and still listing it (the write failed): this process
+        # was asked to forget it, so it does not come back here; a later forget succeeds.
+        temporary = self.ml.REGISTRY.with_name('good.tmp')
+        temporary.write_text(good)
+        os.replace(temporary, self.ml.REGISTRY)
+        with self.assertRaisesRegex(ValueError, 'unavailable'):
+            self.ml.resolve_media(dropped['src'])
+        self.assertEqual(self.ml.forget([identifier]), [identifier])
+        self.assertEqual(self.ml._forgotten, set(), 'trimmed once the registry no longer lists it')
+        self.assertEqual(sorted(self.ml._links()), [kept['src'].split('/')[3]])
+
+    def test_the_last_good_list_stands_in_for_a_damaged_registry_only_briefly(self):
+        first, = self.files(1)
+        entry = self.ml.link(str(first))
+        self.ml._links()
+        self.damage_the_registry()
+        with self.busy_lock(), mock.patch.object(self.ml, 'LAST_GOOD_SECONDS', 0.5):
+            self.assertEqual(self.ml.resolve_media(entry['src']), first.resolve())
+            self.assertEqual(self.ml.resolve_media(entry['src']), first.resolve(), 'within the deferred window too')
+            time.sleep(0.7)
+            with self.assertRaisesRegex(ValueError, 'unavailable'):
+                self.ml.resolve_media(entry['src'])  # fail closed: a link forgotten elsewhere may be in it
+            self.ml._deferred.update(until=0.0)
+            with self.assertRaisesRegex(ValueError, 'unavailable'):
+                self.ml.resolve_media(entry['src'])
+        self.ml._deferred.update(until=0.0)  # the next repair attempt is due
+        self.assertEqual(self.ml._links(), {}, 'repaired once the lock is free: set aside, a new empty list')
+        self.assertIsNotNone(self.ml.recovery_notice())
+
+    def test_a_replace_refused_while_another_process_reads_is_retried(self):
+        first, second = self.files(2)
+        real, calls = os.replace, []
+
+        def refused_twice(source, target):
+            calls.append(target)
+            if len(calls) <= 2:
+                raise PermissionError(13, 'Access is denied')
+            real(source, target)
+        with mock.patch.object(self.ml.os, 'replace', refused_twice):
+            entry = self.ml.link(str(first))
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(self.ml.resolve_media(entry['src']), first.resolve())
+        before = self.ml.REGISTRY.read_bytes()
+        calls.clear()
+
+        def always_refused(source, target):
+            calls.append(target)
+            raise PermissionError(13, 'Access is denied')
+        with mock.patch.object(self.ml.os, 'replace', always_refused), \
+                self.assertRaisesRegex(self.ml.RegistryBusy, 'kept the linked media list open.*Access is denied'):
+            self.ml.link(str(second))
+        self.assertEqual(len(calls), self.ml.REPLACE_ATTEMPTS, 'bounded')
+        self.assertIsInstance(self.ml.RegistryBusy('x'), OSError)
+        self.assertEqual(self.ml.REGISTRY.read_bytes(), before, 'the registry is unchanged')
+        self.assertEqual([p.name for p in self.data.iterdir() if p.name.startswith('.linked-media-')], [],
+                         'no copy left behind')
+        self.ml._cache.update(stamp=None)
+        self.assertEqual(sorted(e['path'] for e in self.ml._links().values()), [str(first.resolve())])
+
+    def test_the_lock_free_reader_opens_the_registry_like_open(self):
+        first, = self.files(1)
+        self.ml.link(str(first))
+        with self.ml._open_for_reading(self.ml.REGISTRY) as source:
+            self.assertEqual(source.read(), self.ml.REGISTRY.read_bytes())
+        with self.assertRaises(FileNotFoundError):
+            self.ml._open_for_reading(self.data / 'missing.json')
+
+    def test_premiere_resolves_linked_media_without_a_patch(self):
+        path, = self.files(1)
+        entry = self.ml.link(str(path))
+        env = {**os.environ, 'SPLICE_DATA_DIR': str(self.data)}
+        # premiere alone: nothing imported media_links to patch it.
+        script = ('import sys; sys.path.insert(0, sys.argv[1]); import premiere\n'
+                  'assert "media_links" not in sys.modules\n'
+                  'print(premiere._media_path(sys.argv[2]))\n')
+        result = subprocess.run([sys.executable, '-c', script, str(ROOT), entry['src']], env=env, capture_output=True,
+                                text=True, timeout=60)
+        self.assertEqual((result.returncode, result.stdout.strip()), (0, str(path.resolve())), result.stderr)
+        script = ('import sys; sys.path.insert(0, sys.argv[1]); import render_movie, media_links, premiere\n'
+                  'assert render_movie._media_path is media_links.resolve_media, "install() rebinds render_movie"\n'
+                  'assert premiere._media_path is not media_links.resolve_media, "premiere is not patched"\n'
+                  'print(render_movie._render_source({"src": sys.argv[2]}))\n')
+        result = subprocess.run([sys.executable, '-c', script, str(ROOT), entry['src']], env=env, capture_output=True,
+                                text=True, timeout=60)
+        self.assertEqual((result.returncode, result.stdout.strip()), (0, str(path.resolve())), result.stderr)
+        import premiere
+        self.assertEqual(premiere.managed_media_path('/assets/score.wav'), ROOT / 'assets' / 'score.wav')
+        with self.assertRaises(ValueError):
+            premiere.managed_media_path(entry['src'])
 
     def test_folder_walk_and_listing_are_bounded(self):
         deep = self.root / 'card'
@@ -856,6 +1385,64 @@ class MediaCache(IsolatedRegistry):
         self.assertEqual(sorted(result['deleted']), sorted([legacy_proxy, proxy]))
         left = sorted(p.name for p in self.ml.MEDIA_ROOT.iterdir())
         self.assertEqual(left, sorted([imported, legacy_import, used_proxy, fresh_proxy]))
+
+    def test_an_unmarked_folder_of_identical_generated_names_is_an_import(self):
+        import hashlib
+        content = b'the same take imported twice'
+        directory = self.ml.MEDIA_ROOT / hashlib.sha256(content).hexdigest()[:32]
+        directory.mkdir()
+        for name in ('a-audio.wav', 'b-audio.wav'):
+            (directory / name).write_bytes(content)
+        stale = time.time() - 3600
+        os.utime(directory, (stale, stale))
+        legacy_proxies = self.ml.MEDIA_ROOT / ('c' * 32)
+        legacy_proxies.mkdir()
+        for name, data in (('edit.mp4', b'edit'), ('seek.mp4', b'seek')):
+            (legacy_proxies / name).write_bytes(data)
+        os.utime(legacy_proxies, (stale, stale))
+        # The original stored second, after a generated-looking file with other bytes: still an import.
+        second = self.ml.MEDIA_ROOT / hashlib.sha256(b'an original').hexdigest()[:32]
+        second.mkdir()
+        (second / 'a-audio.wav').write_bytes(b'something else')
+        (second / 'b-audio.wav').write_bytes(b'an original')
+        os.utime(second, (stale, stale))
+        kinds = {e['id']: e['kind'] for e in self.ml.cache_report()['entries']}
+        self.assertEqual(kinds, {directory.name: 'import', second.name: 'import', legacy_proxies.name: 'proxy'})
+        self.assertEqual(self.ml.prune([])['deleted'], [legacy_proxies.name])
+        self.assertTrue(directory.exists() and second.exists())
+
+    def test_legacy_classification_hashes_a_bounded_amount_per_report(self):
+        identifiers = [self.entry('edit.mp4', None, bytes([i]) * 1000, identifier=f'{i:x}' * 32) for i in range(1, 6)]
+        hashed = []
+        original = self.ml._content_id
+        self.ml._content_id = lambda path: (hashed.append(path), original(path))[1]
+        saved = self.ml.HASH_BYTES_PER_REPORT
+        self.ml.HASH_BYTES_PER_REPORT = 2500
+        self.ml._kinds.clear()
+        try:
+            report = self.ml.cache_report()
+            self.assertEqual(len(hashed), 2)
+            self.assertEqual(report['unclassified'], 3)
+            provisional = [e['id'] for e in report['entries'] if e['provisional']]
+            self.assertEqual(len(provisional), 3)
+            self.assertTrue(all(e['kind'] == 'import' for e in report['entries'] if e['provisional']))
+            # The prune's own report classifies the next two; the last stays unclassified and is kept.
+            deleted = self.ml.prune([])['deleted']
+            self.assertEqual(len(hashed), 4)
+            self.assertEqual(len(deleted), 4)
+            left, = [p.name for p in self.ml.MEDIA_ROOT.iterdir()]
+            self.assertIn(left, provisional)
+            report = self.ml.cache_report()
+            self.assertEqual((len(hashed), report['unclassified'], [e['kind'] for e in report['entries']]),
+                             (5, 0, ['proxy']))
+            big = self.entry('edit.mp4', None, b'x' * 3000, identifier='9' * 32)
+            self.assertEqual({e['id']: e['kind'] for e in self.ml.cache_report()['entries']}[big], 'import',
+                             'a file too large to hash is kept as an import')
+        finally:
+            self.ml._content_id = original
+            self.ml.HASH_BYTES_PER_REPORT = saved
+            self.ml._kinds.clear()
+        self.assertTrue(set(identifiers))
 
     def test_imports_are_deleted_only_when_selected(self):
         imported = self.entry('interview.mp4', 'import', b'interview')
@@ -1046,6 +1633,50 @@ class ProbeDetails(unittest.TestCase):
         playlist.write_text(f"ffconcat version 1.0\nfile '{clip.name}'\n")
         with self.assertRaisesRegex(ValueError, 'cannot decode'):
             decodable(playlist, playlist.name)
+
+    def test_hls_playlists_are_not_media(self):
+        from media_proxy import TEXT_FORMATS, decodable
+        segment = self.dir / 'segment0.ts'
+        ffmpeg('-f', 'lavfi', '-i', 'testsrc2=s=32x18:r=25:d=0.4', '-c:v', 'mpeg4', '-f', 'mpegts', segment)
+        decodable(segment, segment.name)
+        # A playlist picked under its own name (Link media in place takes any file the user picks).
+        # FFmpeg 8 no longer detects one renamed .mov, older versions do; both must be refused.
+        playlist = self.dir / 'playlist.m3u8'
+        playlist.write_text('#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXTINF:0.4,\n'
+                            f'{segment.name}\n#EXT-X-ENDLIST\n')
+        renamed = self.dir / 'playlist.mov'
+        renamed.write_bytes(playlist.read_bytes())
+        with self.assertRaisesRegex(ValueError, 'cannot decode'):
+            decodable(renamed, renamed.name)
+        # Without the refusal FFmpeg reads it as a video through the playlist.
+        probe = subprocess.run(['ffprobe', '-v', 'error', '-protocol_whitelist', 'file', '-show_entries',
+                                'stream=codec_type:format=format_name', '-of', 'json', str(playlist)],
+                               capture_output=True, text=True, timeout=60)
+        data = json.loads(probe.stdout or '{}')
+        self.assertIn('hls', data.get('format', {}).get('format_name', '').split(','))
+        self.assertIn('video', [s.get('codec_type') for s in data.get('streams', [])])
+        with self.assertRaisesRegex(ValueError, 'cannot decode'):
+            decodable(playlist, playlist.name)
+        self.assertIn('hls', TEXT_FORMATS)
+
+    def test_the_refusal_list_passes_ordinary_media(self):
+        from media_proxy import _ffprobe, _text_art, decodable
+        made = {'clip.mp4': ('-c:v', 'mpeg4'), 'clip.mov': ('-c:v', 'mpeg4'), 'clip.mkv': ('-c:v', 'mpeg4'),
+                'clip.avi': ('-c:v', 'mpeg4'), 'clip.ts': ('-c:v', 'mpeg4'), 'clip.mxf': ('-c:v', 'mpeg2video'),
+                'clip.m4v': ('-c:v', 'mpeg4', '-f', 'mp4'), 'still.png': ('-frames:v', '1')}
+        for name, arguments in made.items():
+            with self.subTest(name=name):
+                target = self.dir / name
+                ffmpeg('-f', 'lavfi', '-i', 'testsrc2=s=32x18:r=25:d=0.2', *arguments, target)
+                decodable(target, name)
+                data = _ffprobe(target, '-show_entries', 'stream=codec_type,codec_name:format=format_name')
+                self.assertFalse(_text_art(data['format'], data['streams']))
+        for name, arguments in {'tone.wav': ('-c:a', 'pcm_s16le'), 'tone.flac': ('-c:a', 'flac'),
+                                'tone.m4a': ('-c:a', 'aac'), 'tone.ogg': ('-c:a', 'flac', '-f', 'ogg')}.items():
+            with self.subTest(name=name):
+                target = self.dir / name
+                ffmpeg('-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=0.2', *arguments, target)
+                decodable(target, name)
 
     def test_a_probe_timeout_is_reported_as_a_timeout(self):
         import media_proxy
