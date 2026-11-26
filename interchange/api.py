@@ -6,7 +6,9 @@ with ``options['package']`` a turnover zip of both. The report lists every clip-
 is dropped without a line in it.
 
 ``import_timeline(filename, text, options)`` reads FCPXML, FCP 7 XML, a CMX3600 EDL or OTIO into a
-new Splice project whose ``compatibilityWarnings`` list everything that was not imported. An
+new Splice project whose ``compatibilityWarnings`` list everything that was not imported. With
+``options['linkMedia']`` (always set by :func:`handle`, the server's entry) sources that exist on
+this machine are linked in place through ``media_links``; the rest arrive offline. An
 import is bounded in time and in the timeline items it may visit (:mod:`.budget`) and can be
 stopped with ``handle('cancel', {'jobId': ...})`` using the ``options['jobId']`` it was started with.
 
@@ -26,6 +28,7 @@ from datetime import datetime, timezone
 from . import edl, fcpxml, otio, xmeml
 from .budget import Budget, BudgetExceeded, cancel
 from .cut import InterchangeError, build_cut
+from .project import link_local_media
 from .timecode import frames_timecode, rate_text
 
 FORMATS = ('fcpxml', 'edl', 'otio', 'xmeml')
@@ -34,6 +37,8 @@ HEADINGS = {'fcpxml': 'FCPXML 1.10 (DaVinci Resolve, Final Cut Pro)', 'edl': 'CM
             'otio': 'OpenTimelineIO', 'xmeml': 'Final Cut Pro 7 XML (Premiere Pro, Resolve, Avid)'}
 REFERENCE_MOVIE_OPTION = 'referenceMovie'
 MAX_IMPORT_BYTES = 30 * 1024 * 1024
+#: seconds an import may spend checking local media before linking it in place
+LINK_SECONDS = 60.0
 
 
 def _safe(name: str) -> str:
@@ -50,6 +55,9 @@ def report_text(cut, formats, files) -> str:
              f'({cut.frames} frames' + (f', starting {cut.range_start} frames into the Splice timeline' if cut.range_start else '') + ')',
              f'Clips {sum(1 for e in cut.events)}, sources {len({id(e.source) for e in cut.events if e.source})}, markers {len(cut.markers)}',
              '', 'Files:'] + [f'  {name}' for name, _ in files]
+    lines += ['', 'Media the timeline files reference:'] + (media_lines(cut) or ['  (no media)'])
+    if cut.path_rules:
+        lines += ['', 'Path mapping (applied to every media path in the files above):'] + path_map_lines(cut)
     lines += ['', 'Not carried by any format (all formats):']
     lines += [f'  - {entry}' for entry in report.general] or ['  (nothing)']
     for fmt in formats:
@@ -57,6 +65,51 @@ def report_text(cut, formats, files) -> str:
         lines += ['', f'{HEADINGS[fmt]}:']
         lines += [f'  - {entry}' for entry in report.by_format.get(key, [])] or ['  (everything above aside, nothing further)']
     return '\n'.join(lines) + '\n'
+
+
+LOCATIONS = {
+    'linked': 'linked original',
+    'managed': 'managed copy in Splice\'s media folder (an uploaded file, not the camera original); the receiving '
+               'machine needs this file, so copy it with the turnover',
+    'bundled': 'file bundled with Splice; the receiving machine needs a copy of it',
+    'external': 'path recorded in the project (not linked in Splice)',
+}
+
+
+def _used_sources(cut):
+    seen = {}
+    for event in cut.events:
+        source = event.source
+        if source is not None and not source.nested and not source.generator:
+            seen.setdefault(id(source), source)
+    return sorted(seen.values(), key=lambda s: s.name.lower())
+
+
+def media_lines(cut) -> list:
+    lines = []
+    for source in _used_sources(cut):
+        if not source.path:
+            lines.append(f'  - {source.name}: no file referenced (offline in Splice); relink it before turning over')
+            continue
+        where = LOCATIONS.get(source.location, source.location)
+        if source.original_path is not None and source.path_rule is not None:
+            lines.append(f'  - {source.name}: {where} {source.original_path}, written as {source.path}')
+        else:
+            lines.append(f'  - {source.name}: {where} {source.path}')
+    return lines
+
+
+def path_map_lines(cut) -> list:
+    used = _used_sources(cut)
+    lines = []
+    for index, (source, target) in enumerate(cut.path_rules):
+        count = sum(1 for s in used if s.path_rule == index)
+        lines.append(f'  {index + 1}. {source} -> {target} ({count} source{"" if count == 1 else "s"})')
+    missed = [s.name for s in used if s.path and s.path_rule is None]
+    if missed:
+        lines.append('  Not under any mapping, written unchanged: ' + ', '.join(missed[:20]) +
+                     (f' and {len(missed) - 20} more' if len(missed) > 20 else ''))
+    return lines
 
 
 def _options(options) -> dict:
@@ -156,6 +209,9 @@ def import_timeline(filename: str, text: str, options: dict | None = None) -> di
         budget.check()
     if not project['clips']:
         raise InterchangeError('The timeline file contains no clips Splice can import')
+    if options.get('linkMedia') is True:
+        with Budget(seconds=LINK_SECONDS, job=options.get('jobId'), what='Linking the timeline\'s media') as budget:
+            link_local_media(project, budget)
     label = {'xmeml': 'FCP 7 XML'}.get(kind, kind.upper())
     project['compatibilityWarnings'].insert(0, f'Imported from {filename[:120]} ({label}).')
     return project
@@ -169,7 +225,9 @@ def handle(action: str, payload: dict) -> dict:
     if action == 'export':
         return export_timeline(payload.get('project'), payload.get('options'))
     if action == 'import':
-        return {'project': import_timeline(payload.get('filename', ''), payload.get('text', ''), payload.get('options'))}
+        # in the server, media found on this machine is linked in place (see link_local_media)
+        options = dict(_options(payload.get('options')), linkMedia=True)
+        return {'project': import_timeline(payload.get('filename', ''), payload.get('text', ''), options)}
     if action == 'cancel':
         return {'cancelled': cancel(payload.get('jobId'))}
     raise InterchangeError('Unknown interchange action')

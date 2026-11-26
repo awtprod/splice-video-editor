@@ -4,6 +4,7 @@ const {startSplice} = require('./splice-server.cjs');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const {pathToFileURL} = require('node:url');
 const {chromium} = require('playwright-core');
 
 async function main() {
@@ -123,6 +124,54 @@ async function main() {
     assert.deepEqual(fromEdl.clips.filter(c => c[0] === 'video'), pictures);
     assert.deepEqual(fromEdl.markers, expected.markers);
     console.log('EDL import restores', pictures.length, 'picture events with dissolves and the locator.');
+
+    // A timeline whose media is on this machine outside Splice links it in place: no copy, and it plays.
+    const card = path.join(temp, 'Card A');
+    fs.mkdirSync(card);
+    const camera = path.join(card, 'ridge.mp4');
+    fs.copyFileSync(path.join(root, 'assets', 'ridge.mp4'), camera);
+    const pointed = fs.readFileSync(saved['.fcpxml'], 'utf8').replace(/file:\/\/[^"]*\/assets\/ridge\.mp4/g, pathToFileURL(camera).href);
+    assert.ok(pointed.includes(pathToFileURL(camera).href), 'the timeline points at the camera file');
+    const linkedTimeline = path.join(temp, 'linked.fcpxml');
+    fs.writeFileSync(linkedTimeline, pointed);
+    await importFile(linkedTimeline);
+    const ridge = await page.evaluate(file => Editor.get().project.media.find(m => m.sourcePath === file), fs.realpathSync(camera));
+    assert.ok(ridge, 'the camera file is a source of the imported project');
+    assert.equal(ridge.linked, true, 'linked in place');
+    assert.equal(ridge.offline, false);
+    assert.equal(ridge.sourcePath, fs.realpathSync(camera));
+    assert.match(ridge.originalSrc, /^\/media\/linked\/[a-f0-9]{32}\/ridge\.mp4$/);
+    const size = fs.statSync(camera).size;
+    const managed = path.join(temp, 'data', 'media');
+    const copies = (fs.existsSync(managed) ? fs.readdirSync(managed, {recursive: true}) : [])
+      .map(name => path.join(managed, name)).filter(file => fs.statSync(file).isFile() && fs.statSync(file).size === size);
+    assert.deepEqual(copies, [], 'importing must not copy the original');
+    const plays = await page.evaluate(src => new Promise(resolve => {
+      const video = document.createElement('video');
+      video.muted = true; video.src = src;
+      video.onloadeddata = () => resolve(true); video.onerror = () => resolve(false);
+    }), ridge.src);
+    assert.ok(plays, 'the linked original plays');
+    console.log('A timeline pointing at media on this machine links it in place and plays it.');
+
+    // Export it for a machine that sees the card as X:\Shoot.
+    downloads.length = 0;
+    await fileMenu('#export-timeline');
+    await exportDialog.locator('.interchange-advanced summary').click();
+    await exportDialog.locator('[name=pathMap]').fill(fs.realpathSync(card) + ' => X:\\Shoot');
+    await exportDialog.locator('[type=submit]').click();
+    await exportDialog.locator('[role=status]').filter({hasText: /Exported 1 file/}).waitFor();
+    for (let i = 0; i < 50 && downloads.length < 1; i++) await page.waitForTimeout(100);
+    const mapped = path.join(temp, 'mapped.fcpxml');
+    await downloads[0].saveAs(mapped);
+    const mappedText = fs.readFileSync(mapped, 'utf8');
+    assert.match(mappedText, /src="file:\/\/\/X:\/Shoot\/ridge\.mp4"/);
+    assert.doesNotMatch(mappedText, /\/media\/linked\//, 'never Splice\'s internal URL');
+    const mappedReport = await exportDialog.locator('.interchange-report pre').textContent();
+    assert.match(mappedReport, /Path mapping \(applied/);
+    assert.ok(mappedReport.includes('linked original ' + fs.realpathSync(camera) + ', written as X:\\Shoot\\ridge.mp4'), mappedReport);
+    await exportDialog.locator('[data-close]').click();
+    console.log('Export with a path mapping writes file:///X:/Shoot/ridge.mp4 and records the rule in the report.');
     assert.deepEqual(errors, []);
   } finally {
     await browser?.close();

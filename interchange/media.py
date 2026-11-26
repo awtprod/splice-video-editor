@@ -4,9 +4,10 @@ about itself (start timecode, rate, reel, audio layout).
 A media item may already carry the metadata contract fields (``sourcePath``, ``rate``,
 ``timecode``, ``dropFrame``, ``reel``, ``vfr``, ``audioStreams`` as an integer count of audio
 streams and ``audioStreamDetails`` as ``[{index, channels, layout, codec}]``). The original file is
-probed with ffprobe only for fields that are genuinely missing, and all probes of one export
-share a :class:`ProbeBudget` (a count and a total time), so an export is right on its own and
-never stalls a request. A list in ``audioStreams`` (an earlier draft of the contract) is read too.
+probed with ffprobe only for fields that are genuinely missing (``describe()`` carries no sample
+rate or Broadcast WAV time reference, so sound-only sources are probed for those), and all
+probes of one export share a :class:`ProbeBudget` (a count and a total time), so an export is
+right on its own and never stalls a request. A list in ``audioStreams`` (an earlier draft of the contract) is read too.
 """
 from __future__ import annotations
 
@@ -221,25 +222,96 @@ class Source:
     notes: list = field(default_factory=list)
     nested: bool = False
     generator: bool = False
+    location: str = 'none'      # see Reference.kind
+    original_path: str | None = None   # path on this machine, when export path mapping rewrote it
+    path_rule: int | None = None        # index of the mapping rule that applied
 
     @property
     def channels(self) -> int:
         return sum(int(s.get('channels') or 0) for s in self.audio_streams) if self.audio_streams else (2 if self.has_audio else 0)
 
 
-def _local_candidates(item: dict):
-    for key in ('sourcePath', 'path'):
-        value = item.get(key)
-        if isinstance(value, str) and is_absolute_path(value) and not value.startswith('\\\\'):
-            yield Path(value)
+def _registry():
+    """The server's link-in-place registry (``media_links``); None outside a Splice checkout."""
+    try:
+        import media_links
+    except ImportError:
+        return None
+    return media_links
+
+
+def _is_proxy(path: Path) -> bool:
+    """A file the server derived (edit/seek/grade proxy, nested preview) rather than a user's media."""
+    registry = _registry()
+    if registry is None:
+        return False
+    try:
+        directory = path.parent
+        if not directory.parent.resolve() == registry.MEDIA_ROOT.resolve():
+            return False
+        names = sorted(p.name for p in directory.iterdir() if p.is_file() and not p.name.startswith('.'))
+        return registry._kind(directory, names) == 'proxy'
+    except OSError:
+        return False
+
+
+@dataclass
+class Reference:
+    """Which file a timeline file should name for one media item, and whether it is readable here."""
+    path: str | None
+    local: Path | None
+    kind: str           # 'linked', 'managed', 'bundled', 'external' or 'none'
+    note: str | None = None
+
+
+def media_reference(item: dict) -> Reference:
+    """The original behind a media item, never Splice's internal URL and never a proxy.
+
+    A linked original (``/media/linked/<id>/<name>``) is named by the absolute path recorded in the
+    link-in-place registry, even while its drive is disconnected. Uploaded media is named by the
+    managed copy's real path. ``originalSrc`` is the original when ``src`` is a proxy; a proxy
+    itself is skipped. Paths the item carries (``sourcePath``, ``path``) are used only when no
+    Splice URL resolves, for example for offline media from an imported timeline."""
+    registry = _registry()
+    proxy_only = False
     for key in ('originalSrc', 'src'):
         value = item.get(key)
-        if isinstance(value, str) and value:
+        if not isinstance(value, str) or not value or registry is None:
+            continue
+        if registry.is_linked(value):
             try:
-                from premiere import _media_path
-                yield _media_path(value)
+                _, entry = registry._entry(value)
             except ValueError:
                 continue
+            try:
+                local = registry.resolve_media(value)
+            except ValueError:
+                local = None
+            return Reference(entry['path'], local, 'linked', None if local else
+                             'the linked original is offline on this machine (moved or its drive is disconnected); '
+                             'its recorded path is written')
+        try:
+            from premiere import _media_path
+            resolved = _media_path(value)
+        except (ImportError, ValueError, OSError):
+            continue
+        if _is_proxy(resolved):
+            proxy_only = True
+            continue
+        kind = 'managed' if resolved.is_relative_to(registry.MEDIA_ROOT.resolve()) else 'bundled'
+        return Reference(str(resolved), resolved, kind)
+    for key in ('sourcePath', 'path'):
+        value = item.get(key)
+        if isinstance(value, str) and is_absolute_path(value):
+            local = Path(value) if not value.startswith('\\\\') and Path(value).is_file() else None
+            if local is not None and _is_proxy(local):
+                proxy_only = True
+                continue
+            return Reference(value, local, 'external')
+    if proxy_only:
+        return Reference(None, None, 'none', 'only an edit proxy is on record; proxies are never turned over, '
+                                             'so relink the original')
+    return Reference(None, None, 'none')
 
 
 def _stream_list(value) -> list | None:
@@ -255,6 +327,14 @@ def _stream_list(value) -> list | None:
             streams.append({'index': stream.get('index', index), 'channels': channels,
                             'layout': clean(stream.get('layout'), 40), 'codec': clean(stream.get('codec'), 40)})
     return streams
+
+
+def _sample_rate(item: dict) -> int | None:
+    for value in [item.get('audioSampleRate'), item.get('sampleRate')] + [d.get('sampleRate') for d in (
+            item.get('audioStreamDetails') if isinstance(item.get('audioStreamDetails'), list) else []) if isinstance(d, dict)]:
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and 1000 <= value <= 768000:
+            return int(value)
+    return None
 
 
 def _dimension(value) -> int | None:
@@ -280,15 +360,11 @@ def resolve_source(item: dict, sequence_rate: Fraction, budget: ProbeBudget) -> 
     if item.get('nativeGenerator') is not None or item.get('nativeUnsupported'):
         source.generator = True
         return source
-    local = next((p for p in _local_candidates(item) if p.is_file()), None)
-    source.local = local
-    explicit = item.get('sourcePath')
-    if isinstance(explicit, str) and is_absolute_path(explicit):
-        source.path = explicit
-    elif local is not None:
-        source.path = str(local)
-    elif isinstance(item.get('path'), str) and is_absolute_path(item['path']):
-        source.path = item['path']
+    reference = media_reference(item)
+    local = reference.local
+    source.local, source.path, source.location = local, reference.path, reference.kind
+    if reference.note:
+        source.notes.append(reference.note)
     suffix = Path(base_name(source.path or name)).suffix.lower()
     source.still = bool(item.get('still')) or suffix in STILL_EXTENSIONS
     details = _stream_list(item.get('audioStreamDetails'))
@@ -300,7 +376,11 @@ def resolve_source(item: dict, sequence_rate: Fraction, budget: ProbeBudget) -> 
     rate_known = bool(snap_rate(item.get('rate'))) or source.kind == 'audio' or source.still
     timecode_known = 'timecode' in item
     probe = None
-    needs_probe = not (rate_known and audio_known and timecode_known)
+    sample_rate = _sample_rate(item)
+    # describe() records neither the sample rate nor a Broadcast WAV time reference, so a sound
+    # file (music, location sound) is probed for them; picture sources need no probe for these
+    sound_known = sample_rate is not None or source.kind != 'audio'
+    needs_probe = not (rate_known and audio_known and timecode_known and sound_known)
     if needs_probe and local is not None:
         timeout = budget.take()
         if timeout is None:
@@ -337,7 +417,7 @@ def resolve_source(item: dict, sequence_rate: Fraction, budget: ProbeBudget) -> 
     elif _stream_count(item.get('audioChannels')):
         source.audio_streams = [{'index': 0, 'channels': _stream_count(item['audioChannels']), 'layout': '', 'codec': ''}]
     source.has_audio = bool(source.audio_streams) or source.kind == 'audio'
-    source.audio_rate = probe.audio_rate if probe else None
+    source.audio_rate = (probe.audio_rate if probe else None) or sample_rate
     # size and length
     source.width = _dimension(item.get('width')) or (_dimension(probe.width) if probe else None)
     source.height = _dimension(item.get('height')) or (_dimension(probe.height) if probe else None)
@@ -367,3 +447,69 @@ def resolve_source(item: dict, sequence_rate: Fraction, budget: ProbeBudget) -> 
     elif probe is not None or 'timecode' in item:
         source.timecode_state = 'none'
     return source
+
+
+# -- path mapping for cross-machine turnovers ---------------------------------------------------
+
+MAX_PATH_RULES = 32
+
+
+def _windows_style(path: str) -> bool:
+    return bool(_DRIVE.match(path) or _UNC.match(path))
+
+
+def path_rules(value) -> list:
+    """Validated ``[(from, to), ...]`` from the export option ``pathMap``: a list of
+    ``{'from': prefix, 'to': prefix}``. Both must be absolute paths (POSIX, drive letter or UNC)."""
+    if value in (None, '', []):
+        return []
+    if not isinstance(value, list) or len(value) > MAX_PATH_RULES:
+        raise ValueError(f'Path mapping must be a list of up to {MAX_PATH_RULES} rules')
+    rules = []
+    for rule in value:
+        if not isinstance(rule, dict):
+            raise ValueError('Each path mapping rule needs a "from" and a "to" path')
+        source, target = rule.get('from'), rule.get('to')
+        for side, text in (('from', source), ('to', target)):
+            if not isinstance(text, str) or not text.strip() or len(text) > 1024 or _CONTROL.search(text) or '\x00' in text:
+                raise ValueError(f'Path mapping "{side}" must be a path of up to 1024 characters')
+        source, target = source.strip(), target.strip()
+        if not is_absolute_path(source) or not is_absolute_path(target):
+            raise ValueError(f'Path mapping {source[:60]!r} -> {target[:60]!r}: both sides must be absolute paths '
+                             '(/Volumes/..., /mnt/..., X:\\... or \\\\server\\share\\...)')
+        rules.append((source, target))
+    return rules
+
+
+def _components(path: str):
+    """``(style, parts)``: style 'posix', 'drive' or 'unc'; drive letters upper-cased."""
+    if _DRIVE.match(path):
+        parts = [p for p in re.split(r'[\\/]', path) if p]
+        return 'drive', [parts[0].upper()] + parts[1:]
+    if _UNC.match(path):
+        return 'unc', [p for p in re.split(r'[\\/]', path) if p]
+    return 'posix', [p for p in path.split('/') if p]
+
+
+def _join(style: str, parts: list) -> str:
+    if style == 'drive':
+        return parts[0] + '\\' + '\\'.join(parts[1:])
+    if style == 'unc':
+        return '\\\\' + '\\'.join(parts)
+    return '/' + '/'.join(parts)
+
+
+def map_path(path: str, rules: list):
+    """``(new path, rule index)`` for the first rule whose ``from`` is a whole-component prefix of
+    ``path``, else ``(path, None)``. Windows prefixes compare case-insensitively with either slash;
+    the rest of the path is written in the ``to`` side's style (backslashes for X:\\ and UNC)."""
+    style, parts = _components(path)
+    for index, (source, target) in enumerate(rules):
+        source_style, head = _components(source)
+        if source_style != style or len(head) > len(parts):
+            continue
+        same = (lambda a, b: a.lower() == b.lower()) if style != 'posix' else (lambda a, b: a == b)
+        if all(same(a, b) for a, b in zip(head, parts)):
+            target_style, base = _components(target)
+            return _join(target_style, base + parts[len(head):]), index
+    return path, None

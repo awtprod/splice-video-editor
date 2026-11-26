@@ -2,7 +2,7 @@
 
 Usage: python3 tests/interchange_evidence.py OUTPUT_DIR
 
-Writes the bundled "Alpine Passage" project, a synthetic 23.976 timeline cut from generated
+Starts the server, links the media in place and exports through /api/interchange/export. Writes the bundled "Alpine Passage" project, a synthetic 23.976 timeline cut from generated
 timecoded media, and a 29.97 drop-frame timeline, each as FCPXML, Final Cut Pro 7 XML, EDLs
 (picture and sound), OTIO and a report, with the media beside them and a NOTES.txt saying what an
 importer should show.
@@ -16,16 +16,18 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from interchange.api import export_timeline  # noqa: E402
 from interchange_fixtures import DF, alpine_project, make_media, synthetic_project  # noqa: E402
 
 NOTES = """Splice timeline interchange evidence
 =====================================
 
 Media for every timeline is in media/ (generated test patterns and tones, plus the four
-bundled Splice clips and score). The file URLs point at this folder on the machine that wrote
-it; after copying elsewhere, relink to media/ (Resolve: Relink Clips / Change Source Folder;
-Premiere: Link Media; Final Cut Pro: Relink Files).
+bundled Splice clips and score). The timelines were exported by a running Splice server with
+every source linked in place (File > Link media in place, no copy), so each file names the
+original's absolute path in media/ on the machine that wrote it, never a Splice URL or proxy;
+REPORT.txt lists each reference under "Media the timeline files reference". After copying
+elsewhere, relink to media/ (Resolve: Relink Clips / Change Source Folder; Premiere: Link
+Media; Final Cut Pro: Relink Files), or use synthetic-23976-path-mapped/ (below).
 
 Each folder holds TIMELINE.fcpxml (FCPXML 1.10: Resolve, Final Cut Pro), TIMELINE.xml
 (Final Cut Pro 7 XML, xmeml 5: Premiere Pro, Resolve, Avid), one EDL per picture track
@@ -87,6 +89,12 @@ Which file to give which application:
        so the record timecode crosses the minute boundary: 00:00:59;28, 00:00:59;29,
        00:01:00;02 (;00 and ;01 are skipped).
 
+4. synthetic-23976-path-mapped/: timeline 2 exported with the path mapping option
+   "<this folder>/media => X:\\Turnover\\media", for a Windows machine that sees the media
+   there: FCPXML and OTIO name file:///X:/Turnover/media/..., FCP 7 XML
+   file://localhost/X%3a/Turnover/media/..., the EDLs "* SOURCE FILE: X:\\Turnover\\media\\...".
+   REPORT.txt records the rule and, per source, the local path and the path written.
+
 Known importer behaviour to check (see each REPORT.txt):
 - Resolve ignores FCPXML srcEnable; audio-only uses of A/V files may also bring picture.
 - Resolve imports FCPXML fades as volume keyframes and few or no FCPXML markers.
@@ -101,6 +109,9 @@ Known importer behaviour to check (see each REPORT.txt):
 """
 
 
+MAPPED_TO = 'X:\\Turnover\\media'
+
+
 def drop_project(paths):
     rate = DF
     return {'name': 'Synthetic 2997 DF', 'width': 1920, 'height': 1080, 'fps': float(rate),
@@ -110,9 +121,46 @@ def drop_project(paths):
                        'duration': float(Fraction(1804) / rate) - float(Fraction(1798) / rate), 'in': 0, 'volume': 100}]}
 
 
-def write(folder: Path, project: dict, options: dict):
+class Splice:
+    """``python3 server.py`` with its own data directory, driven like the app (launch link,
+    session cookie, page token). The evidence media is linked in place, as camera originals are."""
+
+    def __init__(self, data: Path):
+        from test_media_server import ServerProcess
+        self.process = ServerProcess(data)
+
+    def call(self, method, route, body=None):
+        status, payload = self.process.json(method, route, body)
+        if status != 200:
+            raise RuntimeError(f'{route}: {status} {payload}')
+        return payload
+
+    def link(self, project: dict) -> dict:
+        """Each media item as media-store.js stores a linked original: describe() spread, then src."""
+        from urllib.parse import quote
+        items = [m for m in project['media'] if m.get('sourcePath')]
+        linked = self.call('POST', '/api/media/link', {'paths': [m['sourcePath'] for m in items]})['files']
+        for item, result in zip(items, linked):
+            if 'src' not in result:
+                raise RuntimeError(f'{item["sourcePath"]}: {result.get("error")}')
+            info = self.call('GET', '/api/media/info?src=' + quote(result['src'], safe=''))
+            keep = {k: item[k] for k in ('id', 'name', 'type')}
+            item.clear()
+            item.update(info, **keep, src=result['src'], originalSrc=result['src'], path=result['sourcePath'],
+                        linked=True, sourceFingerprint=result['fingerprint'], offline=False)
+        return project
+
+    def close(self):
+        self.process.close()
+
+
+def write(splice, folder: Path, project: dict, options: dict):
     folder.mkdir(parents=True, exist_ok=True)
-    result = export_timeline(project, {'formats': ['fcpxml', 'xmeml', 'edl', 'otio'], 'audioEdl': True, **options})
+    for old in folder.iterdir():
+        if old.is_file():
+            old.unlink()
+    result = splice.call('POST', '/api/interchange/export', {'project': project, 'options': {
+        'formats': ['fcpxml', 'xmeml', 'edl', 'otio'], 'audioEdl': True, **options}})
     for file in result['files']:
         (folder / file['name']).write_text(file['content'])
     (folder / 'REPORT.txt').write_text(result['report'])
@@ -120,6 +168,7 @@ def write(folder: Path, project: dict, options: dict):
 
 
 def main(output: Path):
+    import tempfile
     media = output / 'media'
     paths = make_media(media)
     alpine = alpine_project(ROOT)
@@ -129,11 +178,20 @@ def main(output: Path):
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, target)
         item['sourcePath'] = str(target)
-    written = {
-        'alpine-passage': write(output / 'alpine-passage', alpine, {}),
-        'synthetic-23976': write(output / 'synthetic-23976', synthetic_project(paths), {}),
-        'synthetic-2997df': write(output / 'synthetic-2997df', drop_project(paths), {'dropFrame': True, 'startTimecode': '00:00:00;00'}),
-    }
+    with tempfile.TemporaryDirectory(prefix='splice-evidence-') as data:
+        splice = Splice(Path(data))
+        try:
+            synthetic = splice.link(synthetic_project(paths))
+            written = {
+                'alpine-passage': write(splice, output / 'alpine-passage', splice.link(alpine), {}),
+                'synthetic-23976': write(splice, output / 'synthetic-23976', synthetic, {}),
+                'synthetic-2997df': write(splice, output / 'synthetic-2997df', splice.link(drop_project(paths)),
+                                          {'dropFrame': True, 'startTimecode': '00:00:00;00'}),
+                'synthetic-23976-path-mapped': write(splice, output / 'synthetic-23976-path-mapped', synthetic,
+                                                     {'pathMap': [{'from': str(media), 'to': MAPPED_TO}]}),
+            }
+        finally:
+            splice.close()
     (output / 'NOTES.txt').write_text(NOTES)
     for folder, names in written.items():
         print(folder, ' '.join(names))

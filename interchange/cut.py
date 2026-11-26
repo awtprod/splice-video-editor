@@ -12,7 +12,7 @@ import math
 from dataclasses import dataclass, field
 from fractions import Fraction
 
-from .media import MAX_PROBES, PROBE_SECONDS, ProbeBudget, Source, clean, resolve_source
+from .media import MAX_PROBES, PROBE_SECONDS, ProbeBudget, Source, clean, map_path, path_rules, resolve_source
 from .timecode import frames_timecode, seconds_frames, sequence_rate, timecode_frames
 
 MAX_CLIPS = 20_000
@@ -110,6 +110,7 @@ class Cut:
     report: Report
     range_start: int = 0      # first exported frame of the Splice timeline
     track_mix: dict = field(default_factory=dict)
+    path_rules: list = field(default_factory=list)   # [(from, to)] applied to media paths
 
     def timecode(self, frame: int) -> str:
         return frames_timecode(self.tc_start + frame, self.rate, self.drop)
@@ -153,10 +154,17 @@ def build_cut(project: dict, options: dict | None = None) -> Cut:
     report = Report()
     budget = ProbeBudget(min(MAX_PROBES, max(0, int(_number(options.get('maxProbes'), MAX_PROBES)))),
                          min(PROBE_SECONDS, _number(options.get('probeSeconds'), PROBE_SECONDS, 0)))
+    try:
+        rules = path_rules(options.get('pathMap'))
+    except ValueError as error:
+        raise InterchangeError(str(error)) from None
     sources = {}
     for item in project['media']:
         if isinstance(item, dict) and item.get('id') is not None:
-            sources[str(item['id'])] = resolve_source(item, rate, budget)
+            source = sources[str(item['id'])] = resolve_source(item, rate, budget)
+            if source.path and rules:
+                source.original_path = source.path
+                source.path, source.path_rule = map_path(source.path, rules)
     if budget.skipped:
         shown = ', '.join(budget.skipped[:20]) + (f' and {len(budget.skipped) - 20} more' if len(budget.skipped) > 20 else '')
         report.note(f'Probing stopped after {budget.seconds:g} s or {MAX_PROBES} files; not probed: {shown}. '
@@ -171,7 +179,8 @@ def build_cut(project: dict, options: dict | None = None) -> Cut:
             raise InterchangeError('The export range is empty')
     cut = Cut(name=clean(project.get('name') or 'Untitled', 200) or 'Untitled', rate=rate, width=width, height=height,
               tc_start=tc_start, drop=drop, frames=last - first, events=[], sources=sources,
-              markers=[], report=report, range_start=first, track_mix=dict(project.get('trackMix') or {}))
+              markers=[], report=report, range_start=first, track_mix=dict(project.get('trackMix') or {}),
+              path_rules=rules)
     try:
         frames_timecode(tc_start + cut.frames, rate, drop)
     except ValueError:

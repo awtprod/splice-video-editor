@@ -6,3 +6,7 @@
 .interchange-dialog .interchange-report pre{max-height:240px;overflow:auto;white-space:pre-wrap;font-size:12px;background:#121612;border:1px solid #333d33;padding:8px}
 .interchange-dialog .interchange-report summary{cursor:pointer;margin:8px 0}
 .interchange-dialog .interchange-note{margin:0 0 6px 26px;font-size:12px;color:#b9c4b5}
+.interchange-dialog .interchange-advanced{margin:8px 0}
+.interchange-dialog .interchange-advanced summary{cursor:pointer;color:#b9c4b5}
+.interchange-dialog .interchange-advanced .interchange-note{margin:6px 0}
+.interchange-dialog .interchange-advanced textarea{width:100%;box-sizing:border-box;font:12px ui-monospace,monospace;background:#121612;color:inherit;border:1px solid #435142;border-radius:4px;padding:6px}

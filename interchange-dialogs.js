@@ -31,6 +31,20 @@ window.SpliceInterchange = (() => {
     return body;
   }
 
+  // "from => to" per line; blank lines and lines starting with # are ignored.
+  function parsePathMap(text) {
+    const rules = [];
+    for (const [index, raw] of text.split(/\r?\n/).entries()) {
+      const line = raw.trim();
+      if (!line || line.startsWith('#')) continue;
+      const parts = line.split('=>');
+      if (parts.length !== 2 || !parts[0].trim() || !parts[1].trim())
+        throw Error(`Path mapping line ${index + 1}: write it as "from folder => to folder".`);
+      rules.push({ from: parts[0].trim(), to: parts[1].trim() });
+    }
+    return rules;
+  }
+
   function exportTimeline() {
     const state = Editor.get(), project = state.project, node = dialog('Export timeline');
     const form = document.createElement('form');
@@ -51,6 +65,10 @@ window.SpliceInterchange = (() => {
       <label${drop ? '' : ' hidden'}>Timecode<select name="dropFrame"><option value="1">Drop frame</option><option value="0">Non-drop frame</option></select></label>
       <label>Unreadable source timecode<select name="unknownTimecode"><option value="refuse">Stop and list the sources</option><option value="zero">Write 00:00:00:00 and flag each clip</option></select></label>
       <label class="interchange-check"><input type="checkbox" name="package"> Turnover package (.zip with a report of what each format cannot carry)</label>
+      <details class="interchange-advanced"><summary>Path mapping (optional)</summary>
+        <p class="interchange-note">When the receiving machine sees the media under another path, write one rule per line as <code>this machine's folder =&gt; their folder</code>, for example <code>/mnt/shoot =&gt; X:\Shoot</code>. Every media path in the exported files is rewritten; the report lists the rules.</p>
+        <textarea name="pathMap" rows="3" spellcheck="false" placeholder="/mnt/shoot => X:\Shoot"></textarea>
+      </details>
       <p role="status" class="render-state"></p>
       <details class="interchange-report" hidden><summary>Export report</summary><pre></pre><button type="button" data-report>Save report</button></details>
       <footer><button type="button" data-close>Close</button><button type="submit" class="primary">Export</button></footer>`;
@@ -84,6 +102,7 @@ window.SpliceInterchange = (() => {
           startTimecode: fields.startTimecode.value.trim(), dropFrame: drop && fields.dropFrame.value === '1',
           unknownTimecode: fields.unknownTimecode.value,
         };
+        options.pathMap = parsePathMap(fields.pathMap.value);
         if (fields.rangeMode.value === 'custom') options.range = { start: range[0].valueAsNumber, end: range[1].valueAsNumber };
         const result = await post('export', { project: prepared, options });
         report = result.report;
@@ -158,5 +177,5 @@ window.SpliceInterchange = (() => {
 
   document.getElementById('export-timeline')?.addEventListener('click', exportTimeline);
   document.getElementById('import-timeline')?.addEventListener('click', importTimeline);
-  return { exportTimeline, importTimeline };
+  return { exportTimeline, importTimeline, parsePathMap };
 })();

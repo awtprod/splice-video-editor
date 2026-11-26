@@ -3,9 +3,10 @@
 Readers hand over plain records: media (``key``, ``name``, ``path``, ``kind``, ``duration`` and
 whatever timecode facts the file had) and clips in seconds with a track number, where
 ``track='audio-auto'`` asks for the first free audio track. Sources found inside Splice's own
-media folders play at once; every other source arrives offline with its original path, so the
-existing relink flow (by file or folder) can find it. Every reader warning becomes a
-``compatibilityWarnings`` entry, shown in the Project compatibility panel.
+media folders play at once; every other source arrives offline with its original path.
+:func:`link_local_media` then links the ones that exist on this machine in place (no copy);
+what is left offline is found by the existing relink flow (by file or folder). Every reader
+warning becomes a ``compatibilityWarnings`` entry, shown in the Project compatibility panel.
 """
 from __future__ import annotations
 
@@ -127,8 +128,6 @@ def build_project(name: str, rate: Fraction, width: int, height: int, media: lis
             item['duration'] = _seconds(record['duration'])
         if src:
             item['originalSrc'] = src
-        elif path and is_absolute_path(path) and not path.startswith('\\\\') and Path(path).is_file():
-            warnings.append(f'{item["name"]} was found at its original path; use Relink to bring it into Splice.')
         items.append(item)
     by_id = {item['id']: item for item in items}
     out, busy = [], {}
@@ -194,3 +193,50 @@ def build_project(name: str, rate: Fraction, width: int, height: int, media: lis
                         for i, m in enumerate(markers) if 0 <= m['time'] <= total + 1e-6][:5000],
             'trackCounts': {'video': video_tracks, 'audio': audio_tracks}, 'trackState': {},
             'duration': total, 'compatibilityWarnings': [text(w, 1000) for w in dict.fromkeys(warnings)][:500]}
+
+
+def link_local_media(project: dict, budget, limit: int = 2000) -> None:
+    """Link offline sources whose recorded path is a file on this machine through the server's
+    link-in-place registry: no bytes are copied, and only files FFmpeg decodes as audio or video
+    are registered (the same check as File > Link media in place), so a timeline cannot expose a
+    text file, a key or any other non-media file through ``/media/linked/``. Files that fail the
+    check, or that the time budget does not reach, stay offline with a compatibility warning."""
+    import os
+    try:
+        import media_links
+        from media_proxy import decodable
+    except ImportError:
+        return
+    warnings = project['compatibilityWarnings']
+    wanted = []
+    for item in project['media']:
+        path = item.get('sourcePath')
+        if not item.get('offline') or not isinstance(path, str) or not os.path.isabs(path) or path.startswith('\\\\'):
+            continue
+        try:
+            if Path(path).is_file():
+                wanted.append(item)
+        except (OSError, ValueError):
+            continue
+    if not wanted:
+        return
+    if len(wanted) > limit:
+        warnings.append(f'{len(wanted) - limit} sources beyond the first {limit} found on this computer were left '
+                        'offline; relink them by folder.')
+        wanted = wanted[:limit]
+
+    def check(path, name):
+        budget.check()
+        if budget.remaining() < 1:
+            raise ValueError('not checked before the import\'s time limit')
+        decodable(path, name)
+
+    results = media_links.link_many([item['sourcePath'] for item in wanted], validate=check)
+    for item, result in zip(wanted, results):
+        if 'src' in result:
+            item.update(src=result['src'], originalSrc=result['src'], path=result['sourcePath'],
+                        sourcePath=result['sourcePath'], linked=True, sourceFingerprint=result['fingerprint'],
+                        offline=False)
+        else:
+            warnings.append(text(f'{item["name"]} at its recorded path was not linked ({result.get("error")}); '
+                                 'it stays offline for relinking.', 1000))
