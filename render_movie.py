@@ -1183,7 +1183,9 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
 
     command = ['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-filter_complex_threads', '3', '-y',
                *(argument for entry in inputs for argument in entry),
-               '-f', 'lavfi', '-i', f'color=c=black{"@0" if spec["alpha"] else ""}:s={width}x{height}:r={fps}:d={duration:.6f}']
+               '-f', 'lavfi', '-i', f'color=c=black{"@0" if spec["alpha"] else ""}:s={width}x{height}:r={fps}:d={duration:.6f}'
+               # The color source keeps its alpha only through an RGBA output.
+               + (',format=rgba' if spec['alpha'] else '')]
     base_index = len(inputs)
     profile = options.get('_color_profile') or REC709
     hdr_profile = profile if high_depth and profile[1] in HDR_TRANSFERS else None
@@ -2000,7 +2002,8 @@ def _render_delivery(project, output_path, *, options, progress, cancelled, hear
                 output.mkdir(parents=True, exist_ok=True)
             video_file = _stream_picture(project, picture_clips, first, stop, total_frames, fps, width, height, spec, options,
                                          directory, output, cancelled, heartbeat, stage(0, .8), burn, report)
-            video_input = ['-i', str(video_file)] if video_file else []
+            # Muxed through a one-entry concat list, like the window segments.
+            video_input = ['-f','concat','-safe','0','-i',str(_concat_list(directory,'segments.txt',[video_file]))] if video_file else []
         lossy = spec['audio_lossy']
         mix_limiter = None if limiter is None else (limiter, lossy)
         chunks = _render_audio(events, first_sample, stop_sample, mix_limiter, directory, cancelled, heartbeat, stage(.8, .92))
@@ -2458,10 +2461,7 @@ class _Window:
     def finish(self):
         """Wait for the process; raise if it failed or delivered the wrong number of bytes."""
         code = self.process.wait()
-        for thread in self.threads:
-            thread.join(timeout=5)
-        for stream in (self.process.stdout, self.process.stderr):
-            stream.close()
+        self._close(5)
         if code:
             raise ValueError('FFmpeg render failed: ' + ''.join(self.errors)[-1500:])
         if self.received != self.expected:
@@ -2478,13 +2478,16 @@ class _Window:
             self.eof = True
             self.chunks.clear()
             self.cond.notify_all()
+        self._close(2)
+
+    def _close(self, timeout):
         for thread in self.threads:
-            thread.join(timeout=2)
-        for stream in (self.process.stdout, self.process.stderr):
-            try:
+            thread.join(timeout=timeout)
+        # A process FFmpeg started may still hold the pipes: closing them under a blocked reader
+        # would block too. The daemon readers end with that process.
+        if all(not thread.is_alive() for thread in self.threads):
+            for stream in (self.process.stdout, self.process.stderr):
                 stream.close()
-            except OSError:
-                pass
 
 
 def _encoder_command(spec, fps, profile, size, target, *, light_levels=None, pass_number=None, passlog=None, sink=None):
@@ -2692,11 +2695,9 @@ def _pump_windows(project, picture, first, stop, total_frames, fps, width, heigh
             pass
         for reader in readers:
             reader.join(timeout=2)
-        for stream in (encoder.stdout, encoder.stderr):
-            try:
-                stream.close()
-            except OSError:
-                pass
+        if all(not reader.is_alive() for reader in readers):
+            encoder.stdout.close()
+            encoder.stderr.close()
         if not forwarder.is_alive():
             plans.close()
 

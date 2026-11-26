@@ -134,6 +134,9 @@ MASTERING_DISPLAYS = {
     'bt2020': dict(label='Rec. 2020 (D65)', primaries='G(8500,39850)B(6550,2300)R(35400,14600)WP(15635,16450)'),
 }
 LIGHT_LEVEL_MODES = ('measure', 'manual', 'source')
+AV1_CODES = dict(primaries={'bt709': 1, 'bt470bg': 5, 'smpte170m': 6, 'bt2020': 9},
+                 transfer={'bt709': 1, 'smpte170m': 6, 'bt2020-10': 14, 'smpte2084': 16, 'arib-std-b67': 18},
+                 matrix={'bt709': 1, 'bt470bg': 5, 'smpte170m': 6, 'bt2020nc': 9, 'bt2020c': 10})
 BURN_IN_POSITIONS = ('top-left', 'top-center', 'top-right', 'bottom-left', 'bottom-center', 'bottom-right')
 BURN_IN_FIELDS = ('timecode', 'sourceTimecode', 'clipName', 'frame', 'watermark')
 MAX_TEXT = 200
@@ -466,12 +469,19 @@ def encoder_args(spec, fps, profile_tags, *, light_levels=None, pass_number=None
         if pass_number:
             params += [f'pass={pass_number}', f'stats={passlog}.x265']
         args += ['-x265-params', ':'.join(params), '-tag:v', 'hvc1']
-    if codec == 'av1' and spec.get('hdr') and profile_tags[1] == 'smpte2084' and light_levels:
-        hdr = spec['hdr']
-        primaries = MASTERING_DISPLAYS[hdr['display']]['primaries']
-        values = [int(v) / 50000 for v in re.findall(r'\d+', primaries)]
-        args += ['-svtav1-params', 'mastering-display=G({:.4f},{:.4f})B({:.4f},{:.4f})R({:.4f},{:.4f})WP({:.4f},{:.4f})'
-                 'L({:.4f},{:.4f}):content-light={},{}'.format(*values, hdr['maxLuminance'], hdr['minLuminance'], *light_levels)]
+    if codec == 'av1':
+        # SVT-AV1 takes its colour description (ISO/IEC 23091-2 code points) as its own parameters.
+        params = [f'color-primaries={AV1_CODES["primaries"].get(profile_tags[0], 2)}',
+                  f'transfer-characteristics={AV1_CODES["transfer"].get(profile_tags[1], 2)}',
+                  f'matrix-coefficients={AV1_CODES["matrix"].get(profile_tags[2], 2)}', 'color-range=0']
+        if spec.get('hdr') and profile_tags[1] == 'smpte2084':
+            hdr = spec['hdr']
+            primaries = MASTERING_DISPLAYS[hdr['display']]['primaries']
+            values = [int(v) / 50000 for v in re.findall(r'\d+', primaries)]
+            params.append('mastering-display=G({:.4f},{:.4f})B({:.4f},{:.4f})R({:.4f},{:.4f})WP({:.4f},{:.4f})'
+                          'L({:.4f},{:.4f})'.format(*values, hdr['maxLuminance'], hdr['minLuminance']))
+            params.append('content-light={},{}'.format(*(light_levels or (0, 0))))
+        args += ['-svtav1-params', ':'.join(params)]
     if threads:
         args += ['-threads', str(threads)]
     return args
@@ -486,6 +496,9 @@ def _rate_args(rate, pass_number, passlog, codec):
     if rate['mode'] == 'crf':
         return ['-crf', str(rate['crf'])]
     args = ['-b:v', f'{rate["kbps"]}k']
+    if rate['mode'] == 'bitrate':
+        # One pass cannot look ahead: a VBV buffer keeps the average near the target.
+        args += ['-maxrate', f'{round(rate["kbps"] * 1.25)}k', '-bufsize', f'{rate["kbps"]}k']
     if rate['mode'] == 'twopass' and codec == 'h264':
         args += ['-pass', str(pass_number), '-passlogfile', str(passlog)]
     return args
