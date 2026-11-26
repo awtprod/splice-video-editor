@@ -533,8 +533,8 @@ def resolve_media(src):
     while the file keeps the size and modification time it was linked with) or of a managed
     copy, proxy or bundled asset (``/media/...``, ``/assets/...``, through
     ``premiere.managed_media_path``). Raises ValueError for anything else. premiere.py,
-    media_proxy.py and media_peaks.py call it; render_movie.py still reaches it through
-    :func:`install`."""
+    media_proxy.py and media_peaks.py call it; render_movie.py reaches it either through
+    :func:`install` or through the ``premiere._media_path`` alias, depending on import order."""
     identifier, entry = _entry(src)
     if entry is None:
         return premiere.managed_media_path(src)
@@ -567,13 +567,14 @@ def is_linked(src):
 
 
 def install():
-    """Point render_movie's own binding at resolve_media.
+    """Point render_movie's own binding at resolve_media, when render_movie is already loaded.
 
     render_movie.py binds ``premiere._media_path`` by name at import, then imports media_proxy
-    (which imports this module), so this runs in the server and in every export worker before
-    any media is resolved. premiere._media_path already delegates to resolve_media, so the
-    binding works either way; this keeps render_movie on the public resolver until it imports
-    ``resolve_media`` itself. premiere.py is never patched."""
+    (which imports this module). When render_movie is imported first (the export worker), this
+    runs after that binding and rebinds it. When this module is loaded first (premiere, then
+    media_links, then render_movie), render_movie is not there yet and stays bound to
+    ``premiere._media_path``. Both work: that alias delegates to resolve_media at call time.
+    premiere.py is never patched."""
     module = sys.modules.get('render_movie')
     if module is not None and getattr(module, '_media_path', None) in (premiere._media_path,
                                                                         premiere.managed_media_path):

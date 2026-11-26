@@ -40,9 +40,10 @@ REFERENCE_MOVIE_OPTION = 'referenceMovie'
 TESTED_IN = {
     'xmeml': ['Adobe Premiere Pro 27 imported Splice\'s Final Cut 7 XML for three test timelines with zero cut '
               'differences.',
-              'A reversed linked pair arrives unlinked in Premiere (Premiere\'s own export does the same).',
+              'A reversed linked pair arrives unlinked in Premiere; Premiere\'s own re-export of that sequence also '
+              'wrote the reversed pair unlinked.',
               'Premiere shows its own Link Media dialog when mapped paths do not exist.'],
-    'fcpxml': ['DaVinci Resolve 21.1 imported the FCPXML frame-exact.'],
+    'fcpxml': ['DaVinci Resolve 21.1 imported the FCPXML frame-exact, verified on one test timeline.'],
     'edl': ['DaVinci Resolve 21.1 conforms EDLs by timecode only and refuses audio-only EDLs.'],
     'otio': ['DaVinci Resolve 21.1 cancelled an OTIO import in the one attempt made (unverified since the OTIO writer '
              'was changed to match OpenTimelineIO 0.18).'],

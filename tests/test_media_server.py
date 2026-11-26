@@ -384,6 +384,7 @@ class Relaunch(unittest.TestCase):
                 os.utime(path, (old, old))
             link = profile / 'launch-symlink1.html'
             os.symlink(target, link)
+            os.utime(link, (old, old), follow_symlinks=False)  # an old symlink to an old file: still kept
             nested = profile / 'launch-folder1.html'
             nested.mkdir()
             self.assertEqual(remove_stale_launchers(profile), [stale.name])
@@ -397,6 +398,45 @@ class Relaunch(unittest.TestCase):
             os.utime(outside / 'launch-abcdefgh.html', (old, old))
             self.assertEqual(remove_stale_launchers(linked_profile), [], 'never through a symlinked folder')
             self.assertTrue((outside / 'launch-abcdefgh.html').exists())
+
+    def test_stale_launch_cleanup_never_stops_a_start(self):
+        import contextlib
+        import io
+        from splice_app import remove_stale_launchers, write_launcher
+        with tempfile.TemporaryDirectory() as temp:
+            profile = Path(temp) / 'browser'
+            profile.mkdir()
+            old = time.time() - 3600
+            stale = [write_launcher(profile, f'http://127.0.0.1:1/?launch={n}') for n in range(3)]
+            for path in stale:
+                os.utime(path, (old, old))
+            # Another Splice starting at the same moment removed them first: nothing to say.
+            captured = io.StringIO()
+            with contextlib.redirect_stderr(captured), \
+                    mock.patch('splice_app.os.unlink', side_effect=FileNotFoundError(2, 'No such file or directory')):
+                self.assertEqual(remove_stale_launchers(profile), [])
+            self.assertEqual(captured.getvalue(), '')
+            # Files it cannot remove: one line, however many.
+            captured = io.StringIO()
+            with contextlib.redirect_stderr(captured), \
+                    mock.patch('splice_app.os.unlink', side_effect=PermissionError(13, 'Permission denied')):
+                self.assertEqual(remove_stale_launchers(profile), [])
+            self.assertEqual(captured.getvalue().count('could not remove an old launch file'), 1, captured.getvalue())
+            # A profile folder it cannot read: start anyway, say so once.
+            captured = io.StringIO()
+            with contextlib.redirect_stderr(captured), \
+                    mock.patch('splice_app.os.scandir', side_effect=PermissionError(13, 'Permission denied')):
+                self.assertEqual(remove_stale_launchers(profile), [])
+            self.assertEqual(captured.getvalue().count('could not look for old launch files'), 1)
+            if os.name == 'posix' and os.geteuid() != 0:
+                profile.chmod(0)
+                try:
+                    with contextlib.redirect_stderr(io.StringIO()) as real:
+                        self.assertEqual(remove_stale_launchers(profile), [])
+                    self.assertIn('Permission denied', real.getvalue())
+                finally:
+                    profile.chmod(0o700)
+            self.assertEqual(sorted(remove_stale_launchers(profile)), sorted(p.name for p in stale))
 
     def start(self, stdin):
         import io

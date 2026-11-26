@@ -203,13 +203,15 @@ class WindowsNames(unittest.TestCase):
         return media.invalid_on_target('/mnt/shoot/day1/' + name, self.RULE)
 
     def test_device_names_trailing_dots_and_spaces_are_caught(self):
-        for name in ('CON', 'con.mov', 'PRN.wav', 'aux', 'NUL.tar.gz', 'COM1.mov', 'com9', 'LPT1', 'lpt9.mxf', 'COM\u00b9.mov'):
+        for name in ('CON', 'con.mov', 'PRN.wav', 'aux', 'NUL.tar.gz', 'COM1.mov', 'com9', 'LPT1', 'lpt9.mxf', 'COM\u00b9.mov',
+                     'COM0.mov', 'lpt0', 'CONIN$', 'conout$.txt', 'con .mov', 'NUL  .wav', 'aux .tar.gz'):
             with self.subTest(name=name):
                 self.assertIn('reserves for a device', self.problem(name))
         self.assertIn('ends in a dot', self.problem('take.'))
         self.assertIn('ends in a space', self.problem('take '))
         self.assertIn('ends in a dot', media.invalid_on_target('/mnt/shoot/day1./a.mov', self.RULE))
-        for name in ('console.mov', 'COM0.mov', 'COM10.mov', 'LPT.mov', 'nul_take.mov', 'a.con', 'take.mov'):
+        for name in ('console.mov', 'COM10.mov', 'LPT.mov', 'nul_take.mov', 'a.con', 'take.mov', 'CONIN.mov', 'CONOUT$x.mov',
+                     'con x.mov', 'COM.mov'):
             with self.subTest(name=name):
                 self.assertIsNone(self.problem(name))
         self.assertIsNone(media.invalid_on_target('/mnt/shoot/CON.mov', ('/mnt/shoot', '/Volumes/Shoot')))
@@ -228,9 +230,11 @@ class TestedInReport(unittest.TestCase):
         expected = {
             'Final Cut Pro 7 XML (Premiere Pro, Resolve, Avid):': [
                 "Adobe Premiere Pro 27 imported Splice's Final Cut 7 XML for three test timelines with zero cut differences.",
-                "A reversed linked pair arrives unlinked in Premiere (Premiere's own export does the same).",
+                'A reversed linked pair arrives unlinked in Premiere; Premiere\'s own re-export of that sequence also wrote '
+                'the reversed pair unlinked.',
                 'Premiere shows its own Link Media dialog when mapped paths do not exist.'],
-            'FCPXML 1.10 (DaVinci Resolve, Final Cut Pro):': ['DaVinci Resolve 21.1 imported the FCPXML frame-exact.'],
+            'FCPXML 1.10 (DaVinci Resolve, Final Cut Pro):': [
+                'DaVinci Resolve 21.1 imported the FCPXML frame-exact, verified on one test timeline.'],
             'CMX3600 EDL:': ['DaVinci Resolve 21.1 conforms EDLs by timecode only and refuses audio-only EDLs.'],
             'OpenTimelineIO:': ['DaVinci Resolve 21.1 cancelled an OTIO import in the one attempt made (unverified since '
                                 'the OTIO writer was changed to match OpenTimelineIO 0.18).'],
@@ -242,6 +246,7 @@ class TestedInReport(unittest.TestCase):
                 self.assertIn('    ' + fact + '\n', section + '\n', heading)
         only_fcpxml = api.export_timeline(synthetic_project(paths), {'unknownTimecode': 'zero'})['report']
         self.assertNotIn('Premiere Pro 27 imported', only_fcpxml, 'facts appear only for the formats exported')
+        self.assertNotIn('does the same', report, 'only what was observed')
 
 
 class LinkBudget(unittest.TestCase):

@@ -66,19 +66,26 @@ def remove_stale_launchers(directory, min_age=STALE_LAUNCHER_SECONDS):
     directory = Path(directory)
     if directory.is_symlink() or not directory.is_dir():
         return []
-    removed, now = [], time.time()
-    with os.scandir(directory) as entries:
-        for entry in entries:
-            if not LAUNCHER_NAME.fullmatch(entry.name):
-                continue
-            try:
-                if not entry.is_file(follow_symlinks=False) or now - entry.stat(follow_symlinks=False).st_mtime < min_age:
+    removed, failed, now = [], 0, time.time()
+    try:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if not LAUNCHER_NAME.fullmatch(entry.name):
                     continue
-                os.unlink(entry.path)  # Removes a name in this folder; a swapped-in symlink's target is untouched.
-            except OSError as error:
-                print(f"Splice could not remove an old launch file {entry.name}: {error}", file=sys.stderr)
-                continue
-            removed.append(entry.name)
+                try:
+                    if not entry.is_file(follow_symlinks=False) or now - entry.stat(follow_symlinks=False).st_mtime < min_age:
+                        continue
+                    os.unlink(entry.path)  # Removes a name in this folder; a swapped-in symlink's target is untouched.
+                except FileNotFoundError:
+                    continue  # Another Splice starting at the same time removed it first.
+                except OSError as error:
+                    if not failed:  # One line, however many files: the cause is the same.
+                        print(f"Splice could not remove an old launch file {entry.name}: {error}", file=sys.stderr)
+                    failed += 1
+                    continue
+                removed.append(entry.name)
+    except OSError as error:  # An unreadable profile folder: start anyway; the browser will say more.
+        print(f"Splice could not look for old launch files in {directory}: {error}", file=sys.stderr)
     return removed
 
 
