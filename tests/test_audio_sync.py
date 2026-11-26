@@ -89,6 +89,21 @@ class WaveformSync(unittest.TestCase):
                 self.assertAlmostEqual(result['offsetSeconds'], expected_start, delta=.004, msg=result)
                 self.assertIn('drift', result['note'])
 
+    def test_separated_bursts_keep_sample_alignment(self):
+        sound = self.directory/'separated-bursts.wav'
+        bursts = 'between(t,0.3,0.8)+between(t,7.1,7.6)+between(t,50,50.7)+between(t,56,56.4)'
+        ffmpeg('-f', 'lavfi', '-i', 'anoisesrc=r=8000:d=60:seed=7',
+               '-af', f"aeval='val(0)*({bursts})'", str(sound))
+        delayed = self.directory/'separated-bursts-delayed.wav'
+        ffmpeg('-i', str(sound), '-af', 'adelay=16271S:all=1', str(delayed))
+        inverted = self.directory/'separated-bursts-inverted.wav'
+        ffmpeg('-i', str(sound), '-af', 'volume=-1', str(inverted))
+        for recording, expected_samples in ((sound, 0), (delayed, 16271*6), (inverted, 0)):
+            with self.subTest(recording=recording.name):
+                result = audio_sync.waveform_offset(sound, recording, search_seconds=6)
+                self.assertTrue(result['ok'], result)
+                self.assertEqual(result['offsetSamples'], expected_samples, result)
+
     def test_drift_with_hiss_around_quiet_leaders_and_tails(self):
         sound = self.directory/'padded.wav'
         ffmpeg('-i', str(self.recorder), '-af', 'adelay=20000:all=1,apad=pad_dur=20', str(sound))

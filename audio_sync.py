@@ -403,8 +403,10 @@ def waveform_offset(picture_path, sound_path, *, picture_stream=0, sound_stream=
     offset, score, _ = _refine(pic, snd, refine_seed, centre, begin, end)
     result = dict(method='waveform', confidence=round(confidence, 3), peakRatio=round(min(ratio, 99), 2),
                   coarseOffsetSeconds=round(coarse, 4))
-    if offset is None:
-        offset, score = refine_seed, 0.0
+    # The four-second waveform window can be silent between bursts that gave
+    # the eight-second envelope a reliable offset.
+    if offset is None or (windows and score < MIN_LOCAL_CORRELATION):
+        offset = refine_seed
     if windows:
         (early_centre, early_env), (late_centre, late_env) = windows
         rate = (late_env-early_env)/(late_centre-early_centre)
