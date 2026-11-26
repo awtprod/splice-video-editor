@@ -266,6 +266,27 @@ class WindowSeams(ExactCase):
                  dict(type='video', mediaId='c', track=2, start=6-1/24, duration=1/24, **{'in': 12}, transform=dict(scale=50))]
         self.compare(clips)
 
+    def test_rotation_keyframes_with_a_lead_in_on_a_seam(self):
+        # The lead-in starts on the 6 s seam, so the seam moves to the cut's
+        # second frame and the clip's rotation continues in the next window.
+        # rotate's c=none left the uncovered corners unwritten: a reused
+        # frame buffer showed the previous frame's corner pixels there.
+        base = dict(type='video', mediaId='c', track=1, start=6+3/24, duration=3, **{'in': 10},
+                    keyframes={'rotation': [dict(time=0, value=20), dict(time=3, value=90)]})
+        for transition in ('dissolve', 'wipe', 'fade'):
+            with self.subTest(transition=transition):
+                self.compare([dict(base, transition=transition, transitionDuration=3/24, transitionBefore=3/24)])
+
+    def test_wipe_is_fully_revealed_on_its_last_frame(self):
+        # 4 frames at 24 fps: T reaches 4/24 on the frame after the wipe,
+        # which printed to 6 decimals (0.166667) is above T, so the mask
+        # still hid the right edge of that frame.
+        moving = {'x': [dict(time=0, value=60), dict(time=3, value=10)]}
+        clip = dict(type='video', mediaId='c', track=1, start=6+2/24, duration=3, **{'in': 10}, keyframes=moving)
+        wiped = self.compare([dict(clip, transition='wipe', transitionDuration=4/24, transitionBefore=2/24)])
+        plain = self.compare([clip])
+        self.assertEqual(wiped[148:], plain[148:])
+
     def test_transition_starting_one_frame_after_a_seam(self):
         base = dict(type='video', mediaId='c', track=1)
         for transition in ('dissolve', 'wipe', 'fade'):

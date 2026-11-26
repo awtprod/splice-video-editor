@@ -674,6 +674,10 @@ def _transform(clip, width, height, local_offset=0, fps=None):
     if angle or angle_keys:
         # FFmpeg configures rotate's output dimensions from the first input
         # frame. Reserve space for the largest animated scale up front.
+        # The corners outside the rotated picture are filled transparent:
+        # rotate's c=none leaves them unwritten, so a reused frame buffer
+        # shows the previous frame's pixels there (and a window's first
+        # frame, with a fresh buffer, would not match a single render).
         if scale_keys:
             peak = max(float(point['value']) for point in scale_keys)/100
             if angle_keys:
@@ -683,11 +687,11 @@ def _transform(clip, width, height, local_offset=0, fps=None):
                 canvas_width = (width*cos+height*sin)*peak
                 canvas_height = (width*sin+height*cos)*peak
             out_width, out_height = 2*math.ceil(canvas_width/2), 2*math.ceil(canvas_height/2)
-            filters += f",rotate=a='({angle_expr})*PI/180':ow={out_width}:oh={out_height}:c=none"
+            filters += f",rotate=a='({angle_expr})*PI/180':ow={out_width}:oh={out_height}:c=black@0"
         elif angle_keys:
-            filters += f",rotate=a='({angle_expr})*PI/180':ow=hypot(iw\\,ih):oh=ow:c=none"
+            filters += f",rotate=a='({angle_expr})*PI/180':ow=hypot(iw\\,ih):oh=ow:c=black@0"
         else:
-            filters += f',rotate={angle:.5f}*PI/180:ow=rotw(iw):oh=roth(ih):c=none'
+            filters += f',rotate={angle:.5f}*PI/180:ow=rotw(iw):oh=roth(ih):c=black@0'
     elif scale_keys:
         # Filters after an animated scale (opacity, wipe and dip masks, the
         # overlay) keep the frame size of the first frame they see, which
@@ -1225,7 +1229,9 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
             chain += f',fade=t=in:st=0:d={transition_duration:.6f}:alpha=1'
         if clip.get('transition') == 'wipe':
             left = _horizontal_position(clip,width,'W',_keyframe_clock(clip,fps,'T',before))
-            mask = f'if(gte(T,{transition_duration:.6f}),1,lt(X+({left}),{width}*T/{transition_duration:.6f}))'
+            # The frame at the wipe's end is fully revealed: T and the printed
+            # duration can differ by rounding, so compare with 1 us of slack.
+            mask = f'if(gte(T,{transition_duration-1e-6:.9f}),1,lt(X+({left}),{width}*T/{transition_duration:.9f}))'
             chain += _mask_alpha(mask,alpha_format,full_alpha)
         elif clip.get('_wipeMask'):
             # Same format round trip as the window that holds the wipe.
@@ -1727,6 +1733,13 @@ def _render_prepared(project, output_path, *, options=None, progress=None, cance
                                (max(0, out_start-AUDIO_PREROLL_SECONDS), out_end), heartbeat)
     root = Path(work_directory) if work_directory else work_root()
     video_bytes, audio_bytes = _estimated_bytes(width, height, fps, out_duration, codec)
+    # A speed-changed or resampled clip that crosses a chunk seam is rendered
+    # whole first (32-bit float stereo); the longest one is on disk at a time.
+    # Lossy deliveries also keep an AAC file until the mux.
+    longest_stateful = max((event['length'] for event in events if event.get('stateful')), default=0)
+    audio_bytes += min(longest_stateful, out_duration+AUDIO_PREROLL_SECONDS)*AUDIO_RATE*2*4
+    if codec == 'h264':
+        audio_bytes += out_duration*40_000
     output = Path(output_path)
     final_bytes = video_bytes + (out_duration*AUDIO_RATE*2*3 if codec != 'h264' else out_duration*40_000)
     same_volume = output.parent.exists() and os.stat(output.parent).st_dev == os.stat(root).st_dev

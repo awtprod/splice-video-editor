@@ -296,5 +296,38 @@ class Delivery(Case):
                         render_movie.work_root()
 
 
+class Python310(Case):
+    """Splice supports Python 3.10; Fraction accepts format specs only from 3.12."""
+
+    def test_exports_format_no_fraction_with_a_format_spec(self):
+        from fractions import Fraction
+
+        def format_as_on_python_310(value, spec):
+            if spec:
+                raise TypeError(f'unsupported format string passed to Fraction.__format__: {spec!r}')
+            return str(value)
+        source = self.directory/'cam.mp4'
+        ffmpeg('-f', 'lavfi', '-i', 'testsrc2=s=64x36:r=30000/1001:d=6', '-f', 'lavfi', '-i', 'sine=f=300:d=6',
+               '-c:v', 'libx264', '-c:a', 'aac', '-shortest', str(source))
+        fps = 24000/1001
+        clips = [dict(type='video', mediaId='c', track=1, start=0, duration=2, **{'in': .5}),
+                 dict(type='video', mediaId='c', track=1, start=2, duration=1.5, **{'in': 1}, reverse=True, transition='dissolve',
+                      transitionDuration=.5, transitionBefore=.25, keyframes={'opacity': [dict(time=0, value=100), dict(time=1, value=40)]}),
+                 dict(type='video', mediaId='c', track=2, start=1, duration=2, **{'in': 2}, speed=1.5, transition='wipe',
+                      transitionDuration=.3, keyframes={'rotation': [dict(time=0, value=0), dict(time=2, value=30)]}),
+                 dict(type='audio', mediaId='c', track=1, start=0, duration=3.5, **{'in': .5}, speed=1.25),
+                 dict(type='title', track=4, start=.5, duration=2, title='Ten')]
+        project = dict(width=64, height=36, fps=fps, media=[dict(id='c', src=self.src(source))], clips=clips,
+                       captions=[dict(start=.2, duration=1, text='Hello')])
+        with mock.patch.object(Fraction, '__format__', format_as_on_python_310), \
+                mock.patch.multiple(render_movie, VIDEO_WINDOW_SECONDS=1, AUDIO_CHUNK_SECONDS=1.3):
+            for codec, suffix in (('h264', '.mp4'), ('prores', '.mov'), ('wav', '.wav')):
+                for span in (None, {'start': 13/fps, 'end': 61/fps}):
+                    with self.subTest(codec=codec, range=bool(span)):
+                        output = self.directory/f'out{suffix}'
+                        render_to_file(project, output, options={'codec': codec, **({'range': span} if span else {})})
+                        self.assertGreater(output.stat().st_size, 0)
+
+
 if __name__ == '__main__':
     unittest.main()
