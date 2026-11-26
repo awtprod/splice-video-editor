@@ -1,39 +1,30 @@
 /* Shared setup for browser regressions: a private Splice server, Chromium and media helpers. */
-const {spawn, execFileSync} = require('node:child_process');
+const {execFileSync} = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const {chromium} = require('playwright-core');
+const {startSplice: startSpliceServer} = require('./splice-server.cjs');
 
 const root = path.resolve(__dirname, '..');
 
 async function startSplice(prefix) {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-  const server = spawn('python3', ['-u', 'server.py', '--port', '0'], {
-    cwd: root, env: {...process.env, HOME: temp, XDG_DATA_HOME: temp}, stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  let logs = '';
-  server.stderr.on('data', chunk => { logs = (logs + chunk).slice(-4000); });
-  const url = await new Promise((resolve, reject) => {
-    server.stdout.once('data', data => resolve(data.toString().trim()));
-    server.once('error', reject);
-    server.once('exit', code => reject(Error('Server exited: ' + code + ' ' + logs)));
-  });
+  const server = await startSpliceServer({root, env: {HOME: temp, XDG_DATA_HOME: temp}});
   const executablePath = [process.env.SPLICE_CHROME, '/opt/google/chrome/chrome', '/usr/bin/chromium',
     '/usr/bin/google-chrome', chromium.executablePath()].find(file => file && fs.existsSync(file));
-  if (!executablePath) throw Error('Install Chromium or set SPLICE_CHROME');
+  if (!executablePath) {
+    await server.stop();
+    throw Error('Install Chromium or set SPLICE_CHROME');
+  }
   const browser = await chromium.launch({executablePath,
     args: ['--no-sandbox', '--autoplay-policy=no-user-gesture-required', '--js-flags=--expose-gc']});
   async function stop() {
     await browser.close().catch(() => {});
-    if (server.exitCode === null) {
-      const stopped = new Promise(resolve => server.once('exit', resolve));
-      server.kill('SIGTERM');
-      await stopped;
-    }
+    await server.stop();
     fs.rmSync(temp, {recursive: true, force: true});
   }
-  return {url, browser, temp, stop};
+  return {url: server.url, server, browser, temp, stop};
 }
 
 async function openPage(splice, viewport = {width: 1440, height: 900}) {
@@ -45,8 +36,8 @@ async function openPage(splice, viewport = {width: 1440, height: 900}) {
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
   page.on('dialog', dialog => dialog.accept());
-  await page.goto(splice.url);
-  await page.evaluate(() => SpliceSession.ready);
+  // The first context spends the one-time launch link; later contexts share its session cookie.
+  await splice.server.open(page);
   return {page, errors};
 }
 
