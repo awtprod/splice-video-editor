@@ -65,8 +65,43 @@ DEFAULT_LIMITER_CEILING_DB = -1.0
 # measured and re-encoded quieter until it is under the ceiling.
 TRUE_PEAK_OVERSAMPLE = 4
 AAC_PEAK_ATTEMPTS = 6
+# A disabled clip next to a transition is kept as a transparent stand-in with
+# this media id, so its neighbour's transition runs against nothing.
+DISABLED_MEDIA = '\x00disabled'
 WORK_PREFIXES = ('splice-export-', 'splice-segments-', 'splice-audio-', 'splice-lut-', 'splice-render-')
 LOCK_NAME = '.splice-owner.lock'
+
+
+def clip_enabled(clip):
+    """A clip with ``enabled`` False contributes no picture and no sound (absent or True: enabled)."""
+    return clip.get('enabled') is not False
+
+
+def _disabled_stand_ins(clips, fps):
+    """Drop disabled picture clips; keep those on either side of a transition as transparent stand-ins.
+
+    Rule: the transition still happens, with the disabled side contributing
+    nothing. A dissolve from or to a disabled clip dissolves the enabled clip
+    with whatever lies beneath it (black on the lowest track); a wipe wipes the
+    enabled clip on or off over the layers beneath; a dip to black still dips
+    the enabled side to or from black.
+    """
+    joined = set()
+    for clip in clips:
+        if clip.get('type') == 'video' and clip.get('transition') in ('dissolve', 'wipe', 'fade'):
+            joined.add((clip.get('track', 0), round(float(clip['start'])*fps)))
+    kept = []
+    for clip in clips:
+        if clip_enabled(clip):
+            kept.append(clip)
+        elif clip.get('type') == 'video' and (clip.get('transition') in ('dissolve', 'wipe', 'fade') or
+                                               (clip.get('track', 0), round((float(clip['start'])+float(clip['duration']))*fps)) in joined):
+            stand_in = {key: value for key, value in clip.items() if key in
+                        ('id', 'type', 'track', 'start', 'duration', 'transition', 'transitionBefore', 'transitionDuration',
+                         'transitionMatchName')}
+            stand_in.update(mediaId=DISABLED_MEDIA, enabled=False)
+            kept.append(stand_in)
+    return kept
 
 
 def _render_source(item):
@@ -1154,14 +1189,24 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
         first_frame, frames = _frame_span(render_start, render_length, fps)
         still_frames = frames if item.get('_renderStill') else 0
         origin = _sample_origin(render_start, render_length, first_frame, frames, fps, reverse)
-        prefix = _picture_input(index,render_source,render_length,speed,width,height,fps,reverse,still_frames,
-                                frames=frames,origin=origin)
-        fit = _fit_picture(width,height,color,lut_filter,alpha_format,high_depth,item.get('_sourceProfile'),rec709,
-                           still_frames=still_frames,hdr_profile=hdr_profile,conform_pq=conform_pq)
-        # Reverse after scaling so the buffered window holds sequence-size frames.
-        flip = ',reverse' if reverse and not still_frames and index is not None else ''
-        chain = f'{prefix},{fit}{flip}{transform}'
-        if opacity_keys:
+        disabled = bool(item.get('_disabled'))
+        if disabled:
+            # Nothing, for as long as the clip lasts: its neighbour's transition
+            # mixes with the layers beneath.
+            chain = (f'color=c=black@0:s={width}x{height}:r={fps}:d={frames/float(fps):.6f},format={alpha_format},'
+                     f'setpts=PTS-STARTPTS,trim=end_frame={frames}')
+            transform, position = '', 'x=0:y=0'
+        else:
+            prefix = _picture_input(index,render_source,render_length,speed,width,height,fps,reverse,still_frames,
+                                    frames=frames,origin=origin)
+            fit = _fit_picture(width,height,color,lut_filter,alpha_format,high_depth,item.get('_sourceProfile'),rec709,
+                               still_frames=still_frames,hdr_profile=hdr_profile,conform_pq=conform_pq)
+            # Reverse after scaling so the buffered window holds sequence-size frames.
+            flip = ',reverse' if reverse and not still_frames and index is not None else ''
+            chain = f'{prefix},{fit}{flip}{transform}'
+        if disabled:
+            pass
+        elif opacity_keys:
             opacity_expr=_keyframe_expr(clip,'opacity',opacity*100,0,100,_keyframe_clock(clip,fps,'T',before))
             chain += _mask_alpha(f'({opacity_expr})/100',alpha_format,full_alpha)
         elif opacity!=1:
@@ -1170,20 +1215,24 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
         previous = video_clips[prior_number] if prior_number is not None else None
         next_number = followers.get(number)
         following = video_clips[next_number] if next_number is not None else None
-        if following and following.get('transition') == 'dissolve':
-            # Use the same lower layers under both sides of the dissolve.
+        if following and (following.get('transition') == 'dissolve' or
+                          following.get('transition') == 'wipe' and following.get('mediaId') == DISABLED_MEDIA):
+            # Use the same lower layers under both sides of the dissolve (or of
+            # a wipe to a disabled clip, which wipes this clip off).
             filters.append(f'[{active}]split[with{number}][without{next_number}]')
             active = f'with{number}'
         dipped = False
-        if dip_head>0:
+        if disabled:
+            pass
+        elif dip_head>0:
             chain += f',format={dip_rgb},fade=t=in:st=0:d={dip_head:.6f}'
             dipped = True
-        if following and following.get('transition') == 'fade':
+        if following and following.get('transition') == 'fade' and not disabled:
             dip_tail = float(following.get('transitionBefore',0) or 0)
             if dip_tail>0:
                 chain += f',format={dip_rgb},fade=t=out:st={max(0,render_length-dip_tail):.6f}:d={dip_tail:.6f}'
                 dipped = True
-        if clip.get('_dipFormat') and not dipped:
+        if clip.get('_dipFormat') and not dipped and not disabled:
             # The rest of a clip that dips elsewhere: take the same RGB round
             # trip so its pixels match the window that holds the dip.
             chain += f',format={dip_rgb}'
@@ -1211,7 +1260,8 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
             prior_lut=_lut_filter(prior_color,Path(directory)/f'tail-{number}.cube',preserve_headroom=bool(
                 hdr_profile and (prior_item.get('_sourceProfile') or REC709)[1] in HDR_TRANSFERS))
             prior_opacity=_number(prior_tail.get('opacity',100),'opacity',0,100)/100
-            if tail + 1e-6 >= frame_duration:
+            # A disabled outgoing clip has no tail: the incoming clip dissolves or wipes in over what lies beneath.
+            if tail + 1e-6 >= frame_duration and not prior_item.get('_disabled'):
                 cut_frame, tail_frames = _frame_span(start, tail, fps)
                 still_tail = tail_frames if prior_item.get('_renderStill') else 0
                 tail_origin = _sample_origin(start, tail, cut_frame, tail_frames, fps, prior_reverse)
@@ -1225,9 +1275,11 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
                 filters.append(f'{prior_prefix},{prior_fit}{prior_flip}{prior_transform}{prior_alpha},setpts=PTS+{cut_frame}[tail{number}]')
                 filters.append(f'[{active}][tail{number}]overlay={prior_position}:{overlay}[under{number}]')
                 active = f'under{number}'
-        elif clip.get('transition') == 'dissolve':
+        elif clip.get('transition') == 'dissolve' and not disabled:
             chain += f',fade=t=in:st=0:d={transition_duration:.6f}:alpha=1'
-        if clip.get('transition') == 'wipe':
+        if disabled:
+            pass
+        elif clip.get('transition') == 'wipe':
             left = _horizontal_position(clip,width,'W',_keyframe_clock(clip,fps,'T',before))
             # The frame at the wipe's end is fully revealed: T and the printed
             # duration can differ by rounding, so compare with 1 us of slack.
@@ -1238,11 +1290,16 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
             chain += _mask_alpha('1',alpha_format,full_alpha)
         chain += f',setpts=PTS+{first_frame}[clip{number}]'
         filters.append(chain)
-        if overlap_transition and clip.get('transition') == 'dissolve':
+        wipe_off = overlap_transition and disabled and clip.get('transition') == 'wipe'
+        if overlap_transition and clip.get('transition') == 'dissolve' or wipe_off:
             filters.append(f'[without{number}][clip{number}]overlay={position}:{overlay}[incoming{number}]')
             end = render_start+transition_duration
             progress = f'(T-{render_start:.9f})/{transition_duration:.9f}'
-            blend = f'if(lte(T,{render_start:.9f}),A,if(gte(T,{end:.9f}),B,A*(1-{progress})+B*{progress}))'
+            # A wipe to a disabled clip uncovers the layers beneath from the left.
+            mix = f'if(lt(X,W*{progress}),B,A)' if wipe_off else f'A*(1-{progress})+B*{progress}'
+            # (The wipe's last frame is fully uncovered: compare with 1 us of slack, as the wipe mask does.)
+            finish = end-1e-6 if wipe_off else end
+            blend = f'if(lte(T,{render_start:.9f}),A,if(gte(T,{finish:.9f}),B,{mix}))'
             filters.append(f"[{active}][incoming{number}]blend=all_expr='{blend}'[base{number+1}]")
         else:
             filters.append(f'[{active}][clip{number}]overlay={position}:{overlay}[base{number+1}]')
@@ -1290,7 +1347,9 @@ def _audio_events(clips, media_by_id, fps, probes, track_mix, solo, span, heartb
             upcoming.setdefault((candidate['type'], candidate.get('track'), round(float(candidate['start'])*fps)), candidate)
     events = []
     for clip in clips:
-        if clip.get('type') not in ('audio','video'):
+        if clip.get('type') not in ('audio','video') or not clip_enabled(clip):
+            # A disabled clip is silent (its embedded sound too). It stays in
+            # `upcoming`, so a neighbour's crossfade still fades against it.
             continue
         item = media_by_id.get(clip.get('mediaId'))
         if item is None:
@@ -1559,6 +1618,8 @@ def render_to_file(project, output_path, *, options=None, progress=None, cancell
     # Keys with a leading underscore are internal to the renderer.
     options = {key: value for key, value in (options or {}).items() if isinstance(key, str) and not key.startswith('_')}
     if _nested_depth>4: raise ValueError('Nested Premiere sequences exceed four levels')
+    # Nested material used only by disabled clips is not rendered (it would contribute nothing).
+    enabled_media = {clip.get('mediaId') for clip in project.get('clips') or [] if isinstance(clip, dict) and clip_enabled(clip)}
     if not any(isinstance(item,dict) and item.get('nestedProject') for item in project['media']):
         return _render_prepared(project,output_path,options=options,progress=progress,cancelled=cancelled,heartbeat=heartbeat,
                                 work_directory=work_directory)
@@ -1567,7 +1628,7 @@ def render_to_file(project, output_path, *, options=None, progress=None, cancell
         prepared=copy.deepcopy(project)
         for index,item in enumerate(prepared['media']):
             child=item.get('nestedProject')
-            if not child: continue
+            if not child or item.get('id') not in enabled_media: continue
             if _nested_depth>=4: raise ValueError('Nested Premiere sequences exceed four levels')
             suffix='.mov' if options.get('codec')=='prores' else '.mp4'
             target=Path(directory)/f'nested-{index}{suffix}'
@@ -1666,8 +1727,12 @@ def _render_prepared(project, output_path, *, options=None, progress=None, cance
     total = math.ceil((total-1e-9)*fps)/fps
     track_state = project.get('trackState') or {}
     # A hidden track contributes no picture; a hidden video track still plays its audio.
-    picture_clips = [clip for clip in project['clips'] if clip.get('type') in ('video','title') and not
-                     _track_hidden(track_state, clip['type'], clip.get('track', 0 if clip['type'] == 'video' else 4))]
+    picture_clips = _disabled_stand_ins([clip for clip in project['clips'] if clip.get('type') in ('video','title') and not
+                                         _track_hidden(track_state, clip['type'], clip.get('track', 0 if clip['type'] == 'video' else 4))],
+                                        fps)
+    if any(clip.get('mediaId') == DISABLED_MEDIA for clip in picture_clips):
+        project['media'].append({'id': DISABLED_MEDIA, 'name': 'Disabled clip', 'nativeGenerator': 1112293707, '_disabled': True,
+                                 '_kinds': {'video'}, '_actualDuration': float(MAX_SOURCE_SECONDS), '_audioStreams': []})
     options['_output_frames'] = None
     options['_heartbeat'] = heartbeat
     probes = options['_probes'] = {}
