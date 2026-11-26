@@ -1,8 +1,12 @@
 (() => {
-  // Source marks: either may be unset, which three-point editing treats differently.
+  // Source marks: either may be unset, which three-point editing treats differently. Both
+  // include the frame they are set on; `out` is stored as the end of that frame (see Editor.setMark).
   let dialog, media, player, marks = {}, fps = 25, shuttleTimer, shuttleRate = 0;
+  let unsubscribe = null, committedMarks = '{}', frameRequest = 0;
   const markIn = () => Number.isFinite(marks.in) ? marks.in : 0;
   const markOut = () => Number.isFinite(marks.out) ? marks.out : media.duration;
+  // The last frame the range includes, for display.
+  const lastFrame = () => Math.max(markIn(), Math.round(markOut() * fps - 1) / fps);
   const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const snap = value => Math.round(value * fps) / fps;
   const format = seconds => Editor.formatTimecode(seconds,fps);
@@ -11,11 +15,11 @@
   function update() {
     if (!dialog?.open) return;
     dialog.querySelector('.source-time').textContent = format(current())+' / '+format(media.duration);
-    dialog.querySelector('.source-range').textContent = format(markIn())+' → '+format(markOut())+'  ·  '+format(markOut()-markIn());
+    dialog.querySelector('.source-range').textContent = 'In '+format(markIn())+' · Out '+format(lastFrame())+' · '+format(markOut()-markIn());
     dialog.querySelector('.source-plan').textContent = plan();
     dialog.querySelector('.source-scrub').value = current();
     dialog.querySelector('.source-scrub').max = media.duration;
-    requestAnimationFrame(update);
+    frameRequest = requestAnimationFrame(update);
   }
   // Describe how the next edit will be timed: the three-point rule that applies.
   function plan() {
@@ -24,19 +28,32 @@
     const timecode=Editor.sequenceTimecode;
     if(hasIn&&hasOut){
       const fourPoint=Number.isFinite(marks.in)&&Number.isFinite(marks.out);
-      return 'Fills timeline In '+timecode(timeline.in)+' to Out '+timecode(timeline.out)+
+      return 'Fills timeline In '+timecode(timeline.in)+' to Out '+timecode(Editor.markOutFrame(timeline.out))+
         (fourPoint?' (four-point: speed changes if lengths differ)':!Number.isFinite(marks.in)&&Number.isFinite(marks.out)?' back-timed from the source Out':'');
     }
     if(hasIn)return 'Starts at timeline In '+timecode(timeline.in);
-    if(hasOut)return 'Ends at timeline Out '+timecode(timeline.out)+' (back-timed)';
+    if(hasOut)return 'Ends at timeline Out '+timecode(Editor.markOutFrame(timeline.out))+' (back-timed)';
     return 'Starts at the playhead '+timecode(Editor.get().time);
   }
   function close() {
     if (!dialog) return;
     stopShuttle();
+    cancelAnimationFrame(frameRequest);
+    unsubscribe?.();unsubscribe=null;
     player.pause();player.removeAttribute('src');player.load();
     document.removeEventListener('keydown',onKey,true);
     dialog.close();dialog.remove();dialog=null;player=null;media=null;
+    document.querySelector('.workspace')?.classList.remove('source-open');
+  }
+  // Follow the project: undo can change the saved marks, and a new project can drop the source.
+  function follow(state) {
+    if (!dialog || !media) return;
+    const item=state.project.media.find(entry=>entry.id===media.id);
+    if (!item) { close(); return; }
+    const saved=JSON.stringify(item.sourceMarks||{});
+    if (saved===committedMarks) return;
+    committedMarks=saved;
+    marks={...(item.sourceMarks||{})};
   }
   function stopShuttle() {
     if(shuttleTimer)clearInterval(shuttleTimer);
@@ -54,14 +71,17 @@
     },1000/fps);
   }
   function mark(edge) {
-    const point=Math.min(media.duration,snap(current()));
+    // The frame under the source playhead; an Out mark includes it, so it ends one frame later.
+    const frame=Math.round(current()*fps);
+    const lastStart=Math.max(0,Math.ceil(media.duration*fps-1e-6)-1);
     if (edge==='in') {
-      marks.in=Math.min(point,Math.max(0,media.duration-1/fps));
-      if(Number.isFinite(marks.out) && marks.out<marks.in+1/fps) delete marks.out;
+      marks.in=Math.min(frame,lastStart)/fps;
+      if(Number.isFinite(marks.out) && marks.out<marks.in+1/fps-1e-9) delete marks.out;
     } else {
-      marks.out=Math.max(point,Math.min(media.duration,1/fps));
-      if(Number.isFinite(marks.in) && marks.in>marks.out-1/fps) delete marks.in;
+      marks.out=Math.min(Math.min(frame,lastStart)+1,Math.max(1,media.duration*fps))/fps;
+      if(Number.isFinite(marks.in) && marks.in>marks.out-1/fps+1e-9) delete marks.in;
     }
+    committedMarks=JSON.stringify(marks);
     Editor.setSourceSettings(media.id,{sourceMarks:{...marks}});
   }
   function place(mode) {
@@ -75,12 +95,15 @@
     try { result=Editor.placeSource(media.id,{mode,track,audioTrack,marks:{...marks}}); }
     catch (error) { return show(error.message); }
     if (result.speed!==1) Editor.select(result.clips[0]);
-    close();
+    // The monitor stays open: three-point editing is mark, place, mark, place.
+    const verb={insert:'Inserted',overwrite:'Overwrote',append:'Appended'}[mode];
+    show(verb+' '+format(result.duration)+' at '+Editor.sequenceTimecode(result.start)+' · '+result.method+
+      (result.speed!==1?' at '+Math.round(result.speed*100)+'% speed':''),false);
   }
   // The monitor is non-modal: its keys apply only while focus is inside it.
   function onKey(event) {
     if (!dialog?.open || !dialog.contains(document.activeElement)) return;
-    if (/INPUT|SELECT|TEXTAREA/.test(document.activeElement?.tagName) && document.activeElement?.type!=='range') return;
+    if (window.SpliceKeys?.keyBelongsToControl(document.activeElement,event)) return;
     const key=event.key.toLowerCase();
     if(key==='escape'){event.preventDefault();close();}
     if(key==='i'||key==='o'){event.preventDefault();mark(key==='i'?'in':'out');}
@@ -114,8 +137,25 @@
     const soundTarget=media.type==='video' && !media.still && media.audioChannels>0 ?
       `<label class="source-track-label">Camera sound to <select class="source-audio-track"><option value="">Keep inside the picture clip</option>${Array.from({length:soundTracks},(_,i)=>`<option value="${-i-1}"${i===0?' selected':''}>Audio ${i+1}</option>`).join('')}</select></label>` : '';
     dialog=document.createElement('dialog');dialog.className='source-dialog';
-    dialog.innerHTML=`<div class="source-head"><div><small>SOURCE MONITOR</small><strong>${esc(media.name)}</strong></div><button class="source-close" aria-label="Close source monitor">×</button></div><div class="source-stage"><${media.type==='audio'?'audio':'video'} controls playsinline preload="auto"></${media.type==='audio'?'audio':'video'}></div><div class="source-controls"><input class="source-scrub" type="range" min="0" max="${media.duration}" step="${1/fps}" value="0" aria-label="Source playhead"><span class="source-time"></span><div class="source-buttons"><button data-action="back">−1 frame</button><button data-action="play">Play / Pause</button><button data-action="forward">+1 frame</button><button data-action="in">Mark In (I)</button><button data-action="out">Mark Out (O)</button></div><span class="source-range"></span><small class="source-plan"></small><small class="source-shortcuts">J reverse · K stop · L forward · , insert · . overwrite</small><label class="source-bin">Bin path <input type="text" value="${esc(media.bin || '')}" placeholder="e.g. Interview / Camera A" aria-label="Media bin path"></label><label class="source-track-label">Timeline track <select class="source-track">${Array.from({length:trackCount},(_,i)=>media.type==='video'?i+1:-i-1).map(n=>`<option value="${n}">${media.type==='video'?'Video':'Audio'} ${Math.abs(n)}${Math.abs(n)>nativeTrackLimit?' · working project only':''}</option>`).join('')}</select></label>${soundTarget}<div class="source-actions"><button data-action="append">Append</button><button data-action="overwrite" title="Overwrite (.)">Overwrite</button><button class="source-primary" data-action="insert" title="Insert (,)">Insert</button></div><p class="source-status" role="status"></p></div>`;
-    document.body.append(dialog);player=dialog.querySelector('video,audio');player.src=media.src;player.onerror=()=>show('The source file could not be decoded.');player.onended=stopShuttle;
+    dialog.setAttribute('aria-label','Source monitor: '+media.name);
+    const tag=media.type==='audio'?'audio':'video';
+    const trackOptions=Array.from({length:trackCount},(_,i)=>media.type==='video'?i+1:-i-1)
+      .map(n=>`<option value="${n}">${media.type==='video'?'Video':'Audio'} ${Math.abs(n)}${Math.abs(n)>nativeTrackLimit?' · working project only':''}</option>`).join('');
+    // Head, picture, settings (scroll when short) and a footer whose edit buttons are always in view.
+    dialog.innerHTML=`<div class="source-head"><div><small>SOURCE</small><strong>${esc(media.name)}</strong></div><button class="source-close" aria-label="Close source monitor">×</button></div>`+
+      `<div class="source-stage"><${tag} controls playsinline preload="auto"></${tag}></div>`+
+      `<div class="source-controls"><input class="source-scrub" type="range" min="0" max="${media.duration}" step="${1/fps}" value="0" aria-label="Source playhead">`+
+      `<div class="source-readout"><span class="source-time"></span><span class="source-range"></span></div>`+
+      `<div class="source-buttons"><button data-action="back" title="Back one frame (←)">−1</button><button data-action="play" title="Play / pause (Space)">Play</button><button data-action="forward" title="Forward one frame (→)">+1</button><button data-action="in" title="Mark In on this frame (I)">Mark In</button><button data-action="out" title="Mark Out on this frame, included (O)">Mark Out</button></div>`+
+      `<small class="source-shortcuts">I · O mark (both frames included) · J K L shuttle · , insert · . overwrite</small>`+
+      `<label class="source-track-label">Timeline track <select class="source-track">${trackOptions}</select></label>${soundTarget}`+
+      `<label class="source-bin">Bin path <input type="text" value="${esc(media.bin || '')}" placeholder="e.g. Interview / Camera A" aria-label="Media bin path"></label></div>`+
+      `<div class="source-footer"><small class="source-plan"></small><p class="source-status" role="status"></p><div class="source-actions"><button data-action="append">Append</button><button data-action="overwrite" title="Overwrite (.)">Overwrite</button><button class="source-primary" data-action="insert" title="Insert (,)">Insert</button></div></div>`;
+    // A panel of the workspace, left of the program monitor (the inspector makes room).
+    const workspace=document.querySelector('.workspace'), viewer=workspace?.querySelector('.viewer');
+    if (viewer) { viewer.before(dialog); workspace.classList.add('source-open'); }
+    else document.body.append(dialog);
+    player=dialog.querySelector('video,audio');player.src=media.src;player.onerror=()=>show('The source file could not be decoded.');player.onended=stopShuttle;
     player.onloadedmetadata=()=>{
       if(!dialog?.open)return;
       if(Number.isFinite(player.duration)&&player.duration>0){
@@ -158,10 +198,10 @@
     const proxyButton=document.createElement('button');
     const trackPicker=document.createElement('select');
     if(media.type==='video' && !media.still && !Number.isInteger(media.nestedSequence)) {
-      const button=proxyButton;button.type='button';
+      const button=proxyButton;button.type='button';button.className='source-proxy';
       button.textContent=media.seekOptimized?'Seek proxy active':'Build seek proxy';
       button.disabled=!!media.seekOptimized;
-      dialog.querySelector('.source-actions').prepend(button);
+      dialog.querySelector('.source-bin').before(button);
       button.onclick=async()=>{
         const active=dialog;
         button.disabled=trackPicker.disabled=true;
@@ -181,7 +221,7 @@
       trackPicker.append(new Option('Default stereo routing',''));
       for(let i=0;i<media.audioStreams;i++)trackPicker.append(new Option(`Stream ${i+1}`,String(i)));
       trackPicker.value=media.audioStream??'';
-      dialog.querySelector('.source-actions').before(label);
+      dialog.querySelector('.source-bin').before(label);
       trackPicker.onchange=async()=>{
         const active=dialog;
         const choice=trackPicker.value===''?null:Number(trackPicker.value);
@@ -218,6 +258,8 @@
     dialog.tabIndex=-1;
     dialog.show();
     document.addEventListener('keydown',onKey,true);
+    committedMarks=JSON.stringify(item.sourceMarks||{});
+    unsubscribe=Editor.subscribe(follow);
     dialog.focus();
     update();
     const choice=item.sourceAudioStream;

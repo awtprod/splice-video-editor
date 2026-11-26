@@ -29,17 +29,21 @@ async function clipBox(page, id, selector = '') {
   }
 }
 
-// Open the source monitor, mark a source range and place it with the given key.
+// Open the source monitor, mark a source range [from, to) and place it with the given key.
+// Out includes the frame it is marked on, so it is marked on the last frame, one before `to`.
 async function sourceEdit(page, mediaId, {from, to, key}) {
   await state(page, id => SpliceSource.open(id), mediaId);
   await waitFor(page, () => document.querySelector('.source-stage video')?.readyState >= 2);
-  for (const [edge, value] of [['in', from], ['out', to]]) {
+  for (const [edge, value] of [['in', from], ['out', to === undefined ? undefined : to - 1 / 25]]) {
     if (value === undefined) continue;
     await page.locator('.source-scrub').fill(String(value));
     await waitFor(page, target => Math.abs(document.querySelector('.source-stage video').currentTime - target) < .02, value);
     await page.locator(`[data-action=${edge}]`).click();
   }
   await page.keyboard.press(key);
+  // The monitor stays open after an edit; close it so the timeline has the keyboard again.
+  await waitFor(page, () => /^(Inserted|Overwrote|Appended)/.test(document.querySelector('.source-status')?.textContent));
+  await page.locator('.source-close').click();
   await waitFor(page, () => !document.querySelector('.source-dialog'));
 }
 // Drag a clip edge with modifiers held (Alt+Shift rolls only that side's cut).
@@ -78,11 +82,12 @@ async function splitEdits(splice, page, camera) {
   await sourceEdit(page, mediaId, {from: 0, to: 2, key: 'Period'});
   await state(page, () => { Editor.clearMarks(); Editor.seek(2); });
   await page.keyboard.press('i');
-  // The playhead stops at the end of the sequence, so marks past it are set directly.
-  await state(page, () => Editor.setMark('out', 4));
+  // The playhead stops at the end of the sequence, so marks past it are set directly:
+  // Out on the frame at 3.96 s includes it, so the range ends at 4 s.
+  await state(page, () => Editor.setMark('out', 3.96));
   await state(page, id => Editor.setSourceSettings(id, {sourceMarks: {}}), mediaId);
   await sourceEdit(page, mediaId, {from: 4, key: 'Period'});
-  await state(page, () => { Editor.clearMarks(); Editor.setMark('out', 6); });
+  await state(page, () => { Editor.clearMarks(); Editor.setMark('out', 5.96); });
   await state(page, id => Editor.setSourceSettings(id, {sourceMarks: {}}), mediaId);
   await sourceEdit(page, mediaId, {from: 2, to: 4, key: 'Period'});
   await page.keyboard.press('Control+Shift+X');
@@ -206,10 +211,11 @@ async function overwriteOntoLinked(page, camera) {
   await waitFor(page, () => document.querySelector('.source-stage video')?.readyState >= 2);
   await page.locator('.source-scrub').fill('5');
   await page.locator('[data-action=in]').click();
-  await page.locator('.source-scrub').fill('5.8');
+  await page.locator('.source-scrub').fill('5.76');
   await page.locator('[data-action=out]').click();
   await page.locator('[data-action=overwrite]').click();
-  await waitFor(page, () => !document.querySelector('.source-dialog'));
+  await waitFor(page, () => document.querySelector('.source-status')?.textContent.startsWith('Overwrote'));
+  await page.locator('.source-close').click();
   const clips = await state(page, () => Editor.get().project.clips);
   assert.deepEqual(layout(clips), [['audio', -1, 0, .4, 0], ['audio', -1, .4, .8, 5], ['audio', -1, 1.2, .8, 1.2],
     ['video', 1, 0, .4, 0], ['video', 1, .4, .8, 5], ['video', 1, 1.2, .8, 1.2]]);
@@ -231,7 +237,8 @@ async function threePointAndOverwrite(page, camera) {
   // Overwrite one second across the cut at 1 s on a track whose clips are linked to sound.
   await state(page, () => { Editor.clearMarks(); Editor.seek(.4); });
   await page.keyboard.press('i');
-  await state(page, () => Editor.seek(1.4));
+  // Out on the frame at 1.36 s: the range runs to 1.4 s.
+  await state(page, () => Editor.seek(1.36));
   await page.keyboard.press('o');
   await state(page, id => Editor.setSourceSettings(id, {sourceMarks: {}}), mediaId);
   await sourceEdit(page, mediaId, {from: 5, key: 'Period'});
@@ -249,7 +256,7 @@ async function threePointAndOverwrite(page, camera) {
     ['audio', -1, 0, .4, 0], ['audio', -1, .4, .6, 3.4], ['audio', -1, 1, 1, 1],
     ['video', 1, 0, .4, 0], ['video', 1, .4, .6, 3.4], ['video', 1, 1, 1, 1]]);
   // The export dialog defaults its custom range to the timeline In/Out.
-  await state(page, () => { Editor.setMark('in', .4); Editor.setMark('out', 1.6); });
+  await state(page, () => { Editor.setMark('in', .4); Editor.setMark('out', 1.56); });
   await page.locator('#export-video').click();
   assert.deepEqual(await state(page, () => {
     const form = document.querySelector('.studio-dialog form');
@@ -384,9 +391,9 @@ async function hiddenTrack(splice, page) {
   await page.getByRole('button', {name: 'Hide Titles'}).click();
   await settled('low');
   const after = await programColor(page);
+  // The title lane and Video 4 are one Premiere track: hiding the titles stores 'video:4'.
   assert.deepEqual(await state(page, () => Editor.get().project.trackState), {
-    'video:2': {locked: false, syncLocked: true, hidden: true},
-    'title:4': {locked: false, syncLocked: true, hidden: true}, 'video:4': {locked: false, syncLocked: true, hidden: true}});
+    'video:2': {locked: false, syncLocked: true, hidden: true}, 'video:4': {locked: false, syncLocked: true, hidden: true}});
   assert.ok(before[2] > 150 && before[0] < 60, 'blue V2 on top before hiding: ' + before);
   assert.ok(after[0] > 150 && after[2] < 60, 'red V1 after hiding V2: ' + after);
   await capture(page, 'track-output-hidden.png');

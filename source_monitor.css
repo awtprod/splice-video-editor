@@ -1,36 +1,37 @@
-.source-dialog{width:min(920px,calc(100vw - 32px));max-height:min(880px,calc(100vh - 32px));padding:0;color:#edf5e8;background:#181d19;border:1px solid #56634d;border-radius:10px;box-shadow:0 24px 80px #0009;overflow:auto}
-.source-dialog::backdrop{background:#080d08bf}
-.source-head{display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid #374335}
-.source-head>div{display:grid;gap:4px}.source-head small{font:10px 'IBM Plex Mono',monospace;color:#aaca83;letter-spacing:.12em}.source-head strong{font-size:17px}
-.source-close{font-size:27px;line-height:1;background:transparent;border:0;color:#ddebd4;cursor:pointer}
-.source-stage{height:min(45vh,450px);background:#080c09;display:grid;place-items:center}
-.source-stage video{height:100%;max-width:100%;object-fit:contain}
-.source-stage audio{width:min(540px,90%)}
-.source-controls{display:grid;gap:12px;padding:17px 20px 20px}
-.source-scrub{width:100%;accent-color:#c6f178}.source-time,.source-range{font:12px 'IBM Plex Mono',monospace;color:#d7efb8}
-.source-buttons,.source-actions{display:flex;gap:8px;flex-wrap:wrap}
-.source-dialog button:not(.source-close){border:1px solid #4b5948;background:#252e25;color:#ebf4e6;padding:8px 11px;border-radius:5px;cursor:pointer}
-.source-dialog button:hover{border-color:#c6f178}
-.source-bin,.source-track-label{display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:12px;color:#b3c2ac}
-.source-bin input,.source-track-label select{width:min(350px,70%);padding:8px;color:#eef8e9;background:#252e25;border:1px solid #4b5948;border-radius:5px}
-.source-actions{justify-content:flex-end;margin-top:4px}
-.source-dialog .source-primary{background:#c6f178!important;color:#162214!important;border-color:#c6f178!important;font-weight:700}
-.source-status{margin:0;min-height:15px;color:#e4b5a2;font-size:12px}
-.source-stage{overflow:hidden;min-height:0}
-.source-stage video{width:100%;height:100%;min-width:0;min-height:0;max-height:100%;object-fit:contain}
-.source-controls{position:relative;z-index:1}
-.source-stage{height:min(36vh,350px)}
-.source-controls{gap:9px;padding:14px 20px}
-@media(max-height:720px){.source-stage{height:min(30vh,240px)}}
-.source-shortcuts{color:#9aaa98;font:11px 'IBM Plex Mono',monospace}
-/* Non-modal: a floating monitor over the asset and program panels; the timeline stays usable. */
-.source-dialog{position:fixed;inset:64px auto auto 14px;margin:0;z-index:40;width:min(760px,calc(100vw - 28px));max-height:calc(100vh - 80px)}
+/* Source monitor: a non-modal panel of the workspace, left of the program monitor.
+   While it is open the inspector column makes room for it (see .workspace.source-open). */
+.workspace.source-open{grid-template-columns:minmax(180px,18%) minmax(0,1fr) minmax(0,1fr)}
+.workspace.source-open>.inspector{display:none}
+.source-dialog{position:relative;inset:auto;margin:0;padding:0;width:auto;height:auto;max-width:none;max-height:none;min-width:0;min-height:0;
+  color:#edf5e8;background:#181d19;border:1px solid #56634d;border-radius:8px;overflow:hidden;z-index:auto}
+.source-dialog[open]{display:flex;flex-direction:column}
 .source-dialog:focus{outline:none}
 .source-dialog:focus-within{border-color:#8fb05e}
+.source-head{flex:none;display:flex;justify-content:space-between;align-items:center;gap:8px;padding:6px 10px;border-bottom:1px solid #374335;min-width:0}
+.source-head>div{display:flex;align-items:baseline;gap:8px;min-width:0}
+.source-head small{font:10px 'IBM Plex Mono',monospace;color:#aaca83;letter-spacing:.12em}
+.source-head strong{font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.source-close{font-size:22px;line-height:1;background:transparent;border:0;color:#ddebd4;cursor:pointer;padding:0 4px}
+/* The picture takes what the settings and footer leave. */
+.source-stage{flex:1 1 0;min-height:72px;background:#080c09;display:grid;place-items:center;overflow:hidden}
+.source-stage video{width:100%;height:100%;min-width:0;min-height:0;object-fit:contain}
+.source-stage audio{width:min(540px,90%)}
+.source-controls{flex:0 1 auto;min-height:44px;max-height:52%;overflow-y:auto;display:grid;gap:6px;padding:8px 10px}
+.source-scrub{width:100%;margin:0;accent-color:#c6f178}
+.source-readout{display:flex;flex-wrap:wrap;justify-content:space-between;gap:2px 12px}
+.source-time,.source-range{font:11px 'IBM Plex Mono',monospace;color:#d7efb8}
+.source-buttons,.source-actions{display:flex;gap:6px;flex-wrap:wrap}
+.source-dialog button:not(.source-close){border:1px solid #4b5948;background:#252e25;color:#ebf4e6;padding:5px 9px;border-radius:5px;cursor:pointer;font-size:12px}
+.source-dialog button:hover{border-color:#c6f178}
+.source-dialog button:disabled{opacity:.55;cursor:default}
+.source-shortcuts{color:#9aaa98;font:10px 'IBM Plex Mono',monospace}
+.source-bin,.source-track-label{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:12px;color:#b3c2ac}
+.source-bin input,.source-track-label select{width:min(260px,62%);min-width:0;padding:5px;color:#eef8e9;background:#252e25;border:1px solid #4b5948;border-radius:5px}
+.source-proxy{justify-self:start}
+.source-footer{flex:none;display:grid;gap:4px;padding:7px 10px 9px;border-top:1px solid #374335;background:#1b211c}
 .source-plan{color:#c6dba8;font:11px 'IBM Plex Mono',monospace}
-/* Compact enough to leave most of the timeline in view; scrolls inside on short windows. */
-.source-dialog{max-height:min(620px,calc(100vh - 150px))}
-.source-dialog .source-stage{height:min(26vh,240px)}
-.source-dialog .source-controls{gap:7px;padding:11px 16px 14px}
-.source-dialog .source-bin,.source-dialog .source-track-label{gap:10px}
-.source-dialog .source-bin input,.source-dialog .source-track-label select{padding:6px}
+.source-status{margin:0;min-height:0;color:#b9d79a;font-size:12px}
+.source-status:empty{display:none}
+.source-status.error{color:#e4b5a2}
+.source-actions{justify-content:flex-end}
+.source-dialog .source-primary{background:#c6f178!important;color:#162214!important;border-color:#c6f178!important;font-weight:700}

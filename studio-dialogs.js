@@ -123,7 +123,11 @@ window.SpliceDialogs = (() => {
       const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=keys;dd.textContent=action;list.append(dt,dd);
     }
     const close=document.createElement('button');close.textContent='Close';close.onclick=()=>node.close();
+    // The list scrolls on its own so the heading and Close stay in view; it opens at the top.
+    node.classList.add('shortcut-reference');
+    list.className='shortcut-list';
     node.append(list,close);node.showModal();
+    list.scrollTop=0;node.scrollTop=0;
   }
   function compatibility(project=Editor.get().project) {
     const issues=[];

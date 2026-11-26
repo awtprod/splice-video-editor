@@ -70,6 +70,44 @@ class PremiereRoundTrip(unittest.TestCase):
         self.assertIs(reopened['trackState']['video:2']['hidden'], True)
         self.assertNotIn('video:1', reopened['trackState'])
 
+    def test_sequence_start_timecode_and_drop_frame_round_trip(self):
+        # Adobe-authored corpus: Seq A starts 29 frames in and displays 29.97 drop-frame (format 102).
+        adobe = open_project(TRACK_MUTE.read_bytes())
+        self.assertEqual((adobe['startTimecode'], adobe['dropFrame']), (29, True))
+        second = open_project(TRACK_MUTE.read_bytes(), 1)
+        self.assertNotIn('startTimecode', second)
+        # Editing the native sequence keeps or changes both, as Splice asks.
+        self.assertEqual(open_project(save_project(adobe))['startTimecode'], 29)
+        adobe.update(startTimecode=107892, dropFrame=False)
+        changed = open_project(save_project(adobe))
+        self.assertEqual((changed['startTimecode'], changed['dropFrame']), (107892, False))
+        # A new sequence: 01:00:00;00 at 29.97 drop-frame is frame 107892; non-drop is 108000.
+        media = [dict(id='ridge', src='assets/ridge.mp4')]
+        clips = [dict(type='video', mediaId='ridge', start=0, duration=2, track=1, **{'in': 0})]
+        for drop, start in ((True, 107892), (False, 108000)):
+            project = dict(name='NTSC', fps=30000 / 1001, clips=clips, media=media, startTimecode=start, dropFrame=drop)
+            reopened = open_project(save_project(project))
+            self.assertEqual((reopened['startTimecode'], reopened['dropFrame']), (start, drop))
+        # Rates without drop-frame keep their start and report no drop-frame setting.
+        reopened = open_project(save_project(dict(name='PAL', fps=25, clips=clips, media=media, startTimecode=90000)))
+        self.assertEqual(reopened['startTimecode'], 90000)
+        self.assertNotIn('dropFrame', reopened)
+
+    def test_title_and_video_lanes_save_as_one_track(self):
+        media = [dict(id='ridge', src='assets/ridge.mp4')]
+        clips = [dict(type='video', mediaId='ridge', start=0, duration=2, track=1, **{'in': 0}),
+                 dict(type='title', title='Lower third', start=0, duration=2, track=2)]
+        # A hidden title lane hides its Premiere track; it reopens as that video track, hidden.
+        hidden = dict(name='Titles', fps=25, clips=clips, media=media,
+                      trackState={'title:2': {'locked': False, 'syncLocked': True, 'hidden': True}})
+        reopened = open_project(save_project(hidden))
+        self.assertIs(reopened['trackState']['video:2']['hidden'], True)
+        # Different states on the two lanes of one track merge instead of failing the save.
+        mixed = dict(hidden, trackState={'video:2': {'locked': False, 'syncLocked': True, 'hidden': True},
+                                         'title:2': {'locked': True, 'syncLocked': True}})
+        merged = open_project(save_project(mixed))['trackState']['video:2']
+        self.assertEqual((merged['locked'], merged.get('hidden')), (True, True))
+
     def test_split_camera_sound_saves_linked_and_out_of_sync(self):
         MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=MEDIA_ROOT) as directory:

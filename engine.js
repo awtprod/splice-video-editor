@@ -84,6 +84,8 @@
   let revision = 0;
   let gesture = false;
   let gestureBefore = null;
+  // The state an atomic action started from; it must never be changed in place.
+  let transactionBase = null;
   // Linked selection: when off, linked clips move and trim on their own (Premiere's toggle).
   let linkedSelection = true;
   let linkSuspended = 0;
@@ -93,8 +95,8 @@
   const auditionSpan = 4;
   const auditionBuffers = new Map();
   const auditions = new Map();
-  function auditionBuffer(src, index, rate, reversed) {
-    const key=JSON.stringify([src,index,rate,reversed]);
+  function auditionBuffer(src, index, rate, reversed, stream=null) {
+    const key=JSON.stringify([src,index,rate,reversed,stream]);
     let entry=auditionBuffers.get(key);
     if (entry?.retryAfter && performance.now()>=entry.retryAfter) {
       auditionBuffers.delete(key);
@@ -113,7 +115,9 @@
       auditionBuffers.get(oldest).controller.abort();
       auditionBuffers.delete(oldest);
     }
-    fetch('/api/media/audition?'+new URLSearchParams({src,index,rate,reverse:reversed?1:0}),{
+    const query=new URLSearchParams({src,index,rate,reverse:reversed?1:0});
+    if (Number.isInteger(stream)) query.set('stream',stream);
+    fetch('/api/media/audition?'+query,{
       signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)]),
     }).then(async response=>{
       if (!response.ok) throw Error(await response.text());
@@ -131,14 +135,17 @@
   }
   function auditionAudio(element,clip,target,rate,forceSeek) {
     const item=mediaOf(clip);
-    const src=element.getAttribute('src');
+    // A chosen source stream is read from the original file; otherwise from what is playing.
+    const stream=clipAudioStream(clip,item);
+    const chosen=Number.isInteger(stream) ? stream : null;
+    const src=chosen===null ? element.getAttribute('src') : item?.originalSrc||item?.src;
     if (!src || !item || item.audioChannels===0 || item.still || clip.embeddedAudio===false || target<0) return;
     const sourceSpan = auditionSpan*rate;
     const index=Math.floor(target/sourceSpan), step=clip.reverse?-1:1;
-    const initial=auditionBuffer(src,index,rate,clip.reverse);
+    const initial=auditionBuffer(src,index,rate,clip.reverse,chosen);
     const next=index+step;
     if (next>=0 && next*sourceSpan<item.duration && (clip.reverse?target-index*sourceSpan:(index+1)*sourceSpan-target)<rate*.75)
-      auditionBuffer(src,next,rate,clip.reverse);
+      auditionBuffer(src,next,rate,clip.reverse,chosen);
     if (!playing || playbackRate<0 || audioContext.state!=='running') return;
     let state=auditions.get(element);
     const now=audioContext.currentTime;
@@ -162,7 +169,7 @@
       state.target=target;
     } else if (state.end-now<.12 && state.next>=0 && state.next*sourceSpan<item.duration) {
       chunk=state.next;
-      buffer=auditionBuffer(src,chunk,rate,clip.reverse);
+      buffer=auditionBuffer(src,chunk,rate,clip.reverse,chosen);
       start=state.end;
       offset=0;
     }
@@ -270,8 +277,20 @@
   const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
   const snap = (value) => Math.round(Number(value) * project.fps) / project.fps;
   const selected = () => project.clips.find((c) => c.id === selectedId);
-  const duration = () =>
-    Math.max(0, ...project.clips.map((c) => c.start + c.duration));
+  // Per-project caches for what playback asks every frame. A project object changes only
+  // through snapshot() (which clears them) or is replaced by a new one.
+  let cachedFor = null, cachedDuration = 0;
+  const duration = () => {
+    if (cachedFor !== project) {
+      let end = 0;
+      for (const clip of project.clips) end = Math.max(end, clip.start + clip.duration);
+      cachedFor = project;
+      cachedDuration = end;
+      indexedFor = null;
+    }
+    return cachedDuration;
+  };
+  let indexedFor = null;
   const notify = () => subscribers.forEach((fn) => fn(Editor.get()));
   // Undo states share large immutable payloads instead of copying them per edit:
   // LUT tables are replaced, never mutated, and strings (the embedded Premiere
@@ -315,13 +334,39 @@
   }
   // In-place edits: retire the current state to history and continue on a copy.
   const snapshot = () => {
+    cachedFor = null;
     if (gesture) {
-      if (project === gestureBefore) project = cloneState(project);
+      if (project === gestureBefore || project === transactionBase) project = cloneState(project);
       return;
     }
     remember(project);
     project = cloneState(project);
   };
+  // One user action that takes several edits: it becomes one undo step, or, if any part
+  // fails, the project returns to exactly where it was and the error is raised.
+  function atomically(action) {
+    if (transactionBase) return action();
+    const before = project, inGesture = gesture;
+    transactionBase = before;
+    if (!inGesture) { gesture = true; gestureBefore = before; }
+    let failed = false;
+    try {
+      return action();
+    } catch (error) {
+      failed = true;
+      throw error;
+    } finally {
+      transactionBase = null;
+      if (!inGesture) { gesture = false; gestureBefore = null; }
+      if (failed) project = before;
+      else if (project !== before && sameValue(before, project)) project = before;
+      else if (project !== before && !inGesture) remember(before);
+      project.duration = duration();
+      time = clamp(time, 0, project.duration);
+      syncMedia(true);
+      notify();
+    }
+  }
   const mediaOf = (clip) => project.media.find((m) => m.id === clip.mediaId);
   const titleTrack = () => Math.min(64,Math.max(4,...project.clips.filter(c=>c.type==='video').map(c=>c.track+1)));
   function sourceSelection(item, marks=item.sourceMarks, stream=item.sourceAudioStream) {
@@ -472,6 +517,9 @@
   let videoDipFollowers=new Map();
   const followingTransition = clip => transitionFollowers.get(clip.id);
   function indexTransitions() {
+    duration();
+    if (indexedFor===project) return;
+    indexedFor=project;
     const cuts=new Map();transitionFollowers=new Map();videoDipFollowers=new Map();
     for(const clip of project.clips) if(['dissolve','wipe'].includes(clip.transition) || (clip.type==='video' && clip.transition==='fade'))
       cuts.set(`${clip.type}:${clip.track}:${Math.round(clip.start*project.fps)}`,clip);
@@ -1005,6 +1053,21 @@
     }
     ctx.restore();
   }
+  // Whether a video layer paints every pixel of the frame with full opacity right now.
+  function coversFrame(clip, canvas, dissolvePairs) {
+    if (clip.type!=='video' || clip.transition==='wipe' || clip.transition==='fade' || dissolvePairs.has(clip.id)) return false;
+    if (time<clip.start || videoDipFollowers.get(clip.id)) return false;
+    const item=mediaOf(clip);
+    if (!item || item.nativeGenerator===1414680150) return false;
+    const element=videoFor(clip);
+    if (!(element instanceof HTMLVideoElement) || element.readyState<2 || !element.videoWidth || !element.videoHeight) return false;
+    if (Math.abs(element.videoWidth/element.videoHeight-canvas.width/canvas.height)>.01) return false;
+    const opacity=animated(clip,"opacity",Number(clip.opacity??100));
+    const scale=animated(clip,"scale",Number(clip.transform?.scale??100));
+    const x=animated(clip,"x",Number(clip.transform?.x??0)), y=animated(clip,"y",Number(clip.transform?.y??0));
+    const rotation=animated(clip,"rotation",Number(clip.transform?.rotation??0));
+    return opacity>=100 && scale>=100 && !x && !y && !rotation;
+  }
   function drawFrame(canvas) {
     const active = at('video', time);
     if (!mutedTracks.video && active && mediaOf(active)?.src &&
@@ -1023,7 +1086,13 @@
       const previous=preceding(clip);
       if (previous) {dissolvePairs.set(clip.id,previous);outgoingIds.add(previous.id);}
     }
-    for (const clip of visible) {
+    // Layers under an opaque, untransformed full-frame picture cannot show: skip drawing them.
+    // (Their camera sound still plays; this only saves compositing work on stacked tracks.)
+    let firstShown=0;
+    for (let index=visible.length-1;index>=0;index--) {
+      if (coversFrame(visible[index],canvas,dissolvePairs)) { firstShown=index; break; }
+    }
+    for (const clip of visible.slice(firstShown)) {
       if (clip.type==='title') {
         paintTitle(ctx,canvas,clip);
         continue;
@@ -1231,6 +1300,22 @@
       clipIds.add(clip.id);
     }
   }
+  // Older projects could give a title lane its own lock or visibility. Premiere has one video
+  // track for both, so fold 'title:N' into 'video:N': locked or hidden if either was, sync-locked
+  // only if both were.
+  function mergeTitleTrackStates(source) {
+    const states = source.trackState;
+    if (!states) return;
+    for (const key of Object.keys(states)) {
+      if (!key.startsWith("title:")) continue;
+      const videoKey = "video:" + key.slice(6), title = states[key], video = states[videoKey] || {};
+      const merged = {locked: !!(title.locked || video.locked),
+        syncLocked: title.syncLocked !== false && video.syncLocked !== false};
+      if (title.hidden || video.hidden) merged.hidden = true;
+      if (merged.locked || !merged.syncLocked || merged.hidden || states[videoKey]) states[videoKey] = merged;
+      delete states[key];
+    }
+  }
   // Titles share the picture lane of their track number, as they do in Premiere.
   const laneOf = (clip) => (clip.type === "audio" ? "audio:" : "video:") + clip.track;
   const hasSound = (item) => item?.type === "video" && !item.still && item.audioChannels > 0;
@@ -1290,8 +1375,20 @@
   }
   // Remove material between two times on the given lanes, cutting clips that cross the range.
   // A link survives only when the range cuts every member of the group the same way.
-  function clearRange(source, lanes, from, to) {
+  function clearRange(source, lanes, from, to, {lift = false} = {}) {
     const crossing = (clip) => lanes.has(laneOf(clip)) && clip.start < to - 1e-6 && clip.start + clip.duration > from + 1e-6;
+    // A transition goes with the material it joins: drop it when the range removes part of the
+    // transition or the clip before its cut. A lift ending on a cut leaves a gap before the next
+    // clip, so its transition goes too; an overwrite puts new material there and keeps it.
+    for (const clip of source.clips) {
+      if (!lanes.has(laneOf(clip)) || !["dissolve", "wipe", "fade", "native"].includes(clip.transition)) continue;
+      const head = clip.start - transitionBefore(clip), tail = head + requestedTransitionLength(clip);
+      const cutInRange = clip.start >= from - 1e-6 && (lift ? clip.start <= to + 1e-6 : clip.start < to - 1e-6);
+      if (cutInRange || (head < to - 1e-6 && tail > from + 1e-6)) {
+        clip.transition = "none";
+        for (const key of ["transitionBefore", "transitionDuration", "transitionMatchName"]) delete clip[key];
+      }
+    }
     const groups = new Map();
     for (const clip of source.clips) if (clip.linkGroup) {
       if (!groups.has(clip.linkGroup)) groups.set(clip.linkGroup, []);
@@ -1380,22 +1477,62 @@
       .map(value => String(value).padStart(2, "0"));
     return fields.slice(0, 3).join(":") + (dropFrame ? ";" : ":") + fields[3];
   }
-  function timecodeFields(text) {
-    const digits = text.replace(/[^\d:;.]/g, "");
-    const parts = /[:;.]/.test(digits) ? digits.split(/[:;.]/) :
-      digits.padStart(8, "0").match(/../g);
-    if (!parts || parts.length > 4 || parts.some(part => !/^\d{1,4}$/.test(part)))
+  // Typed timecode, as fields from hours down to frames; only the fields typed are returned.
+  // With ":" or ";" the text is split into fields ("." separates too). Without them, digits
+  // fill pairs from the right and each "." stands for "00": "2." is 2 seconds,
+  // "1.." is 1 minute and "1000" is 10 seconds.
+  function typedFields(text) {
+    const value = String(text).replace(/\s+/g, "");
+    if (!value || !/^[\d:;.]+$/.test(value)) throw new Error("Type a timecode such as 01:00:10:00.");
+    let parts;
+    if (/[:;]/.test(value)) parts = value.split(/[:;.]/);
+    else {
+      const digits = value.replace(/\./g, "00");
+      if (digits.length > 8) throw new Error("Type at most eight digits: hours, minutes, seconds and frames.");
+      parts = [];
+      for (let end = digits.length; end > 0; end -= 2) parts.unshift(digits.slice(Math.max(0, end - 2), end));
+    }
+    if (parts.length > 4 || parts.some(part => !/^\d{1,2}$/.test(part)))
       throw new Error("Type a timecode such as 01:00:10:00.");
-    return [0, 0, 0, ...parts.map(Number)].slice(-4);
+    return parts.map(Number);
   }
-  function timecodeToFrames(text, fps, dropFrame) {
-    const [hours, minutes, seconds, frames] = timecodeFields(text);
+  const timecodeFields = text => [0, 0, 0, ...typedFields(text)].slice(-4);
+  function fieldsToFrames([hours, minutes, seconds, frames], fps, dropFrame) {
     const nominal = Math.round(fps);
-    if (frames >= nominal || minutes > 59 || seconds > 59) throw new Error("That timecode is out of range for " + Number(fps.toFixed(3)) + " fps.");
+    if (frames >= nominal || minutes > 59 || seconds > 59 || hours > 23)
+      throw new Error("That timecode is out of range for " + Number(fps.toFixed(3)) + " fps.");
+    const dropped = nominal / 15;
+    // Drop-frame timecode skips these labels at the start of every minute except each tenth.
+    if (dropFrame && seconds === 0 && frames < dropped && minutes % 10 !== 0)
+      throw new Error(framesToLabel([hours, minutes, seconds, frames], true) + " does not exist in drop-frame timecode; that minute starts at " +
+        framesToLabel([hours, minutes, 0, dropped], true) + ".");
     const totalMinutes = hours * 60 + minutes;
     let count = (totalMinutes * 60 + seconds) * nominal + frames;
-    if (dropFrame) count -= (nominal / 15) * (totalMinutes - Math.floor(totalMinutes / 10));
+    if (dropFrame) count -= dropped * (totalMinutes - Math.floor(totalMinutes / 10));
     return count;
+  }
+  const framesToLabel = (fields, dropFrame) => fields.slice(0, 3).map(value => String(value).padStart(2, "0")).join(":") +
+    (dropFrame ? ";" : ":") + String(fields[3]).padStart(2, "0");
+  const timecodeToFrames = (text, fps, dropFrame) => fieldsToFrames(timecodeFields(text), fps, dropFrame);
+  // Return every effect and adjustment on a clip to its default, speed and direction included.
+  // Callers wrap this in atomically(): if the speed cannot return to 100%, nothing changes.
+  function resetClipNow(id) {
+    Editor.editProject((next) => {
+      const target = next.clips.find((c) => c.id === id);
+      for (const key of ["pan", "opacity", "transform", "keyframes", "fadeIn", "fadeOut", "transitionBefore",
+        "transitionDuration", "transitionMatchName"]) delete target[key];
+      target.volume = 100;
+      target.transition = "none";
+      if (target.type === "video") target.color = {brightness: 100, contrast: 100, saturation: 100};
+      else if (target.type === "title") target.color = {};
+    });
+    const current = project.clips.find((c) => c.id === id);
+    if (current.reverse) Editor.updateClip(id, {reverse: false});
+    if ((Number(current.speed) || 1) === 1 || current.nativeTimeRemap) return;
+    try { Editor.setClipSpeed(id, 1); }
+    catch (error) {
+      throw new Error("Reset needs room to return the clip to 100% speed, so nothing was reset: " + error.message);
+    }
   }
   const defaultStartTimecode = (fps, dropFrame) => timecodeToFrames("01:00:00:00", fps, dropFrame);
   const Editor = {
@@ -1406,6 +1543,10 @@
     sequenceTimecode(seconds, source = project) {
       return framesToTimecode(Math.round((seconds || 0) * source.fps) + (source.startTimecode || 0), source.fps, usesDropFrame(source));
     },
+    // Typed positions. "+" or "-" moves relative to `base` (the playhead). An absolute entry with
+    // fewer than four fields replaces the playhead's timecode from the right: at 01:00:05:12,
+    // "1000" goes to 01:00:10:00 and "2." to 01:00:02:00. Labels that drop-frame timecode skips
+    // are refused rather than moved.
     parseSequenceTimecode(text, base = time) {
       const value = String(text).trim();
       const relative = /^[+-]/.test(value) ? (value[0] === "-" ? -1 : 1) : 0;
@@ -1414,7 +1555,10 @@
         const offset = ((hours * 60 + minutes) * 60 + seconds) * Math.round(project.fps) + frames;
         return Math.round(base * project.fps + relative * offset) / project.fps;
       }
-      const frames = timecodeToFrames(value, project.fps, usesDropFrame()) - (project.startTimecode || 0);
+      const typed = typedFields(value);
+      const current = Editor.sequenceTimecode(base).split(/[:;]/).map(Number);
+      const fields = [...current.slice(0, 4 - typed.length), ...typed];
+      const frames = fieldsToFrames(fields, project.fps, usesDropFrame()) - (project.startTimecode || 0);
       if (frames < 0) throw new Error("That timecode is before the sequence start.");
       return frames / project.fps;
     },
@@ -1470,9 +1614,11 @@
     isTrackLocked(track, kind) { return trackLocked(kind || (track < 0 ? "audio" : "video"), track); },
     isTrackSyncLocked(track, kind) { return syncLocked(kind || (track < 0 ? "audio" : "video"), track); },
     isTrackHidden(track, kind) { return trackHidden(kind || (track < 0 ? "audio" : "video"), track); },
+    // A title lane and the video lane of the same number are one Premiere video track, so they
+    // share one state, stored under 'video:N' (a title lane without its own entry follows it).
     setTrackState(track, kind, patch) {
-      const key=trackKey(kind, track);
-      const current={locked:false,syncLocked:true,...project.trackState?.[key]};
+      const key=trackKey(kind==="title"?"video":kind, track);
+      const current={locked:false,syncLocked:true,...trackState(kind, track)};
       const next={...current,...patch};
       if (next.locked===current.locked && next.syncLocked===current.syncLocked && !!next.hidden===!!current.hidden) return;
       if (typeof next.locked!=="boolean" || typeof next.syncLocked!=="boolean" ||
@@ -1480,8 +1626,7 @@
       if (next.hidden && kind==="audio") throw new Error("Mute audio tracks instead of hiding them.");
       if (!next.hidden) delete next.hidden;
       snapshot(); project.trackState ||= {}; project.trackState[key]=next;
-      if(track===4 && (kind==="title" || kind==="video"))
-        project.trackState[trackKey(kind==="title"?"video":"title",4)]={...next};
+      delete project.trackState[trackKey("title",track)];
       lastPaintedFrame=-1;
       syncMedia(true);
       notify();
@@ -1558,12 +1703,14 @@
       selectedId = id;
       notify();
     },
+    // Source marks and the audio stream for new edits belong to the project and undo with it.
+    // Media objects are shared between undo states, so the change goes on a copy, never in place.
     setSourceSettings(id, settings) {
-      const item=project.media.find(entry=>entry.id===id);
-      if (!item) return;
-      Object.assign(item,settings);
-      revision++;
-      notify();
+      if (!project.media.some(entry=>entry.id===id)) return;
+      Editor.editProject(next=>{
+        const index=next.media.findIndex(entry=>entry.id===id);
+        next.media[index]={...next.media[index],...structuredClone(settings)};
+      });
     },
     sourceSelection,
     titleTrack,
@@ -1897,14 +2044,20 @@
       }
       return [...points].sort((a, b) => a - b).map((frame) => frame / project.fps);
     },
-    // Timeline In/Out marks, in seconds on frame boundaries.
+    // Timeline In/Out marks. Both marks include the frame they are set on, as in Premiere,
+    // Avid and Resolve: In 50 / Out 80 is 31 frames. Stored representation (project.marks and
+    // media.sourceMarks), in seconds on frame boundaries: `in` is the start of the first
+    // included frame and `out` is the end of the last one, so marking Out on frame N stores
+    // (N + 1) / fps and the range is [in, out). Projects saved before this change stored the
+    // same [in, out) range, so they load unchanged.
     setMark(edge, at = time) {
       if (!["in", "out"].includes(edge)) throw new Error("Choose an In or Out mark.");
       const marks = {...project.marks};
       if (at === null) delete marks[edge];
       else {
         if (!Number.isFinite(Number(at))) throw new Error("Choose a timeline position.");
-        marks[edge] = Math.max(0, snap(at));
+        const frame = Math.max(0, Math.round(Number(at) * project.fps));
+        marks[edge] = (edge === "out" ? frame + 1 : frame) / project.fps;
         // A new mark that crosses the other one replaces it, as in Premiere.
         if (Number.isFinite(marks.in) && Number.isFinite(marks.out) && marks.out <= marks.in) delete marks[edge === "in" ? "out" : "in"];
       }
@@ -1925,6 +2078,10 @@
       snapshot();
       project.marks = {in: clip.start, out: snap(clip.start + clip.duration)};
       notify();
+    },
+    // The frame an Out mark is on: the last frame the range includes.
+    markOutFrame(out) {
+      return Math.max(0, Math.round(out * project.fps) - 1) / project.fps;
     },
     // Three- and four-point editing from a source into the timeline.
     // Ranges come from the source In/Out and the timeline In/Out; with both timeline marks
@@ -1999,7 +2156,7 @@
       if (!Number.isFinite(from) || !Number.isFinite(to)) throw new Error("Mark a timeline In and Out first (I and O).");
       const lanes = new Set(project.clips.filter((clip) => !trackLocked(clip.type, clip.track)).map(laneOf));
       Editor.editProject((next) => {
-        clearRange(next, lanes, from, to);
+        clearRange(next, lanes, from, to, {lift: true});
         if (!extract) return;
         for (const clip of next.clips)
           if (lanes.has(laneOf(clip)) && clip.start >= to - 1e-6) clip.start = snap(clip.start - (to - from));
@@ -2065,35 +2222,24 @@
       const offset = clip && syncOffset(clip);
       if (!offset?.frames) return;
       const shift = offset.frames / project.fps;
-      Editor.withoutLinks(() => {
-        if (how === "slip") Editor.slipClip(id, shift * (Number(clip.speed) || 1));
-        else Editor.updateClip(id, {start: clip.start - shift});
+      // All or nothing: a slip that runs out of source is undone rather than left halfway.
+      atomically(() => {
+        Editor.withoutLinks(() => {
+          if (how === "slip") Editor.slipClip(id, shift * (Number(clip.speed) || 1));
+          else Editor.updateClip(id, {start: clip.start - shift});
+        });
+        if (syncOffset(project.clips.find((c) => c.id === id))?.frames)
+          throw new Error(how === "slip" ? "Not enough source media to slip this clip into sync." : "Another clip is in the way of moving this clip into sync.");
       });
-      if (syncOffset(project.clips.find((c) => c.id === id))?.frames)
-        throw new Error(how === "slip" ? "Not enough source media to slip this clip into sync." : "Another clip is in the way of moving this clip into sync.");
     },
     // Return every effect and adjustment on a clip to its default.
     resetClip(id) {
       const clip = project.clips.find((c) => c.id === id);
       if (!clip) return;
       ensureEditable(clip);
-      Editor.editProject((next) => {
-        const target = next.clips.find((c) => c.id === id);
-        for (const key of ["pan", "opacity", "transform", "keyframes", "fadeIn", "fadeOut", "transitionBefore",
-          "transitionDuration", "transitionMatchName"]) delete target[key];
-        target.volume = 100;
-        target.transition = "none";
-        if (target.type === "video") target.color = {brightness: 100, contrast: 100, saturation: 100};
-        else if (target.type === "title") target.color = {};
-      });
-      const current = project.clips.find((c) => c.id === id);
-      if (current.reverse) Editor.updateClip(id, {reverse: false});
-      if ((Number(current.speed) || 1) === 1 || current.nativeTimeRemap) return;
-      try { Editor.setClipSpeed(id, 1); }
-      catch (error) {
-        throw new Error("Effects were reset, but speed stays at " + Math.round(current.speed * 100) + "%: " + error.message);
-      }
+      atomically(() => resetClipNow(id));
     },
+    atomically,
     splitClipAt,
     split() {
       const clip = selected() || at("video", time);
@@ -2112,15 +2258,22 @@
       const removing=project.clips.filter(clip=>selected.has(clip.id));
       if(!removing.length)return;
       for(const clip of removing)ensureEditable(clip);
-      const begin=Math.min(...removing.map(clip=>clip.start));
-      const end=Math.max(...removing.map(clip=>clip.start+clip.duration));
-      if(ripple && removing.some(clip=>Math.abs(clip.start-begin)>.001 || Math.abs(clip.start+clip.duration-end)>.001))
-        throw new Error("Ripple delete one aligned edit group at a time.");
+      // Ripple closes every stretch of time the removed clips covered: a later clip on a
+      // sync-locked track moves left by the length of the stretches that end before it.
+      const spans=[];
+      for(const clip of [...removing].sort((a,b)=>a.start-b.start)){
+        const last=spans.at(-1), end=clip.start+clip.duration;
+        if(last && clip.start<=last[1]+.001) last[1]=Math.max(last[1],end);
+        else spans.push([clip.start,end]);
+      }
       Editor.editProject(next=>{
         next.clips=next.clips.filter(clip=>!selected.has(clip.id));
-        if(ripple)for(const clip of next.clips)
-          if(clip.start>=end-.001&&!trackLocked(clip.type,clip.track)&&syncLocked(clip.type,clip.track))
-            clip.start=snap(clip.start-(end-begin));
+        if(!ripple)return;
+        for(const clip of next.clips){
+          if(trackLocked(clip.type,clip.track)||!syncLocked(clip.type,clip.track))continue;
+          const shift=spans.filter(([,end])=>end<=clip.start+.001).reduce((sum,[begin,end])=>sum+end-begin,0);
+          if(shift)clip.start=Math.max(0,snap(clip.start-shift));
+        }
       });
       selectedId = project.clips[0]?.id || null;
       notify();
@@ -2150,8 +2303,9 @@
       const clip = {
         id: uid(),
         mediaId: null,
-        start: time,
-        duration: 4,
+        start: snap(time),
+        // Four seconds, rounded to whole frames so the title stays on the frame grid at 23.976 and 29.97.
+        duration: Math.round(4 * project.fps) / project.fps,
         in: 0,
         track,
         type: "title",
@@ -2231,6 +2385,7 @@
         imported = (await response.json()).project;
       } else imported = JSON.parse(await file.text());
       validateProject(imported);
+      mergeTitleTrackStates(imported);
       if (window.SpliceMedia) await window.SpliceMedia.restore(imported);
       history=[];future=[];gesture=false;gestureBefore=null;revision++;
       project = imported;

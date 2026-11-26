@@ -25,35 +25,46 @@
   let toastTimer;
   const px = (seconds) => seconds * pps;
   const waveformCache = new Map();
-  async function waveform(src) {
-    if (!waveformCache.has(src))
+  async function waveform(src, stream = null) {
+    const key = JSON.stringify([src, stream]);
+    if (!waveformCache.has(key)) {
+      const query = new URLSearchParams({src});
+      if (Number.isInteger(stream)) query.set("stream", stream);
       waveformCache.set(
-        src,
+        key,
         (async () => {
-          const response=await fetch('/api/media/waveform?src='+encodeURIComponent(src),{signal:AbortSignal.timeout(215000)});
+          const response=await fetch('/api/media/waveform?'+query,{signal:AbortSignal.timeout(215000)});
           if(!response.ok) return null;
           return (await response.json()).peaks;
         })().catch(() => null),
       );
-    return waveformCache.get(src);
+    }
+    return waveformCache.get(key);
   }
-  async function paintWave(canvas, media, clip) {
+  // `width` is the clip's on-screen width, known from the zoom; measuring the canvas here would
+  // force a layout for every audio clip after each re-render.
+  async function paintWave(canvas, media, clip, width) {
     if (!media?.src) return;
-    let src=media.src;
+    let src=media.src, chosen=null;
     const stream='audioStream' in clip?clip.audioStream:media.audioStream??null;
-    if(stream!==(media.audioStream??null)) {
+    if(Number.isInteger(stream)) {
+      // The server reads the chosen stream straight from the source file.
+      src=media.originalSrc||media.src;
+      chosen=stream;
+    } else if(stream!==(media.audioStream??null)) {
       const preview=SpliceMedia.preparePreview(media,stream);
       await preview?.done;
       src=preview?.src;
     }
     if (!src || !canvas.isConnected) return;
-    const samples = await waveform(src);
+    const samples = await waveform(src, chosen);
     if (!samples?.length || !canvas.isConnected) return;
-    const width = Math.max(1, Math.round(canvas.getBoundingClientRect().width));
-    canvas.width = Math.min(8192,width * 2);
+    canvas.width = Math.min(8192, Math.round(Math.max(1, width) * Math.min(2, window.devicePixelRatio || 1)));
     canvas.height = 92;
     const ctx = canvas.getContext("2d");
     ctx.fillStyle = "#a3eab9";
+    // Every bar goes into one path and is filled once.
+    const bars = new Path2D();
     const duration = media.duration || clip.duration;
     const samplesPerSecond = samples.length / duration;
     // The clip plays clip.duration * speed seconds of source, backwards when reversed.
@@ -71,8 +82,9 @@
       )
         peak = Math.max(peak, Math.abs(samples[i]));
       const h = Math.max(2, peak * canvas.height * 0.82);
-      ctx.fillRect(x, (canvas.height - h) / 2, 2, h);
+      bars.rect(x, (canvas.height - h) / 2, 2, h);
     }
+    ctx.fill(bars);
   }
   const typeOf = (clip) => clip.type;
   const notify = (message) => {
@@ -88,8 +100,12 @@
   let pending = false;
   let relinkTarget = null;
   const thumbPending = new Set();
+  // Generated thumbnails live here, keyed by source, instead of being written onto media
+  // objects that earlier undo states share.
+  const generatedThumbs = new Map();
+  const thumbOf = (media) => media?.thumb || generatedThumbs.get(media?.src) || "";
   function makeThumb(media) {
-    if (media.thumb || !media.src || media.type !== "video" || thumbPending.has(media.id) || thumbPending.size>=3) return;
+    if (thumbOf(media) || !media.src || media.type !== "video" || thumbPending.has(media.id) || thumbPending.size>=3) return;
     thumbPending.add(media.id);
     const video = document.createElement("video");
     video.muted = true;
@@ -101,7 +117,7 @@
       canvas.width = 320;
       canvas.height = 180;
       canvas.getContext("2d").drawImage(video, 0, 0, 320, 180);
-      media.thumb = canvas.toDataURL("image/jpeg", .75);
+      generatedThumbs.set(media.src, canvas.toDataURL("image/jpeg", .75));
       thumbPending.delete(media.id);
       video.removeAttribute("src");
       video.load();
@@ -177,7 +193,7 @@
   }
   function mediaCard(media, project) {
     const audio = media.type === "audio";
-    const picture = audio ? "♫" : media.thumb ? `<img src="${esc(media.thumb)}" alt="">` : "▶";
+    const picture = audio ? "♫" : thumbOf(media) ? `<img src="${esc(thumbOf(media))}" alt="">` : "▶";
     const details = mediaDetails(media);
     return `<button class="media-card" draggable="true" data-media="${esc(media.id)}" title="${esc(details)}"><div class="media-thumb ${audio ? "audio-thumb" : ""}">${picture}<span class="media-icon">${audio ? "♫" : "▶"}</span><span class="media-duration">${fmt(media.duration, project.fps).slice(3, 8)}</span></div><span class="media-name">${esc(media.name)}</span><span class="media-meta">${esc(mediaLabel(media))}</span>${details ? `<span class="media-meta media-extra">${esc(details)}</span>` : ""}</button>`;
   }
@@ -274,7 +290,7 @@
   function positionTime(event, element) {
     return Math.max(0, (event.clientX-element.getBoundingClientRect().left)/pps);
   }
-  let viewStart=0, viewEnd=Infinity;
+  let viewStart=0, viewEnd=Infinity, renderedWidth=0;
   let selectedEdit=null;
   // Timeline viewport size and scroll, cached from observers and scroll events so a re-render
   // after every edit never has to force a synchronous layout to read them.
@@ -337,7 +353,9 @@
       ...Array.from({length:Math.min(64,Math.max(2,project.trackCounts?.audio||3,-lowestAudio+1))},(_,n)=>({kind:'audio',track:-n-1,name:'Audio '+(n+1)}))];
   }
   // Clips too narrow to read are painted on one canvas per lane instead of becoming DOM nodes.
-  const tinyClipWidth=4;
+  const tinyClipWidth=8;
+  // Below this width a clip is too narrow for a readable waveform; it gets none.
+  const waveformMinWidth=16;
   function paintDensity(surface, clips, kind) {
     if (!clips.length) return;
     const canvas=document.createElement("canvas");
@@ -370,17 +388,19 @@
       '<span class="clip-name">'+(clip.linkGroup?linkIcon:"")+esc(name)+'</span>'+
       (offset?`<span class="sync-badge" role="button" tabindex="-1" data-sync="${esc(clip.id)}" title="Out of sync by ${Math.abs(offset)} frames. Click to move or slip into sync.">${offset>0?"+":"−"}${Math.abs(offset)}</span>`:"")+
       '<span class="trim-handle trim-left" title="Trim in · Alt+drag trims only this side of a linked clip"></span><span class="trim-handle trim-right" title="Trim out · Alt+drag trims only this side of a linked clip"></span>';
-    if (media?.thumb) {
+    if (thumbOf(media)) {
       // Set the thumbnail as a property: generated thumbnails are long data URLs, costly to escape and parse as markup.
       const image=document.createElement("img");
-      image.className="clip-image";image.alt="";image.src=media.thumb;
+      image.className="clip-image";image.alt="";image.src=thumbOf(media);
       node.prepend(image);
     }
     if (Number.isInteger(clip.nestedSequence)) {
       node.title += ' · Double-click to open nested sequence';
       node.ondblclick=()=>busy(()=>SpliceSession.sequence(clip.nestedSequence));
     }
-    if(lane.kind==="audio"||embedded)requestAnimationFrame(()=>paintWave(node.querySelector("canvas"),media,clip));
+    const waveWidth=Math.max(tinyClipWidth,px(clip.duration)-1)-6;
+    if((lane.kind==="audio"||embedded)&&waveWidth>=waveformMinWidth)
+      requestAnimationFrame(()=>paintWave(node.querySelector("canvas"),media,clip,waveWidth));
     return node;
   }
   function renderMarks(project, height) {
@@ -393,7 +413,7 @@
     range.classList.toggle("open-in",!Number.isFinite(marks.in));
     range.classList.toggle("open-out",!Number.isFinite(marks.out));
     range.style.left=px(from)+"px";range.style.width=Math.max(2,px(to-from))+"px";range.style.height=height+"px";
-    range.title="Timeline "+(Number.isFinite(marks.in)?"In "+tc(marks.in):"")+(Number.isFinite(marks.out)?" Out "+tc(marks.out):"")+
+    range.title="Timeline "+(Number.isFinite(marks.in)?"In "+tc(marks.in):"")+(Number.isFinite(marks.out)?" Out "+tc(editor.markOutFrame(marks.out)):"")+
       (Number.isFinite(marks.in)&&Number.isFinite(marks.out)?" · Duration "+fmt(marks.out-marks.in,project.fps):"");
     surface.append(range);
   }
@@ -405,6 +425,7 @@
     const {min,max}=zoomLimits(state);
     pps=clamp(pps,min,max);
     const width=surfaceWidth(duration,screen);
+    renderedWidth=width;
     viewStart=Math.max(0,viewport.left-screen);viewEnd=Math.min(width,viewport.left+2*screen);
     const visible=(start,end)=>px(start)<=viewEnd && px(end)>=viewStart;
     $("timeline-surface").style.width=width+"px";
@@ -729,7 +750,8 @@
     $("linked-toggle").classList.toggle("active", state.linkedSelection);
     $("linked-toggle").setAttribute("aria-pressed", String(state.linkedSelection));
     const marks = state.project.marks || {};
-    const label = [Number.isFinite(marks.in) ? "In " + tc(marks.in) : "", Number.isFinite(marks.out) ? "Out " + tc(marks.out) : ""].filter(Boolean).join(" · ");
+    // The Out label names the last frame the range includes.
+    const label = [Number.isFinite(marks.in) ? "In " + tc(marks.in) : "", Number.isFinite(marks.out) ? "Out " + tc(editor.markOutFrame(marks.out)) : ""].filter(Boolean).join(" · ");
     $("mark-status").textContent = label;
     $("mark-status").hidden = !label;
   });
@@ -751,19 +773,30 @@
     if(scrollFrame||gesture)return;
     scrollFrame=requestAnimationFrame(()=>{
       scrollFrame=0;
-      if((surface.scrollLeft<viewStart+surface.clientWidth/4 && viewStart>0) ||
-         (surface.scrollLeft+1.25*surface.clientWidth>viewEnd && viewEnd<surface.scrollWidth))
+      // Cached sizes only: reading scrollWidth or clientWidth here would force a layout.
+      const screen=timelineWidth();
+      if((viewport.left<viewStart+screen/4 && viewStart>0) ||
+         (viewport.left+1.25*screen>viewEnd && viewEnd<renderedWidth))
         renderTimeline(editor.get());
     });
   });
   // Out-of-sync badge: offer Premiere's "Move into sync" and "Slip into sync".
-  function syncMenu(id, anchor) {
-    document.querySelector(".sync-menu")?.remove();
+  // One menu at a time; closing it always removes its outside-click listener.
+  let closeSyncMenu=null;
+  function syncMenu(id, box) {
+    closeSyncMenu?.();
     const menu=document.createElement("div");menu.className="sync-menu";menu.setAttribute("role","menu");
-    const box=anchor.getBoundingClientRect();
-    menu.style.left=Math.min(window.innerWidth-190,box.left)+"px";menu.style.top=Math.max(8,box.top-80)+"px";
-    const close=()=>{menu.remove();window.removeEventListener("pointerdown",dismiss,true);};
+    menu.style.left=clamp(box.left,8,window.innerWidth-190)+"px";
+    // Below the badge when there is room, otherwise above it.
+    const below=box.bottom+4, height=84;
+    menu.style.top=(below+height<=window.innerHeight-8?below:Math.max(8,box.top-height-4))+"px";
     const dismiss=event=>{if(!menu.contains(event.target))close();};
+    const close=()=>{
+      menu.remove();
+      window.removeEventListener("pointerdown",dismiss,true);
+      if(closeSyncMenu===close)closeSyncMenu=null;
+    };
+    closeSyncMenu=close;
     for(const [how,label] of [["move","Move into sync"],["slip","Slip into sync"]]){
       const item=document.createElement("button");item.type="button";item.setAttribute("role","menuitem");item.textContent=label;
       item.onclick=()=>{close();safeEdit(()=>editor.bringIntoSync(id,how));};
@@ -776,7 +809,14 @@
   }
   lanes.addEventListener("pointerdown",e=>{
     const badge=e.target.closest(".sync-badge");
-    if(badge){e.stopPropagation();e.preventDefault();editor.select(badge.dataset.sync);syncMenu(badge.dataset.sync,badge);return;}
+    if(badge){
+      e.stopPropagation();e.preventDefault();
+      // Measure the badge before selecting: selection re-renders the timeline and replaces it.
+      const box=badge.getBoundingClientRect(), id=badge.dataset.sync;
+      editor.select(id);
+      syncMenu(id,box);
+      return;
+    }
     const density=e.target.closest(".lane-density");
     if(density){
       // Zoomed far out, a click on the painted lane selects the clip under the pointer.
@@ -957,6 +997,9 @@
     const clip=clipAtPlayhead();
     if(!clip)return notify("Park the playhead inside a clip to ripple trim it.");
     const start=clip.start;
+    // The playhead frame goes with the end trim, so on the first frame nothing would remain.
+    if(edge==="end"&&Math.round(editor.get().time*editor.get().project.fps)<=Math.round(start*editor.get().project.fps))
+      return notify("The playhead is on the clip's first frame. Move it into the clip to ripple trim its end.");
     if(safeEdit(()=>{editor.trimEdge(clip.id,edge,editor.get().time,{ripple:true});return true;})&&edge==="start")editor.seek(start);
   }
   function trimSelectedEdit(frames) {
@@ -1035,10 +1078,10 @@
     {keys:"← · →",action:"Step one frame",test:press(arrows),run:e=>step(forward(e)?1:-1)},
     {keys:"Shift + ← · →",action:"Step five frames",test:press(arrows,{shift:true}),run:e=>step(forward(e)?5:-5)},
     {keys:"↑ · ↓",action:"Go to previous · next edit point",test:press(["ArrowUp","ArrowDown"]),run:e=>editPoint(forward(e)?1:-1)},
-    {keys:"I · O",action:"Mark timeline In · Out at the playhead",test:press(["i","o"]),run:e=>safeEdit(()=>editor.setMark(e.key.toLowerCase()==="i"?"in":"out"))},
-    {keys:"Shift + I · O",action:"Go to timeline In · Out",test:press(["i","o"],{shift:true}),run:e=>{
-      const mark=editor.get().project.marks?.[e.key.toLowerCase()==="i"?"in":"out"];
-      if(Number.isFinite(mark))editor.seek(mark);
+    {keys:"I · O",action:"Mark timeline In · Out on the frame under the playhead (both frames are included)",test:press(["i","o"]),run:e=>safeEdit(()=>editor.setMark(e.key.toLowerCase()==="i"?"in":"out"))},
+    {keys:"Shift + I · O",action:"Go to the timeline In frame · Out frame",test:press(["i","o"],{shift:true}),run:e=>{
+      const out=e.key.toLowerCase()==="o", mark=editor.get().project.marks?.[out?"out":"in"];
+      if(Number.isFinite(mark))editor.seek(out?editor.markOutFrame(mark):mark);
     }},
     {keys:"X",action:"Mark In and Out around the selected clip",test:press("x"),run:commands.markClip},
     {keys:"Ctrl/Cmd + Shift + X",action:"Clear timeline In and Out",test:press("x",{ctrl:true,shift:true}),run:commands.clearMarks},
@@ -1091,9 +1134,22 @@
     {keys:"Click the sync number",action:"Move or slip an out-of-sync clip back into sync"},
   ];
   window.SpliceKeymap=keymap.map(({keys,action})=>({keys,action}));
+  // Only controls that take typed text (or list type-ahead) keep keys from the timeline. A slider
+  // keeps its arrow keys and a checkbox or button its Space and Enter; every other shortcut works.
+  const textEntry=new Set(["text","search","email","number","password","tel","url","date","time","datetime-local","month","week"]);
+  function keyBelongsToControl(element, e) {
+    if (!element || element===document.body) return false;
+    if (element.isContentEditable || element.tagName==="TEXTAREA" || element.tagName==="SELECT") return true;
+    if (element.tagName!=="INPUT") return false;
+    const type=(element.getAttribute("type")||"text").toLowerCase();
+    if (textEntry.has(type)) return true;
+    if (type==="range") return /^(Arrow|Home$|End$|Page)/.test(e.key);
+    return e.key===" " || e.key==="Enter";
+  }
+  window.SpliceKeys={keyBelongsToControl};
   document.addEventListener("keydown", (e) => {
     if (document.querySelector("dialog:modal") || e.target?.closest?.(".source-dialog, .sync-menu")) return;
-    const typing=/INPUT|TEXTAREA|SELECT/.test(document.activeElement?.tagName);
+    const typing=keyBelongsToControl(document.activeElement,e);
     const binding=keymap.find(row=>row.test&&(row.anywhere||!typing)&&row.test(e));
     if(!binding)return;
     e.preventDefault();

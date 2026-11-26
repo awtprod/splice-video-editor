@@ -242,6 +242,40 @@ def _read_transition(track, item, clip_data):
     clip_data['transitionMatchName'] = matching.match_name
 
 
+# MZ.Sequence.VideoTimeDisplayFormat values for the NTSC rates, drop-frame and not
+# (py-premiere's TIMECODE_FORMATS, as Adobe's projects store them).
+DROP_FRAME_DISPLAY = {8475667200: (102, 103), 4237833600: (106, 107)}
+
+
+def _sequence_timecode(sequence):
+    """Splice's startTimecode (frames) and dropFrame from the sequence's zero point and display format."""
+    result = {}
+    if sequence.timebase:
+        frames = round(sequence.zero_point.ticks / sequence.timebase)
+        if frames > 0:
+            result['startTimecode'] = frames
+    formats = DROP_FRAME_DISPLAY.get(sequence.timebase)
+    display = sequence.video_display_format
+    if formats and display in formats:
+        result['dropFrame'] = display == formats[0]
+    return result
+
+
+def _write_sequence_timecode(sequence, data):
+    """Store Splice's start timecode and drop-frame choice in the sequence (zero point, display format)."""
+    start = data.get('startTimecode') or 0
+    if not isinstance(start, int) or isinstance(start, bool) or start < 0:
+        raise ValueError('Invalid sequence start timecode')
+    if sequence.zero_point.ticks != start * sequence.timebase:
+        sequence.zero_point = py_premiere.Time(start * sequence.timebase)
+    formats = DROP_FRAME_DISPLAY.get(sequence.timebase)
+    if formats:
+        # Splice shows drop-frame at these rates unless the project turns it off.
+        wanted = formats[0] if data.get('dropFrame') is not False else formats[1]
+        if sequence.video_display_format != wanted:
+            sequence.video_display_format = wanted
+
+
 def open_project(data, index=0, _seen=()):
     _check_size(data)
     if index in _seen:
@@ -417,6 +451,7 @@ def open_project(data, index=0, _seen=()):
                 item['nestedProject'] = child
         width, height = sequence.frame_size or (1920, 1080)
         fps = py_premiere.TICKS_PER_SECOND / sequence.timebase if sequence.timebase else 30
+        timecode = _sequence_timecode(sequence)
         track_mix = {}
         track_state = {}
         for kind, tracks in (('video', sequence.video_tracks), ('audio', sequence.audio_tracks)):
@@ -460,7 +495,7 @@ def open_project(data, index=0, _seen=()):
                 warnings.append(f"{label} at {clip['start']:.2f}s: Premiere volume keys outside the source trim are preserved; preview and export use the clip's static volume.")
             if source_media is not None and source_media.get('nativeGenerator') is not None:
                 warnings.append(f"{source_media['name']} is a native Premiere generator; preview and export are unavailable.")
-        return {'name': sequence.name, 'width': width, 'height': height, 'fps': fps,
+        return {'name': sequence.name, 'width': width, 'height': height, 'fps': fps, **timecode,
                 'premiereSequences': [item.name for item in project.sequences], 'premiereSequence': index,
                 'media': media, 'clips': clips, 'captions': captions,
                 'trackState': track_state,
@@ -470,6 +505,28 @@ def open_project(data, index=0, _seen=()):
                 'premiereOriginal': base64.b64encode(data).decode('ascii'), 'premiereManaged': managed,
                 'trackMix': track_mix,
                 'markers': [{'id': marker.guid, 'name': marker.name, 'time': marker.start.seconds} for marker in sequence.markers]}
+
+
+def _merged_track_states(states):
+    """Fold title-lane states into their video track: Premiere has one track for both.
+
+    Locked or hidden if either lane was; sync-locked only if both were.
+    """
+    merged = {}
+    for key, state in states.items():
+        if not isinstance(key, str) or not isinstance(state, dict):
+            raise ValueError('Invalid Premiere track state target')
+        target = 'video:' + key[6:] if key.startswith('title:') else key
+        current = merged.get(target)
+        if current is None:
+            merged[target] = dict(state)
+            continue
+        merged[target] = {
+            'locked': bool(current.get('locked')) or bool(state.get('locked')),
+            'syncLocked': current.get('syncLocked', True) is not False and state.get('syncLocked', True) is not False,
+            'hidden': bool(current.get('hidden')) or bool(state.get('hidden')),
+        }
+    return merged
 
 
 def save_project(data):
@@ -529,16 +586,15 @@ def save_project(data):
             raise ValueError('Unsupported video track number')
         custom = base._replace(frame_rate=chosen[0], width=width, height=height, time_display=chosen[1], video_tracks=highest_video)
         sequence = project.add_sequence(str(data.get('name') or 'Untitled')[:120], sequence_format=custom)
-    track_states = data.get('trackState') or {}
+    _write_sequence_timecode(sequence, data)
+    track_states = _merged_track_states(data.get('trackState') or {})
     for key, state in track_states.items():
         try:
             kind, raw_track = key.split(':', 1)
             number = int(raw_track)
         except (ValueError, AttributeError) as exc:
             raise ValueError('Invalid Premiere track state target') from exc
-        tracks = sequence.audio_tracks if kind == 'audio' else sequence.video_tracks if kind in ('video', 'title') else None
-        if kind == 'title' and f'video:{number}' in track_states and track_states[f'video:{number}'] != state:
-            raise ValueError(f'Title and video track {number} share one native Premiere lock state')
+        tracks = sequence.audio_tracks if kind == 'audio' else sequence.video_tracks if kind == 'video' else None
         if tracks is None:
             raise ValueError('Invalid Premiere track state target')
         index = -number - 1 if kind == 'audio' else number - 1
