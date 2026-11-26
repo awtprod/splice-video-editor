@@ -396,6 +396,11 @@ def read(data: bytes, options: dict | None = None, budget=None) -> dict:
         else:
             per_hour = round(rate) * 3600 - (108 * round(rate) // 30 if record_drop else 0)
             tc_start = (first_record // per_hour) * per_hour
+            warnings.append(f'A CMX3600 EDL does not record its sequence start, so Splice started the timeline at '
+                            f'{frames_timecode(tc_start, rate, record_drop and rate in DROP_FRAME_RATES)}, the whole '
+                            f'hour at or before the first event '
+                            f'({frames_timecode(first_record, rate, record_drop and rate in DROP_FRAME_RATES)}). If the '
+                            'sequence started elsewhere, import again with its start timecode.')
     except ValueError as error:
         raise ValueError(f'Malformed timecode in the EDL: {error}') from None
 
