@@ -215,27 +215,10 @@ class Staging:
         if not os.access(self.projects, os.W_OK | os.X_OK) or not os.access(self.root, os.W_OK | os.X_OK):
             raise PlaceError('The library is not writable by Splice (no permission to add a project).')
         self.staging = self.root / STAGING
-        self.lock = self.work = self.made_staging = None
+        self.lock = self.work = None
         self.placed = None
         try:
-            try:
-                os.mkdir(self.staging, 0o700)
-                self.made_staging = True
-            except FileExistsError:
-                _no_link(self.staging, 'the staging folder')
-                if os.stat(self.staging).st_uid != os.getuid() if hasattr(os, 'getuid') else False:
-                    raise PlaceError('The library\'s staging folder belongs to another user; remove '
-                                     f'{self.staging} when no save is running.') from None
-            import hashlib
-            self.lock = self.staging / ('lock-' + hashlib.sha256(fold_name(self.name).encode()).hexdigest()[:32])
-            try:
-                fd = os.open(self.lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o600)
-            except FileExistsError:
-                self.lock = None
-                raise PlaceError(f'Another save of a project named “{self.name}” is running (or one was interrupted: '
-                                 'if no save is running, remove the lock file in “Resolve Projects/.splice-staging”).'
-                                 ) from None
-            os.close(fd)
+            self._lock()
             self.work = self.staging / ('build-' + secrets.token_hex(8))
             os.mkdir(self.work, 0o700)
             if os.stat(self.work).st_dev != os.stat(self.projects).st_dev:
@@ -250,6 +233,32 @@ class Staging:
             self.close()
             raise
 
+    def _lock(self):
+        """Make (or use) the staging folder and take the lock of the name. Another save that
+        removes the empty staging folder meanwhile is answered by making it again."""
+        import hashlib
+        lock = self.staging / ('lock-' + hashlib.sha256(fold_name(self.name).encode()).hexdigest()[:32])
+        for _attempt in range(8):
+            try:
+                os.mkdir(self.staging, 0o700)
+            except FileExistsError:
+                _no_link(self.staging, 'the staging folder')
+                if hasattr(os, 'getuid') and os.stat(self.staging).st_uid != os.getuid():
+                    raise PlaceError('The library\'s staging folder belongs to another user; remove '
+                                     f'{self.staging} when no save is running.') from None
+            try:
+                fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+            except FileExistsError:
+                raise PlaceError(f'Another save of a project named “{self.name}” is running (or one was interrupted: '
+                                 'if no save is running, remove the lock file in “Resolve Projects/.splice-staging”).'
+                                 ) from None
+            except FileNotFoundError:
+                continue  # the staging folder was removed by a save that just finished
+            os.close(fd)
+            self.lock = lock
+            return
+        raise PlaceError('The library\'s staging folder keeps disappearing; try the save again.')
+
     @property
     def db(self):
         return self.folder / 'Project.db'
@@ -263,12 +272,17 @@ class Staging:
         file_mode = stat.S_IMODE(db_info.st_mode) if db_info else stat.S_IMODE(folder_info.st_mode) & 0o666
         os.chmod(self.db, file_mode)
         os.chmod(self.folder, stat.S_IMODE(folder_info.st_mode))
+        self.notes = []
         if hasattr(os, 'chown'):
             for path, info in ((self.db, db_info or folder_info), (self.folder, folder_info)):
+                current = os.stat(path, follow_symlinks=False)
+                if (current.st_uid, current.st_gid) == (info.st_uid, info.st_gid):
+                    continue
                 try:
                     os.chown(path, info.st_uid, info.st_gid, follow_symlinks=False)
                 except OSError:
-                    pass  # not permitted: the library's own default ownership applies
+                    self.notes.append(f'The owner of {path.name} could not be set to match the library\'s '
+                                      'projects (not permitted); it keeps Splice\'s.')
         library_users(self.library)  # checked again right before the rename
         check_new(self.projects, self.name)
         target = self.projects / self.name

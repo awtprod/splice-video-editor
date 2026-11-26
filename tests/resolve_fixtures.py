@@ -787,7 +787,7 @@ def write_seed(path, pic, snd, *, name='Seed project', with_grade=False, timelin
                 Sm2SequenceContainer_id=container)
         pic_path, snd_path = pic[0], snd[0]
         cut = [(0, 10, 2), (10, 8, 14), (18, 6, 0)]
-        pictures, sounds = [], []
+        pictures = []
         for n, (at, length, src) in enumerate(cut):
             p_id, s_id = ids(), ids()
             pictures.append((p_id, s_id, at, length, src))

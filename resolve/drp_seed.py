@@ -228,10 +228,7 @@ def convert(drp_path, donor):
         if root.get('DbId'):
             _element(conv, root)
         else:
-            for el in root.iter():
-                if el.get('DbId') and el is not root:
-                    pass
-            conv.unplaced.append((name, 'a document without a project object'))
+            conv.unplaced.append((name, 'a document without an object at its root'))
     where = {rid: table for table, rows in conv.rows.items() for rid in rows}
     values = {}
     for table, rid, prop, index, child in conv.pending:

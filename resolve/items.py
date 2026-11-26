@@ -17,9 +17,9 @@ import uuid
 from fractions import Fraction
 
 from . import blobs
-from .codec import (KD_STRING, CodecError, contains_text, envelope, kd_decode, kd_encode, kd_get, kd_set, pb_decode,
-                    pb_encode, pb_get, unwrap)
-from .mediapool import STANDARD_RATES, ClipRows, MediaPoolError, guarded, start_seconds
+from .codec import (KD_STRING, CodecError, envelope, kd_decode, kd_encode, parse_envelope, pb_decode, pb_encode,
+                    pb_get, unwrap)
+from .mediapool import STANDARD_RATES, MediaPoolError, guarded, start_seconds
 
 PICTURE, SOUND, TRANSITION = 'Sm2TiVideoClip', 'Sm2TiAudioClip', 'Sm2TiTransition'
 ITEM_TYPES = {PICTURE: 'picture', SOUND: 'sound'}
@@ -244,7 +244,6 @@ def relink(item, partners):
 
 
 def _version(blob):
-    from .codec import parse_envelope
     parsed = parse_envelope(blob)
     if parsed is None or parsed[0] is None:
         raise ItemError('bad_template', 'item FieldsBlob is not a versioned envelope')
@@ -367,15 +366,6 @@ def transition_payload_ok():
     return zlib.decompress(SOUND_FIELD[4:]) == SOUND_PAYLOAD and size == len(SOUND_PAYLOAD)
 
 
-def no_template_ids(row, needles):
-    """The label of an id of ``needles`` left in any layer of ``row``'s values, or None."""
-    for value in row.values():
-        found = contains_text(value, needles)
-        if found:
-            return found
-    return None
-
-
 __all__ = ['ITEM_COLUMNS', 'ITEM_CONSTANTS', 'LATER_COLUMNS', 'ItemError', 'MediaView', 'author_item',
-           'author_transition', 'fresh_fields', 'links_of', 'media_view', 'relink', 'timemap', 'transition_problem',
-           'ClipRows', 'CodecError', 'kd_get', 'kd_set']
+           'author_transition', 'fresh_fields', 'links_of', 'media_view', 'picture_tail', 'relink', 'timemap',
+           'transition_problem']

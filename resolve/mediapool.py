@@ -24,8 +24,8 @@ from datetime import datetime, timezone
 from fractions import Fraction
 
 from . import blobs
-from .codec import (KD_STRING, CodecError, contains_text, edit_kd, edit_message, kd_decode, kd_encode, kd_get,
-                    kd_set, pb_decode, pb_encode, pb_get, pb_remove, rewrap, unwrap)
+from .codec import (CodecError, contains_text, edit_kd, edit_message, kd_decode, kd_get, kd_set, pb_decode,
+                    pb_encode, pb_get, pb_remove, rewrap, unwrap)
 
 STANDARD_RATES = tuple(Fraction(n, d) for n, d in (
     (24000, 1001), (24, 1), (25, 1), (30000, 1001), (30, 1), (48000, 1001), (48, 1), (50, 1),
@@ -1413,5 +1413,3 @@ def project_frame_rate(config_rows):
     nearest = min(STANDARD_RATES, key=lambda s: abs(value - s))
     return nearest if abs(value - nearest) <= nearest / 1000 else None
 
-
-KD_LINK_TYPE = KD_STRING

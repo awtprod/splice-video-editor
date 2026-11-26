@@ -24,6 +24,8 @@ from .source import ResolveError, load_library, snapshot
 from .writer import EXACT, NOT_WRITTEN, OPT_IN, Report, Seed, WriteError, Writer, prepare_template
 
 MAX_TIMELINES = 64
+#: New media files measured for one save at most (each is probed with FFprobe).
+MAX_NEW_FILES = 500
 
 
 def _digest(row, project_id, new_id):
@@ -219,6 +221,8 @@ class Measurer:
         if local is None:
             return None, 'its file is not on this computer'
         key = (str(local), resolve_path)
+        if key not in self.cache and len(self.cache) >= MAX_NEW_FILES:
+            return None, f'more than {MAX_NEW_FILES} new files in one save'
         if key not in self.cache:
             try:
                 self.cache[key] = (measure(local, resolve_path), str(local))
@@ -268,6 +272,7 @@ def run(payload, *, originals, scratch, resolve_media, drp_seed=None):
         result['user'] = user
         if request.confirm:
             placed = staging.finish()
+            result['notes'] = result.get('notes', []) + staging.notes
             result['written'] = True
             result['project'] = {'name': request.name, 'path': str(placed / 'Project.db')}
         else:

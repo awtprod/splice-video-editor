@@ -21,7 +21,7 @@ import uuid
 from fractions import Fraction
 
 from . import blobs, codec, effects, importer, items, mediapool
-from .source import ResolveError, connect
+from .source import ResolveError
 
 SUPPORTED_VERSIONS = frozenset({17})
 RESOLVE_TRIGGERS = frozenset({
@@ -122,7 +122,6 @@ class Seed:
         if missing or len(self.columns['Sm2TiItem']) != len(items.ITEM_COLUMNS):
             raise WriteError('The seed\'s timeline items have other columns than Resolve 21.1 writes; it may come '
                              'from another Resolve version.')
-        self.taken = set()
 
     def rows(self, table, where='1', args=()):
         if table not in self.columns:
@@ -463,13 +462,9 @@ class Writer:
         transitions = self._transitions(placed, timeline, start, name)
         # Seed items no Splice clip claims: removed when the reader made a clip of them, kept
         # otherwise (items Splice never imported stay as they are).
-        imported_types = ('Sm2TiVideoClip', 'Sm2TiAudioClip', 'Sm2TiGenerator', 'Sm2TiTitle')
         for item_id, (kind, track_id, row) in timeline.items.items():
-            if item_id in claimed or row['DbType'] == items.TRANSITION:
-                continue
-            if row['DbType'] in imported_types or row['DbType'].startswith('Sm2Ti') and row['DbType'] != 'Sm2TiTrack':
-                if self._imported_item(row, timeline):
-                    self._delete(item_id, row, timeline, name)
+            if item_id not in claimed and row['DbType'] != items.TRANSITION and self._imported_item(row, timeline):
+                self._delete(item_id, row, timeline, name)
         self._orders(placed, transitions, timeline, start)
         for clip, item_id, kind, track_id, s, d, i, new, view, partners in placed:
             expected[item_id] = {'kind': kind, 'track': track_id, 'start': s - start, 'duration': d, 'in': i,
@@ -700,10 +695,8 @@ class Writer:
             stand_in = clip.get('enabled') is False and opacity == 0
             if isinstance(opacity, (int, float)) and abs(opacity - imported) > _EPSILON and not stand_in:
                 report.add(NOT_WRITTEN, 'Opacity changes', where)
-        else:
-            for key in ('pan',):
-                if clip.get(key):
-                    report.add(NOT_WRITTEN, 'Clip pan', where)
+        elif clip.get('pan'):
+            report.add(NOT_WRITTEN, 'Clip pan', where)
 
     def _links(self, placed, timeline, name):
         """Links follow Splice's link groups. A group whose members are linked in the seed exactly
