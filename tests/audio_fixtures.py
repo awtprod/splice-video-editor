@@ -59,3 +59,92 @@ if __name__ == '__main__':
         speech_like(sys.argv[2], float(sys.argv[3]), int(sys.argv[4]))
     elif sys.argv[1] == 'take':
         camera_take(sys.argv[2], sys.argv[3], float(sys.argv[4]), float(sys.argv[5]))
+
+
+# ---- shared helpers for tests/test_audio_*.py ----
+import contextlib
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+
+def ffmpeg(*arguments, timeout=180):
+    subprocess.run(['ffmpeg', '-nostdin', '-y', '-v', 'error', *arguments], check=True, timeout=timeout)
+
+
+def pcm(path, channels=2, start=None, duration=None):
+    """Interleaved float samples of a file's first audio stream (48 kHz)."""
+    window = [*(['-ss', str(start)] if start is not None else []), *(['-t', str(duration)] if duration is not None else [])]
+    return array('f', subprocess.check_output(['ffmpeg', '-nostdin', '-v', 'error', *window, '-i', str(path), '-vn', '-ac', str(channels),
+                                               '-ar', '48000', '-f', 'f32le', '-c:a', 'pcm_f32le', 'pipe:1'], timeout=300))
+
+
+def independent_true_peak(path):
+    """4x oversampled peak (dBTP) with the SoX resampler: a different interpolator from the
+    limiter's own detector (libswresample) and from ebur128's."""
+    log = subprocess.run(['ffmpeg', '-nostdin', '-v', 'info', '-i', str(path), '-vn', '-af',
+                          'aresample=resampler=soxr:precision=28:osr=192000,astats=measure_perchannel=none:measure_overall=Peak_level',
+                          '-f', 'null', '-'], capture_output=True, text=True, timeout=300).stderr
+    import re
+    found = re.findall(r'Peak level dB:\s+(-?[0-9.]+|-inf)', log)
+    return -math.inf if found[-1] == '-inf' else float(found[-1])
+
+
+def loudness(path, channels=2):
+    """(integrated LUFS to 0.001, LRA LU, ebur128 true peak dBTP) as FFmpeg measures them."""
+    import re
+    log = Path(tempfile.mkdtemp(dir=Path(path).parent))/'r128.txt'
+    report = subprocess.run(['ffmpeg', '-nostdin', '-nostats', '-v', 'info', '-i', str(path), '-vn', '-af',
+                             'ebur128=peak=true:framelog=quiet:metadata=1,ametadata=mode=print:file='+str(log).replace(':', r'\:'),
+                             '-f', 'null', '-'], capture_output=True, text=True, timeout=300).stderr
+    values = re.findall(r'lavfi\.r128\.I=(-?[\d.]+|-inf|nan)', log.read_text())
+    log.unlink(); log.parent.rmdir()
+    summary = report[report.rfind('Integrated loudness:'):]
+    lra = float(re.search(r'LRA:\s+(-?[\d.]+)', summary).group(1))
+    peak = re.search(r'Peak:\s+(-?[\d.]+|-inf) dBFS', summary[summary.rfind('True peak:'):]).group(1)
+    integrated = float(values[-1]) if values and values[-1] not in ('-inf', 'nan') else -math.inf
+    return integrated, lra, (-math.inf if peak == '-inf' else float(peak))
+
+
+def tone_level(samples, frequency, begin, end, channels=2, channel=0, rate=48000):
+    """Amplitude of a steady tone in one channel between two seconds (single-bin DFT)."""
+    first, stop = round(begin*rate), round(end*rate)
+    step = 2*math.pi*frequency/rate
+    real = imaginary = 0.0
+    for k in range(first, stop):
+        value = samples[k*channels+channel]
+        real += value*math.cos(step*k); imaginary += value*math.sin(step*k)
+    return 2*math.hypot(real, imaginary)/max(1, stop-first)
+
+
+class AudioCase(unittest.TestCase):
+    """A scratch folder under the media root and a one-call render."""
+    def setUp(self):
+        from premiere import MEDIA_ROOT
+        MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(dir=MEDIA_ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.directory = Path(self.temp.name)
+        self.media_root = MEDIA_ROOT
+
+    def src(self, path):
+        return '/media/' + str(Path(path).relative_to(self.media_root))
+
+    def source(self, name, graph, seconds=10, channels=2, rate=48000):
+        path = self.directory/name
+        if not path.exists():
+            ffmpeg('-f', 'lavfi', '-i', graph, '-t', str(seconds), '-ar', str(rate), '-ac', str(channels), '-c:a', 'pcm_f32le', str(path))
+        return path
+
+    def render(self, clips, media, *, codec='wav', name='mix', chunk=None, events=None, report=None, fps=25, project=None, **options):
+        import render_movie
+        suffix = {'wav': '.wav', 'h264': '.mp4', 'prores': '.mov', 'stems': '.zip', 'loudness': '.json'}[codec]
+        output = self.directory/(name+suffix)
+        patches = {}
+        if chunk: patches['AUDIO_CHUNK_SECONDS'] = chunk
+        if events: patches['AUDIO_CHUNK_EVENTS'] = events
+        body = dict(width=32, height=18, fps=fps, media=media, clips=clips, **(project or {}))
+        with mock.patch.multiple(render_movie, **patches) if patches else contextlib.nullcontext():
+            render_movie.render_to_file(body, output, options={'codec': codec, **options}, report=report)
+        return output

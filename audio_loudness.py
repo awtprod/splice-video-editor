@@ -381,7 +381,8 @@ def finish(input_args, total_samples, directory, *, ceiling=None, normalization=
     if progress: progress(.25)
     peak_after_gain = measured['truePeak']+gain
     needs_limit = ceiling is not None and math.isfinite(peak_after_gain) and peak_after_gain > ceiling
-    limiter = report['limiter'] = None if ceiling is None else {'ceilingDbtp': ceiling, 'acted': False}
+    limiter = report['limiter'] = None if ceiling is None else {'ceilingDbtp': ceiling, 'acted': False, 'regions': 0,
+                                                                'maxReductionDb': 0.0}
     if not needs_limit and abs(gain) < 1e-9:
         report['gainDb'] = 0.0
         report['output'] = report['input']

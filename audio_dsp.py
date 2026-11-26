@@ -176,7 +176,7 @@ def ffmpeg_filters(normalized, rate=48000):
     filters = []
     if 'denoise' in normalized:
         value = normalized['denoise']
-        filters.append(f"afftdn=nr={value['amount']:.3f}:nf={value['floor']:.3f}:tn=1")
+        filters.append(f"afftdn=nr={value['amount']:.3f}:nf={value['floor']:.3f}")
     if 'gate' in normalized:
         value = normalized['gate']
         filters.append(f"agate=threshold={10**(value['threshold']/20):.9f}:ratio={value['ratio']:.6f}:"
