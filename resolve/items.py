@@ -198,23 +198,38 @@ def media_start(view, timeline_items):
     """``(MediaStartTime, None)`` for a new item playing ``view`` on a timeline whose items are
     ``timeline_items`` (seed rows), or ``(None, why)`` when the value cannot be known.
 
-    The value the clip's other items on the same timeline hold, when they agree (Resolve keeps
-    one start per clip and timeline: on the real samples items of a timeline imported from
-    FCPXML hold the exact quotient of the timecode and the rate, one unit in the last place
-    from the pool's value, and the items of one timeline hold a clip's sound start where its
-    other timelines hold its picture timecode); otherwise the rule (the picture timecode over
-    the rate, or a sound file's own start), unless the clip's picture timecode and sound start
-    differ: then nothing shows which a new item gets, and the item is refused."""
+    For a clip whose picture timecode and sound start are the same: the value the clip's other
+    items on the same timeline hold when they agree and lie within :data:`SAME_START` of the
+    timecode (items of a timeline imported from FCPXML hold the exact quotient of the timecode
+    and the rate, one unit in the last place from the pool's value), otherwise the rule (the
+    picture timecode over the rate, or a sound file's own start).
+
+    For a clip whose picture timecode and sound start differ, the real samples hold such a clip
+    at most once per timeline, as one linked picture+sound pair placed together; on most
+    timelines that pair holds the picture timecode and on a few the sound start. Nothing shows
+    what Resolve gives a separately placed new item, so the only proven case is the one where
+    the clip's items on this timeline all hold its picture timecode: the new item gets that
+    value. Every other case (no item of it on the timeline, items that disagree, items holding
+    the sound start or any other value) is refused."""
     held = {row.get('MediaStartTime') for row in timeline_items
             if row.get('MediaRef') == view.media_id and row.get('DbType') in (PICTURE, SOUND)}
     value = next(iter(held)) if len(held) == 1 else None
-    usable = isinstance(value, float) and math.isfinite(value)
-    if usable and (start_conflict(view) or abs(value - view.start_seconds) <= SAME_START):
+    usable = (isinstance(value, float) and math.isfinite(value)
+              and abs(value - view.start_seconds) <= SAME_START)
+    if usable:
         return value, None
     if not start_conflict(view):
         return view.start_seconds, None
-    why = ('its other items on this timeline hold different starts' if len(held) > 1 else
-           'no item of it is on this timeline to take the start from')
+    if not held:
+        why = 'no item of it is on this timeline to take the start from'
+    elif len(held) > 1:
+        why = 'its other items on this timeline hold different starts'
+    elif (isinstance(value, float) and view.sound_start is not None
+          and abs(value - view.sound_start) <= SAME_START):
+        why = ('its items on this timeline hold the sound start, and nothing shows which start '
+               'Resolve gives a separately placed new item')
+    else:
+        why = 'its items on this timeline hold a start that is neither its picture timecode nor its sound start'
     return None, why
 
 

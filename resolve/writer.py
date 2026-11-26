@@ -351,6 +351,24 @@ class Timeline:
         return tracks[number - 1]['Sm2TiTrack_id'] if 1 <= number <= len(tracks) else None
 
 
+def first_overlap(accepted, kept_spans):
+    """The first of the crossfades ``accepted`` (dicts with ``track`` and ``span``) that overlaps
+    a kept transition of its track (``kept_spans``: track -> ``[(start, end, id)]``) or one of
+    the others starting before it (the earlier one wins), or ``None``."""
+    by = {}
+    for n, c in enumerate(accepted):
+        by.setdefault(c['track'], []).append((c['span'][0], n, c))
+    for track, group in by.items():
+        end = None
+        for _start, _n, c in sorted(group, key=lambda g: g[:2]):
+            if any(k[0] < c['span'][1] and c['span'][0] < k[1] for k in kept_spans.get(track, ())):
+                return c
+            if end is not None and c['span'][0] < end:
+                return c
+            end = c['span'][1] if end is None else max(end, c['span'][1])
+    return None
+
+
 class Writer:
     """Plans and applies the changes of every timeline, then the project's own."""
 
@@ -771,7 +789,8 @@ class Writer:
         if media_start is None:
             report.add(NOT_WRITTEN, 'New clips from media whose picture timecode and sound start differ (Resolve '
                        'stores either as the clip\'s start and nothing shows which a new clip gets, so a wrong guess '
-                       'would show other frames): place one clip of it on this timeline in Resolve first',
+                       'would show other frames; a new clip is written only where this timeline\'s clips of the same '
+                       'media start at its picture timecode): place it in Resolve',
                        f'{where} — {view.name} ({why})')
             return None
         item_id = self.fresh()
@@ -1136,7 +1155,18 @@ class Writer:
         carriers = {entry[0].get('resolveTransitionId'): entry for entry in placed
                     if entry[0].get('resolveTransitionId')}
         touched = {u[1] for u in self.updates if set(u[2]) & {'Start', 'Duration', 'In', 'Sm2TiTrack_id'}}
-        kept_spans = {}       # track id -> [(start, end, seed item id)]
+        kept_spans = {}       # track id -> [(start, end, seed item id)]: seed transitions kept
+        pending = {}          # Splice clip id -> the changed seed crossfade it may replace
+
+        def keep(item_id, kind, track_id, row, s, d):
+            kept.add(item_id)
+            out.append({'id': item_id, 'track': track_id, 'start': _whole(row, 'Start') + self.delta,
+                        'duration': round(d), 'seed': True,
+                        'kind': kind, 'pretty': row.get('PrettyType')})
+            kept_spans.setdefault(track_id, []).append((s, s + d, item_id))
+            if self.delta:
+                self._shift(item_id, row)
+
         for item_id, (kind, track_id, row) in timeline.items.items():
             if row['DbType'] != items.TRANSITION:
                 continue
@@ -1168,24 +1198,20 @@ class Writer:
                     if problem is None and self._work(item_id, row):
                         problem = 'the Resolve transition carries other Resolve work'
                     if problem is None:
-                        self._delete(item_id, row, timeline, name, transition=True, changed=True)
+                        # Decided once every new crossfade's span is known (see below).
+                        pending[carrier[0].get('id')] = (item_id, kind, track_id, row, s, d, where, carrier)
                         replaced.add(carrier[0].get('id'))
                         continue
                     self.report.add(NOT_WRITTEN, 'Changes to Resolve transitions (length, alignment or kind) not '
                                     f'written: the transition stays as it is in Resolve ({problem})',
                                     f'{where} at {carrier[0].get("start", 0):.2f} s')
             if meets and not removed:
-                kept.add(item_id)
-                out.append({'id': item_id, 'track': track_id, 'start': _whole(row, 'Start') + self.delta,
-                            'duration': round(d), 'seed': True,
-                            'kind': kind, 'pretty': row.get('PrettyType')})
-                kept_spans.setdefault(track_id, []).append((s, s + d, item_id))
-                if self.delta:
-                    self._shift(item_id, row)
+                keep(item_id, kind, track_id, row, s, d)
                 if carrier is None and row.get('PrettyType') not in items.SOUND_KINDS.values():
                     self.report.add(EXACT, 'Resolve transitions Splice does not show, kept on their cut', where)
             else:
                 self._delete(item_id, row, timeline, name, transition=True, removed=removed)
+        candidates = []       # sound crossfades that pass the gate, in clip order
         for entry in placed:
             clip, item_id, kind, track_id, s = entry[0], entry[1], entry[2], entry[3], entry[4]
             style = clip.get('transition')
@@ -1201,10 +1227,11 @@ class Writer:
             on_cut = [k for k in kept_spans.get(track_id, ()) if k[0] < span[1] and span[0] < k[1]]
             if on_cut and clip.get('id') not in replaced:
                 # A Splice crossfade on a cut where a Resolve transition is kept (a clip that lost
-                # its link to it): the Resolve one stays, and a second one is never added.
-                seed_row = timeline.items[on_cut[0][2]][2]
-                seen = self._as_read(seed_row, kind, _whole(seed_row, 'Start') + self.delta,
-                                     on_cut[0][1] - on_cut[0][0], s)
+                # its link to it): the Resolve one stays, and a second one is never added. Only
+                # seed transitions are in kept_spans, so the lookup is always of a seed row.
+                seed_entry = timeline.items.get(on_cut[0][2])
+                seen = None if seed_entry is None else self._as_read(
+                    seed_entry[2], kind, _whole(seed_entry[2], 'Start') + self.delta, on_cut[0][1] - on_cut[0][0], s)
                 if self._asked(clip, timeline.rate) != seen:
                     self.report.add(NOT_WRITTEN, 'Transitions on a cut that keeps a Resolve transition (the Resolve '
                                     'one stays as it is; a second one is not added)', where)
@@ -1216,19 +1243,48 @@ class Writer:
             if problem:
                 self.report.add(NOT_WRITTEN, f'Sound crossfades Resolve cannot take as written ({problem})', where)
                 continue
+            start = s - items.frames_before(frames)
+            candidates.append({'clip': clip, 'track': track_id, 's': s, 'frames': frames, 'name': resolve_name,
+                               'span': (start, start + frames), 'where': where})
+
+        # Crossfades written in this save must not overlap each other or a kept Resolve
+        # transition. A refused one that would have replaced a changed Resolve crossfade
+        # leaves that one as it is (its span then counts as kept), which can refuse others.
+        def restore(clip_id, why):
+            back = pending.pop(clip_id, None)
+            if back is not None:
+                keep(*back[:6])
+                self.report.add(NOT_WRITTEN, 'Changes to Resolve transitions (length, alignment or kind) not '
+                                f'written: the transition stays as it is in Resolve ({why})', back[6])
+            return back is not None
+        offered = {c['clip'].get('id') for c in candidates}
+        for clip_id in [k for k in pending if k not in offered]:
+            restore(clip_id, 'the new crossfade could not be written')
+        accepted = list(candidates)
+        while True:
+            bad = first_overlap(accepted, kept_spans)
+            if bad is None:
+                break
+            accepted.remove(bad)
+            if not restore(bad['clip'].get('id'), 'it would overlap another transition on this track'):
+                self.report.add(NOT_WRITTEN, 'Sound crossfades Resolve cannot take as written (it would overlap '
+                                'another transition on this track)', bad['where'])
+        for seed_item, _kind, _track, row, _s, _d, _where, _carrier in pending.values():
+            self._delete(seed_item, row, timeline, name, transition=True, changed=True)
+        for c in accepted:
             transition_id = self.fresh()
-            row, _join = items.author_transition(resolve_name, track_id, 0, s, frames, timeline.rate, transition_id)
+            row, _join = items.author_transition(c['name'], c['track'], 0, c['s'], c['frames'], timeline.rate,
+                                                 transition_id)
             self.inserts.append(('Sm2TiItem', row))
-            out.append({'id': transition_id, 'track': track_id, 'start': s - items.frames_before(frames),
-                        'duration': frames, 'seed': False, 'kind': 'audio', 'name': resolve_name,
-                        'pretty': items.SOUND_KINDS[resolve_name]})
-            kept_spans.setdefault(track_id, []).append((s - before, s - before + frames, transition_id))
+            out.append({'id': transition_id, 'track': c['track'], 'start': c['span'][0],
+                        'duration': c['frames'], 'seed': False, 'kind': 'audio', 'name': c['name'],
+                        'pretty': items.SOUND_KINDS[c['name']]})
             self.operations.add('add_sound_transitions')
-            if clip.get('id') in replaced:
+            if c['clip'].get('id') in replaced:
                 self.report.add(EXACT, 'Resolve sound crossfades changed (length or kind): written anew the way '
-                                'Resolve writes one, centred on the cut', where)
+                                'Resolve writes one, centred on the cut', c['where'])
             else:
-                self.report.add(EXACT, 'Sound crossfades (Cross Fade 0 dB or +3 dB, centred on the cut)', where)
+                self.report.add(EXACT, 'Sound crossfades (Cross Fade 0 dB or +3 dB, centred on the cut)', c['where'])
         return out
 
     def _work(self, item_id, row):

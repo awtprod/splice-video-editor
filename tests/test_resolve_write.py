@@ -836,6 +836,72 @@ class TransitionChangeTests(SaveCase):
         self.assertEqual(tree_state(self.library), before)
 
 
+    def overlapping(self, changed, fresh, name, reverse=False):
+        """The seed crossfade at cut 10 changed to ``changed`` frames and a fresh ``fresh``-frame
+        one at the next cut whose span overlaps it."""
+        project = self.opened()
+        fps = project['fps']
+        sound = [c for c in project['clips'] if c['type'] == 'audio']
+        for c in (sound[2], self.clip(project, 'video', 2)):
+            c['in'] = 10 / fps
+        sound[1].update(transitionDuration=changed / fps, transitionBefore=items.frames_before(changed) / fps)
+        sound[2].update(transition='dissolve', transitionDuration=fresh / fps,
+                        transitionBefore=items.frames_before(fresh) / fps, transitionMatchName='Constant Power')
+        if reverse:
+            project['clips'].reverse()
+        before = tree_state(self.library)
+        check = self.run_save(self.payload(project, name=name, confirm=False))
+        self.assertEqual(tree_state(self.library), before)
+        result = self.run_save(self.payload(project, name=name))
+        for report in (check, result):
+            line = next(line for line in report['lines'] if 'would overlap another transition' in line['what'])
+            self.assertEqual((line['status'], line['count']), (writer.NOT_WRITTEN, 1))
+            self.assertTrue(line['what'].startswith('Sound crossfades Resolve cannot take as written'))
+            self.assertTrue(any(line['what'].startswith('Resolve sound crossfades changed') for line in report['lines']))
+        start = project['startFrame']
+        self.assertEqual(self.transitions(result['project']['path']),
+                         [(str(start + 10 - items.frames_before(changed)), str(changed), 'Cross Fade +3DB')])
+
+    def test_a_new_crossfade_overlapping_a_changed_one_is_refused_not_a_crash(self):
+        self.overlapping(16, 8, 'Overlap')
+
+    def test_the_mirror_case_and_clip_order_do_not_matter(self):
+        self.overlapping(8, 10, 'Mirror')
+        self.overlapping(16, 8, 'Reversed', reverse=True)
+
+    def test_a_replacement_refused_for_overlap_leaves_the_resolve_crossfade(self):
+        project = self.opened()
+        fps = project['fps']
+        seed = self.transitions(self.db)
+        self.carrier(project).update(transitionDuration=12 / fps, transitionBefore=6 / fps)
+        real = writer.first_overlap
+        calls = []
+
+        def refuse_replacement(accepted, kept_spans):
+            # As if another transition overlapped the changed one (no fixture has two seed ones).
+            calls.append(len(accepted))
+            return accepted[0] if len(calls) == 1 and accepted else real(accepted, kept_spans)
+        with mock.patch.object(writer, 'first_overlap', refuse_replacement):
+            result = self.run_save(self.payload(project, name='Kept'))
+        self.assertEqual(self.transitions(result['project']['path']), seed)
+        line = next(line for line in result['lines'] if line['what'].startswith('Changes to Resolve transitions'))
+        self.assertIn('it would overlap another transition', line['what'])
+        self.assertFalse(any(line['what'].startswith('Resolve sound crossfades changed') for line in result['lines']))
+
+    def test_a_refused_replacement_keeps_the_resolve_crossfade_and_can_refuse_others(self):
+        kept = {'t': []}
+        a = {'track': 't', 'span': (0, 10)}
+        b = {'track': 't', 'span': (8, 12)}
+        c = {'track': 't', 'span': (20, 24)}
+        other = {'track': 'u', 'span': (0, 10)}
+        self.assertIs(writer.first_overlap([b, a, c, other], kept), b)
+        self.assertIsNone(writer.first_overlap([a, c, other], kept))
+        self.assertIsNone(writer.first_overlap([{'track': 't', 'span': (0, 4)}, {'track': 't', 'span': (4, 8)}], kept))
+        kept['t'].append((19, 21, 'seed'))
+        self.assertIs(writer.first_overlap([a, c], kept), c)
+        self.assertIs(writer.first_overlap([{'track': 't', 'span': (0, 30)}, a], {}), a)
+
+
 class RoundingReportTests(SaveCase):
     def test_rounding_is_reported_only_where_a_rounded_value_is_written(self):
         last = self.ids['pictures'][-1]
@@ -1080,22 +1146,41 @@ class MediaStartTests(unittest.TestCase):
         self.assertIsNone(value)
         self.assertIn('no item of it is on this timeline', why)
 
-    def test_the_value_the_clips_items_on_the_timeline_hold(self):
-        rows = [{'MediaRef': 'm', 'DbType': items.PICTURE, 'MediaStartTime': 931.5973333333334},
-                {'MediaRef': 'm', 'DbType': items.SOUND, 'MediaStartTime': 931.5973333333334}]
-        self.assertEqual(items.media_start(self.view(3599.9964, 931.5973333333334), rows), (931.5973333333334, None))
-        rows[1]['MediaStartTime'] = 3599.9964
+    def pair(self, value):
+        return [{'MediaRef': 'm', 'DbType': items.PICTURE, 'MediaStartTime': value},
+                {'MediaRef': 'm', 'DbType': items.SOUND, 'MediaStartTime': value}]
+
+    def test_two_starts_a_pair_holding_the_picture_timecode_is_the_only_proven_case(self):
+        tc, sound = 3599.9964, 931.5973333333334
+        self.assertEqual(items.media_start(self.view(tc, sound), self.pair(tc)), (tc, None))
+
+    def test_two_starts_a_pair_holding_the_sound_start_is_refused(self):
+        value, why = items.media_start(self.view(3599.9964, 931.5973333333334), self.pair(931.5973333333334))
+        self.assertIsNone(value)
+        self.assertIn('hold the sound start', why)
+
+    def test_two_starts_a_held_value_that_is_neither_start_is_refused(self):
+        for tampered in (3606.9964, 0.0, 938.5973333333334, float('inf'), float('nan'), None, '3599.9964'):
+            value, why = items.media_start(self.view(3599.9964, 931.5973333333334), self.pair(tampered))
+            self.assertIsNone(value, tampered)
+            self.assertIn('neither its picture timecode nor its sound start', why)
+
+    def test_two_starts_items_that_disagree_are_refused(self):
+        rows = self.pair(3599.9964)
+        rows[1]['MediaStartTime'] = 931.5973333333334
         value, why = items.media_start(self.view(3599.9964, 931.5973333333334), rows)
         self.assertIsNone(value)
         self.assertIn('different starts', why)
-        # A neighbouring double the clip's items hold (a timeline imported from FCPXML) is kept.
+
+    def test_one_start_keeps_the_rule_and_the_neighbouring_double(self):
         import math
         near = math.nextafter(3600.0, 0)
         self.assertEqual(items.media_start(self.view(3600.0, 3600.0), [{'MediaRef': 'm', 'DbType': items.SOUND,
                                                                          'MediaStartTime': near}]), (near, None))
         # A far value on a clip without a conflict is not taken: the rule stands.
-        self.assertEqual(items.media_start(self.view(3600.0, 3600.0), [{'MediaRef': 'm', 'DbType': items.SOUND,
-                                                                         'MediaStartTime': 12.0}]), (3600.0, None))
+        self.assertEqual(items.media_start(self.view(3600.0, 3600.0), self.pair(12.0)), (3600.0, None))
+        self.assertEqual(items.media_start(self.view(3600.0, None), self.pair(12.0)), (3600.0, None))
+        self.assertEqual(items.media_start(self.view(3600.0, 3600.0), []), (3600.0, None))
 
 
 class MediaStartSaveTests(SaveCase):
@@ -1134,6 +1219,20 @@ class MediaStartSaveTests(SaveCase):
         finally:
             conn.close()
         self.assertEqual(len(held), 1)
+        # When they hold the sound start, nothing proves what a separately placed item gets.
+        shutil.copyfile(self.db, self.kept)
+
+        def held_sound(clip):
+            view = real(clip)
+            if view.picture:
+                view.sound_start = view.start_seconds
+                view.start_seconds += 2668.4
+            return view
+        with mock.patch.object(items, 'media_view', held_sound):
+            result = self.run_save(self.payload(project, name='Splice cut 2', confirm=False))
+        line = next(line for line in result['lines'] if line['what'].startswith('New clips from media whose picture'))
+        self.assertEqual((line['status'], line['count']), (writer.NOT_WRITTEN, 1))
+        self.assertIn('hold the sound start', line['all'][0])
 
 
 class StillRadiometryTests(unittest.TestCase):
