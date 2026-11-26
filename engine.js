@@ -1488,6 +1488,14 @@
   const laneOf = (clip) => (clip.type === "audio" ? "audio:" : "video:") + clip.track;
   const hasSound = (item) => item?.type === "video" && !item.still && item.audioChannels > 0;
   const startOfLane = (lane) => ({kind: lane.startsWith("audio") ? "audio" : "video", track: Number(lane.split(":")[1])});
+  // Intersect the selected picture's source range with the recording, then place it on the timeline.
+  function syncSoundPlacement(picture, sound, offset, fps) {
+    const speed = Number(picture.speed) || 1;
+    let start = picture.start, length = picture.duration, inPoint = Number(picture.in || 0) + offset;
+    if (inPoint < 0) { start += -inPoint/speed; length -= -inPoint/speed; inPoint = 0; }
+    if (sound.duration && inPoint + length*speed > sound.duration) length = (sound.duration - inPoint)/speed;
+    return length > 1/fps ? {start: Math.round(start*1e9)/1e9, duration: length, in: inPoint} : null;
+  }
   function freeAudioTrack(source, from, to) {
     for (let track = -1; track >= -64; track--) {
       if (trackLocked("audio", track, source)) continue;
@@ -1948,6 +1956,8 @@
       project.trackMix[key] = next;
       syncMedia(); notify();
     },
+    clipAudioStream,
+    syncSoundPlacement,
     // Dual-system sound: link each picture clip to its separately recorded sound.
     // `offset` is seconds: a picture source time t plays the sound file at t + offset.
     // scratch: 'mute' turns the camera's own sound off (embeddedAudio false), 'keep' leaves it.
@@ -1964,15 +1974,12 @@
           if (!Number.isFinite(offset)) throw Error('Invalid sync offset.');
           ensureEditable(picture);
           const speed = Number(picture.speed) || 1;
-          let start = picture.start, length = picture.duration, inPoint = Number(picture.in || 0) + offset;
-          if (inPoint < 0) { start += -inPoint/speed; length -= -inPoint/speed; inPoint = 0; }
-          if (sound.duration && inPoint + length*speed > sound.duration) length = (sound.duration - inPoint)/speed;
-          start = Math.round(start*1e9)/1e9;
-          if (!(length > 1/next.fps)) throw Error(`${sound.name || 'The sound file'} does not overlap ${picture.title || 'the picture clip'} at that offset.`);
-          const track = freeAudioTrack(next, start, start + length);
+          const placement = syncSoundPlacement(picture, sound, offset, next.fps);
+          if (!placement) throw Error(`${sound.name || 'The sound file'} does not overlap ${picture.title || 'the picture clip'} at that offset.`);
+          const track = freeAudioTrack(next, placement.start, placement.start + placement.duration);
           if (track === null) throw Error("There is no free, unlocked audio track for the synced sound.");
           const group = picture.linkGroup || uid();
-          const clip = {id: uid(), mediaId, type: 'audio', track, start, duration: length, in: inPoint, title: '', volume: 100,
+          const clip = {id: uid(), mediaId, type: 'audio', track, ...placement, title: '', volume: 100,
             transition: 'none', linkGroup: group, ...(speed !== 1 ? {speed} : {})};
           picture.linkGroup = group;
           if (scratch === 'mute') {

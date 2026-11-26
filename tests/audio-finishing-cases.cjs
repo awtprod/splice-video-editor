@@ -232,10 +232,13 @@ async function exportDialog(splice, media) {
 // A take: a recorder WAV of syllable-like bursts (tests/audio_fixtures.py) and a camera clip whose
 // scratch sound starts `offset` seconds into it (quieter, filtered, hiss, AAC).
 function makeTake(directory, offset) {
-  const recorder = path.join(directory, `recorder-${offset}.wav`), camera = path.join(directory, `camera-${offset}.mp4`);
+  const recorder = path.join(directory, `recorder-${offset}.wav`), scratch = path.join(directory, `camera-${offset}.mp4`);
+  const camera = path.join(directory, 'multistream.mov');
   const fixtures = path.join(root, 'tests', 'audio_fixtures.py');
   execFileSync('python3', [fixtures, 'speech', recorder, '40', '7']);
-  execFileSync('python3', [fixtures, 'take', recorder, camera, String(offset), '20']);
+  execFileSync('python3', [fixtures, 'take', recorder, scratch, String(offset), '20']);
+  ffmpeg(['-i', scratch, '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=mono', '-map', '0:v:0', '-map', '1:a:0', '-map', '0:a:0',
+    '-c:v', 'copy', '-c:a', 'pcm_s16le', '-t', '20', camera]);
   return {recorder, camera};
 }
 
@@ -250,6 +253,7 @@ async function syncCommand(splice) {
     await waitFor(page, () => Editor.get().project.media.length === 2 && Editor.get().project.media.every(item => item.duration > 0), null, 30000);
     await state(page, () => Editor.editProject(project => {
       const camera = project.media.find(item => item.type === 'video');
+      camera.audioStream = 1; // The matching scratch recording is the second stream.
       project.clips.push({id: 'pic', mediaId: camera.id, type: 'video', track: 1, start: 2, duration: 12, in: 1, color: {}, volume: 100,
         transition: 'none', title: '', embeddedAudio:false, linkGroup:'camera-pair'});
       project.clips.push({id:'scratch', mediaId:camera.id, type:'audio', track:-1, start:2, duration:12, in:1, linkGroup:'camera-pair'});
@@ -284,9 +288,72 @@ async function syncCommand(splice) {
     const restored = await page.evaluate(() => Editor.get().project.clips);
     assert.deepEqual(restored.map(c => c.id), ['pic', 'scratch']);
     assert.ok(restored.every(c => c.linkGroup === 'camera-pair' && c.enabled !== false));
+    await state(page, stream => Editor.editProject(project => { project.clips.find(c => c.id === 'pic').audioStream = stream; }),
+      keep ? null : 0);
+    await page.locator('.edit-menu summary').click();
+    await page.locator('.edit-menu [data-command=syncSound]').click();
+    await dialog.locator('[name=method]').selectOption('waveform');
+    await dialog.locator('button[type=submit]').click();
+    await waitFor(page, () => /synced and linked/.test(document.querySelector('.audio-sync-results')?.textContent || ''));
+    assert.match(await dialog.locator('.audio-sync-results').innerText(), /0 synced and linked/);
+    assert.equal(await state(page, () => Editor.get().project.clips.length), 2);
     assert.deepEqual(errors, []);
     await page.context().close();
   }
+}
+
+async function syncTimecodeBin(splice) {
+  const {shot, waitFor} = lazy();
+  const camera = path.join(splice.temp, 'timecoded.mov');
+  ffmpeg(['-f', 'lavfi', '-i', 'color=gray:s=160x90:r=25:d=10', '-timecode', '10:00:03:12', '-c:v', 'libx264', camera]);
+  const files = [camera];
+  for (const [name, duration, start] of [['Earlier', 60, 9*3600], ['Before trim', 7, 10*3600], ['Matching', 3, 10*3600+9]]) {
+    const wav = path.join(splice.temp, name + '.wav');
+    ffmpeg(['-f', 'lavfi', '-i', 'sine=r=48000:d=' + duration, '-write_bext', '1', '-metadata', 'time_reference=' + start*48000, wav]);
+    files.push(wav);
+  }
+  const {page, errors} = await openPage(splice);
+  await page.evaluate(() => SpliceSession.newProject({name: 'Timecode bin', width: 320, height: 180, fps: 25}));
+  await page.locator('#media-input').setInputFiles(files);
+  await waitFor(page, () => Editor.get().project.media.length === 4 && Editor.get().project.media.every(item => item.duration > 0));
+  await page.evaluate(() => {
+    Editor.editProject(project => {
+      for (const sound of project.media.filter(item => item.type === 'audio')) sound.bin = 'Location sound';
+      const picture = {mediaId:project.media.find(item => item.type === 'video').id, type:'video', track:1};
+      project.clips.push({...picture, id:'pic', start:2, duration:2, in:4, speed:2},
+        {...picture, id:'late', title:'Late trim', start:5, duration:1, in:9});
+    });
+    Editor.select('pic');
+  });
+  await page.keyboard.press('a'); // Select both picture clips forward on V1.
+  assert.equal(await page.evaluate(() => SpliceWorkspace.selection().length), 2);
+  await page.locator('.edit-menu summary').click();
+  await page.locator('.edit-menu [data-command=syncSound]').click();
+  const dialog = page.locator('.audio-sync-dialog');
+  await dialog.locator('[name=sound]').selectOption('bin:Location sound');
+  await dialog.locator('[name=method]').selectOption('timecode');
+  await dialog.locator('button[type=submit]').click();
+  await waitFor(page, () => !document.querySelector('.audio-sync-dialog [type=submit]').disabled);
+  const message = await dialog.locator('.audio-sync-results').innerText();
+  await shot(page, 'sync-timecode-bin');
+  assert.match(message, /1 synced and linked/);
+  assert.match(message, /Late trim: no overlapping sound/i);
+  const placed = await page.evaluate(() => {
+    const {clips, media} = Editor.get().project, audio = clips.find(c => c.type === 'audio');
+    return {source:media.find(m => m.id === audio.mediaId).name, start:audio.start, duration:audio.duration, in:audio.in};
+  });
+  assert.equal(placed.source, 'Matching.wav');
+  assert.equal(placed.in, 0);
+  assert.ok(Math.abs(placed.start - 2.76) < 1e-6 && Math.abs(placed.duration - 1.24) < 1e-6);
+  record('timecodeBin', placed);
+  await dialog.locator('[name=sound]').selectOption({label:'Earlier.wav'});
+  await dialog.locator('button[type=submit]').click();
+  await waitFor(page, () => !document.querySelector('.audio-sync-dialog [type=submit]').disabled);
+  assert.match(await dialog.locator('.audio-sync-results').innerText(), /no overlapping sound/i);
+  assert.ok(await dialog.locator('[data-apply]').isHidden());
+  assert.equal(await page.evaluate(() => Editor.get().project.clips.length), 3);
+  assert.deepEqual(errors, []);
+  await page.context().close();
 }
 
 // The preview's IIRFilterNodes (the browser's own filter code, fed audio-dsp.js coefficients)
@@ -526,6 +593,6 @@ async function performance12(splice, media) {
 }
 
 const cases = [eqParity, dynamicsParity, monoDynamics, embeddedSoundCut, auditionEffects, busEffects,
-  inspectorAudio, automation, exportDialog, syncCommand, performance12];
+  inspectorAudio, automation, exportDialog, syncCommand, syncTimecodeBin, performance12];
 const selectedCases = process.env.AUDIO_CASES && process.env.AUDIO_CASES.split(',');
 exports.cases = selectedCases ? cases.filter(fn => selectedCases.includes(fn.name)) : cases;
