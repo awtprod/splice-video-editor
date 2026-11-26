@@ -1089,12 +1089,17 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
     rec709 = options.get('colorSpace')=='rec709'
     conform_pq = options.get('colorSpace')=='pq'
     # Composite in 4:4:4 for 4:4:4 and RGB deliveries, with an alpha base when alpha is delivered.
-    wide = spec['chroma'] == '444'
-    base_format = ('yuva444p10le' if spec['alpha'] else 'yuv444p10le') if wide else 'yuv422p10le' if high_depth else 'yuv420p'
-    alpha_format = 'yuva444p10le' if wide else 'yuva422p10le' if high_depth else 'yuva420p'
+    # High-depth paths work in at least 4:2:2 even when the final encoder uses 4:2:0.
+    chroma = spec['chroma']
+    if high_depth and chroma == '420':
+        chroma = '422'
+    depth_suffix = 'p10le' if high_depth else 'p'
+    alpha_format = f'yuva{chroma}{depth_suffix}'
+    base_format = alpha_format if spec['alpha'] else f'yuv{chroma}{depth_suffix}'
     full_alpha = 'yuva444p10le' if high_depth else 'yuva444p'
     dip_rgb = 'gbrap10le' if high_depth else 'gbrap'
-    overlay = 'eof_action=pass:shortest=0:format=' + ('yuv444p10' if wide else 'yuv422p10' if high_depth else 'yuv420')
+    overlay_format = f'yuv{chroma}p10' if high_depth else f'yuv{chroma}'
+    overlay = 'eof_action=pass:shortest=0:format=' + overlay_format
     if not isinstance(render_options, dict) or not isinstance(render_options.get('mutedTracks', {}), dict):
         raise ValueError('Invalid render options')
     muted = render_options.get('mutedTracks', {})

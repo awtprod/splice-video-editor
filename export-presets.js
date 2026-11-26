@@ -297,7 +297,9 @@ window.SpliceDelivery = (() => {
         speed: options.speed, crf: options.crf, audioCodec: options.audioCodec});
       if (options.videoBitrate) videoBitrate.value = options.videoBitrate;
       alpha.checked = !!options.alpha;
-      if (options.colorSpace) form.elements.colorSpace.value = options.colorSpace;
+      form.elements.colorSpace.value = options.colorSpace ?? 'source';
+      srt.checked = !!options.captionFiles?.includes('srt');
+      vtt.checked = !!options.captionFiles?.includes('vtt');
       if (options.audioBitrate && [...form.elements.bitrate.options].some(o => Number(o.value) === options.audioBitrate)) form.elements.bitrate.value = String(options.audioBitrate);
       else if (options.audioBitrate) { form.elements.bitrate.append(new Option(String(options.audioBitrate))); form.elements.bitrate.value = String(options.audioBitrate); }
       timecode.checked = options.timecode !== false;

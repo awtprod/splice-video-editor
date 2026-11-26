@@ -114,6 +114,7 @@ async function main() {
       const key = Object.keys(capabilities.machine.variants).find(key => key.startsWith('h264|high422|') && key.endsWith('|mp4|'));
       assert.ok(key);
       capabilities.machine.variants[key] = 'profile probe failed';
+      capabilities.presets.find(item => item.id === 'festival-hq').options.captionFiles = ['vtt'];
       const hdr = capabilities.presets.find(item => item.id === 'youtube-uhd-hdr').options.hdr;
       Object.assign(hdr, {lightLevels: 'manual', maxCll: 600, maxFall: 200});
       await route.fulfill({response, json: capabilities});
@@ -141,6 +142,12 @@ async function main() {
     await page.locator(`${dialog} select[name=preset]`).selectOption('youtube-uhd-hdr');
     assert.equal(await page.locator(`${dialog} [name=hdrMaxCll]`).inputValue(), '600');
     assert.equal(await page.locator(`${dialog} [name=hdrMaxFall]`).inputValue(), '200');
+    await page.locator(`${dialog} select[name=preset]`).selectOption('festival-hq');
+    assert.equal(await page.locator(`${dialog} [name=colorSpace]`).inputValue(), 'source');
+    assert.ok(await page.locator(`${dialog} [name=captionVtt]`).isChecked());
+    assert.equal(await page.locator(`${dialog} [name=captionSrt]`).isChecked(), false);
+    await page.locator(`${dialog} select[name=preset]`).selectOption('broadcast-prores');
+    assert.equal(await page.locator(`${dialog} [name=captionVtt]`).isChecked(), false);
     await page.locator(`${dialog} [name=codec]`).selectOption('wav');
     for (const format of ['pcm16', 'pcm32f']) {
       const check = page.waitForRequest(req => req.url().endsWith('/api/delivery/check') &&

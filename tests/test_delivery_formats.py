@@ -235,6 +235,21 @@ class Intra(DeliveryCase):
         with self.assertRaisesRegex(ValueError, 'cannot carry alpha'):
             delivery.normalize(dict(codec='dnxhr', profile='444', alpha=True))
 
+    def test_8bit_dnxhr_preserves_alternating_chroma_rows(self):
+        source = self.media / 'chroma-stripes.mkv'
+        ffmpeg('-f', 'lavfi', '-i', f"nullsrc=s={W}x{H},format=yuv422p,geq=lum=128:cb='64+128*mod(Y,2)':cr=128",
+               '-t', '1', '-c:v', 'ffv1', str(source))
+        project = self.project()
+        project['media'][0]['src'] = self.src(source)
+        project['clips'] = [dict(type='video', track=1, mediaId='m', start=0, duration=.5)]
+        for profile in ('lb', 'sq', 'hq'):
+            with self.subTest(profile=profile):
+                path, _ = self.render(project, dict(codec='dnxhr', profile=profile))
+                plane = subprocess.check_output(['ffmpeg', '-v', 'error', '-i', str(path), '-vf', 'extractplanes=u',
+                                                '-frames:v', '1', '-f', 'rawvideo', 'pipe:1'], timeout=60)
+                center = H//2 * (W//2) + W//4
+                self.assertGreater(plane[center + W//2] - plane[center], 90)
+
     def test_dnxhr_profiles_in_mov_and_mxf(self):
         for profile, label, pix, depth in (('lb', 'DNXHR LB', 'yuv422p', 8), ('sq', 'DNXHR SQ', 'yuv422p', 8), ('hq', 'DNXHR HQ', 'yuv422p', 8),
                                            ('hqx', 'DNXHR HQX', 'yuv422p10le', 10), ('444', 'DNXHR 444', 'yuv444p10le', 10)):
