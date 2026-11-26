@@ -208,12 +208,14 @@ async function playback(page) {
       steps.push(performance.now() - step);
       await new Promise(resolve => requestAnimationFrame(resolve));
     }
-    return {totalMs: Math.round(performance.now() - started), slowestStepMs: Math.round(Math.max(...steps)),
+    return {totalMs: Math.round(performance.now() - started), stepsMs: Math.round(steps.reduce((sum, value) => sum + value, 0)),
+      slowestStepMs: Math.round(Math.max(...steps)),
       nodes: document.querySelectorAll('.timeline-clip').length};
   });
-  // Before this round one step took up to 250 ms (3.7-6 s for all 40). The total includes painting
-  // and swings with machine load, so it is reported; the slowest step is what the fix bounds.
-  assert.ok(zoom.slowestStepMs < 180, JSON.stringify(zoom));
+  // Before this round the 40 re-renders took 1.3-1.7 s of script time (3.7-6 s with painting; one step
+  // up to 250 ms). Painting and single steps swing with machine load, so they are reported and the
+  // summed re-render time is what the fix bounds.
+  assert.ok(zoom.stepsMs < 1100, JSON.stringify(zoom));
   console.log('5,000 clips, 12 tracks, 3 h: playback at fit ' + JSON.stringify(played) + '; 40 zoom steps ' + JSON.stringify(zoom));
 }
 
