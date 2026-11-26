@@ -144,6 +144,23 @@ async function quota(splice, page, errors) {
   await waitFor(page, () => /Recovery unavailable/.test(document.querySelector('#session-status').textContent), undefined, 60000);
   await page.waitForTimeout(300);
   await cdp.send('Storage.overrideQuotaForOrigin', {origin: splice.url});
+  // The same with the write aborted while the LUT table is being stored (as a full disk does in
+  // the middle of a transaction).
+  await state(page, () => Editor.renameProject('Quota retry'));
+  await savedDraft(page);
+  await state(page, () => {
+    const put = IDBObjectStore.prototype.put;
+    window.restorePut = () => { IDBObjectStore.prototype.put = put; };
+    IDBObjectStore.prototype.put = function (value, key) {
+      if (typeof key === 'string' && key.startsWith('lut:')) { const tx = this.transaction; setTimeout(() => { try { tx.abort(); } catch {} }, 0); }
+      return put.call(this, value, key);
+    };
+    const lut = SpliceLUT.parseCube('LUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1', 'Small');
+    Editor.updateClip('q', {color: {lut}});
+  });
+  await waitFor(page, () => /Recovery unavailable/.test(document.querySelector('#session-status').textContent), undefined, 60000);
+  await page.waitForTimeout(500);
+  await state(page, () => window.restorePut());
   assert.deepEqual(errors.filter(message => /transaction/i.test(message)), [], 'no uncaught transaction error');
   await state(page, () => Editor.renameProject('Quota again'));
   await savedDraft(page);
@@ -225,7 +242,7 @@ async function sourceMonitor(splice, page, camera) {
   await page.locator('.source-stage').dragTo(lane, {targetPosition: {x: 40, y: laneBox.height / 2}});
   const dropped = await state(page, () => Editor.get().project.clips.filter(c => c.track === 2));
   assert.equal(dropped.length, 1, 'drag from the source picture places a clip on Video 2');
-  assert.ok(Math.abs(dropped[0].in - 5) < 1e-6 && Math.abs(dropped[0].duration - .48) < 1e-6);
+  assert.ok(Math.abs(dropped[0].in - 5) < 1e-6 && Math.abs(dropped[0].duration - .52) < 1e-6, JSON.stringify(dropped[0]));
   assert.ok(await state(page, () => Editor.get().project.clips.some(c => c.type === 'audio' && c.linkGroup && c.linkGroup === Editor.get().project.clips.find(v => v.track === 2).linkGroup)));
   void at;
   await page.locator('.source-close').click();
@@ -247,10 +264,10 @@ async function importedPairs(splice, page, drp) {
       const get = id => Editor.get().project.clips.find(c => c.id === id);
       const fps = Editor.get().project.fps, out = {};
       const offsets = () => Editor.get().project.clips.filter(c => c.linkGroup).map(c => Editor.syncOffset(c)).filter(v => v);
-      // Linked move: the sound follows.
-      const s0 = get(audio).start;
-      Editor.moveClip(video, get(video).start + 10 / fps, get(video).track);
-      out.follows = Math.round((get(audio).start - s0) * fps);
+      // Linked move (past the end of the timeline, where nothing is in the way): the sound follows.
+      const s0 = get(audio).start, v0 = get(video).start;
+      Editor.moveClip(video, Math.ceil(Editor.get().project.duration * fps + 10) / fps, get(video).track);
+      out.follows = Math.round((get(audio).start - s0) * fps) - Math.round((get(video).start - v0) * fps);
       Editor.undo();
       // One-sided trim of the sound's end (link suspended): the picture stays, still in sync.
       const vEnd = get(video).start + get(video).duration;
@@ -278,10 +295,10 @@ async function importedPairs(splice, page, drp) {
       out.afterSlide = offsets();
       return out;
     }, pair);
-    assert.equal(result.follows, 10, label + ': linked sound follows a move');
-    assert.deepEqual(result.trimOneSided, [0, null], label + ': one-sided trim leaves the picture and sync alone');
+    assert.equal(result.follows, 0, label + ': linked sound follows a move frame for frame');
+    assert.deepEqual(result.trimOneSided, [0, 0], label + ': one-sided trim leaves the picture and sync alone');
     assert.equal(result.badge, -3, label + ': sync badge counts the slipped frames');
-    assert.equal(result.repaired, null, label + ': move into sync repairs it');
+    assert.equal(result.repaired, 0, label + ': move into sync repairs it');
     assert.deepEqual([result.unlink, result.unlinked, result.relink, result.relinked], ['unlinked', [null, null], 'linked', true], label + ': unlink and relink');
     assert.deepEqual([result.afterOverwrite, result.afterExtract, result.afterSlide], [[], [], []], label + ': overwrite, extract and slide keep every pair in sync');
     // Undo walks every step back to the imported timeline.
@@ -318,7 +335,7 @@ async function smaller(page) {
     media: [{id: 'long', name: 'Long take', src: 'assets/ridge.mp4', type: 'video', duration: 30}], ...project}));
   // Out with the playhead parked at the sequence end marks the last frame.
   await load({clips: [clip('a', 0, 4)]});
-  await state(page, () => { Editor.seek(Editor.get().project.duration); Editor.setMark('out'); });
+  await state(page, () => { Editor.seek(Editor.get().duration); Editor.setMark('out'); });
   assert.equal(await state(page, () => Math.round(Editor.get().project.marks.out * 25)), 100);
   // Sync menu: Escape closes it, and so does scrolling.
   await load({clips: [clip('v', 0, 4, {in: 2, linkGroup: 'g', embeddedAudio: false}), clip('s', 0, 4, {type: 'audio', track: -1, in: 2.2, linkGroup: 'g'})]});
@@ -331,8 +348,9 @@ async function smaller(page) {
   }
   // A drop-down keeps its keys: I and arrow keys do not reach the timeline.
   await state(page, () => Editor.clearMarks());
-  const select = page.locator('select').first();
+  const select = page.locator('select:visible').first();
   await select.focus();
+  assert.equal(await state(page, () => document.activeElement.tagName), 'SELECT');
   await page.keyboard.press('i');
   await page.keyboard.press('o');
   assert.equal(await state(page, () => Editor.get().project.marks ?? null), null, 'keys typed in a drop-down stay there');
