@@ -1521,8 +1521,8 @@ body{min-width:1024px}
   .viewer-bottom{gap:8px;padding-left:12px;padding-right:12px}
 }
 /* Export video: the Audio group, the finished export's report, and a footer that stays in view. */
-.export-dialog{width:min(560px,90vw)}
-.export-dialog form>footer{position:sticky;bottom:-22px;margin:20px -22px -22px;padding:12px 22px 22px;background:#1c211d;border-top:1px solid #2e372e}
+.studio-dialog[data-dialog=export]{width:min(560px,90vw);scroll-padding-bottom:84px}
+.studio-dialog[data-dialog=export] form>footer{position:sticky;bottom:-22px;margin:20px -22px -22px;padding:12px 22px 22px;background:#1c211d;border-top:1px solid #2e372e}
 .export-audio{border:1px solid #3a4538;border-radius:6px;margin:16px 0 4px;padding:2px 12px 10px}
 .export-audio legend{padding:0 6px;font-weight:600;color:#c9d6c4}
 .export-audio label{margin:10px 0}

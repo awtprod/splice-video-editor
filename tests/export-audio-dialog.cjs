@@ -12,7 +12,7 @@ const {startSplice, openPage, ffmpeg} = require('./browser-harness.cjs');
 const evidence = process.env.SPLICE_EVIDENCE_DIR;
 const state = (page, fn, arg) => page.evaluate(fn, arg);
 const waitFor = (page, fn, arg, timeout = 15000) => page.waitForFunction(fn, arg, {timeout});
-const dialog = '.export-dialog';
+const dialog = '.studio-dialog[data-dialog=export]';
 // The renderer's export options (render_movie._export_settings) and the type each must have.
 const accepted = {codec: 'string', crf: 'number', audioBitrate: 'number', colorSpace: 'string', range: 'object',
   limiter: 'boolean', limiterCeiling: 'number', aacPeakSafe: 'boolean', subtitleLanguage: 'string'};
@@ -43,7 +43,7 @@ async function openDialog(page) {
   await page.locator(dialog).waitFor();
 }
 const field = (page, name) => page.locator(`${dialog} [name=${name}]`);
-const visible = (page, name) => state(page, name => !document.querySelector(`.export-dialog [name=${name}]`).closest('label').hidden, name);
+const visible = (page, name) => state(page, name => !document.querySelector(`.studio-dialog[data-dialog=export] [name=${name}]`).closest('label').hidden, name);
 const closeDialog = page => page.locator(`${dialog} [data-cancel]`).click();
 
 // Watch the requests the page makes: the export POST bodies and the last status of each job.
@@ -72,7 +72,7 @@ async function render(page, seen) {
   const posts = seen.posts.length, polls = seen.jobs.length;
   const download = page.waitForEvent('download', {timeout: 120000});
   await page.locator(`${dialog} [type=submit]`).click();
-  await page.waitForFunction(() => !document.querySelector('.export-dialog [type=submit]').disabled, null, {timeout: 120000});
+  await page.waitForFunction(() => !document.querySelector('.studio-dialog[data-dialog=export] [type=submit]').disabled, null, {timeout: 120000});
   const status = await page.locator(`${dialog} .render-state`).textContent();
   if (!/ exported\./.test(status)) { download.catch(() => {}); throw Error('Export did not complete: ' + status); }
   assert.equal(seen.posts.length, posts + 1, 'one export request');
@@ -88,17 +88,17 @@ async function render(page, seen) {
 
 async function reportShown(page) {
   return state(page, () => ({
-    hidden: document.querySelector('.export-dialog .export-report').hidden,
-    measured: document.querySelector('.export-dialog .export-measured')?.textContent ?? null,
-    warnings: [...document.querySelectorAll('.export-dialog .export-warnings li')].map(item => item.textContent),
+    hidden: document.querySelector('.studio-dialog[data-dialog=export] .export-report').hidden,
+    measured: document.querySelector('.studio-dialog[data-dialog=export] .export-measured')?.textContent ?? null,
+    warnings: [...document.querySelectorAll('.studio-dialog[data-dialog=export] .export-warnings li')].map(item => item.textContent),
   }));
 }
 const signed = value => (value > 0 ? '+' : value < 0 ? '−' : '') + Math.abs(value).toFixed(1);
 
 async function checkFits(page) {
   const fit = await state(page, () => {
-    const box = document.querySelector('.export-dialog').getBoundingClientRect();
-    const buttons = [...document.querySelectorAll('.export-dialog footer button')].map(button => {
+    const box = document.querySelector('.studio-dialog[data-dialog=export]').getBoundingClientRect();
+    const buttons = [...document.querySelectorAll('.studio-dialog[data-dialog=export] footer button')].map(button => {
       const rect = button.getBoundingClientRect();
       return document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2) === button;
     });
@@ -121,7 +121,7 @@ async function behaviour(splice, page, clip, seen) {
   assert.equal(await field(page, 'limiter').isChecked(), true);
   assert.equal(await field(page, 'limiterCeiling').inputValue(), '-1');
   assert.deepEqual(await state(page, () => {
-    const ceiling = document.querySelector('.export-dialog [name=limiterCeiling]');
+    const ceiling = document.querySelector('.studio-dialog[data-dialog=export] [name=limiterCeiling]');
     return [ceiling.min, ceiling.max];
   }), ['-24', '0']);
   assert.equal(await field(page, 'aacPeakSafe').isChecked(), false);
@@ -129,12 +129,12 @@ async function behaviour(splice, page, clip, seen) {
   assert.match(await page.locator('#export-peak-safe-help').textContent(), /0\.5 dB steps.*reports the gain/);
   assert.equal(await field(page, 'subtitleLanguage').inputValue(), 'und');
   assert.equal(await visible(page, 'subtitleLanguage'), true, 'captions make a subtitle stream');
-  assert.deepEqual(await state(page, () => [...document.querySelector('.export-dialog [name=subtitleLanguage]').options].map(o => o.value)),
+  assert.deepEqual(await state(page, () => [...document.querySelector('.studio-dialog[data-dialog=export] [name=subtitleLanguage]').options].map(o => o.value)),
     ['und', 'eng', 'spa', 'fra', 'deu', 'ita', 'por', 'jpn', 'kor', 'zho', 'ara', 'hin', 'other']);
   assert.equal(await visible(page, 'subtitleLanguageCode'), false);
 
   // Every new control is labelled and reachable by Tab, in reading order.
-  const order = await state(page, () => [...document.querySelectorAll('.export-dialog input,.export-dialog select')]
+  const order = await state(page, () => [...document.querySelectorAll('.studio-dialog[data-dialog=export] input,.studio-dialog[data-dialog=export] select')]
     .filter(el => !el.closest('[hidden]') && !el.disabled).map(el => [el.name, el.labels.length > 0 && el.labels[0].textContent.trim() !== '']));
   for (const [name, labelled] of order) assert.ok(labelled, `${name} is labelled`);
   await field(page, 'bitrate').focus();
@@ -151,8 +151,8 @@ async function behaviour(splice, page, clip, seen) {
   await field(page, 'subtitleLanguageCode').pressSequentially('io ');
   assert.equal(await field(page, 'subtitleLanguageCode').inputValue(), 'io ');
   assert.equal(await state(page, () => JSON.stringify([Editor.get().time, Editor.get().project.marks, Editor.get().project.clips.length])), before);
-  assert.equal(await state(page, () => SpliceKeys.keyBelongsToControl(document.querySelector('.export-dialog [name=limiterCeiling]'), {key: 'i'})), true);
-  assert.equal(await state(page, () => SpliceKeys.keyBelongsToControl(document.querySelector('.export-dialog [name=subtitleLanguageCode]'), {key: 'i'})), true);
+  assert.equal(await state(page, () => SpliceKeys.keyBelongsToControl(document.querySelector('.studio-dialog[data-dialog=export] [name=limiterCeiling]'), {key: 'i'})), true);
+  assert.equal(await state(page, () => SpliceKeys.keyBelongsToControl(document.querySelector('.studio-dialog[data-dialog=export] [name=subtitleLanguageCode]'), {key: 'i'})), true);
 
   // Invalid input is refused in the dialog with a message; no job starts.
   const posts = seen.posts.length;
@@ -244,8 +244,13 @@ async function screenshots(page, clip, seen) {
   await field(page, 'codec').selectOption('h264');
   await render(page, seen);
   assert.ok((await reportShown(page)).warnings.length, 'the finished default MP4 shows a warning');
-  // The report sits under the status line; scroll it into view as an editor would.
-  await page.locator(`${dialog} .export-report`).scrollIntoViewIfNeeded();
+  // The finished export scrolls its report into view, clear of the footer.
+  const clear = await state(page, () => {
+    const form = document.querySelector('.studio-dialog[data-dialog=export]');
+    const report = form.querySelector('.export-report').getBoundingClientRect(), footer = form.querySelector('footer').getBoundingClientRect();
+    return report.top >= form.getBoundingClientRect().top && report.bottom <= footer.top + 1;
+  });
+  assert.ok(clear, 'the whole report is visible above the footer');
   await capture(page, 'export-finished-warning');
   await closeDialog(page);
 }
