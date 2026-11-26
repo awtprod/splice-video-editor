@@ -5,6 +5,145 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const {chromium} = require('playwright-core');
+const vm = require('node:vm');
+
+// ---- Pure checks under Node: scopes.js draws into a recording 2D context. Every expectation
+// below is computed here from the Rec. 709 / broadcast definitions, not read from scopes.js.
+function recorder(log) {
+  const ctx = {font:'10px monospace', calls:log};
+  for (const name of ['fillRect','strokeRect','beginPath','moveTo','lineTo','stroke','arc','fillText','strokeText','save','restore','drawImage','putImageData','setLineDash'])
+    ctx[name] = (...args) => { log.push({name, args, strokeStyle:ctx.strokeStyle, fillStyle:ctx.fillStyle, dash:ctx.dash, align:ctx.textAlign, font:ctx.font}); if (name === 'setLineDash') ctx.dash = args[0].length > 0; };
+  // Monospace text: 0.6 em per character.
+  ctx.measureText = value => ({width:String(value).length*parseFloat(ctx.font)*.6});
+  return ctx;
+}
+function loadScopes() {
+  const traces = [];
+  const sandbox = {window:{}, document:{createElement:() => ({width:0, height:0, getContext:() => { const log = []; traces.push(log); return recorder(log); }})},
+    ImageData:class { constructor(data, width, height) { Object.assign(this, {data, width, height}); } }};
+  sandbox.window.document = sandbox.document;
+  vm.runInNewContext(fs.readFileSync(path.join(__dirname, '..', 'scopes.js'), 'utf8'), sandbox);
+  return {S:sandbox.window.SpliceScopes, traces};
+}
+const frameOf = (width, height, pixel) => {
+  const data = new Uint8ClampedArray(width*height*4);
+  for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) data.set([...pixel(x, y), 255], (y*width+x)*4);
+  return {data, width, height};
+};
+// Draw a scope and return its calls, layout and trace image.
+function draw(kind, width, height, frame) {
+  const {S, traces} = loadScopes(), log = [];
+  const layout = S.render(recorder(log), kind, width, height, 1, frame);
+  const put = traces.flat().filter(call => call.name === 'putImageData').at(-1);
+  return {S, log, layout, trace:put?.args[0]};
+}
+function unitChecks() {
+  const {S} = loadScopes();
+  const exactLuma = (r, g, b) => 2126*r+7152*g+722*b;           // luma x 10000
+  // Every 8-bit colour lands in the nearest luma code: at most 0.5 code from the exact value.
+  let worst = 0;
+  for (let r = 0; r < 256; r++) for (let g = 0; g < 256; g++) for (let b = 0; b < 256; b++)
+    worst = Math.max(worst, Math.abs(S.lumaCode(r, g, b)*10000-exactLuma(r, g, b)));
+  assert.ok(worst <= 5000, `luma is at most 0.5 code off (worst ${worst/10000})`);
+  // Waveform and histogram both bin luma: pure red 54, green 182, blue 18 (Rec. 709 x 255, rounded).
+  // One red, two green and three blue pixels, so each count also says which primary it came from.
+  const primaries = frameOf(6, 1, x => [[255,0,0],[0,255,0],[0,255,0],[0,0,255],[0,0,255],[0,0,255]][x]);
+  const wave = S.analyze(primaries.data, 6, 1, 'waveform', 6), hist = S.analyze(primaries.data, 6, 1, 'histogram');
+  [[0,54],[1,182],[2,182],[3,18],[4,18],[5,18]].forEach(([column, code]) => assert.equal(wave.luma[column*256+code], 1, `waveform luma of picture column ${column} is ${code}`));
+  assert.deepEqual([54,182,18].map(code => hist.histogram[3][code]), [1,2,3], 'histogram luma: red 54, green 182, blue 18');
+  // Histogram channels count their own channel.
+  assert.deepEqual([0,1,2].map(channel => [hist.histogram[channel][255], hist.histogram[channel][0]]), [[1,5],[2,4],[3,3]], 'histogram R, G, B');
+  // Waveform columns: 960 picture columns into 480 bins, two per bin, in order.
+  const ramp = frameOf(960, 1, x => [x%256, x%256, x%256]), columns = S.analyze(ramp.data, 960, 1, 'waveform');
+  for (let x = 0; x < 960; x++) assert.ok(columns.luma[(x >> 1)*256+x%256] >= 1, `picture column ${x} lands in bin ${x >> 1}`);
+  // Sampling: at most 960 columns and 960x540 pixels for any shape; 16:9 at 1080p gives 960x540.
+  assert.deepEqual({...S.sampleSize(1920, 1080)}, {width:960, height:540});
+  assert.deepEqual({...S.sampleSize(960, 540)}, {width:960, height:540});
+  assert.deepEqual({...S.sampleSize(960, 1707)}, {width:540, height:960});
+  assert.deepEqual({...S.sampleSize(1080, 1080)}, {width:720, height:720});
+  assert.deepEqual({...S.sampleSize(320, 240)}, {width:320, height:240});
+  for (const [w, h] of [[1080,1920],[1440,1080],[4096,2160],[720,1280],[2000,300]]) {
+    const size = S.sampleSize(w, h);
+    assert.ok(size.width <= 960 && size.width*size.height <= 960*540 && (size.width === 960 || size.width*size.height > 960*540*.99) && Math.abs(size.width/size.height-w/h) < .02*w/h+1/size.height, `${w}x${h} -> ${JSON.stringify(size)}`);
+  }
+
+  // Level axis: 255 at the top of the plot, 0 at the bottom; legal-range lines at 16 and 235.
+  const gray = frameOf(64, 36, () => [200,200,200]);
+  const waveform = draw('waveform', 400, 240, gray), plot = waveform.layout.plot;
+  const levelY = level => plot.y+(255-level)/255*(plot.h-1);
+  const label = (log, value) => log.filter(call => call.name === 'fillText' && call.args[0] === value);
+  assert.ok(Math.abs(label(waveform.log, '100')[0].args[2]-levelY(255)) < .01, '100 % is at the top');
+  assert.ok(Math.abs(label(waveform.log, '0')[0].args[2]-levelY(0)) < .01, '0 % is at the bottom');
+  // Strokes: each line is beginPath/moveTo/lineTo/stroke; collect [x0,y0,x1,y1,style,dashed].
+  const lines = log => {
+    const out = [];
+    for (let i = 0; i+1 < log.length; i++) if (log[i].name === 'moveTo' && log[i+1].name === 'lineTo') out.push([...log[i].args, ...log[i+1].args, log[i+1].strokeStyle, log[i+1].dash]);
+    return out;
+  };
+  const amber = lines(waveform.log).filter(line => line[5] && line[4].startsWith('rgba(224,164,74'));
+  assert.deepEqual(amber.map(line => line[1]).sort((a, b) => a-b), [Math.round(levelY(235))+.5, Math.round(levelY(16))+.5], 'legal-range lines at 235 and 16');
+  for (const code of ['255 1023','235 940','16 64','0 0']) assert.equal(label(waveform.log, code).length, 1, `code label ${code}`);
+  // The trace of a flat 200 gray sits on the 200 row of the plot, across the plot.
+  const rowOf = y => { let n = 0; for (let x = 0; x < plot.w; x++) if (waveform.trace.data[(y*plot.w+x)*4+3]) n++; return n; };
+  const row = Math.round((255-200)/255*(plot.h-1));
+  assert.ok(rowOf(row) > plot.w*.9 && rowOf(Math.round((255-55)/255*(plot.h-1))) === 0, 'waveform trace at level 200');
+
+  // Parade: three panels side by side covering the plot, widths within a pixel.
+  const parade = draw('parade', 400, 240, gray).layout;
+  assert.equal(parade.panels[0].x, 0);
+  for (let i = 0; i < 3; i++) assert.equal(parade.panels[i].x+parade.panels[i].w, i < 2 ? parade.panels[i+1].x : parade.plot.w, `panel ${i} meets the next`);
+  assert.ok(Math.max(...parade.panels.map(p => p.w))-Math.min(...parade.panels.map(p => p.w)) <= 1, 'panels share the width');
+
+  // Vectorscope: 75 % bar targets and the skin-tone line, from Rec. 709 Cb/Cr over a +-0.55 range.
+  const RANGE = .55, bars = {R:[1,0,0],Mg:[1,0,1],B:[0,0,1],Cy:[0,1,1],G:[0,1,0],Yl:[1,1,0]};
+  const vector = draw('vector', 300, 300, gray), vp = vector.layout.plot;
+  const at = (cb, cr) => [vp.x+(cb+RANGE)/(2*RANGE)*vp.w, vp.y+(1-(cr+RANGE)/(2*RANGE))*vp.h];
+  const boxes = vector.log.filter(call => call.name === 'strokeRect' && call.strokeStyle === 'rgba(224,230,224,.85)').map(call => [call.args[0]+call.args[2]/2, call.args[1]+call.args[3]/2]);
+  assert.equal(boxes.length, 6);
+  for (const [name, [r, g, b]] of Object.entries(bars)) {
+    const y = .75*(.2126*r+.7152*g+.0722*b), [x0, y0] = at((.75*b-y)/1.8556, (.75*r-y)/1.5748);
+    assert.ok(boxes.some(([x, yy]) => Math.hypot(x-x0, yy-y0) <= 1.5), `${name} target at its 75 % position`);
+  }
+  const skin = lines(vector.log).find(line => line[4].startsWith('rgba(224,164,74'));
+  const [cx, cy] = at(0, 0);
+  assert.ok(Math.hypot(skin[0]-cx, skin[1]-cy) < .01, 'skin line starts at the centre');
+  assert.ok(Math.abs(Math.atan2(cy-skin[3], skin[2]-cx)*180/Math.PI-123) < .2, 'skin line at 123 degrees');
+  assert.ok(Math.abs(Math.hypot(skin[2]-cx, skin[3]-cy)-.5/(2*RANGE)*vp.w) < .5, 'skin line reaches the 50 % ring');
+
+  // Histogram: tick lines on the centre column of their level.
+  const histogram = draw('histogram', 400, 240, gray), hp = histogram.layout.plot;
+  const ticks = lines(histogram.log).filter(line => line[4] === 'rgba(160,185,160,.26)').map(line => line[0]);
+  assert.deepEqual(ticks, [0,64,128,192,255].map(level => hp.x+Math.min(hp.w-1, Math.floor((level+.5)*hp.w/256))+.5), 'histogram ticks');
+  assert.equal(label(histogram.log, '1023').length, 1, '10-bit full scale is 1023');
+
+  // Narrow scopes (156 CSS px): no two labels of a histogram row touch, and no vectorscope label
+  // covers a trace from 75 % and 100 % bars.
+  const narrowHistogram = draw('histogram', 156, 200, gray);
+  const rows = new Map();
+  for (const call of narrowHistogram.log.filter(call => call.name === 'fillText' && call.args[2] > narrowHistogram.layout.plot.y+narrowHistogram.layout.plot.h)) {
+    const width = String(call.args[0]).length*parseFloat(call.font)*.6, x = call.args[1];
+    const span = call.align === 'left' ? [x, x+width] : call.align === 'right' ? [x-width, x] : [x-width/2, x+width/2];
+    const list = rows.get(call.args[2]) ?? []; list.push(span); rows.set(call.args[2], list);
+  }
+  assert.equal(rows.size, 3, 'three label rows');
+  for (const spans of rows.values()) {
+    spans.sort((a, b) => a[0]-b[0]);
+    assert.ok(spans.length >= 3, 'ends and middle stay labelled');
+    for (let i = 1; i < spans.length; i++) assert.ok(spans[i][0]-spans[i-1][1] >= 3, `histogram labels keep apart: ${JSON.stringify(spans)}`);
+  }
+  const saturated = frameOf(12, 2, (x, y) => Object.values(bars)[x%6].map(value => Math.round(value*(x < 6 ? 191 : 255))));
+  for (const size of [156, 300]) {
+    const scope = draw('vector', size, size, saturated), sp = scope.layout.plot, font = scope.layout.font;
+    for (const call of scope.log.filter(call => call.name === 'fillText' && Object.keys(bars).includes(call.args[0]))) {
+      const half = String(call.args[0]).length*font*.3, [x, y] = [call.args[1]-sp.x, call.args[2]-sp.y];
+      let covered = 0;
+      for (let yy = Math.floor(y-font/2); yy <= Math.ceil(y+font/2); yy++) for (let xx = Math.floor(x-half); xx <= Math.ceil(x+half); xx++)
+        if (xx >= 0 && yy >= 0 && xx < sp.w && yy < sp.h && scope.trace.data[(yy*sp.w+xx)*4+3]) covered++;
+      assert.equal(covered, 0, `${size} px vectorscope: label ${call.args[0]} sits on a trace`);
+    }
+  }
+  console.log(`Scope maths: luma within 0.5 code for all 2^24 colours, bins, axes, legal lines, targets, skin line, ticks and narrow labels.`);
+}
 
 // Test pictures: left red / right blue, a gray ramp, 75 % colour bars, a flat dark gray.
 const FRAMES = {
@@ -24,6 +163,7 @@ const blueTrace = ([r,g,b]) => b-g >= 14 && b-r >= 14;
 const fill = ([r,g,b]) => Math.max(r,g,b) >= 100 && !(r > g+30 && g > b+40);
 
 async function main() {
+  unitChecks();
   const root = path.resolve(__dirname, '..');
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'splice-scopes-'));
   const proof = process.env.SPLICE_PROOF_DIR;
@@ -121,6 +261,10 @@ async function main() {
     assert.equal(coverage(2, blueTrace, 'left', band.top)+coverage(2, blueTrace, 'right', band.bottom), 0, 'blue: opposite halves stay empty');
     console.log('RGB parade: red, green and blue trace by picture position and level.');
     if (legacy) throw new Error('Build has no scope picker; the remaining checks need it.');
+    // The scope reads the whole 16:9 monitor picture (up to 960 columns), not a thumbnail.
+    const sampled = await page.evaluate(() => { const c = document.querySelector('#preview-canvas'); return {preview:[c.width, c.height], sample:SpliceScopes.sampleOf(document.querySelector('.splice-scope'))}; });
+    assert.ok(sampled.preview[0] >= 640, JSON.stringify(sampled));
+    assert.deepEqual([sampled.sample.width, sampled.sample.height], sampled.preview[0] <= 960 ? sampled.preview : [960, Math.round(sampled.preview[1]*960/sampled.preview[0])], JSON.stringify(sampled));
 
     const shot = async name => { if (proof) await page.locator('.splice-scopes').screenshot({path:path.join(proof,name)}); };
 
@@ -214,6 +358,19 @@ async function main() {
     await page.waitForFunction(() => document.querySelector('#preview-canvas').getContext('2d').getImageData(10,200,1,1).data[0] > 180);
     assert.ok(Math.abs(await levelOf()-191) < 6, 'an inverting 65-point LUT moves 64 to 191 on the scope');
     console.log('Scopes follow the graded picture (exposure and a 65-point LUT).');
+    // A long 1D LUT is applied as its 65-point lattice in preview and export; the inspector says so.
+    const note = async entries => {
+      await page.evaluate(count => {
+        const rows = ['LUT_1D_SIZE '+count];
+        for (let i = 0; i < count; i++) { const y = (i/(count-1))**(1/2.4); rows.push(`${y} ${y} ${y}`); }
+        Editor.updateClip('frame-gray', {color:{lut:SpliceLUT.parseCube(rows.join('\n'), 'toe.cube'), lutIntensity:100}});
+        Editor.select(null); Editor.select('frame-gray');
+      }, entries);
+      return page.evaluate(() => document.querySelector('.splice-lut-note')?.textContent ?? '');
+    };
+    assert.match(await note(1024), /1024 entries.*65-point table, up to 14\.0 code values/);
+    assert.equal(await note(65), '', 'a 65-entry 1D LUT is exact and has no note');
+    console.log('A 1024-entry 1D LUT shows its measured 65-point error (14.0 codes); a 65-entry one does not.');
     await page.evaluate(() => Editor.updateClip('frame-gray', {color:{lut:null}}));
 
     // ---- Playback, pausing and scrubbing keep the scopes current; cost per repaint is measured.
@@ -280,7 +437,41 @@ async function main() {
       for (const kind of ['parade','vector']) { await scope(kind); await shot(`narrow-900px-${kind}.png`); }
       await page.screenshot({path:path.join(proof,'workspace-narrow-900px.png')});
     }
+    if (proof) for (const kind of ['waveform','histogram']) { await scope(kind); await shot(`narrow-900px-${kind}.png`); }
     console.log('Scopes resize with the height control and a narrow window.');
+
+    // ---- Vertical, square and 4:3 sequences: the sample stays within 960x540 pixels.
+    await page.setViewportSize({width:1440, height:960});
+    for (const [label, width, height] of [['9x16',1080,1920],['1x1',1080,1080],['4x3',1440,1080]]) {
+      await page.evaluate(({width, height}) => SpliceSession.newProject({name:'Shape', width, height, fps:25}), {width, height});
+      await page.locator('#media-input').setInputFiles(path.join(root,'assets/ridge.mp4'));
+      await page.waitForFunction(() => Editor.get().project.media.length === 1);
+      await page.evaluate(() => {
+        const media = Editor.get().project.media[0];
+        Editor.editProject(project => { project.clips = [{id:'shape', mediaId:media.id, type:'video', track:1, start:0, duration:Math.min(8, media.duration), in:0, color:{}}]; });
+        Editor.select('shape'); Editor.seek(.5);
+      });
+      await page.waitForFunction(() => Editor.get().video.readyState >= 2 && !Editor.get().video.seeking && document.querySelector('.splice-scope'));
+      await page.waitForTimeout(250);
+      const shape = await page.evaluate(() => {
+        const canvas = document.querySelector('.splice-scope'), preview = document.querySelector('#preview-canvas'), out = {preview:[preview.width, preview.height], cost:{}};
+        for (const kind of SpliceScopes.kinds) {
+          document.querySelector(`[data-scope="${kind}"]`).click();
+          const times = [];
+          for (let i = 0; i < 12; i++) { const start = performance.now(); SpliceScopes.paint(canvas, true); times.push(performance.now()-start); }
+          times.sort((a, b) => a-b); out.cost[kind] = +times[6].toFixed(1);
+        }
+        out.sample = SpliceScopes.sampleOf(canvas);
+        return out;
+      });
+      const pixels = shape.sample.width*shape.sample.height, aspect = shape.sample.width/shape.sample.height;
+      assert.ok(pixels <= 960*540 && pixels > 960*540*.98, `${label}: ${JSON.stringify(shape)}`);
+      assert.ok(Math.abs(aspect-shape.preview[0]/shape.preview[1]) < .01, `${label}: sample keeps the picture shape ${JSON.stringify(shape)}`);
+      for (const [kind, milliseconds] of Object.entries(shape.cost)) assert.ok(milliseconds < 60, `${label} ${kind} repaint took ${milliseconds} ms`);
+      console.log(`${label} sequence: monitor ${shape.preview.join('x')}, scopes sample ${shape.sample.width}x${shape.sample.height}, repaint ms ${JSON.stringify(shape.cost)}`);
+      if (proof && label === '9x16') for (const kind of ['waveform','parade','vector','histogram']) { await scope(kind); await shot(`vertical-9x16-${kind}.png`); }
+    }
+    if (proof) await page.screenshot({path:path.join(proof,'workspace-4x3.png')});
     assert.deepEqual(errors, []);
   } finally {
     await browser?.close();

@@ -1,18 +1,20 @@
 (() => {
   // Video scopes read the program monitor canvas, which already carries the grade
-  // (exposure, white balance, LUT), at up to 960 columns, and bin it at full vertical resolution.
-  const LEVELS = 256, COLUMNS = 480, MAX_SAMPLE_WIDTH = 960, VECTOR_CELLS = 128, VECTOR_RANGE = .55;
+  // (exposure, white balance, LUT). They sample at most 960 columns and at most 960x540 pixels
+  // (rows and columns picked evenly, no blending), so a 9:16 or 1:1 picture costs what 16:9 does.
+  const LEVELS = 256, COLUMNS = 480, MAX_SAMPLE_WIDTH = 960, MAX_SAMPLES = 960*540, VECTOR_CELLS = 128, VECTOR_RANGE = .55;
   const KINDS = [['waveform','Waveform'],['parade','RGB parade'],['vector','Vectorscope'],['histogram','Histogram']];
   const HEIGHT = {min:120, max:420, step:10};
   const CHANNELS = [[255,110,110],[110,255,130],[110,160,255]];
   const TRACE = [190,255,190];
+  const BACKGROUND = '#0c110d';
   const SKIN_DEGREES = 123;
   // Rec. 709: chroma axes are (B-Y)/1.8556 and (R-Y)/1.5748, luma weights below.
   const KR = .2126, KG = .7152, KB = .0722, CB_SCALE = 1.8556, CR_SCALE = 1.5748;
   // Colour-bar targets: the six 75 % bars, in the order they appear around the scope.
   const TARGETS = [['R',[1,0,0]],['Mg',[1,0,1]],['B',[0,0,1]],['Cy',[0,1,1]],['G',[0,1,0]],['Yl',[1,1,0]]];
   const state = {kind:'parade', height:200, luma:true};
-  const layouts = new WeakMap(), signatures = new WeakMap();
+  const layouts = new WeakMap(), signatures = new WeakMap(), samples = new WeakMap();
   let lastPaint = -Infinity, lastCost = 0, work, workContext, trace;
 
   const clamp = (value, low, high) => Math.min(high, Math.max(low, value));
@@ -20,9 +22,27 @@
     const y = KR*r+KG*g+KB*b;
     return [(b-y)/CB_SCALE, (r-y)/CR_SCALE];
   };
+  // Luma code of an 8-bit pixel with the exact Rec. 709 weights, rounded to the nearest code
+  // (at most 0.5 code from the exact value). Products are tabled once per channel.
+  const LUMA_R = new Float64Array(256), LUMA_G = new Float64Array(256), LUMA_B = new Float64Array(256);
+  for (let value = 0; value < 256; value++) { LUMA_R[value] = KR*value; LUMA_G[value] = KG*value; LUMA_B[value] = KB*value; }
+  const lumaCode = (r, g, b) => (LUMA_R[r]+LUMA_G[g]+LUMA_B[b]+.5)|0;
+  // Vectorscope cell coordinates, (B-Y)/1.8556 and (R-Y)/1.5748 scaled to cells, split into one
+  // term per channel value (red, green, blue tables of 256 each; the centre offset rides on red).
+  const CB_CELL = new Float64Array(768), CR_CELL = new Float64Array(768);
+  for (let value = 0, scale = VECTOR_CELLS/(2*VECTOR_RANGE)/255; value < 256; value++) {
+    CB_CELL[value] = -KR*value/CB_SCALE*scale+VECTOR_CELLS/2; CB_CELL[256+value] = -KG*value/CB_SCALE*scale; CB_CELL[512+value] = (1-KB)*value/CB_SCALE*scale;
+    CR_CELL[value] = (1-KR)*value/CR_SCALE*scale+VECTOR_CELLS/2; CR_CELL[256+value] = -KG*value/CR_SCALE*scale; CR_CELL[512+value] = -KB*value/CR_SCALE*scale;
+  }
+  // The picture size the scopes sample from a source of width x height.
+  function sampleSize(width, height) {
+    const scale = Math.min(1, MAX_SAMPLE_WIDTH/width, Math.sqrt(MAX_SAMPLES/(width*height)));
+    let w = Math.max(1, Math.round(width*scale)), h = Math.max(1, Math.round(height*scale));
+    while (w*h > MAX_SAMPLES) if (w/width > h/height) w--; else h--;
+    return {width:w, height:h};
+  }
 
-  // Count pixels into the bins the chosen scope needs. Pure: takes RGBA bytes. Integer luma uses the
-  // Rec. 709 weights scaled by 256 (54, 183, 19), which round to 255 for white.
+  // Count pixels into the bins the chosen scope needs. Pure: takes RGBA bytes.
   function analyze(rgba, width, height, kind, columns = COLUMNS) {
     if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1 || rgba.length < width*height*4)
       throw new Error('Scopes need a picture of at least one pixel.');
@@ -31,32 +51,34 @@
       const count = Math.max(1, Math.min(columns, width)), column = new Uint16Array(width);
       for (let x = 0; x < width; x++) column[x] = Math.floor(x*count/width);
       result.columns = count;
+      // Picture columns go in strips of TILE, so the bins of one strip stay in cache while its rows are read.
+      const TILE = 64;
       if (kind === 'waveform') {
         const luma = new Uint32Array(count*LEVELS);
-        for (let y = 0, i = 0; y < height; y++) for (let x = 0; x < width; x++, i += 4)
-          luma[column[x]*LEVELS+((rgba[i]*54+rgba[i+1]*183+rgba[i+2]*19+128)>>8)]++;
+        for (let x0 = 0; x0 < width; x0 += TILE) for (let y = 0, x1 = Math.min(width, x0+TILE); y < height; y++)
+          for (let x = x0, i = (y*width+x0)*4; x < x1; x++, i += 4) luma[column[x]*LEVELS+lumaCode(rgba[i], rgba[i+1], rgba[i+2])]++;
         result.luma = luma;
       } else {
         const red = new Uint32Array(count*LEVELS), green = new Uint32Array(count*LEVELS), blue = new Uint32Array(count*LEVELS);
-        for (let y = 0, i = 0; y < height; y++) for (let x = 0; x < width; x++, i += 4) {
-          const base = column[x]*LEVELS;
-          red[base+rgba[i]]++; green[base+rgba[i+1]]++; blue[base+rgba[i+2]]++;
-        }
+        for (let x0 = 0; x0 < width; x0 += TILE) for (let y = 0, x1 = Math.min(width, x0+TILE); y < height; y++)
+          for (let x = x0, i = (y*width+x0)*4; x < x1; x++, i += 4) {
+            const base = column[x]*LEVELS;
+            red[base+rgba[i]]++; green[base+rgba[i+1]]++; blue[base+rgba[i+2]]++;
+          }
         result.parade = [red, green, blue];
       }
     } else if (kind === 'histogram') {
       const red = new Uint32Array(LEVELS), green = new Uint32Array(LEVELS), blue = new Uint32Array(LEVELS), luma = new Uint32Array(LEVELS);
       for (let i = 0, end = width*height*4; i < end; i += 4) {
         red[rgba[i]]++; green[rgba[i+1]]++; blue[rgba[i+2]]++;
-        luma[(rgba[i]*54+rgba[i+1]*183+rgba[i+2]*19+128)>>8]++;
+        luma[lumaCode(rgba[i], rgba[i+1], rgba[i+2])]++;
       }
       result.histogram = [red, green, blue, luma];
     } else if (kind === 'vector') {
-      const cells = new Uint32Array(VECTOR_CELLS*VECTOR_CELLS), scale = VECTOR_CELLS/(2*VECTOR_RANGE)/255;
-      const bias = VECTOR_CELLS/2;
+      const cells = new Uint32Array(VECTOR_CELLS*VECTOR_CELLS);
       for (let i = 0, end = width*height*4; i < end; i += 4) {
-        const r = rgba[i], g = rgba[i+1], b = rgba[i+2], y = KR*r+KG*g+KB*b;
-        const x = Math.floor((b-y)/CB_SCALE*scale+bias), v = Math.floor((r-y)/CR_SCALE*scale+bias);
+        const r = rgba[i], g = rgba[i+1], b = rgba[i+2];
+        const x = Math.floor(CB_CELL[r]+CB_CELL[256+g]+CB_CELL[512+b]), v = Math.floor(CR_CELL[r]+CR_CELL[256+g]+CR_CELL[512+b]);
         cells[(VECTOR_CELLS-1-v)*VECTOR_CELLS+x]++;
       }
       result.vector = cells;
@@ -86,6 +108,12 @@
   const levelY = (plot, level) => plot.y+(LEVELS-1-level)/(LEVELS-1)*(plot.h-1);
   function text(ctx, value, x, y, align = 'left', color = '#b9c9b5') {
     ctx.fillStyle = color; ctx.textAlign = align; ctx.fillText(value, x, y);
+  }
+  // Text drawn over traces gets a dark outline so it stays readable on top of them.
+  function haloText(ctx, value, x, y, align, color, width) {
+    ctx.textAlign = align; ctx.lineWidth = width; ctx.lineJoin = 'round'; ctx.strokeStyle = BACKGROUND;
+    ctx.strokeText(value, x, y); ctx.lineWidth = 1;
+    text(ctx, value, x, y, align, color);
   }
   function line(ctx, x0, y0, x1, y1, color, dash = []) {
     ctx.strokeStyle = color; ctx.setLineDash(dash); ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke(); ctx.setLineDash([]);
@@ -182,17 +210,15 @@
     // Skin-tone line: 123° counter-clockwise from the +Cb axis, drawn to the 50 % ring.
     const angle = SKIN_DEGREES*Math.PI/180, skin = vectorPoint(plot, Math.cos(angle)*.5, Math.sin(angle)*.5);
     line(ctx, cx, cy, skin[0], skin[1], 'rgba(224,164,74,.9)', [Math.round(5*unit), Math.round(3*unit)]);
-    ctx.font = `${font}px "IBM Plex Mono", monospace`; ctx.textBaseline = 'middle';
-    text(ctx, 'skin', skin[0], skin[1]-Math.round(font*.7), 'center', '#e0a44a');
     // 75 % colour-bar targets.
-    const box = Math.max(5, radius(.05));
+    const box = Math.max(5, radius(.05)), labels = [];
     for (const [name, rgb] of TARGETS) {
       const [cb, cr] = chroma(...rgb.map(value => value*.75)), [x, y] = vectorPoint(plot, cb, cr);
       ctx.strokeStyle = 'rgba(224,230,224,.85)'; ctx.strokeRect(Math.round(x-box/2)+.5, Math.round(y-box/2)+.5, Math.round(box), Math.round(box));
-      const outward = Math.hypot(x-cx, y-cy) || 1;
-      text(ctx, name, x+(x-cx)/outward*(box/2+font*.9), y+(y-cy)/outward*(box/2+font*.7), 'center', '#d6e0d3');
+      // Beside the box, clockwise. Straight outward is where the same hue at 100 % lands.
+      const length = Math.hypot(x-cx, y-cy) || 1, side = box/2+font*.85;
+      labels.push([name, x+(cy-y)/length*side, y+(x-cx)/length*side]);
     }
-    ctx.textBaseline = 'alphabetic';
     // Each occupied cell is drawn as a small dot so single colours stay visible at any size.
     const side = plot.w, image = new Uint8ClampedArray(side*side*4), cell = side/VECTOR_CELLS, dot = Math.max(Math.ceil(cell), Math.round(2.5*unit));
     for (let row = 0; row < VECTOR_CELLS; row++) for (let column = 0; column < VECTOR_CELLS; column++) {
@@ -206,6 +232,11 @@
       }
     }
     blitTrace(ctx, layout, image, side, side);
+    ctx.font = `${font}px "IBM Plex Mono", monospace`; ctx.textBaseline = 'middle';
+    const halo = Math.max(2, Math.round(3*unit));
+    haloText(ctx, 'skin', skin[0], skin[1]-Math.round(font*.7), 'center', '#e0a44a', halo);
+    for (const [name, x, y] of labels) haloText(ctx, name, x, y, 'center', '#d6e0d3', halo);
+    ctx.textBaseline = 'alphabetic';
   }
 
   // The pixel column a level occupies: its centre, so one rule serves narrow and wide plots.
@@ -214,15 +245,20 @@
     const {plot, font} = layout, unit = font/10, bins = data.histogram;
     ctx.lineWidth = Math.max(1, Math.round(unit*.75));
     ctx.font = `${font}px "IBM Plex Mono", monospace`; ctx.textBaseline = 'alphabetic';
-    // Three rows of tick labels: percent, 8-bit and 10-bit code values.
-    const ticks = [0,64,128,192,255];
-    ticks.forEach((level, index) => {
-      const x = plot.x+histogramColumn(level, plot.w)+.5;
-      line(ctx, x, plot.y, x, plot.y+plot.h, 'rgba(160,185,160,.26)');
+    // Three rows of tick labels: percent, 8-bit and 10-bit code values. Ticks are labelled in
+    // priority order (ends, middle, quarters); one whose labels would touch another stays bare.
+    const ticks = [0,64,128,192,255], placed = [], gap = font*.6;
+    for (const level of ticks) { const x = plot.x+histogramColumn(level, plot.w)+.5; line(ctx, x, plot.y, x, plot.y+plot.h, 'rgba(160,185,160,.26)'); }
+    for (const index of [0,4,2,1,3]) {
+      const level = ticks[index], x = plot.x+histogramColumn(level, plot.w)+.5;
       const align = index === 0 ? 'left' : index === ticks.length-1 ? 'right' : 'center';
       const values = [`${Math.round(level/255*100)}%`, String(level), String(tenBit(level))];
-      values.forEach((value, row) => text(ctx, value, align === 'left' ? plot.x : align === 'right' ? plot.x+plot.w : x, plot.y+plot.h+Math.round(font*(1.15+row*1.05)), align, row === 0 ? '#b9c9b5' : '#8fa08c'));
-    });
+      const wide = Math.max(...values.map(value => ctx.measureText(value).width)), anchor = align === 'left' ? plot.x : align === 'right' ? plot.x+plot.w : x;
+      const span = align === 'left' ? [anchor, anchor+wide] : align === 'right' ? [anchor-wide, anchor] : [anchor-wide/2, anchor+wide/2];
+      if (placed.some(other => span[0] < other[1]+gap && span[1] > other[0]-gap)) continue;
+      placed.push(span);
+      values.forEach((value, row) => text(ctx, value, anchor, plot.y+plot.h+Math.round(font*(1.15+row*1.05)), align, row === 0 ? '#b9c9b5' : '#8fa08c'));
+    }
     for (const level of [16,235]) {
       const label = layout.compact ? String(level) : `${level} ${tenBit(level)}`, x = plot.x+histogramColumn(level, plot.w)+.5;
       line(ctx, x, plot.y, x, plot.y+plot.h, 'rgba(224,164,74,.8)', [Math.round(4*unit), Math.round(3*unit)]);
@@ -262,13 +298,22 @@
 
   const DRAW = {waveform:drawWaveform, parade:drawParade, vector:drawVector, histogram:drawHistogram};
 
-  // Read the program frame once per repaint, capped at MAX_SAMPLE_WIDTH columns.
+  // Draw one scope of an RGBA frame into a 2D context of width x height bitmap pixels.
+  function render(ctx, kind, width, height, u, frame) {
+    const layout = layoutFor(kind, width, height, u);
+    DRAW[kind](ctx, layout, analyze(frame.data, frame.width, frame.height, kind));
+    return layout;
+  }
+
+  // Read the program frame once per repaint, at most MAX_SAMPLES pixels. Smoothing is off, so a
+  // smaller sample keeps evenly spaced rows and columns with their own values.
   function capture() {
     const source = document.querySelector('#preview-canvas');
     if (!source || !source.width || !source.height) return null;
-    const width = Math.min(source.width, MAX_SAMPLE_WIDTH), height = Math.max(1, Math.round(source.height*width/source.width));
+    const {width, height} = sampleSize(source.width, source.height);
     if (!work) { work = document.createElement('canvas'); workContext = work.getContext('2d', {willReadFrequently:true}); }
     if (work.width !== width || work.height !== height) { work.width = width; work.height = height; }
+    workContext.imageSmoothingEnabled = false;
     workContext.drawImage(source, 0, 0, width, height);
     const image = workContext.getImageData(0, 0, width, height);
     const words = new Uint32Array(image.data.buffer);
@@ -278,7 +323,7 @@
   }
 
   function clear(canvas, ctx, message) {
-    ctx.fillStyle = '#0c110d'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = BACKGROUND; ctx.fillRect(0, 0, canvas.width, canvas.height);
     if (message) { ctx.fillStyle = '#b9c9b5'; ctx.font = '12px monospace'; ctx.textAlign = 'center'; ctx.fillText(message, canvas.width/2, canvas.height/2); }
   }
   // Repaint `canvas` from the program monitor. Throttled to the cost of the last paint unless forced.
@@ -302,10 +347,9 @@
     if (!frame) { clear(canvas, ctx, 'No picture'); layouts.delete(canvas); return; }
     const signature = `${state.kind}|${state.luma}|${width}x${height}|${frame.hash}`;
     if (!force && !resized && signatures.get(canvas) === signature) { lastCost = performance.now()-started; return; }
-    const layout = layoutFor(state.kind, width, height, width/Math.max(1, box.width));
     clear(canvas, ctx);
-    DRAW[state.kind](ctx, layout, analyze(frame.data, frame.width, frame.height, state.kind));
-    layouts.set(canvas, layout); signatures.set(canvas, signature);
+    const layout = render(ctx, state.kind, width, height, width/Math.max(1, box.width), frame);
+    layouts.set(canvas, layout); signatures.set(canvas, signature); samples.set(canvas, {width:frame.width, height:frame.height});
     lastCost = performance.now()-started;
   }
 
@@ -333,5 +377,6 @@
       paint(canvas, true);
     });
   }
-  window.SpliceScopes = {analyze, paint, markup, bind, layoutOf:canvas => layouts.get(canvas), kinds:KINDS.map(item => item[0]), range:VECTOR_RANGE};
+  window.SpliceScopes = {analyze, render, paint, markup, bind, sampleSize, lumaCode, layoutOf:canvas => layouts.get(canvas),
+    sampleOf:canvas => samples.get(canvas), kinds:KINDS.map(item => item[0]), range:VECTOR_RANGE};
 })();

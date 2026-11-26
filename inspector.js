@@ -7,6 +7,11 @@
   const field = (title, key, value, min, max, step = .04, group = '') =>
     `<label class="splice-number"><span>${title}</span><input aria-label="${title}" type="number" data-field="${key}" data-group="${group}" min="${min}" max="${max}" step="${step}" value="${value}"></label>`;
   const section = (title, body) => `<section class="splice-section"><h3>${title}</h3>${body}</section>`;
+  // A 1D LUT longer than the 65-point lattice is applied as that lattice in preview and export alike.
+  const lutNote = lut => {
+    const error = lut?.curve ? window.SpliceLUT.curveError(lut) : 0;
+    return error >= .5 ? `<p class="splice-lut-note" role="note">This 1D LUT has ${lut.curve.size} entries. Preview and export apply it as a ${lut.size}-point table, up to ${error.toFixed(1)} code values (8-bit) away from the file.</p>` : '';
+  };
   const option = (key, title, selected) => `<option value="${escape(key)}" ${key === selected ? 'selected' : ''}>${escape(title)}</option>`;
   let automationProperty = 'opacity';
   let showSafeArea = false;
@@ -66,7 +71,8 @@
         label('Exposure', 'exposure', number(color.exposure, 0), -4, 4, .1, ' EV', 'color') +
         label('Temperature', 'temperature', number(color.temperature, 0), -100, 100, 1, '', 'color') +
         label('Tint', 'tint', number(color.tint, 0), -100, 100, 1, '', 'color') +
-        `<div class="splice-lut-row"><button type="button" data-action="import-lut">Import .cube LUT</button><span>${escape(color.lut?.title || 'No LUT')}</span>${color.lut ? '<button type="button" data-action="remove-lut">Remove</button>' : ''}</div>` +
+        `<div class="splice-lut-row"><button type="button" data-action="import-lut">Import .cube LUT</button><span title="${escape(color.lut?.title || 'No LUT')}">${escape(color.lut?.title || 'No LUT')}</span>${color.lut ? '<button type="button" data-action="remove-lut">Remove</button>' : ''}</div>` +
+        lutNote(color.lut) +
         (color.lut ? label('LUT intensity', 'lutIntensity', number(color.lutIntensity, 100), 0, 100, 1, '%', 'color') : '') +
         '<input type="file" class="splice-lut-input" accept=".cube" hidden>' +
         window.SpliceScopes.markup());
