@@ -189,7 +189,7 @@
       `<label>Channels<select name="audioLayout"><option value="stereo">Stereo</option><option value="5.1">5.1 · L R C LFE Ls Rs</option><option value="5.1-downmix">5.1 mix delivered as a stereo downmix</option></select></label>` +
       `<label>Deliver<select name="audioDeliver" aria-describedby="export-stems-help"><option value="program">Program with the picture</option><option value="stems">Stems and mix as WAV files (ZIP, no picture)</option></select></label>` +
       `<label class="export-check" hidden>Per-track iso WAVs<input name="isoTracks" type="checkbox"></label>` +
-      `<p class="export-help" id="export-stems-help" hidden>One WAV per stem (set stems in the Audio workspace), full length and sample-aligned, before the master compressor and limiter.</p>`);
+      `<p class="export-help" id="export-stems-help" hidden>Set stems in the Audio workspace. Stems and isos are full-length, sample-aligned 32-bit float WAVs taken before the master compressor and limiter. The finished mix is a 24-bit WAV.</p>`);
     const form = group.closest('form');
     const sync = () => {
       const normalize = form.elements.normalize.value, stems = form.elements.audioDeliver.value === 'stems';

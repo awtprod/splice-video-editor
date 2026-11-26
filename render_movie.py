@@ -2034,6 +2034,7 @@ def render_to_file(project, output_path, *, options=None, progress=None, cancell
             target=Path(directory)/f'nested-{index}{suffix}'
             child_options={**options,'codec':'prores' if suffix=='.mov' else 'h264'}
             child_options.pop('range',None)
+            child_options.pop('isoTracks',None)
             render_to_file(child,target,options=child_options,cancelled=cancelled,heartbeat=heartbeat,work_directory=work_directory,
                            _nested_depth=_nested_depth+1)
             item['src']='/media/'+str(target.relative_to(MEDIA_ROOT))
@@ -2215,7 +2216,7 @@ def _render_prepared(project, output_path, *, options=None, progress=None, cance
     # Chunks, the program bus, the finished program and the delivered PCM (float, float, float, 24-bit).
     audio_bytes = audio_bytes*channels/2*3.75 + _prerender_peak_bytes(events, first_sample, stop_sample, channels)
     if codec == 'stems':
-        audio_bytes += out_duration*AUDIO_RATE*channels*3*(len({plan['stem'] for plan in plans.values()})+
+        audio_bytes += out_duration*AUDIO_RATE*channels*4*(len({plan['stem'] for plan in plans.values()})+
                                                            (len(plans) if iso else 0)+1)
     if codec == 'h264':
         audio_bytes += out_duration*40_000
@@ -2341,16 +2342,16 @@ def _render_stems(project, events, plans, settings, iso, first_sample, stop_samp
                                                 heartbeat=heartbeat)
     step()
     gain = report.get('gainDb') or 0.0
-    pcm = ['-c:a', 'pcm_s24le', '-ar', str(AUDIO_RATE), '-ac', str(channels)]
     files = []
 
-    def deliver(arguments, filters, target):
+    def deliver(arguments, filters, target, codec='pcm_f32le'):
         chain = ','.join([*filters, f'aformat=channel_layouts={name}']) if filters else f'aformat=channel_layouts={name}'
-        _run_ffmpeg(['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y', *arguments, '-af', chain, *pcm,
+        _run_ffmpeg(['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y', *arguments, '-af', chain,
+                     '-c:a', codec, '-ar', str(AUDIO_RATE), '-ac', str(channels),
                      str(target)], cancelled, heartbeat)
         files.append(target)
     mix_file = Path(directory)/'mix.wav'
-    deliver(finished, [], mix_file)
+    deliver(finished, [], mix_file, 'pcm_s24le')
     delivered = audio_loudness.measure(['-i', str(mix_file)], cancelled, heartbeat, channels=channels)
     report.update(container='stems', layout=layout, channels=channels, output=audio_loudness.public(delivered))
     _legacy_report(report, delivered, limiter)

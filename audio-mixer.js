@@ -110,9 +110,9 @@
   }
   // The clip part of the chain, rebuilt only when the clip's effects or mapping change.
   const MAPS = {left: [[1,0],[1,0]], right: [[0,1],[0,1]], mono: [[.5,.5],[.5,.5]], swap: [[0,1],[1,0]]};
-  function routeClip(route, clip, project) {
+  function routeClip(route, clip, project, sourceChannels) {
     const mono = project.trackMix?.[String(clip.track)]?.channels === 'mono';
-    const map = MAPS[clip.channelMap] ? clip.channelMap : 'stereo';
+    const map = sourceChannels !== 1 && MAPS[clip.channelMap] ? clip.channelMap : 'stereo';
     const key = fxKey(clip.audioFx) + map + (mono ? ':mono' : '') + (workletLoaded ? ':w' : '');
     if (route.mixKey !== key) {
       route.mixKey = key;

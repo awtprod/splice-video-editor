@@ -249,7 +249,9 @@
     const route=routeAudio(element);
     if (window.SpliceMixer) {
       if (mixerConfigured!==project) { window.SpliceMixer.configure(project); mixerConfigured=project; }
-      window.SpliceMixer.routeClip(route,clip,project);
+      const item = mediaOf(clip), stream = clipAudioStream(clip,item);
+      const channels = item?.audioStreamChannels?.[stream] ?? item?.audioStreamDetails?.[stream]?.channels ?? item?.audioChannels;
+      window.SpliceMixer.routeClip(route,clip,project,channels);
     }
     const gain=clip.type==='video' && clip.embeddedAudio===false ? 0 : audibility(clip);
     const pan=clamp(((Number(clip.pan)||0)+trackPan(clip.track))/100,-1,1);

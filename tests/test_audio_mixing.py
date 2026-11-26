@@ -223,6 +223,27 @@ class Stems(AudioCase):
                 self.assertGreater(tone_level(samples, selected, 1, 2), .05)
                 self.assertLess(tone_level(samples, rejected, 1, 2), .001)
 
+    def test_stems_and_isos_retain_overrange_peaks(self):
+        media = [dict(id='hot', src=self.src(self.source('hot.wav', "aevalsrc='0.8*sin(2*PI*500*t)|0.8*sin(2*PI*500*t)':s=48000", 2)))]
+        clips = [dict(type='audio', track=-1, mediaId='hot', start=0, duration=2, volume=200)]
+        output = self.render(clips, media, codec='stems', isoTracks=True, limiter=True)
+        with zipfile.ZipFile(output) as archive:
+            for name in ['stem-01-Other.wav', 'iso-A1.wav']:
+                self.assertAlmostEqual(max(self.read(archive, name)), 1.6, delta=.002)
+            self.assertLess(max(self.read(archive, 'mix.wav')), 1)
+
+    def test_nested_project_with_per_track_isos(self):
+        source = self.source('recorder.wav', 'sine=f=500', 2)
+        child = dict(width=32, height=18, fps=25, media=[dict(id='a', src=self.src(source))],
+                     clips=[dict(type='audio', track=-1, mediaId='a', start=0, duration=2)])
+        media = [dict(id='nested', nestedProject=child)]
+        clips = [dict(type='video', track=1, mediaId='nested', start=0, duration=2)]
+        output = self.render(clips, media, codec='stems', isoTracks=True)
+        with zipfile.ZipFile(output) as archive:
+            self.assertGreater(max(self.read(archive, 'iso-V1.wav')), .04)
+        with self.assertRaisesRegex(ValueError, 'Track isos are part of the stems export'):
+            self.render(clips, media, codec='wav', isoTracks=True)
+
     def test_a_master_compressor_is_named_when_stems_cannot_sum(self):
         clips, media, project = self.project()
         project['masterFx']['comp'] = {'threshold': -30, 'ratio': 4}

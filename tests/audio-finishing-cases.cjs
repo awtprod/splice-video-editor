@@ -398,10 +398,10 @@ async function monoDynamics(splice) {
     const route = {source:ctx.createGain(), input:ctx.createGain(), gain:ctx.createGain(), pan:ctx.createStereoPanner(), analyser:ctx.createAnalyser()};
     route.source.connect(route.input);
     route.gain.connect(route.pan).connect(route.analyser);
-    const clip = {id:'mono', track:-1, audioFx:{comp:{ratio:1, makeup:0}}};
+    const clip = {id:'mono', track:-1, channelMap:'right', audioFx:{comp:{ratio:1, makeup:0}}};
     const project = {clips:[clip]};
     SpliceMixer.configure(project);
-    SpliceMixer.routeClip(route, clip, project);
+    SpliceMixer.routeClip(route, clip, project, 1);
     const source = ctx.createConstantSource();
     source.offset.value = .1;
     source.connect(route.source);
