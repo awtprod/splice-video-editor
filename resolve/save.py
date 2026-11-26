@@ -267,7 +267,7 @@ class Measurer:
             else:
                 resolve_path, rule = mapped(local, self.request.mappings) if local else (None, None)
                 if rule is not None:
-                    self.rules_used.setdefault(rule, {})[Path(str(local)).name] = None
+                    self.rules_used.setdefault(rule, {})[resolve_path] = Path(str(local)).name
         if local is None:
             return None, 'its file is not on this computer'
         key = (str(local), resolve_path)
@@ -451,7 +451,9 @@ def _write(request, target, scratch, resolve_media, report):
         raise WriteError('Self-check failed: the written project does not read back as meant: '
                          + '; '.join(differences[:5]) + '. Nothing was placed.')
     for index, (source, target) in enumerate(request.mappings):
-        for name in measurer.rules_used.get(index, ()):
+        for resolve_path, name in measurer.rules_used.get(index, {}).items():
+            if not writer.authored.get(resolve_path):
+                continue  # a file that was not written is reported where it was refused
             report.add(EXACT, 'Media paths mapped for the Resolve computer (where several rules match a path, the '
                        'longest “from” folder wins, whatever the order)', f'{source} => {target}: {name}')
     report.add(EXACT, 'Everything else in the seed (bins, grades, Fusion, Fairlight, project settings) carried over '

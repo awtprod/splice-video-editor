@@ -154,6 +154,8 @@ class RoundTripTests(SaveCase):
         self.assertEqual(again['trackState'], {'video:2': {'hidden': True}, 'audio:-1': {'locked': True}})
         # The new WAV is a media-pool clip of the new project, at the mapped path.
         self.assertIn('E:\\Show\\new.wav', [m.get('path') for m in again['media']])
+        mapped = next(line for line in result['lines'] if line['what'].startswith('Media paths mapped'))
+        self.assertEqual(mapped['all'], [f'{self.dir} => E:\\Show: new.wav'])
         # Rows the edit did not touch are the seed's, byte for byte.
         for table in ('Sm2MpFolder', 'BtVideoInfo', 'ListMgt::LmVersionTable', 'Sm2Timeline'):
             self.assertEqual(self.rows(self.kept, table), self.rows(saved, table), table)
