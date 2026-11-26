@@ -222,13 +222,19 @@ def timecode_seconds(text, rate):
     """Seconds since midnight of an SMPTE timecode label at ``rate`` (drop-frame aware)."""
     import re
     match = re.fullmatch(r'(\d{2}):(\d{2}):(\d{2})([:;.,])(\d{2,3})', str(text or ''))
-    if not match or not rate:
+    if not match or not math.isfinite(rate) or not 1 <= rate <= 1000:
         return None
     hours, minutes, seconds, frames = (int(match.group(index)) for index in (1, 2, 3, 5))
     nominal = round(rate)
+    if hours >= 24 or minutes >= 60 or seconds >= 60 or frames >= nominal:
+        return None
     count = ((hours*60+minutes)*60+seconds)*nominal+frames
-    if match.group(4) in ';,' and nominal in (30, 60):
+    if match.group(4) in ';,':
+        if nominal not in (30, 60) or abs(rate-nominal*1000/1001) > .001:
+            return None
         dropped = 2 if nominal == 30 else 4
+        if minutes % 10 and seconds == 0 and frames < dropped:
+            return None
         total_minutes = hours*60+minutes
         count -= dropped*(total_minutes-total_minutes//10)
     return count/rate

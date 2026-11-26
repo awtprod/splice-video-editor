@@ -299,7 +299,7 @@ def _envelope_bytes(runs, gain, total_samples):
     chunk = 1 << 16
     position = 0
     for first, gains in runs:
-        start = first*WINDOW
+        start = min(total_samples, first*WINDOW)
         while position < start:
             count = min(chunk, start-position)
             yield unity*count
@@ -308,9 +308,16 @@ def _envelope_bytes(runs, gain, total_samples):
         for index, value in enumerate(gains):
             following = gains[index+1] if index+1 < len(gains) else 1.0
             step = (following-value)/WINDOW
-            samples.extend(gain*(value+step*k) for k in range(WINDOW))
-        yield samples.tobytes()
-        position = start+len(gains)*WINDOW
+            count = min(WINDOW, total_samples-position)
+            if count <= 0:
+                break
+            samples.extend(gain*(value+step*k) for k in range(count))
+            position += count
+            if len(samples) >= chunk:
+                yield samples.tobytes()
+                samples = array('f')
+        if samples:
+            yield samples.tobytes()
     while position < total_samples:
         count = min(chunk, total_samples-position)
         yield unity*count

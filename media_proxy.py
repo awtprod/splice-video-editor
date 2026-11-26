@@ -229,7 +229,10 @@ def _rotation(stream):
 
 def _time_reference(fmt):
     value = _tag(fmt.get('tags'), 'time_reference')
-    return int(value) if value and value.isdigit() and int(value) < 2**63 else None
+    if not value or not value.isascii() or not value.isdecimal() or len(value) > 19:
+        return None
+    reference = int(value)
+    return reference if reference < 2**63 else None
 
 
 def _sample_rate(audio):

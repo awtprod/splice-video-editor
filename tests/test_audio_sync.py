@@ -87,7 +87,9 @@ class TimecodeSync(unittest.TestCase):
     def test_drop_frame_labels(self):
         self.assertAlmostEqual(audio_sync.timecode_seconds('00:01:00;02', 30000/1001), 1800*1001/30000, places=9)
         self.assertAlmostEqual(audio_sync.timecode_seconds('00:10:00;00', 30000/1001), 17982*1001/30000, places=9)
-        self.assertIsNone(audio_sync.timecode_seconds('garbage', 25))
+        for text, rate in [('garbage', 25), ('22:75:00:00', 25), ('00:00:00:25', 25),
+                           ('00:01:00;00', 30000/1001), ('00:00:00:00', float('nan'))]:
+            self.assertIsNone(audio_sync.timecode_seconds(text, rate))
 
     def test_requests_are_validated(self):
         for payload, message in (({}, '1 to 40'), ({'pairs': [{'picture': 'a'}]}, 'names a picture and a sound'),

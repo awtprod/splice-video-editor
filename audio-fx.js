@@ -51,7 +51,7 @@
       const values = {...defaults(kind), ...(fx[kind] || {})};
       html += `<fieldset class="fx-block" data-block="${kind}"><legend><label><input type="checkbox" data-toggle="${kind}" ${fx[kind] && values.enabled !== false ? 'checked' : ''}> ${TITLES[kind]}</label></legend>` +
         `<div class="fx-grid">${FIELDS[kind].map(([key,label,unit,step]) => number(kind, key, label, unit, step, values[key], owner)).join('')}</div>` +
-        (kind === 'denoise' ? '<p class="fx-note">Applied on export (FFmpeg afftdn). Preview plays without it.</p>' :
+        (kind === 'denoise' ? '<p class="fx-note">Set the noise floor to the level of steady background hiss.</p>' :
           `<div class="fx-gr" data-gr="${kind}" role="meter" aria-label="${TITLES[kind]} gain reduction" aria-valuemin="0" aria-valuemax="24" aria-valuenow="0"><span></span><output>0.0 dB</output></div>`) +
         '</fieldset>';
     }

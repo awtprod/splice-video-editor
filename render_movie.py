@@ -1420,7 +1420,7 @@ def _transition_curve(power, expression):
 
 def _automation(points, key, low, high, limit):
     """Validated keyframes [(time, value, ease)] sorted by time."""
-    if not points:
+    if points is None:
         return []
     if not isinstance(points, list): raise ValueError(f'Invalid {key} keyframes')
     if len(points) > limit: raise ValueError(f'More than {limit} {key} keyframes, the export limit')
@@ -1470,7 +1470,7 @@ def _pan_expressions(pan_expr, mono):
 
 
 def _track_settings(track_mix, track):
-    mix = track_mix.get(str(track)) or {}
+    mix = track_mix.get(str(track), {})
     if not isinstance(mix, dict): raise ValueError('Invalid track mix')
     return mix
 
@@ -1479,11 +1479,11 @@ def track_plan(track_mix, track):
     """Validated processing of one audio track (cached per export by the caller)."""
     mix = _track_settings(track_mix, track)
     fx = audio_dsp.normalize(mix.get('fx'), label=f'track A{abs(int(track))} effects')
-    keys = mix.get('keyframes') or {}
+    keys = mix.get('keyframes', {})
     if not isinstance(keys, dict) or any(key not in ('volume', 'pan') for key in keys):
         raise ValueError('Invalid track automation: use volume and pan keyframes')
     route = mix.get('route', 'front')
-    if route not in TRACK_ROUTES: raise ValueError('Invalid track routing: use ' + ', '.join(TRACK_ROUTES))
+    if not isinstance(route, str) or route not in TRACK_ROUTES: raise ValueError('Invalid track routing: use ' + ', '.join(TRACK_ROUTES))
     channels = mix.get('channels', 'stereo')
     if channels not in ('stereo', 'mono'): raise ValueError('Invalid track channels: use stereo or mono')
     stem = mix.get('stem', '')
@@ -1570,7 +1570,7 @@ def _audio_events(clips, media_by_id, fps, probes, track_mix, solo, span, heartb
         rates = item.get('_audioRates') or []
         stream_rates = {number: (rates[number] if number < len(rates) and rates[number] else AUDIO_RATE) for number in streams}
         mapping = clip.get('channelMap', 'stereo')
-        if mapping not in CHANNEL_MAPS: raise ValueError('Invalid channel mapping: use ' + ', '.join(CHANNEL_MAPS))
+        if not isinstance(mapping, str) or mapping not in CHANNEL_MAPS: raise ValueError('Invalid channel mapping: use ' + ', '.join(CHANNEL_MAPS))
         source_channels = 2 if len(streams) > 1 else next(iter(streams.values()))
         mono = source_channels == 1 or plan['mono']
         if source_channels == 1:

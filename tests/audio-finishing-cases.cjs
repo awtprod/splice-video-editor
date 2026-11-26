@@ -305,6 +305,11 @@ print(json.dumps(out))`, {fx, frequencies}));
 async function dynamicsParity(splice) {
   const {state, python} = lazy();
   const {page, errors} = await openPage(splice);
+  const effects = {
+    comp: {threshold: -24, ratio: 4, attack: 5, release: 80, knee: 6, makeup: 3},
+    gate: {threshold: -30, ratio: 6, attack: 1, release: 60, range: -30},
+    denoise: {amount: 20, floor: -35},
+  };
   const signals = JSON.parse(python(`
 import json, sys, subprocess, array, base64, audio_dsp
 request = json.load(sys.stdin)
@@ -315,11 +320,10 @@ out = {'input': base64.b64encode(pcm()).decode()}
 for kind, settings in request.items():
     fx = audio_dsp.normalize({kind: settings})
     out[kind] = base64.b64encode(pcm(audio_dsp.ffmpeg_filters(fx)[0])).decode()
-print(json.dumps(out))`, {comp: {threshold: -24, ratio: 4, attack: 5, release: 80, knee: 6, makeup: 3},
-    gate: {threshold: -30, ratio: 6, attack: 1, release: 60, range: -30}}));
+print(json.dumps(out))`, effects));
   const results = {};
-  for (const kind of ['comp', 'gate']) {
-    results[kind] = await state(page, async ([signals, kind]) => {
+  for (const kind of Object.keys(effects)) {
+    results[kind] = await state(page, async ([signals, kind, settings]) => {
       const decode = text => { const bytes = Uint8Array.from(atob(text), c => c.charCodeAt(0)); return new Float32Array(bytes.buffer); };
       const input = decode(signals.input), expected = decode(signals[kind]), frames = input.length/2;
       const context = new OfflineAudioContext(2, frames, 48000);
@@ -327,8 +331,6 @@ print(json.dumps(out))`, {comp: {threshold: -24, ratio: 4, attack: 5, release: 8
       const buffer = context.createBuffer(2, frames, 48000);
       for (let channel = 0; channel < 2; channel++) buffer.copyToChannel(input.filter((_, index) => index % 2 === channel), channel);
       const source = context.createBufferSource(); source.buffer = buffer;
-      const settings = kind === 'comp' ? {comp: {threshold: -24, ratio: 4, attack: 5, release: 80, knee: 6, makeup: 3}} :
-        {gate: {threshold: -30, ratio: 6, attack: 1, release: 60, range: -30}};
       const node = new AudioWorkletNode(context, 'splice-dynamics', {outputChannelCount: [2], processorOptions: settings});
       source.connect(node).connect(context.destination); source.start();
       const rendered = await context.startRendering();
@@ -342,7 +344,7 @@ print(json.dumps(out))`, {comp: {threshold: -24, ratio: 4, attack: 5, release: 8
         }
       }
       return {maxAbs, maxDb};
-    }, [signals, kind]);
+    }, [signals, kind, {[kind]: effects[kind]}]);
   }
   record('dynamicsParity', results);
   for (const [kind, {maxDb}] of Object.entries(results)) assert.ok(maxDb < .01, `${kind} preview differs from export by ${maxDb} dB`);

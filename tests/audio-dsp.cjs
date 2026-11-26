@@ -83,6 +83,22 @@ for (const [kind, [filter, settings]] of Object.entries(filters)) {
   results[kind] = {maxAbsDifference: worst};
   assert.ok(worst < 1e-6, `${kind}: preview port differs from FFmpeg by ${worst}`);
 }
+// Independent left/right histories must survive worklet quantum boundaries.
+const noiseSettings = {amount: 20, floor: -35};
+const noiseFilter = execFileSync('python3', ['-c',
+  'import audio_dsp,json,sys; print(audio_dsp.noise_filter(json.loads(sys.argv[1]),48000))', JSON.stringify(noiseSettings)],
+  {cwd: root, encoding: 'utf8'}).trim();
+const dry = decode(source), clean = decode(source, noiseFilter);
+const reducer = new dsp.NoiseReducer(noiseSettings, 48000, dry.length);
+let noiseDifference = 0;
+for (let i = 0; i < dry[0].length; i += 128) {
+  reducer.process(dry.map(channel => channel.subarray(i, i+128)));
+}
+for (let ch = 0; ch < dry.length; ch++) {
+  for (let i = 0; i < dry[ch].length; i++) noiseDifference = Math.max(noiseDifference, Math.abs(dry[ch][i]-clean[ch][i]));
+}
+assert.ok(noiseDifference < 1e-6, `de-noise preview differs from export by ${noiseDifference}`);
+results.denoise = {maxAbsDifference: noiseDifference};
 if (process.env.SPLICE_EVIDENCE_DIR) fs.writeFileSync(path.join(process.env.SPLICE_EVIDENCE_DIR, 'meter-vs-ebur128.json'), JSON.stringify(results, null, 2));
 console.log('audio DSP checks passed', JSON.stringify(Object.fromEntries(Object.entries(results).map(([k, v]) => [k, v.ours ?
   {integrated: [v.ours.integrated.toFixed(2), v.ffmpeg.integrated], range: [v.ours.range.toFixed(2), v.ffmpeg.range]} : v]))));

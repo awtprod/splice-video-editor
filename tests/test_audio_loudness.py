@@ -139,6 +139,13 @@ class TruePeakLimiter(AudioCase):
         self.assertLessEqual(independent_true_peak(output), -1.0)
         self.assertLessEqual(audio['output']['truePeakDbtp'], -1.0)
 
+    def test_limiter_release_ends_at_the_last_program_sample(self):
+        from audio_loudness import _envelope_bytes, WINDOW
+        for count in (1, WINDOW+3, 29*WINDOW):
+            with self.subTest(count=count):
+                data = b''.join(_envelope_bytes([(0, [.5]*30)], 1, count))
+                self.assertEqual(len(data), 4*count)
+
     def test_every_pcm_container_holds_the_true_peak_ceiling(self):
         for codec in ('wav', 'prores'):
             for ceiling in (-1.0, -2.0, -6.0):

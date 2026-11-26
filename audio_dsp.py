@@ -1,7 +1,7 @@
 """Audio processing settings shared by the editor and the renderer.
 
 One implementation of each formula lives here (Python side); audio-dsp.js
-holds the browser's copy and tests/test_audio_parity.py proves they agree.
+holds the browser's copy and tests/audio-dsp.cjs proves they agree.
 
 * Parametric EQ: RBJ "Audio EQ Cookbook" biquads. The renderer feeds the
   exact coefficients to FFmpeg's ``biquad`` filter (64-bit), the preview feeds
@@ -10,8 +10,8 @@ holds the browser's copy and tests/test_audio_parity.py proves they agree.
 * Compressor and gate: FFmpeg's ``acompressor`` and ``agate`` (export, the
   authority). The preview runs a port of the same per-sample algorithm in an
   AudioWorklet (audio-dsp.js); the measured tolerance is in the tests.
-* De-noise: FFmpeg ``afftdn`` (export only; the preview plays it bypassed and
-  says so).
+* De-noise: subtract stationary noise power in three complementary frequency
+  bands, with the same detector and reduction floor in the preview.
 
 Settings shape (clip ``audioFx``, track ``trackMix[n].fx``, ``masterFx``)::
 
@@ -170,13 +170,34 @@ def has_dynamics(normalized):
     return any(key in normalized for key in ('comp', 'gate', 'denoise'))
 
 
+def noise_filter(settings, rate):
+    """Three complementary bands sum to the dry signal at unity gain.
+    Registers 0/1 hold low-pass history, 2..4 band powers, 5..7 samples.
+    The white-noise power in each band follows its impulse-response energy.
+    """
+    a, b = (1-math.exp(-2*math.pi*hz/rate) for hz in (350, 3500))
+    smoothing = 1-math.exp(-1/(.008*rate))
+    low, wide = a/(2-a), b/(2-b)
+    cross = a*b/(a+b-a*b)
+    fractions = (low, wide+low-2*cross, 1+wide-2*b)
+    power = 2*10**(settings['floor']/10)
+    minimum = 10**(-settings['amount']/20)
+    operations = [f'st(0,ld(0)+{a}*(val(ch)-ld(0)))', f'st(1,ld(1)+{b}*(val(ch)-ld(1)))',
+                  'st(5,ld(0))', 'st(6,ld(1)-ld(0))', 'st(7,val(ch)-ld(1))']
+    bands = []
+    for i, fraction in enumerate(fractions):
+        sample, energy = f'ld({5+i})', f'ld({2+i})'
+        operations.append(f'st({2+i},{energy}+{smoothing}*({sample}*{sample}-{energy}))')
+        bands.append(f'{sample}*max({minimum},1-{power*fraction}/max(1e-20,{energy}))')
+    return "aeval=exprs='" + ';'.join([*operations, '+'.join(bands)]) + "':c=same"
+
+
 def ffmpeg_filters(normalized, rate=48000):
     """FFmpeg filters for validated settings, in processing order:
     de-noise, gate, EQ, compressor (the order the preview uses)."""
     filters = []
     if 'denoise' in normalized:
-        value = normalized['denoise']
-        filters.append(f"afftdn=nr={value['amount']:.3f}:nf={value['floor']:.3f}")
+        filters.append(noise_filter(normalized['denoise'], rate))
     if 'gate' in normalized:
         value = normalized['gate']
         filters.append(f"agate=threshold={10**(value['threshold']/20):.9f}:ratio={value['ratio']:.6f}:"

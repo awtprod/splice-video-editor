@@ -305,7 +305,38 @@
     return points[points.length-1].value;
   }
 
-  const api = {biquad,validateFx,validateAutomation,curveValue,BOUNDS,eqBands,eqSections,magnitudeDb,compressorState,compressorGain,gateState,gateGain,runDynamics,
+  // Same complementary bands and band-power subtraction as audio_dsp.noise_filter.
+  class NoiseReducer {
+    constructor(settings, rate, channels) {
+      this.low = 1-Math.exp(-2*Math.PI*350/rate);
+      this.wide = 1-Math.exp(-2*Math.PI*3500/rate);
+      this.smoothing = 1-Math.exp(-1/(.008*rate));
+      const a=this.low, b=this.wide, low=a/(2-a), wide=b/(2-b);
+      const power=2*10**((settings.floor ?? -50)/10);
+      this.noise=[low, wide+low-2*a*b/(a+b-a*b), 1+wide-2*b].map(fraction => fraction*power);
+      this.minimum=10**(-(settings.amount ?? 12)/20);
+      this.state=Array.from({length:channels}, () => new Float64Array(5));
+    }
+    process(channels) {
+      for (let ch=0; ch<channels.length; ch++) {
+        const samples=channels[ch], state=this.state[ch];
+        for (let i=0; i<samples.length; i++) {
+          const input=samples[i];
+          state[0]+=this.low*(input-state[0]);
+          state[1]+=this.wide*(input-state[1]);
+          let output=0;
+          for (let band=0; band<3; band++) {
+            const value=band===0 ? state[0] : band===1 ? state[1]-state[0] : input-state[1];
+            const power=state[band+2]+=this.smoothing*(value*value-state[band+2]);
+            output+=value*Math.max(this.minimum,1-this.noise[band]/Math.max(1e-20,power));
+          }
+          samples[i]=output;
+        }
+      }
+    }
+  }
+
+  const api = {NoiseReducer,biquad,validateFx,validateAutomation,curveValue,BOUNDS,eqBands,eqSections,magnitudeDb,compressorState,compressorGain,gateState,gateGain,runDynamics,
     kWeighting,LoudnessMeter,EQ_TYPES,energyToLufs};
 
   // ---- AudioWorklet processors ----
@@ -325,6 +356,7 @@
       configure(data) {
         if (!data) return;
         const stages=[];
+        this.noise=data.denoise ? new NoiseReducer(data.denoise,sampleRate,2) : null;
         if (data.gate) stages.push(gateState(data.gate,sampleRate));
         if (data.comp) stages.push(compressorState(data.comp,sampleRate));
         // Keep the detector state of an unchanged stage kind so edits do not click.
@@ -335,6 +367,7 @@
         const input=inputs[0], output=outputs[0];
         if (!input.length) { for (const channel of output) channel.fill(0); return this.alive; }
         for (let c=0;c<output.length;c++) output[c].set(input[Math.min(c,input.length-1)]);
+        this.noise?.process(output);
         if (this.stages.length) runDynamics(this.stages,output,output[0].length);
         if (currentTime-this.sent>.05) {
           this.sent=currentTime;

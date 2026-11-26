@@ -5,7 +5,7 @@
 //   master: bus -> master EQ -> master compressor -> loudness meter -> speakers
 // EQ runs as IIRFilterNodes fed the same RBJ coefficients the renderer gives FFmpeg
 // (audio-dsp.js / audio_dsp.py). Dynamics run in an AudioWorklet that ports FFmpeg's
-// acompressor/agate. De-noise (FFmpeg afftdn) is applied on export only.
+// acompressor/agate. De-noise runs the same band-power subtraction on both paths.
 (() => {
   const dsp = window.SpliceAudioDSP;
   let context = null, ready = null, workletLoaded = false;
@@ -64,6 +64,7 @@
     const chain = [];
     const dynamics = dynamicsOf(fx);
     // Order as in the renderer: (de-noise), gate, EQ, compressor.
+    if (fx?.denoise && fx.denoise.enabled !== false && workletLoaded) chain.push(dynamicsNode(bus, {denoise: fx.denoise}));
     if (dynamics?.gate && workletLoaded) chain.push(dynamicsNode(bus, {gate: dynamics.gate}));
     for (const [b0,b1,b2,a1,a2] of dsp.eqSections(fx?.eq, context.sampleRate))
       chain.push(context.createIIRFilter([b0,b1,b2],[1,a1,a2]));
