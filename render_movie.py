@@ -1346,7 +1346,7 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
                     '-t', f'{float(duration):.6f}', '-r', str(fps)])
     if spec['mode'] == 'stream':
         # Raw frames in the delivery's pixel format for the one encoder (see _stream_picture).
-        command.extend(['-f', 'rawvideo', 'pipe:1'])
+        command.extend(['-threads:v', '1', '-f', 'rawvideo', 'pipe:1'])
         return command
     output = Path(output_path)
     command.extend([*delivery.encoder_args(spec, fps, profile, threads=4), *_color_tags(profile, spec)])
@@ -2394,7 +2394,7 @@ def _render_picture(project, picture, first, stop, total_frames, fps, width, hei
 PIXEL_BYTES = {'yuv420p': 1.5, 'yuv420p10le': 3, 'yuv422p': 2, 'yuv422p10le': 4, 'yuv444p10le': 6, 'yuva444p10le': 8,
                'rgb24': 3, 'rgba': 4, 'rgb48be': 6, 'rgba64be': 8, 'rgb48le': 6, 'rgba64le': 8, 'gbrp10le': 6,
                'gbrpf32le': 12, 'gbrapf32le': 16, 'gbrp16le': 6}
-READ_AHEAD_BYTES = 1024 * 1024 * 1024
+READ_AHEAD_BYTES = 32 * 1024 * 1024
 PIPE_CHUNK = 1 << 20
 
 
@@ -2407,7 +2407,7 @@ class _Window:
         self.buffered = 0
         self.received = 0
         self.eof = False
-        self.head = False
+        self.read_error = None
         self.errors = collections.deque(maxlen=100)
         self.cond = threading.Condition()
         self.process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -2419,9 +2419,9 @@ class _Window:
         try:
             while True:
                 with self.cond:
-                    while not self.head and self.buffered >= self.cap and not self.eof:
+                    while self.buffered >= self.cap and not self.eof:
                         self.cond.wait(.5)
-                data = self.process.stdout.read1(PIPE_CHUNK)
+                data = self.process.stdout.read(PIPE_CHUNK)
                 if not data:
                     break
                 self.activity[0] = time.monotonic()
@@ -2430,8 +2430,8 @@ class _Window:
                     self.buffered += len(data)
                     self.received += len(data)
                     self.cond.notify_all()
-        except (OSError, ValueError):
-            pass
+        except (OSError, ValueError) as error:
+            self.read_error = error
         finally:
             with self.cond:
                 self.eof = True
@@ -2441,14 +2441,12 @@ class _Window:
         try:
             for raw in self.process.stderr:
                 self.errors.append(raw.decode('utf-8', 'replace'))
-        except (OSError, ValueError):
-            pass
+        except (OSError, ValueError) as error:
+            self.errors.append(str(error))
 
     def take(self):
         """The next chunk, or None at the end of this window's output."""
         with self.cond:
-            self.head = True
-            self.cond.notify_all()
             while not self.chunks and not self.eof:
                 self.cond.wait(.5)
             if not self.chunks:
@@ -2464,6 +2462,8 @@ class _Window:
         self._close(5)
         if code:
             raise ValueError('FFmpeg render failed: ' + ''.join(self.errors)[-1500:])
+        if self.read_error is not None:
+            raise ValueError(f'Could not read the picture window: {self.read_error}') from self.read_error
         if self.received != self.expected:
             raise ValueError(f'A picture window produced {self.received} bytes instead of {self.expected}')
 
@@ -2499,7 +2499,8 @@ def _encoder_command(spec, fps, profile, size, target, *, light_levels=None, pas
     hw_filter = delivery.hardware_filter(spec)
     if hw_filter:
         command += ['-vf', hw_filter]
-    command += delivery.encoder_args(spec, fps, profile, light_levels=light_levels, pass_number=pass_number, passlog=passlog)
+    command += delivery.encoder_args(spec, fps, profile, light_levels=light_levels, pass_number=pass_number, passlog=passlog,
+                                     threads=6 if spec['encoder'] == 'libx264' else None)
     if spec['kind'] != 'images':
         command += _color_tags(profile, spec)
     if pass_number == 1:
@@ -2563,8 +2564,8 @@ def _pump_windows(project, picture, first, stop, total_frames, fps, width, heigh
     size = spec['_frame']
     frame_bytes = round(size['width'] * size['height'] * PIXEL_BYTES[spec['pix_fmt']])
     stall = _stall_seconds()
-    workers = _parallel_windows(width, height)
-    cap = max(PIPE_CHUNK, min(READ_AHEAD_BYTES, int(_memory_available() * .25)) // max(1, workers - 1))
+    workers = min(2, _parallel_windows(width, height))
+    cap = max(PIPE_CHUNK, min(READ_AHEAD_BYTES, int(_memory_available() * .25)) // workers)
     activity = [time.monotonic()]
     errors = collections.deque(maxlen=200)
     encoder = subprocess.Popen(['ffmpeg', '-progress', 'pipe:1', '-stats_period', '1', *command[1:]],
@@ -2575,8 +2576,10 @@ def _pump_windows(project, picture, first, stop, total_frames, fps, width, heigh
     lock = threading.Lock()
 
     def read_progress():
+        previous = None
         for raw in encoder.stdout:
-            if raw.startswith(b'progress='):
+            if raw.startswith(b'frame=') and raw != previous:
+                previous = raw
                 activity[0] = time.monotonic()
 
     def read_errors():
@@ -2668,6 +2671,8 @@ def _pump_windows(project, picture, first, stop, total_frames, fps, width, heigh
             raise ValueError(message)
         elif state['error'] is not None:
             failure = state['error']
+        elif not state['done']:
+            raise ValueError('FFmpeg encoder exited before the final picture window')
         if failure is not None:
             if isinstance(failure, (BrokenPipeError, OSError)) and not isinstance(failure, (InterruptedError, TimeoutError)):
                 raise ValueError('FFmpeg encoder stopped: ' + ''.join(errors)[-1500:])

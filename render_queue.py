@@ -13,6 +13,8 @@ the job's scratch folder.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
+import errno
 import json
 import os
 from pathlib import Path
@@ -20,11 +22,13 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
 
 import delivery
+from render_movie import _export_settings
 
 MAX_JOBS = 500
 MAX_FINISHED = 200
@@ -61,12 +65,14 @@ def _folder(value):
     if value in (None, ''):
         folder = default_folder()
         folder.mkdir(parents=True, exist_ok=True)
-        return folder
+        value = str(folder)
     if not isinstance(value, str) or len(value) > 4096 or '\x00' in value:
         raise ValueError('Invalid output folder')
     folder = Path(value).expanduser()
     if not folder.is_absolute():
         raise ValueError('Choose the output folder as a full path')
+    if any(part.is_symlink() for part in (folder, *folder.parents)):
+        raise ValueError('The output folder is a link: choose its actual path')
     folder = folder.resolve()
     if not folder.is_dir():
         raise ValueError(f'The output folder {folder} does not exist')
@@ -75,12 +81,51 @@ def _folder(value):
     return folder
 
 
-def _targets(folder, name, spec):
+@contextmanager
+def _destination(value):
+    """Pin the chosen Linux directory across delivery, even if a parent gets renamed."""
+    folder = _folder(value)
+    if not sys.platform.startswith('linux'):
+        yield folder
+        return
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fd = os.open(folder.anchor, flags)
+    try:
+        for part in folder.parts[1:]:
+            child = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        yield Path('/proc/self/fd') / str(fd)
+    finally:
+        os.close(fd)
+
+
+def _publish_file(staged, target, overwrite):
+    if overwrite:
+        os.replace(staged, target)
+        return
+    try:
+        os.link(staged, target)
+    except OSError as error:
+        if error.errno not in (errno.EPERM, errno.ENOTSUP, errno.ENOSYS, errno.EACCES):
+            raise
+        # FAT/exFAT has no hard links. Exclusive creation preserves the same no-clobber rule.
+        with target.open('xb') as destination:
+            try:
+                with staged.open('rb') as source:
+                    shutil.copyfileobj(source, destination)
+            except BaseException:
+                destination.close()
+                target.unlink()
+                raise
+
+
+def _targets(folder, name, spec, captions=()):
     """The paths a job writes: the output (file or image folder) and its possible sidecars."""
     if spec['kind'] == 'images':
         return [folder / name]
     main = folder / f'{name}.{spec["extension"]}'
-    return [main] + [folder / f'{name}.{kind}' for kind in ('srt', 'vtt')]
+    return [main] + [folder / f'{name}.{kind}' for kind in captions]
 
 
 class RenderQueue:
@@ -157,7 +202,9 @@ class RenderQueue:
             options = entry.get('options')
             if not isinstance(options, dict):
                 raise ValueError('Invalid export options')
-            spec = delivery.normalize(options)
+            if any(key.startswith('_') for key in options):
+                raise ValueError('Invalid private export option')
+            spec, *_ = _export_settings(options)
             if spec['kind'] != 'audio' and isinstance(width, int) and isinstance(height, int) and isinstance(fps, (int, float)):
                 problems = delivery.frame_problems(spec, width, height, fps)
                 if problems:
@@ -173,15 +220,15 @@ class RenderQueue:
             if key in names:
                 raise ValueError(f'Two exports in this batch would both be named {name}')
             names.add(key)
-            targets = _targets(folder, name, spec)
-            with self.lock:
-                claimed = {Path(t).as_posix() for job in self.jobs if job['state'] in ACTIVE + ('rendering',) for t in job['targets']}
-            if any(Path(t).as_posix() in claimed for t in targets[:1]):
-                raise ValueError(f'Another queued export already writes {targets[0].name} in that folder')
-            if targets[0].is_symlink():
-                raise ValueError(f'{targets[0].name} in that folder is a link: Splice does not write through links')
-            if targets[0].exists() and not overwrite:
-                conflicts.append(targets[0].name)
+            captions = set(spec['caption_files'])
+            if not delivery.CONTAINERS[spec['container']]['subtitles']:
+                captions.add('srt')
+            targets = _targets(folder, name, spec, sorted(captions) if project.get('captions') and options.get('captions', True) else ())
+            for target in targets:
+                if target.is_symlink():
+                    raise ValueError(f'{target.name} is a link: Splice does not write through links')
+                if target.exists() and not overwrite:
+                    conflicts.append(target.name)
             prepared.append(dict(options=options, spec=spec, name=name, preset=preset, targets=targets))
         if conflicts:
             raise ConflictError('Already in the output folder: ' + ', '.join(conflicts) + '. Replace them?')
@@ -190,6 +237,12 @@ class RenderQueue:
         with self.lock:
             if len([job for job in self.jobs if job['state'] not in FINISHED]) + len(prepared) > MAX_JOBS:
                 raise ValueError(f'The queue holds at most {MAX_JOBS} jobs')
+            claimed = {t for job in self.jobs if job['state'] in ACTIVE + ('rendering',) for t in job['targets']}
+            for item in prepared:
+                for target in item['targets']:
+                    if str(target) in claimed:
+                        raise ValueError(f'Another queued export already writes {target.name} in that folder')
+                    claimed.add(str(target))
             for item in prepared:
                 identifier = uuid.uuid4().hex
                 self._project_file(identifier).write_text(text, encoding='utf-8')
@@ -220,6 +273,8 @@ class RenderQueue:
         from fractions import Fraction
         from interchange.api import export_timeline
         from interchange.timecode import timecode_frames
+        if not isinstance(overwrite, bool):
+            raise ValueError('Invalid overwrite setting')
         if movie not in ('h264', 'prores'):
             raise ValueError('The reference movie is H.264 or ProRes Proxy')
         if not isinstance(project, dict):
@@ -255,6 +310,10 @@ class RenderQueue:
         spec = delivery.normalize(movie_options)
         identifier = uuid.uuid4().hex
         with self.lock:
+            if sum(job['state'] not in FINISHED for job in self.jobs) >= MAX_JOBS:
+                raise ValueError(f'The queue holds at most {MAX_JOBS} jobs')
+            if any(str(target) in job['targets'] for job in self.jobs if job['state'] in ACTIVE + ('rendering',)):
+                raise ValueError(f'Another queued export already writes {target.name} in that folder')
             self._project_file(identifier).write_text(json.dumps(rendered), encoding='utf-8')
             self.jobs.append(dict(
                 id=identifier, state='queued', name=name, preset='Turnover reference movie', options=movie_options,
@@ -267,21 +326,21 @@ class RenderQueue:
         self.wake.set()
         return [identifier]
 
-    def _package(self, job, identifier, spec):
+    def _package(self, job, identifier, spec, folder):
         """Write the turnover zip: the exporter's files, the rendered movie and the request marked done."""
         import base64
         import io
         import zipfile
         output, _ = self.exports.outputs(identifier)
-        folder = _folder(job['folder'])
-        target = folder / f'{job["name"]}-turnover.zip'
+        name = _clean_name(job['name'])
+        target = folder / f'{name}-turnover.zip'
         notes = []
         if target.is_symlink():
             raise ValueError(f'{target} is a link: Splice does not write through links')
         if target.exists() and not job['overwrite']:
             for number in range(2, 1000):
                 candidate = folder / f'{job["name"]}-turnover ({number}).zip'
-                if not candidate.exists():
+                if not os.path.lexists(candidate):
                     notes.append(f'{target.name} appeared while this job rendered, so the package was saved as {candidate.name}.')
                     target = candidate
                     break
@@ -289,7 +348,8 @@ class RenderQueue:
                 raise ValueError(f'{target.name} already exists in {folder}')
         turnover = job['turnover']
         movie_name = f'{turnover["base"]}-reference.{spec["extension"]}'
-        temporary = target.with_name(target.name + '.partial')
+        with tempfile.NamedTemporaryFile(dir=folder, delete=False) as handle:
+            temporary = Path(handle.name)
         try:
             with zipfile.ZipFile(io.BytesIO(base64.b64decode(turnover['package']))) as source, \
                     zipfile.ZipFile(temporary, 'w', zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
@@ -303,10 +363,9 @@ class RenderQueue:
                     archive.writestr(entry, data)
                 # Video is already compressed: store it.
                 archive.write(output, f'{turnover["base"]}/{movie_name}', compress_type=zipfile.ZIP_STORED)
-            os.replace(temporary, target)
-        except BaseException:
+            _publish_file(temporary, target, job['overwrite'])
+        finally:
             temporary.unlink(missing_ok=True)
-            raise
         return [str(target)], notes
 
     def _trim(self):
@@ -479,7 +538,10 @@ class RenderQueue:
             with self.lock:
                 job.update(warnings=status['warnings'], report=status['report'], finished=time.time(), eta=None)
             if status['state'] == 'complete':
-                outputs, notes = (self._package if job.get('turnover') else self._deliver)(job, identifier, spec)
+                publish = self._package if job.get('turnover') else self._deliver
+                with _destination(job['folder']) as folder:
+                    paths, notes = publish(job, identifier, spec, folder)
+                    outputs = [str(Path(job['folder']) / Path(path).name) for path in paths]
                 with self.lock:
                     job.update(state='complete', progress=1, outputs=outputs, warnings=job['warnings'] + notes)
             else:
@@ -496,39 +558,46 @@ class RenderQueue:
             self.exports.release(identifier)
             self.wake.set()
 
-    def _deliver(self, job, identifier, spec):
+    def _deliver(self, job, identifier, spec, folder):
         """Move the finished output and sidecars into the chosen folder; never replace unconfirmed."""
         output, sidecars = self.exports.outputs(identifier)
-        folder = _folder(job['folder'])
-        name, notes = job['name'], []
-        targets = _targets(folder, name, spec)
-        if targets[0].exists() and not job['overwrite']:
+        name, notes = _clean_name(job['name']), []
+        captions = [sidecar.suffix[1:] for sidecar in sidecars]
+        targets = _targets(folder, name, spec, captions)
+        if any(target.is_symlink() for target in targets):
+            raise ValueError('An output is a link: Splice does not write through links')
+        if not job['overwrite'] and any(target.exists() for target in targets):
             for number in range(2, 1000):
                 candidate = f'{name} ({number})'
-                if not _targets(folder, candidate, spec)[0].exists():
-                    notes.append(f'{targets[0].name} appeared in the folder while this job rendered, so this export was '
-                                 f'saved as {candidate} instead of replacing it.')
-                    name = candidate
+                candidates = _targets(folder, candidate, spec, captions)
+                if not any(os.path.lexists(target) for target in candidates):
+                    notes.append(f'An output appeared while rendering, so this export was saved as {candidate} instead.')
+                    targets = candidates
                     break
             else:
-                raise ValueError(f'{targets[0].name} already exists in {folder}')
-            targets = _targets(folder, name, spec)
-        main = targets[0]
-        if main.is_symlink():
-            raise ValueError(f'{main} is a link: Splice does not write through links')
-        if spec['kind'] == 'images':
-            if main.exists():
-                shutil.rmtree(main) if main.is_dir() and not main.is_symlink() else main.unlink()
-            # The renderer named the files after the folder: keep them matched.
-            shutil.move(str(output), str(main))
-        else:
-            if main.exists() and main.is_dir():
-                raise ValueError(f'{main} is a folder')
-            shutil.move(str(output), str(main))
-        delivered = [str(main)]
-        for sidecar in sidecars:
-            target = folder / f'{name}{sidecar.suffix}'
-            shutil.move(str(sidecar), str(target))
+                raise ValueError(f'No available output name for {name}')
+        delivered = []
+        for source, target in zip([output, *sidecars], targets):
+            if source.is_dir():
+                with tempfile.TemporaryDirectory(dir=folder) as stage:
+                    staged = Path(stage) / 'images'
+                    shutil.move(str(source), str(staged))
+                    previous = Path(stage) / 'previous'
+                    if os.path.lexists(target):
+                        if not job['overwrite']:
+                            raise FileExistsError(target)
+                        os.rename(target, previous)
+                    try:
+                        os.rename(staged, target)
+                    except BaseException:
+                        if previous.exists():
+                            os.rename(previous, target)
+                        raise
+            else:
+                with tempfile.TemporaryDirectory(dir=folder) as stage:
+                    staged = Path(stage) / 'file'
+                    shutil.move(str(source), str(staged))
+                    _publish_file(staged, target, job['overwrite'])
             delivered.append(str(target))
         return delivered, notes
 

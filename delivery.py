@@ -343,7 +343,7 @@ def _output_size(options):
 
 def _caption_files(options):
     value = options.get('captionFiles', [])
-    _check(isinstance(value, list) and all(v in ('srt', 'vtt') for v in value) and len(set(value)) == len(value),
+    _check(isinstance(value, list) and len(value) <= 2 and all(v in ('srt', 'vtt') for v in value) and len(set(value)) == len(value),
            'Invalid caption files: choose srt and/or vtt')
     return list(value)
 
@@ -838,7 +838,8 @@ def validate_preset(preset):
     _check(not unknown, f'Unknown preset option {sorted(unknown)[0]!r}' if unknown else '')
     for key in ('range',):
         _check(key not in options, 'A preset cannot carry an export range')
-    normalize(resolve_preset_options(options, 1920, 1080))
+    from render_movie import _export_settings
+    _export_settings(resolve_preset_options(options, 1920, 1080))
     identifier = preset.get('id') or 'user-' + hashlib.sha256(name.encode()).hexdigest()[:12]
     _check(isinstance(identifier, str) and re.fullmatch(r'user-[a-z0-9-]{1,40}', identifier), 'Invalid preset id')
     return dict(id=identifier, name=name, purpose=purpose, group='My presets', options=options)
@@ -884,9 +885,14 @@ def save_user_presets(presets):
     _check(len(text) <= PRESET_FILE_LIMIT * 4, 'The presets are too large to save')
     path = user_presets_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix('.tmp')
-    temporary.write_text(text, encoding='utf-8')
-    os.replace(temporary, path)
+    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as handle:
+        temporary = Path(handle.name)
+        try:
+            handle.write(text.encode('utf-8'))
+            handle.close()
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
     return clean
 
 
@@ -895,7 +901,7 @@ def import_presets(text):
     _check(isinstance(text, str) and len(text) <= PRESET_FILE_LIMIT, 'The preset file is too large')
     try:
         data = json.loads(text)
-    except ValueError:
+    except (ValueError, RecursionError):
         raise ValueError('The preset file is not JSON') from None
     entries = data.get('presets') if isinstance(data, dict) and 'presets' in data else [data]
     _check(isinstance(entries, list) and 0 < len(entries) <= MAX_USER_PRESETS, 'The preset file holds no presets')

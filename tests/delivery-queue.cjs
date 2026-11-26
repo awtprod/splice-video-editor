@@ -72,7 +72,7 @@ async function checkFits(page) {
     const box = document.querySelector('.studio-dialog[data-dialog=export]').getBoundingClientRect();
     const render = document.querySelector('.studio-dialog[data-dialog=export] footer [type=submit]').getBoundingClientRect();
     const hit = document.elementFromPoint(render.left + render.width / 2, render.top + render.height / 2);
-    return {inside: box.top >= 0 && box.bottom <= innerHeight && box.right <= innerWidth, render: hit?.closest('[type=submit]') !== null};
+    return {inside: box.top >= 0 && box.bottom <= innerHeight && box.right <= innerWidth, render: Boolean(hit?.closest('[type=submit]'))};
   });
   assert.ok(fit.inside, 'the Export dialog fits the window');
   assert.ok(fit.render, 'Render stays reachable');
@@ -95,7 +95,7 @@ async function exportOptions(page) {
 }
 
 async function main() {
-  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'splice-dq-'));
+  const temp = fs.mkdtempSync(path.join(process.env.SPLICE_TEMP_DIR || os.tmpdir(), 'splice-dq-'));
   const out = path.join(temp, 'Exports');
   fs.mkdirSync(out);
   const scratch = path.join(temp, 'scratch');
@@ -222,6 +222,7 @@ async function main() {
     await project(page, clip, 120);
     await openExport(page);
     await checkFits(page);
+    await shot(page, 'delivery-export-default');
     await page.locator(`${dialog} select[name=preset]`).selectOption('archive');
     await page.locator(`${dialog} .export-output summary`).click();
     await page.locator(`${dialog} [name=outputName]`).fill('Long master');
@@ -269,6 +270,9 @@ async function main() {
     await openExport(page);
     await checkFits(page);
     await shot(page, 'delivery-export-small');
+    await page.locator(`${dialog} .export-open-queue`).click();
+    await page.locator(queueDialog).waitFor();
+    await shot(page, 'delivery-queue-small');
     assert.deepEqual(errors, []);
     console.log('Delivery queue passed.');
   } finally {
