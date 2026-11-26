@@ -1423,16 +1423,20 @@ button svg {
     display: none;
   }
   .media-row span:nth-child(1) {
-    flex: 1 1 60%;
+    flex: 1 0 calc(100% - 96px);
     padding: 6px 5px 3px 6px;
     color: #e7efe4;
     font-size: 11px;
     font-weight: 700;
   }
   .media-row span:nth-child(2) {
-    flex: 0 0 auto;
-    padding: 6px 6px 3px;
+    flex: 0 0 96px;
+    padding: 6px 6px 3px 0;
     color: #e7efe4;
+    text-align: right;
+  }
+  .media-row span:nth-child(3):not(:empty)::after {
+    content: " fps";
   }
   .media-row span:nth-child(n + 3):not(:empty) ~ span:not(:empty)::before {
     content: "· ";
@@ -1453,4 +1457,15 @@ button svg {
 .shortcut-reference > button {
   align-self: flex-end;
   flex: none;
+}
+/* Below 1320 px the four pool tabs tighten so Captions stays in view. */
+@media (max-width: 1320px) {
+  .library-tabs {
+    justify-content: space-between;
+    gap: 3px;
+    padding: 0 8px;
+  }
+  .library-tabs button {
+    font-size: 11px;
+  }
 }
