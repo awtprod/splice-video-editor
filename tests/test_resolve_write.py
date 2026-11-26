@@ -3,6 +3,7 @@ report of what is not written, the safety rules of placing a project, framing an
 import copy
 import errno
 import os
+import re
 import shutil
 import sqlite3
 import stat
@@ -415,6 +416,23 @@ class SafetyTests(SaveCase):
         self.assertFalse((self.library / 'Resolve Projects' / place.STAGING).exists())
 
 
+    def test_a_full_disk_while_copying_the_seed_is_a_clean_refusal(self):
+        import errno
+        from resolve import ResolveError
+        project = self.opened()
+        before = tree_state(self.library)
+
+        def full(source, target):
+            Path(target).write_bytes(b'partial')
+            raise OSError(errno.ENOSPC, 'No space left on device')
+        with mock.patch('resolve.save.shutil.copyfile', full):
+            with self.assertRaises(ResolveError) as caught:
+                self.run_save(self.payload(project, name='Full disk'))
+        self.assertIn('could not copy the seed project into the library (No space left on device)',
+                      str(caught.exception))
+        self.assertIn('nothing was placed', str(caught.exception))
+        self.assertEqual(tree_state(self.library), before)
+
 class HostileSeedTests(SaveCase):
     def replace_seed(self, change):
         conn = sqlite3.connect(self.kept)
@@ -578,6 +596,20 @@ class PathMappingTests(unittest.TestCase):
         self.assertEqual(facts.map_path('/mnt/media/x.mov', facts.check_mappings(
             [{'from': '/mnt/media', 'to': '\\\\nas\\share'}])), '\\\\nas\\share\\x.mov')
 
+    def test_on_a_tie_the_earlier_rule_wins(self):
+        from resolve import facts
+        rules = facts.check_mappings([{'from': '/mnt/media', 'to': 'E:\\'}, {'from': '/mnt/media/', 'to': 'F:\\'}])
+        self.assertEqual(facts.mapped('/mnt/media/x.mov', rules), ('E:\\x.mov', 0))
+        self.assertEqual(facts.mapped('/mnt/media/x.mov', list(reversed(rules))), ('F:\\x.mov', 0))
+
+    def test_a_from_folder_with_dot_components_is_refused(self):
+        from resolve import facts
+        for source in ('/a/../b', '/a/./b', 'E:\\x\\..\\y', '/a/..'):
+            with self.assertRaises(ValueError) as caught:
+                facts.check_mappings([{'from': source, 'to': 'E:\\'}])
+            self.assertIn('“..”', str(caught.exception))
+        self.assertEqual(len(facts.check_mappings([{'from': '/a/..b/c.d', 'to': 'E:\\'}])), 1)
+
     def test_rules_must_be_absolute_paths(self):
         from resolve import facts
         for rule in ({'from': 'media', 'to': 'E:\\'}, {'from': '/mnt', 'to': 'E:'}, {'from': '/mnt', 'to': ''}):
@@ -623,6 +655,13 @@ class LibraryEvidenceTests(unittest.TestCase):
         folder.mkdir()
         conn = sqlite3.connect(folder / 'Project.db')
         conn.execute('CREATE TABLE SM_Project (SM_Project_id)')
+        conn.commit()
+        conn.close()
+        # An empty SM_Project table is not a project Resolve saved.
+        self.assertIn('Create the library in Resolve first', self.refused())
+        conn = sqlite3.connect(folder / 'Project.db')
+        conn.execute("INSERT INTO SM_Project VALUES ('p')")
+        conn.commit()
         conn.close()
         self.assertEqual(sorted(place.library_users(self.library)[2]), ['guest'])
         # A linked User.db is not evidence.
@@ -643,6 +682,17 @@ class LibraryEvidenceTests(unittest.TestCase):
         for path in ('/etc/passwd', '/etc/Project.db', str(projects / 'B' / 'Project.db'), 'Project.db',
                      str(projects / 'A' / 'other.db'), str(projects / 'A' / '..' / 'A' / 'Project.db'),
                      str(projects / 'Missing' / 'Project.db'), str(projects / 'Project.db')):
+            self.assertIsNone(place.project_db_inside(path, projects), path)
+        # Deeper than one project folder, though inside the library: refused.
+        (projects / 'A' / 'Deeper').mkdir()
+        (projects / 'A' / 'Deeper' / 'Project.db').write_bytes(b'x')
+        self.assertIsNone(place.project_db_inside(projects / 'A' / 'Deeper' / 'Project.db', projects))
+        # Links that stay inside the library (a project folder, or a Project.db, naming another
+        # project's): refused all the same.
+        (projects / 'C').symlink_to(projects / 'A', target_is_directory=True)
+        (projects / 'D').mkdir()
+        (projects / 'D' / 'Project.db').symlink_to(projects / 'A' / 'Project.db')
+        for path in (projects / 'C' / 'Project.db', projects / 'D' / 'Project.db'):
             self.assertIsNone(place.project_db_inside(path, projects), path)
 
 
@@ -756,6 +806,90 @@ class StaleStagingTests(SaveCase):
         self.assertFalse(self.staging().exists())
 
 
+    def old_entries(self, root, *names, marker=True, lock_text=None):
+        staging = root / place.STAGING
+        staging.mkdir(exist_ok=True)
+        for name in names:
+            path = staging / name
+            if name.startswith('build-'):
+                path.mkdir()
+                if marker:
+                    (path / place.MARKER).write_bytes(place._MARKER_TEXT)
+            else:
+                path.write_text(lock_text if lock_text is not None else place._LOCK_TEXT + 'build-' + '0' * 16)
+        self.age(3600)
+
+    def test_only_entries_with_splices_marker_are_removed(self):
+        root = self.library / 'Resolve Projects'
+        ours, empty = 'build-' + 'a' * 16, 'build-' + 'b' * 16
+        self.old_entries(root, ours)
+        self.old_entries(root, empty, marker=False)
+        hand = self.staging() / ('build-' + 'c' * 16)
+        hand.mkdir()
+        (hand / 'notes.txt').write_text('mine')
+        (self.staging() / 'build-x').mkdir()
+        (self.staging() / 'build-y').mkdir()
+        (self.staging() / 'build-y' / place.MARKER).write_bytes(place._MARKER_TEXT)
+        foreign_lock = 'lock-' + 'd' * 32
+        self.old_entries(root, foreign_lock, lock_text='my own notes')
+        own_lock, empty_lock = 'lock-' + 'e' * 32, 'lock-' + 'f' * 32
+        self.old_entries(root, own_lock)
+        self.old_entries(root, empty_lock, lock_text='')
+        self.assertEqual(sorted(place.clean_stale(root)), sorted([ours, empty, own_lock, empty_lock]))
+        self.assertEqual(sorted(p.name for p in self.staging().iterdir()),
+                         sorted(['build-' + 'c' * 16, 'build-x', 'build-y', foreign_lock]))
+        self.assertEqual((hand / 'notes.txt').read_text(), 'mine')
+
+    def test_a_linked_or_unopenable_lock_does_not_postpone_the_cleanup(self):
+        root = self.library / 'Resolve Projects'
+        self.old_entries(root, 'build-' + 'a' * 16)
+        target = self.dir / 'elsewhere'
+        target.write_text(place._LOCK_TEXT + 'build-' + 'a' * 16)
+        (self.staging() / ('lock-' + '1' * 32)).symlink_to(target)
+        unopenable = self.staging() / ('lock-' + '2' * 32)
+        unopenable.write_text(place._LOCK_TEXT + 'build-' + 'b' * 16)
+        unopenable.chmod(0)
+        self.age(3600)
+        try:
+            removed = place.clean_stale(root)
+        finally:
+            unopenable.chmod(0o600)
+        self.assertIn('build-' + 'a' * 16, removed)
+        self.assertTrue(target.exists())
+        self.assertTrue((self.staging() / ('lock-' + '1' * 32)).is_symlink())
+
+    def test_a_staging_folder_that_is_a_link_or_a_file_is_left_alone(self):
+        root = self.library / 'Resolve Projects'
+        outside = self.dir / 'outside-staging'
+        outside.mkdir()
+        build = outside / ('build-' + 'a' * 16)
+        build.mkdir()
+        (build / place.MARKER).write_bytes(place._MARKER_TEXT)
+        old = build.lstat().st_mtime - 3600
+        os.utime(build, (old, old))
+        (root / place.STAGING).symlink_to(outside, target_is_directory=True)
+        self.assertEqual(place.clean_stale(root), [])
+        self.assertTrue(build.is_dir())
+        (root / place.STAGING).unlink()
+        (root / place.STAGING).write_text('a file')
+        self.assertEqual(place.clean_stale(root), [])
+        self.assertEqual((root / place.STAGING).read_text(), 'a file')
+
+    def test_a_read_only_staging_folder_is_named_in_the_refusal(self):
+        staging = self.staging()
+        staging.mkdir()
+        (staging / 'left by hand').write_text('x')  # so the folder is not removed as empty
+        staging.chmod(0o500)
+        try:
+            with self.assertRaises(place.PlaceError) as caught:
+                place.Staging(self.library, 'Read only')
+        finally:
+            staging.chmod(0o700)
+        self.assertIn("cannot write in the library's staging folder", str(caught.exception))
+        self.assertIn(str(staging), str(caught.exception))
+        self.assertNotIn('The library is not writable', str(caught.exception))
+
+
 class TransitionChangeTests(SaveCase):
     def carrier(self, project):
         return next(c for c in project['clips'] if c.get('resolveTransitionId'))
@@ -797,6 +931,22 @@ class TransitionChangeTests(SaveCase):
         line = next(line for line in result['lines'] if line['what'].startswith('Changes to Resolve transitions'))
         self.assertEqual(line['status'], writer.NOT_WRITTEN)
 
+    def test_a_changed_resolve_crossfade_carrying_resolve_work_is_kept_not_rewritten(self):
+        project = self.opened()
+        fps = project['fps']
+        seed = self.transitions(self.db)
+        conn = sqlite3.connect(self.kept)
+        transition = conn.execute("SELECT Sm2TiItem_id FROM Sm2TiItem WHERE DbType = 'Sm2TiTransition'").fetchone()[0]
+        conn.execute('INSERT INTO BtLockableBlob (BtLockableBlob_id, DbType, BlobOwner, FieldsBlob) VALUES (?, ?, ?, ?)',
+                     ('marker-1', 'BtMarkerBlob', transition, b''))
+        conn.commit()
+        conn.close()
+        self.carrier(project).update(transitionDuration=12 / fps, transitionBefore=6 / fps)
+        result = self.run_save(self.payload(project, name='With work'))
+        self.assertEqual(self.transitions(result['project']['path']), seed)
+        line = next(line for line in result['lines'] if line['what'].startswith('Changes to Resolve transitions'))
+        self.assertIn('carries other Resolve work', line['what'])
+
     def test_a_crossfade_without_its_resolve_id_never_adds_a_second_one(self):
         project = self.opened()
         fps = project['fps']
@@ -813,6 +963,37 @@ class TransitionChangeTests(SaveCase):
         self.assertEqual(self.transitions(result['project']['path']), seed)
         self.assertTrue(any(line['what'].startswith('Transitions on a cut that keeps a Resolve transition')
                             for line in result['lines']))
+
+    def test_the_per_cut_check_counts_and_edges(self):
+        from resolve import save as save_module
+
+        class Seed:
+            def __init__(self, rows):
+                self.items = {r['Sm2TiItem_id']: r for r in rows}
+
+            def rows(self, table, where, args):
+                return [{'DbAssociate': i} for i in self.items]
+
+            def row(self, table, rid):
+                return self.items.get(rid)
+        timeline = mock.Mock(tracks={'video': [], 'audio': [{'Sm2TiTrack_id': 'a1'}]})
+
+        def item(rid, start, length, kind=items.SOUND, pretty=None):
+            return {'Sm2TiItem_id': rid, 'Start': str(start), 'Duration': str(length), 'DbType': kind,
+                    'PrettyType': pretty}
+        clips = [item('c1', 0, 10), item('c2', 10, 10)]
+        fade = item('t1', 8, 4, items.TRANSITION, 'Cross Fade +3DB')
+        meant = [{'track': 'a1', 'start': 8, 'duration': 4, 'pretty': 'Cross Fade +3DB'}]
+        self.assertEqual(save_module.transitions_per_cut(Seed(clips + [fade]), timeline, meant, 'T'), [])
+        out = save_module.transitions_per_cut(Seed(clips), timeline, meant, 'T')
+        self.assertEqual(out, ['T · Audio 1: 0 transition(s) read back, 1 meant'])
+        longer = dict(fade, Duration='6')
+        out = save_module.transitions_per_cut(Seed(clips + [longer]), timeline, meant, 'T')
+        self.assertEqual(out, ['T · Audio 1: 1 transition(s) read back, 1 meant (another length, start or kind)'])
+        away = item('t2', 40, 4, items.TRANSITION, 'Cross Fade +3DB')
+        out = save_module.transitions_per_cut(Seed(clips + [away]), timeline,
+                                              [dict(meant[0], start=40)], 'T')
+        self.assertEqual(out, ['T · Audio 1: a transition at frame 40 is on no clip edge'])
 
     def test_the_self_check_compares_transitions_per_cut(self):
         project = self.opened()
@@ -957,6 +1138,135 @@ def _calls(source, name):
     return out
 
 
+def _js_skip(src, i):
+    """Index after the string, template literal or comment at ``i`` (or ``i`` itself)."""
+    ch = src[i]
+    if ch in '"\'':
+        j = i + 1
+        while j < len(src) and src[j] != ch:
+            j += 2 if src[j] == '\\' else 1
+        return j + 1
+    if ch == '`':
+        j, depth = i + 1, 0
+        while j < len(src):
+            if src[j] == '\\':
+                j += 2
+                continue
+            if src[j] == '`' and depth == 0:
+                return j + 1
+            if src.startswith('${', j):
+                depth += 1
+                j += 2
+                continue
+            if src[j] == '}' and depth:
+                depth -= 1
+            j += 1
+        return j
+    if src.startswith('//', i):
+        j = src.find('\n', i)
+        return len(src) if j < 0 else j
+    if src.startswith('/*', i):
+        j = src.find('*/', i + 2)
+        return len(src) if j < 0 else j + 2
+    return i
+
+
+def _literal_keys(src, start):
+    """``(keys, spreads, end)`` of the object literal whose ``{`` is at ``start``: its top-level
+    keys (``key:``, ``"key":``, shorthand ``key``), the spread expressions, and the index after
+    its ``}``."""
+    keys, spreads = [], []
+    depth, i, item = 0, start, ''
+    pieces = []
+    while i < len(src):
+        j = _js_skip(src, i)
+        if j != i:
+            if depth == 1:
+                item += src[i:j]
+            i = j
+            continue
+        ch = src[i]
+        if ch in '{[(':
+            depth += 1
+            if depth == 1:
+                i += 1
+                continue
+        elif ch in '}])':
+            depth -= 1
+            if depth == 0:
+                pieces.append(item)
+                break
+        if depth == 1 and ch == ',':
+            pieces.append(item)
+            item = ''
+        elif depth >= 1:
+            item += ch
+        i += 1
+    for piece in pieces:
+        text = piece.strip()
+        if not text:
+            continue
+        if text.startswith('...'):
+            spreads.append(text[3:].strip())
+            continue
+        m = re.match(r'''(?:["']([\w$]+)["']|([A-Za-z_$][\w$]*))\s*(:|\(|$)''', text, re.S)
+        if m:
+            keys.append(m.group(1) or m.group(2))
+    return keys, spreads, i + 1
+
+
+def _object_literals(src):
+    """Every ``{`` that opens an object literal (after ``=``, ``(``, ``,``, ``:``, ``[``,
+    ``return``, ``=>``, ``?`` or ``||``/``&&``/``??``), with its keys and spreads."""
+    out = []
+    i = 0
+    while i < len(src):
+        j = _js_skip(src, i)
+        if j != i:
+            i = j
+            continue
+        if src[i] == '{':
+            before = src[:i].rstrip()
+            if re.search(r'(?:[=(,:\[?]|\breturn|\|\||&&|\?\?)$', before) and not before.endswith('=>'):
+                keys, spreads, _end = _literal_keys(src, i)
+                out.append((i, keys, spreads))
+        i += 1
+    return out
+
+
+#: Names the editor gives a clip (or a copy of one) where it builds or changes it.
+_CLIP_VARS = r'(?:clip|c|piece|sound|picture|base|right|left|selection|structuredClone\(clip\))'
+
+
+def editor_fields(sources):
+    """``{table: {key, ...}}`` of every field the editor's JavaScript ``sources`` set on a clip,
+    a project, a track state or a track mix in a form the plain ``x.key =`` scan misses: keys of
+    clip-shaped object literals (with a ``track`` and a ``mediaId`` or ``type``, or spreading a
+    clip), ``Object.assign(clip, {...})``, ``clip["key"] =``, spreads of the project, and the
+    patches given to ``setTrackState`` / ``updateTrackMix``."""
+    import re
+    out = {'clip': set(), 'project': set(), 'trackState': set(), 'trackMix': set()}
+    for src in sources:
+        for pos, keys, spreads in _object_literals(src):
+            before = src[max(0, pos - 160):pos]
+            if re.search(r'Object\.assign\(\s*' + _CLIP_VARS + r'\s*,\s*$', before) or \
+                    any(re.fullmatch(_CLIP_VARS, sp) for sp in spreads) or \
+                    'track' in keys and ('mediaId' in keys or 'type' in keys):
+                out['clip'].update(keys)
+            if any(re.fullmatch(r'(?:project|next)', sp) for sp in spreads) or \
+                    re.search(r'Object\.assign\(\s*(?:project|next)\s*,\s*$', before):
+                out['project'].update(keys)
+            if any(sp.startswith('trackState(') for sp in spreads) or re.search(r'setTrackState\([^;{}]*$', before):
+                out['trackState'].update(keys)
+            if any(sp.startswith('project.trackMix') for sp in spreads) or re.search(r'updateTrackMix\([^;{}]*$', before):
+                out['trackMix'].update(k for k in keys)
+        for var_key in re.findall(r'\b' + _CLIP_VARS + r'\[\s*["\'](\w+)["\']\s*\]\s*=(?!=)', src):
+            out['clip'].add(var_key)
+        for var_key in re.findall(r'\bproject\[\s*["\'](\w+)["\']\s*\]\s*=(?!=)', src):
+            out['project'].add(var_key)
+    return out
+
+
 class EditorFieldCoverageTests(unittest.TestCase):
     """Every field the editor can set has a line in the writer's field tables (written,
     reported, derived or bookkeeping): a field the editor gains later fails here until the writer
@@ -1002,7 +1312,41 @@ class EditorFieldCoverageTests(unittest.TestCase):
                 need(groups[group], [key], group or 'clip')
         for listed in re.findall(r"\['opacity','x','y','scale','rotation'[^\]]*\]|\['volume'\]|\['opacity'\]", inspector):
             need(writer.KEYFRAME_FIELDS, re.findall(r"'(\w+)'", listed), 'keyframes')
+        sources = [(ROOT / name).read_text() for name in ('engine.js', 'inspector.js', 'track_controls.js',
+                                                          'workspace.js', 'captions.js')]
+        found = editor_fields(sources)
+        self.assertGreaterEqual(len(found['clip']), 10)  # the scan sees the editor's own clip literals
+        need(writer.CLIP_FIELDS, found['clip'], 'clip')
+        need(writer.PROJECT_FIELDS, found['project'], 'project')
+        need(writer.TRACK_STATE_FIELDS, found['trackState'], 'trackState')
+        need(writer.TRACK_MIX_FIELDS, found['trackMix'], 'trackMix')
         self.assertEqual(unknown, [])
+
+    def test_the_scan_sees_every_way_the_editor_adds_a_field(self):
+        planted = {
+            'clip literal': ('const picture = {id: uid(), type: "video", track: 1, glow: 2, ...base};', 'clip', 'glow'),
+            'clip spread': ('kept.push(links.assign({...right, ...native, id: clip.id, shine: 1}, clip));', 'clip', 'shine'),
+            'quoted key': ('const c2 = {"id": 1, "track": 2, "mediaId": m, "warp": 3};', 'clip', 'warp'),
+            'bracket': ('clip["sparkle"] = true;', 'clip', 'sparkle'),
+            'Object.assign': ('Object.assign(picture, {embeddedAudio: false, tint2: 4});', 'clip', 'tint2'),
+            'project spread': ('const p = {...project, theme: "dark"};', 'project', 'theme'),
+            'track state spread': ('const current={locked:false,syncLocked:true,...trackState(kind, track), dim: 1};',
+                                   'trackState', 'dim'),
+            'track state patch': ('() => editor.setTrackState(lane.track, lane.kind, {folded: true});',
+                                  'trackState', 'folded'),
+            'track mix patch': ('editor.updateTrackMix(lane.track, {width: 3});', 'trackMix', 'width'),
+        }
+        for what, (code, table, key) in planted.items():
+            self.assertIn(key, editor_fields([code])[table], what)
+        # Strings, comments and nested literals do not count; media literals are not clips.
+        quiet = editor_fields(['// {track: 1, type: "video", nope: 1}\n',
+                               'const s = "{track: 1, mediaId: 2, nope: 3}";',
+                               'const m = {id: 1, name: "a", src: "b", type: "video"};',
+                               'const c = {id: 1, track: 2, type: "audio", color: {deep: 1}};'])
+        self.assertNotIn('nope', quiet['clip'])
+        self.assertNotIn('src', quiet['clip'])
+        self.assertNotIn('deep', quiet['clip'])
+        self.assertIn('color', quiet['clip'])
 
 
 class EveryFeatureTests(SaveCase):
@@ -1249,6 +1593,53 @@ class StillRadiometryTests(unittest.TestCase):
         self.assertIn('#14, #15', why)
         self.assertIn('not established', why)
         self.assertIn('cannot be read', mediapool.still_radiometry_variant(mock.Mock(video={'Radiometry': b'\x01'})))
+
+
+    PLAIN = ((1, 102), (2, 2), (5, 16), (6, 3), (19, 0), (27, 0))
+    SECOND = ((1, 102), (2, 2), (5, 16), (6, 3), (14, 2), (15, 6), (19, 0), (27, 0))
+    KIND = ('still', 'png', None, None, False, False, (), ('rgba', 'gbr', '-', '-', 'pc', '0'))
+
+    def facts(self, pix_fmt='rgba'):
+        from resolve import mediapool
+        facts = mock.Mock(spec=mediapool.Facts)
+        facts.name, facts.style, facts.kind = 'Title card.png', 'windows', self.KIND[:7] + ((pix_fmt,) + self.KIND[7][1:],)
+        return facts
+
+    def author(self, template_fields, seed_stills, template_facts=True):
+        """``mediapool.author`` of a still with everything but the colour-description evidence
+        stubbed: which reasons make the new still unverified."""
+        from resolve import mediapool
+        template_rows = self.rows(*template_fields)
+        template_rows.__class__ = mediapool.ClipRows
+        built = mock.Mock(build=mock.Mock(return_value={}), media_id='new', notes=[])
+        with mock.patch.object(mediapool, '_check_picture_decoded'), \
+                mock.patch.object(mediapool, 'kind_of_facts', side_effect=lambda f: f.kind), \
+                mock.patch.object(mediapool, 'kind_of_rows', return_value=self.KIND[:7] + (None,)), \
+                mock.patch.object(mediapool, '_Derived'), mock.patch.object(mediapool, '_Writer', return_value=built), \
+                mock.patch.object(mediapool, 'outside_envelope', return_value=[]), \
+                mock.patch.object(mediapool, '_template_mismatch', return_value=None), \
+                mock.patch.dict(mediapool.KINDS, {self.KIND: ('verified', 3, '', {})}):
+            template = mediapool.Template(template_rows, self.facts() if template_facts else None)
+            clip = mediapool.author(self.facts(), template, mock.Mock(), allow_unverified=True,
+                                    seed_stills=[(self.rows(*f), self.facts(p)) for f, p in seed_stills])
+        return clip.status, clip.unverified
+
+    def test_a_new_still_needs_a_seed_still_of_its_pixel_format_in_one_form(self):
+        # The template (measured, same pixel format, plain form) is the evidence; others agree.
+        self.assertEqual(self.author(self.PLAIN, []), ('verified', ()))
+        self.assertEqual(self.author(self.PLAIN, [(self.PLAIN, 'rgba'), (self.SECOND, 'rgb24')]), ('verified', ()))
+        # A still of the same pixel format in the second form: which form the new one gets is unknown.
+        status, why = self.author(self.PLAIN, [(self.SECOND, 'rgba')])
+        self.assertEqual(status, 'unverified')
+        self.assertIn('in both of Resolve\'s colour descriptions', why[-1])
+        # The template in the second form (the gate on the template itself).
+        status, why = self.author(self.SECOND, [])
+        self.assertEqual(status, 'unverified')
+        self.assertIn('second form', why[-1])
+        # No measured still of this pixel format at all.
+        status, why = self.author(self.PLAIN, [(self.PLAIN, 'rgb24')], template_facts=False)
+        self.assertEqual(status, 'unverified')
+        self.assertIn('no still of the seed whose file Splice could measure has this pixel format (rgba)', why[-1])
 
 
 class NewMediaReportTests(SaveCase):

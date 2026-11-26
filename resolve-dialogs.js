@@ -65,7 +65,7 @@ window.SpliceResolve = (() => {
     const issues = project.compatibilityWarnings?.length || 0;
     // What came in disabled, hidden, muted or locked, and where linked media is: from the importer.
     const summary = (project.resolveSource?.summary || []).filter(line => typeof line === 'string').slice(0, 4);
-    const parts = [extra, ...summary, issues ? 'Opened from Resolve. ' + issues + ' item' + (issues === 1 ? '' : 's') + ' listed in File → Project compatibility.' : ''];
+    const parts = [extra, ...summary, issues ? 'Opened from Resolve. ' + issues + ' item' + (issues === 1 ? '' : 's') + ' listed in File → Resolve compatibility details.' : ''];
     const notice = parts.filter(Boolean).join(' ');
     if (notice) {
       const node = toast(notice, extra || summary.length || issues ? 12 : 6);

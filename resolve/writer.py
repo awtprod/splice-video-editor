@@ -460,7 +460,8 @@ class Writer:
             template_facts = self.facts_for_template(template)
             try:
                 authored = mediapool.author(facts, mediapool.Template(template, template_facts), placement,
-                                            taken=frozenset(self.taken), allow_unverified=self.allow_unverified)
+                                            taken=frozenset(self.taken), allow_unverified=self.allow_unverified,
+                                            seed_stills=self.seed_stills() if kind[0] == 'still' else None)
             except mediapool.MediaPoolError as error:
                 last = (error, template_facts)
                 if error.code in ('kind_mismatch', 'bad_template'):
@@ -520,6 +521,20 @@ class Writer:
         return (f'pixel format {pix}, colour space {space}, transfer {transfer}, primaries {primaries}, colour range '
                 f'{color_range}' + ('' if color_range != '-' else ' (unset in the file)') +
                 (f', rotated {rotation}°' if rotation not in ('0', '-', 0) else ''))
+
+    def seed_stills(self):
+        """``[(rows, facts or None)]`` of every still in the seed's media pool (measured once)."""
+        if getattr(self, '_seed_stills', None) is None:
+            stills = []
+            for clip in self.clips.values():
+                try:
+                    if mediapool.kind_of_rows(clip)[0] != 'still':
+                        continue
+                except mediapool.MediaPoolError:
+                    continue
+                stills.append((clip, self.facts_for_template(clip)))
+            self._seed_stills = stills
+        return self._seed_stills
 
     def facts_for_template(self, clip):
         try:

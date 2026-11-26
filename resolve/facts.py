@@ -9,6 +9,7 @@ wall clock (this computer's time zone), the creation time in UTC where the file 
 import ctypes
 import json
 import os
+import re
 import stat
 import sys
 import time
@@ -34,7 +35,12 @@ def check_mappings(mappings):
         return []
     if isinstance(mappings, list) and len(mappings) > MAX_MAPPINGS:
         raise ValueError(f'Path mapping must be a list of at most {MAX_MAPPINGS} rules.')
-    return path_rules(mappings)
+    rules = path_rules(mappings)
+    for rule in mappings or ():
+        side = rule.get('from') if isinstance(rule, dict) else None
+        if isinstance(side, str) and any(part in ('.', '..') for part in re.split(r'[\\/]', side)):
+            raise ValueError('A path mapping “from” folder cannot hold “.” or “..”: give the folder itself.')
+    return rules
 
 
 def map_path(local, mappings):

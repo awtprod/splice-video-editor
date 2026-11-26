@@ -20,10 +20,13 @@ opened:
 * On every failure path the build folder and the lock are removed, so nothing is left in the
   library; what cannot be removed is named in the error. A save that is killed cannot clean up,
   so every save first removes what interrupted saves left (:func:`clean_stale`): only Splice's
-  own ``build-*`` folders and ``lock-*`` files, only once they are older than
+  own ``build-*`` folders (holding Splice's marker file, or empty) and ``lock-*`` files
+  (holding Splice's lock text, or empty), only once they are older than
   :data:`STALE_SECONDS` and no live save holds their lock (each save holds an ``flock`` on its
-  lock file, which names its build folder), never following a link; the staging folder itself
-  goes when it is empty. The server does the same at start for the libraries it saved into.
+  lock file, which names its build folder), never following a link; a lock that is a link or
+  cannot be opened is ignored. Where ``flock`` does not work (Windows, some network file
+  systems) entries are removed by age only, after :data:`STALE_SECONDS_UNLOCKABLE`. The
+  staging folder itself goes when it is empty. The server does the same at start for the libraries it saved into.
 """
 import errno
 import os
@@ -45,6 +48,13 @@ STALE_SECONDS = 30
 STALE_SECONDS_UNLOCKABLE = 24 * 3600
 _BUILD = re.compile(r'build-[0-9a-f]{16}\Z')
 _LOCK = re.compile(r'lock-[0-9a-f]{32}\Z')
+#: The marker file every build folder holds from right after it is made (an empty build folder,
+#: from a save killed before it wrote the marker, holds nothing and is removed too). A folder
+#: with Splice's naming but without the marker is never removed.
+MARKER = '.splice-build'
+_MARKER_TEXT = b'Splice save in progress\n'
+#: What a lock file holds: this prefix and the name of its build folder.
+_LOCK_TEXT = 'splice-save '
 MAX_NAME = 200
 _FORBIDDEN = set('\\/:*?"<>|')
 _RESERVED = {'CON', 'PRN', 'AUX', 'NUL', 'CONIN$', 'CONOUT$'} | {f'{p}{n}' for p in ('COM', 'LPT') for n in
@@ -123,8 +133,11 @@ def _resolve_database(path, table):
                 return False
         conn = sqlite3.connect(f'file:{Path(path).as_posix()}?mode=ro&immutable=1', uri=True)
         try:
-            return conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
-                                (table,)).fetchone() is not None
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                            (table,)).fetchone() is None:
+                return False
+            # A project database Resolve made holds its project's row.
+            return table != 'SM_Project' or conn.execute('SELECT 1 FROM "SM_Project" LIMIT 1').fetchone() is not None
         finally:
             conn.close()
     except (OSError, ValueError, Exception):  # sqlite3.Error and anything a crafted file raises
@@ -289,15 +302,13 @@ def move_no_replace(folder, target):
 
 def _held(path):
     """Whether a live process holds the ``flock`` of the lock file ``path``: True, False, or None
-    where the file system cannot tell (no ``fcntl``, or ``flock`` refused)."""
+    where the file system cannot tell (no ``fcntl``, or ``flock`` refused). Raises ``OSError``
+    when the file cannot be opened (a link, no permission)."""
     try:
         import fcntl
     except ImportError:
         return None
-    try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
-    except OSError:
-        return None
+    fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -312,14 +323,40 @@ def _held(path):
 
 
 def _read_lock(path):
+    """The build folder a lock names, '' for an empty lock (a save killed before it wrote it),
+    or None when the file is not one of Splice's locks."""
+    fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
     try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
-    except OSError:
-        return ''
-    try:
-        return os.read(fd, 256).decode('ascii', 'replace').strip()
+        text = os.read(fd, 256).decode('ascii', 'replace')
     finally:
         os.close(fd)
+    if text == '':
+        return ''
+    if text.startswith(_LOCK_TEXT) and _BUILD.match(text[len(_LOCK_TEXT):]):
+        return text[len(_LOCK_TEXT):]
+    return None
+
+
+def _ours(folder):
+    """Whether the build folder ``folder`` is Splice's: it holds the marker (a regular file,
+    not a link, with Splice's text), or nothing at all."""
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return False
+    if not names:
+        return True
+    try:
+        info = os.lstat(os.path.join(folder, MARKER))
+        if not stat.S_ISREG(info.st_mode) or info.st_size != len(_MARKER_TEXT):
+            return False
+        fd = os.open(os.path.join(folder, MARKER), os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+        try:
+            return os.read(fd, 64) == _MARKER_TEXT
+        finally:
+            os.close(fd)
+    except OSError:
+        return False
 
 
 def clean_stale(root, *, now=None, age=None):
@@ -344,31 +381,36 @@ def clean_stale(root, *, now=None, age=None):
     except OSError:
         return removed
     live = set()
+    unlockable = False
     for entry in locks:
         try:
             st = os.lstat(entry.path)
+            if not stat.S_ISREG(st.st_mode) or (hasattr(os, 'getuid') and st.st_uid != os.getuid()):
+                continue  # a link or another user's file: ignored, the other entries are still cleaned
+            named = _read_lock(entry.path)
+            held = _held(entry.path)
         except OSError:
-            continue
-        if not stat.S_ISREG(st.st_mode) or (hasattr(os, 'getuid') and st.st_uid != os.getuid()):
-            continue
-        held = _held(entry.path)
+            continue  # cannot be opened: not a lock a save of this user holds; ignored
+        if named is None:
+            continue  # not one of Splice's locks: never removed
+        unlockable = unlockable or held is None
         limit = STALE_SECONDS_UNLOCKABLE if held is None else (STALE_SECONDS if age is None else age)
         if held or now - st.st_mtime < limit:
-            live.add(_read_lock(entry.path))
+            live.add(named)
             continue
         try:
             os.unlink(entry.path)
             removed.append(entry.name)
         except OSError:
-            live.add(_read_lock(entry.path))
-    unlockable = any(_held(e.path) is None for e in locks if os.path.lexists(e.path))
+            live.add(named)
     for entry in builds:
         try:
             st = os.lstat(entry.path)
         except OSError:
             continue
-        if not stat.S_ISDIR(st.st_mode) or (hasattr(os, 'getuid') and st.st_uid != os.getuid()):
-            continue  # a link or anything not Splice's own: left alone
+        if not stat.S_ISDIR(st.st_mode) or (hasattr(os, 'getuid') and st.st_uid != os.getuid()) or \
+                not _ours(entry.path):
+            continue  # a link, another user's folder, or a folder without Splice's marker: left alone
         limit = STALE_SECONDS_UNLOCKABLE if unlockable else (STALE_SECONDS if age is None else age)
         if entry.name in live or now - st.st_mtime < limit:
             continue
@@ -405,6 +447,12 @@ class Staging:
             self._lock(build)
             self.work = self.staging / build
             os.mkdir(self.work, 0o700)
+            marker = os.open(self.work / MARKER, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                             getattr(os, 'O_NOFOLLOW', 0), 0o600)
+            try:
+                os.write(marker, _MARKER_TEXT)
+            finally:
+                os.close(marker)
             if os.stat(self.work).st_dev != os.stat(self.projects).st_dev:
                 raise PlaceError('The staging folder is on another file system than the projects, so the project '
                                  'could not be moved in with one rename.')
@@ -412,7 +460,8 @@ class Staging:
             os.mkdir(self.folder, 0o700)
         except OSError as error:
             self.close()
-            raise PlaceError(f'The library is not writable ({error.strerror or error}).') from None
+            raise PlaceError(f'Splice cannot write in the library\'s staging folder {self.staging} '
+                             f'({error.strerror or error}); nothing was placed.') from None
         except BaseException:
             self.close()
             raise
@@ -446,7 +495,7 @@ class Staging:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except (ImportError, OSError):
                 pass  # no flock here: stale entries are then removed by age only
-            os.write(fd, build.encode('ascii'))
+            os.write(fd, (_LOCK_TEXT + build).encode('ascii'))
             return
         raise PlaceError('The library\'s staging folder keeps disappearing; try the save again.')
 

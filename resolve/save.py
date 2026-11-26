@@ -291,7 +291,13 @@ class Measurer:
 
 
 def _copy_seed(source, target):
-    shutil.copyfile(source, target)
+    try:
+        shutil.copyfile(source, target)
+    except OSError as error:
+        # A full disk (or any write error) while copying the seed: the build folder is removed
+        # by the caller, so nothing is placed.
+        raise ResolveError(f'Splice could not copy the seed project into the library ({error.strerror or error}); '
+                           'nothing was placed.') from None
 
 
 def run(payload, *, originals, scratch, resolve_media, drp_seed=None, remember=None):

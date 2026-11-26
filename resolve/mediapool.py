@@ -987,10 +987,13 @@ def _check_picture_decoded(facts):
 
 
 @guarded('bad_template')
-def author(facts, template, placement, *, taken=frozenset(), new_id=lambda: str(uuid.uuid4()), allow_unverified=False):
+def author(facts, template, placement, *, taken=frozenset(), new_id=lambda: str(uuid.uuid4()), allow_unverified=False,
+           seed_stills=None):
     """The rows of a new media clip for ``facts`` built from ``template`` (see the module
     docstring). A result that would not be verified is refused (``unverified``) unless
-    ``allow_unverified``; then its ``status`` is ``unverified`` with the reasons."""
+    ``allow_unverified``; then its ``status`` is ``unverified`` with the reasons. ``seed_stills``
+    (``[(rows, facts or None)]``, every still of the seed) is the evidence a new still needs: see
+    :func:`still_form_evidence`."""
     if not isinstance(facts, Facts):
         raise MediaPoolError('bad_facts', 'the facts are not checked facts')
     if not isinstance(template, Template) or not isinstance(template.rows, ClipRows):
@@ -1031,6 +1034,10 @@ def author(facts, template, placement, *, taken=frozenset(), new_id=lambda: str(
     variant = still_radiometry_variant(template.rows) if file_kind[0] == 'still' else None
     if variant:
         unverified.append(variant)
+    elif file_kind[0] == 'still':
+        evidence = still_form_evidence(file_kind, [(template.rows, template.facts)] + list(seed_stills or ()))
+        if evidence:
+            unverified.append(evidence)
     if unverified and not allow_unverified:
         raise MediaPoolError('unverified', f'the rows of {facts.name} would not be verified: ' + '; '.join(unverified),
                              _UNVERIFIED_HINT)
@@ -1060,6 +1067,32 @@ def still_radiometry_variant(rows):
         return ("the template still's colour description (Radiometry) is Resolve's second form (fields "
                 + ', '.join(f'#{n}' for n in extra) + '), and which file property makes Resolve write that form is '
                 'not established')
+    return None
+
+
+def still_form_evidence(file_kind, stills):
+    """Why a new still of ``file_kind`` is not verified for want of evidence of its colour
+    description, or None. Resolve describes a still in one of two forms and what in a file makes
+    it pick the second is not established, so a new still is verified only when the seed holds a
+    still whose file was measured with the same pixel format (which fixes the bit depth and the
+    alpha), and every such still is in the plain form."""
+    look = file_kind[-1] or ('-',)
+    same = []
+    for rows, facts in stills:
+        if facts is None:
+            continue
+        try:
+            other = kind_of_facts(facts)
+        except MediaPoolError:
+            continue
+        if other[0] == 'still' and (other[-1] or ('-',))[0] == look[0]:
+            same.append(rows)
+    if not same:
+        return (f'no still of the seed whose file Splice could measure has this pixel format ({look[0]}), so '
+                'which of Resolve\'s two colour descriptions the new still gets is not shown')
+    if any(still_radiometry_variant(rows) for rows in same):
+        return (f'the seed holds stills of this pixel format ({look[0]}) in both of Resolve\'s colour descriptions, '
+                'so which one the new still gets is not shown')
     return None
 
 
