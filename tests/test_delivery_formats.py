@@ -229,6 +229,19 @@ class Intra(DeliveryCase):
         without, _ = self.render(self.project(alpha_only=True), dict(codec='prores', profile='4444'))
         self.assertEqual(self.video(probe(without))['pix_fmt'], 'yuv444p12le', 'alpha only when asked for')
 
+    def test_nested_sequence_keeps_transparent_areas(self):
+        child = self.project(alpha_only=True)
+        parent = self.project(extra=dict(media=[dict(id='nested', nestedProject=child)],
+                                         clips=[dict(type='video', track=1, mediaId='nested', start=0, duration=1)]))
+        for options in [dict(codec='prores', profile='4444', alpha=True), dict(codec='png', alpha=True)]:
+            with self.subTest(codec=options['codec']):
+                path, _ = self.render(parent, options)
+                frame = sorted(path.glob('*.png'))[0] if path.is_dir() else path
+                alpha = subprocess.check_output(['ffmpeg', '-v', 'error', '-i', str(frame), '-vf', 'alphaextract,format=gray',
+                                                 '-frames:v', '1', '-f', 'rawvideo', 'pipe:1'], timeout=60)
+                self.assertLess(alpha[2*W + 2], 5)
+                self.assertGreater(alpha[60*W + 128], 250)
+
     def test_alpha_refused_where_the_format_has_none(self):
         with self.assertRaisesRegex(ValueError, 'cannot carry alpha'):
             delivery.normalize(dict(codec='prores', profile='hq', alpha=True))

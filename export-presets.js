@@ -303,6 +303,9 @@ window.SpliceDelivery = (() => {
       if (options.audioBitrate && [...form.elements.bitrate.options].some(o => Number(o.value) === options.audioBitrate)) form.elements.bitrate.value = String(options.audioBitrate);
       else if (options.audioBitrate) { form.elements.bitrate.append(new Option(String(options.audioBitrate))); form.elements.bitrate.value = String(options.audioBitrate); }
       timecode.checked = options.timecode !== false;
+      reel.value = options.reel ?? '';
+      title.value = options.title ?? '';
+      comment.value = options.comment ?? '';
       if (options.hdr) {
         display.value = options.hdr.display || 'p3d65';
         maxLum.value = options.hdr.maxLuminance ?? 1000;

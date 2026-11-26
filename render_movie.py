@@ -1719,13 +1719,16 @@ def render_to_file(project, output_path, *, options=None, progress=None, cancell
             if _nested_depth>=4: raise ValueError('Nested Premiere sequences exceed four levels')
             # A nested sequence is rendered as an intermediate: ProRes 422 HQ under high-depth
             # deliveries, H.264 under 8-bit ones, with the parent's audio and colour settings.
-            child_codec=delivery.legacy_codec(_delivery_spec(options))
+            parent_spec = _delivery_spec(options)
+            child_codec=delivery.legacy_codec(parent_spec)
             child_codec='h264' if child_codec=='wav' else child_codec
             suffix='.mov' if child_codec=='prores' else '.mp4'
             target=Path(directory)/f'nested-{index}{suffix}'
             child_options={key:options[key] for key in ('limiter','limiterCeiling','aacPeakSafe','audioBitrate','subtitleLanguage',
                                                          'captions') if key in options}
             child_options['codec']=child_codec
+            if parent_spec['alpha']:
+                child_options.update(profile='4444', alpha=True)
             if child_codec=='prores' and options.get('colorSpace') in ('rec709','pq'):
                 child_options['colorSpace']=options['colorSpace']
             if child_codec=='h264' and options.get('codec','h264')=='h264' and 'crf' in options and not options.get('rateControl'):
@@ -2870,7 +2873,7 @@ def _delivery_tail(spec, width, height, fps, profile, burn, directory):
             steps.append(f'scale={out_w}:{out_h}:flags=lanczos')
         steps.append('setsar=1')
     if burn:
-        steps.extend(_burn_in_filters(burn, out_w, out_h, fps, directory))
+        steps.extend(_burn_in_filters(burn, out_w, out_h, fps, directory, profile))
     if spec['mode'] == 'stream' or spec['kind'] == 'images':
         if spec['kind'] == 'images':
             # zimg writes planar 16-bit RGB; FFmpeg repacks it into the file's pixel format.
@@ -2879,19 +2882,24 @@ def _delivery_tail(spec, width, height, fps, profile, burn, directory):
     return ','.join(steps)
 
 
-def _burn_in_filters(burn, width, height, fps, directory):
+def _burn_in_filters(burn, width, height, fps, directory, profile):
     settings = burn['settings']
     fields = settings['fields']
     size = max(10, round(height * settings['size'] / 100))
     margin = round(height * (0.06 if settings['safeMargins'] else 0.03))
     font = _filter_path(burn['font'])
-    box = f'fontfile={font}:fontsize={size}:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw={max(2, size//6)}'
+    def graphic(rgb):
+        if profile[1] in HDR_TRANSFERS:
+            rgb = _hdr_graphic_color(rgb, profile[0], profile[1])
+        return '0x' + rgb
+    white = graphic('ffffff')
+    box = f'fontfile={font}:fontsize={size}:fontcolor={white}:box=1:boxcolor=black@0.6:boxborderw={max(2, size//6)}'
     rate = Fraction(fps).limit_denominator(1001)
     filters = []
     if settings['safeMargins']:
-        for share, color in ((0.93, 'white@0.5'), (0.90, 'yellow@0.5')):
+        for share, color in ((0.93, white), (0.90, graphic('ffff00'))):
             inset = (1 - share) / 2
-            filters.append(f'drawbox=x=iw*{inset:.4f}:y=ih*{inset:.4f}:w=iw*{share:.4f}:h=ih*{share:.4f}:color={color}:t=2')
+            filters.append(f'drawbox=x=iw*{inset:.4f}:y=ih*{inset:.4f}:w=iw*{share:.4f}:h=ih*{share:.4f}:color={color}@0.5:t=2')
     def place(position, row=0):
         x, y = BURN_IN_XY[position]
         shift = f'-{row*round(size*1.5)}' if position.startswith('bottom') else f'+{row*round(size*1.5)}'
@@ -2920,5 +2928,5 @@ def _burn_in_filters(burn, width, height, fps, directory):
         text = Path(directory) / 'burn-watermark.txt'
         text.write_text(settings['watermark'], encoding='utf-8')
         filters.append(f"drawtext=fontfile={font}:textfile={_filter_path(text)}:expansion=none:fontsize={round(height/8)}:"
-                       f"fontcolor=white@{settings['watermarkOpacity']/100:.2f}:x=(w-text_w)/2:y=(h-text_h)/2")
+                       f"fontcolor={white}@{settings['watermarkOpacity']/100:.2f}:x=(w-text_w)/2:y=(h-text_h)/2")
     return filters

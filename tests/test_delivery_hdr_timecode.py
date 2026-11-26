@@ -125,6 +125,14 @@ class HDR(Case):
         self.assertEqual((stream['color_primaries'], stream['color_transfer'], stream['color_space'], stream['pix_fmt'],
                           stream['codec_tag_string']), ('bt2020', 'smpte2084', 'bt2020nc', 'yuv420p10le', 'hvc1'))
 
+    def test_burn_in_white_in_a_pq_delivery(self):
+        clip = self.neutral_source('dark', 160, 160, 'smpte2084')
+        target = self.out / 'burn-in.mp4'
+        render_to_file(self.project(clip), target, options=dict(codec='hevc', profile='main10',
+                       colorSpace='source', burnIns=dict(fields=['timecode', 'clipName'], size=8)))
+        peak = self.side_data(target)['Content light level metadata']['max_content']
+        self.assertAlmostEqual(peak, 203, delta=25)
+
     def test_entered_light_levels_and_a_rec2020_display(self):
         clip = self.neutral_source('entered', 500, 700, 'smpte2084')
         target = self.out / 'entered.mp4'
