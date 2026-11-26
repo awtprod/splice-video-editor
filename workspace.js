@@ -91,6 +91,7 @@
     document.querySelector(".toast")?.remove();
     const node = document.createElement("div");
     node.className = "toast";
+    node.setAttribute("role", "status");
     node.textContent = message;
     document.body.append(node);
     clearTimeout(toastTimer);
@@ -187,15 +188,19 @@
     };
     return [...items].sort((a, b) => compare(a, b) * mediaSort.direction);
   }
-  function mediaDetails(media) {
+  function mediaDetails(media, withPath = true) {
     return [mediaRate(media) && mediaRate(media) + " fps", mediaTimecode(media) && "TC " + mediaTimecode(media),
-      media.reel && "Reel " + media.reel, mediaAudio(media), media.sourcePath].filter(Boolean).join(" · ");
+      media.reel && "Reel " + media.reel, mediaAudio(media), withPath && media.sourcePath].filter(Boolean).join(" · ");
   }
+  // A card's linked-media path is one line, cut short with an ellipsis; the tooltip has it in full.
   function mediaCard(media, project) {
     const audio = media.type === "audio";
     const picture = audio ? "♫" : thumbOf(media) ? `<img src="${esc(thumbOf(media))}" alt="">` : "▶";
-    const details = mediaDetails(media);
-    return `<button class="media-card" draggable="true" data-media="${esc(media.id)}" title="${esc(details)}"><div class="media-thumb ${audio ? "audio-thumb" : ""}">${picture}<span class="media-icon">${audio ? "♫" : "▶"}</span><span class="media-duration">${fmt(media.duration, project.fps).slice(3, 8)}</span></div><span class="media-name">${esc(media.name)}</span><span class="media-meta">${esc(mediaLabel(media))}</span>${details ? `<span class="media-meta media-extra">${esc(details)}</span>` : ""}</button>`;
+    const details = mediaDetails(media, false);
+    const tooltip = [media.name, mediaDetails(media)].filter(Boolean).join("\n");
+    const extra = details ? `<span class="media-meta media-extra">${esc(details)}</span>` : "";
+    const path = media.sourcePath ? `<span class="media-meta media-path" title="${esc(media.sourcePath)}">${esc(media.sourcePath)}</span>` : "";
+    return `<button class="media-card" draggable="true" data-media="${esc(media.id)}" title="${esc(tooltip)}"><div class="media-thumb ${audio ? "audio-thumb" : ""}">${picture}<span class="media-icon">${audio ? "♫" : "▶"}</span><span class="media-duration">${fmt(media.duration, project.fps).slice(3, 8)}</span></div><span class="media-name">${esc(media.name)}</span><span class="media-meta">${esc(mediaLabel(media))}</span>${extra}${path}</button>`;
   }
   function mediaTable(items, project) {
     const arrow = (key) => mediaSort.key === key ? (mediaSort.direction > 0 ? " ▲" : " ▼") : "";
@@ -237,8 +242,10 @@
         }
         if(!el.onclick) el.onclick=()=>SpliceSource.open(el.dataset.media);
         const media=project.media.find(m=>m.id===el.dataset.media);
-        if(Number.isInteger(media?.nestedSequence)){el.onclick=()=>busy(()=>SpliceSession.sequence(media.nestedSequence));el.title="Open nested sequence";}
-        else el.title=media?.offline?"Relink this source":"Open source monitor";
+        // The tooltip says what a click does, then the card's details (its full path included).
+        let action=media?.offline?"Relink this source":"Open source monitor";
+        if(Number.isInteger(media?.nestedSequence)){el.onclick=()=>busy(()=>SpliceSession.sequence(media.nestedSequence));action="Open nested sequence";}
+        el.title=action+(el.title?"\n"+el.title:"");
         el.ondragstart = (e) =>
           e.dataTransfer.setData("text/plain", el.dataset.media);
       });
@@ -294,7 +301,7 @@
   let selectedEdit=null;
   // Timeline viewport size and scroll, cached from observers and scroll events so a re-render
   // after every edit never has to force a synchronous layout to read them.
-  const viewport={width:0,left:0};
+  const viewport={width:0,height:0,left:0,top:0};
   const timelineWidth=()=>Math.max(300,viewport.width||$("track-scroll").clientWidth);
   function scrollTimelineTo(left) {
     const scroll=$("track-scroll");
@@ -302,8 +309,12 @@
     viewport.left=scroll.scrollLeft;
   }
   // Ruler spacing: the smallest step that leaves room for a full timecode label.
+  // Frame steps divide the timecode rate, so every second's ticks are evenly spaced.
   function rulerStep(fps) {
-    const steps=[1/fps,2/fps,5/fps,10/fps,1,2,5,10,15,30,60,120,300,600,900,1800,3600,7200];
+    const nominal=Math.round(fps);
+    const frameSteps=[];
+    for(let frames=1;frames<nominal;frames++)if(nominal%frames===0)frameSteps.push(frames/fps);
+    const steps=[...frameSteps,1,2,5,10,15,30,60,120,300,600,900,1800,3600,7200];
     return steps.find(step=>px(step)>=96) || steps.at(-1);
   }
   const surfaceWidth = (duration, screen) => Math.max(screen, px(duration) + Math.max(120, screen * .25));
@@ -417,9 +428,85 @@
       (Number.isFinite(marks.in)&&Number.isFinite(marks.out)?" · Duration "+fmt(marks.out-marks.in,project.fps):"");
     surface.append(range);
   }
+  // Track heights. Empty tracks are drawn short; tracks that hold clips, and V1 and A1 where
+  // edits land, share the rest of the timeline's height (from 36 to 64 px each), so they all
+  // fit without scrolling whenever they can.
+  const rulerHeight=31, compactLane=30;
+  const laneKey=lane=>lane.kind+":"+lane.track;
+  const clipLaneKey=clip=>(clip.type==="title"?"title":clip.type)+":"+clip.track;
+  function laneHeights(visibleLanes, used) {
+    const full=visibleLanes.map(lane=>used.has(laneKey(lane))||lane.kind!=="title"&&Math.abs(lane.track)===1);
+    const fullCount=full.filter(Boolean).length;
+    const room=(viewport.height||240)-rulerHeight-(full.length-fullCount)*compactLane;
+    const tallest=window.innerHeight<=850?50:64;
+    const each=clamp(Math.floor(room/Math.max(1,fullCount)),36,tallest);
+    return full.map(isFull=>isFull?each:compactLane);
+  }
+  // Vertical position of the track area: centred on the V1/A1 boundary when a project opens,
+  // and moved only as far as needed to show the tracks an edit changed.
+  let layout={opened:-1,lanes:[],heights:[],counts:new Map()};
+  function laneCounts(project) {
+    const counts=new Map();
+    for(const clip of project.clips){
+      const key=clipLaneKey(clip);
+      const [count,sum]=counts.get(key)||[0,0];
+      counts.set(key,[count+1,sum+clip.start*3+clip.duration]);
+    }
+    return counts;
+  }
+  function laneSpan(keys) {
+    let top=rulerHeight, from=Infinity, to=-Infinity;
+    layout.lanes.forEach((lane,index)=>{
+      const height=layout.heights[index];
+      if(keys.has(laneKey(lane))){from=Math.min(from,top);to=Math.max(to,top+height);}
+      top+=height;
+    });
+    return Number.isFinite(from)?{from,to}:null;
+  }
+  function placeTracks(scrollTo) {
+    const scroll=$("track-scroll");
+    const visible=Math.max(1,viewport.height-rulerHeight);
+    const total=layout.heights.reduce((sum,height)=>sum+height,0);
+    const top=clamp(Math.round(scrollTo),0,Math.max(0,total-visible));
+    if(Math.abs(top-scroll.scrollTop)<1)return;
+    scroll.scrollTop=top;
+    viewport.top=top;
+  }
+  // Show every track that holds clips (and V1 and A1) when they fit, centred; otherwise centre
+  // the V1/A1 boundary, as other editors keep the picture/sound divider in view.
+  function centreTracks() {
+    const visible=viewport.height-rulerHeight;
+    const required=new Set(["video:1","audio:-1",...layout.counts.keys()]);
+    const span=laneSpan(required);
+    if(span&&span.to-span.from<=visible){
+      placeTracks((span.from+span.to)/2-rulerHeight-visible/2);
+      return;
+    }
+    const firstAudio=layout.lanes.findIndex(lane=>lane.kind==="audio");
+    const divider=layout.heights.slice(0,Math.max(0,firstAudio)).reduce((sum,height)=>sum+height,0);
+    placeTracks(divider-visible/2);
+  }
+  function revealLanes(keys) {
+    const span=laneSpan(keys);
+    if(!span)return;
+    const visible=viewport.height-rulerHeight;
+    // Lane span in scroll coordinates: the sticky ruler covers the first 31 px of the view.
+    const from=span.from-rulerHeight, to=span.to-rulerHeight;
+    if(from>=viewport.top&&to<=viewport.top+visible)return;
+    placeTracks(to-from>visible||from<viewport.top?from:to-visible);
+  }
   function renderTimeline(state) {
     const {project,duration,selectedId}=state;
     const visibleLanes=laneList(project);
+    const counts=laneCounts(project);
+    const heights=laneHeights(visibleLanes,counts);
+    const changed=new Set();
+    for(const [key,value] of counts){
+      const before=layout.counts.get(key);
+      if(!before||before[0]!==value[0]||Math.abs(before[1]-value[1])>1e-6)changed.add(key);
+    }
+    const opened=state.opened!==layout.opened;
+    layout={opened:state.opened,lanes:visibleLanes,heights,counts};
     // Read every scroll metric before touching the DOM, so the rebuild never forces a synchronous layout.
     const screen=timelineWidth();
     const {min,max}=zoomLimits(state);
@@ -430,17 +517,20 @@
     const visible=(start,end)=>px(start)<=viewEnd && px(end)>=viewStart;
     $("timeline-surface").style.width=width+"px";
     $("playhead").style.left=px(state.time)+"px";
-    const height=31+visibleLanes.length*64;
+    const height=rulerHeight+heights.reduce((sum,lane)=>sum+lane,0);
     $("timeline-surface").style.height=height+"px";
     $("zoom-label").textContent=describeSpan(screen/pps);
     $("zoom-label").title="Visible span · "+(pps*1/project.fps).toFixed(2)+" px per frame";
     const ruler=$("time-ruler");ruler.innerHTML="";
+    // Ticks fall on whole timecode seconds (drop-frame aware), so labels read 01:00:20:00
+    // rather than 01:00:19:29 at 29.97 and 59.94 fps.
     const step=rulerStep(project.fps);
-    ruler.style.backgroundSize=px(step)+"px 100%";
-    const first=Math.floor(viewStart/px(step)), last=Math.ceil(viewEnd/px(step));
-    for(let index=first;index<=last;index++){
-      const tick=document.createElement("span");tick.className="ruler-tick";
-      tick.style.left=px(index*step)+5+"px";tick.textContent=tc(index*step);ruler.append(tick);
+    for(const {time,label} of editor.rulerTicks(viewStart/pps,viewEnd/pps,step)){
+      const tick=document.createElement("span");
+      tick.className="ruler-tick";
+      tick.style.left=px(time)+"px";
+      tick.textContent=label;
+      ruler.append(tick);
     }
     for(const marker of project.markers||[]){
       if(!visible(marker.time,marker.time))continue;
@@ -458,11 +548,17 @@
     }
     $("track-heads").querySelectorAll(".track-head").forEach(node=>node.remove());
     const lanes=$("track-lanes");lanes.replaceChildren();
-    for(const lane of visibleLanes){
+    visibleLanes.forEach((lane,index)=>{
       const head=document.createElement("div");head.className="track-head";
+      const laneHeight=heights[index]+"px";
+      const compact=heights[index]===compactLane;
+      head.style.height=laneHeight;
+      head.classList.toggle("is-compact",compact);
       window.SpliceTracks.renderHeader(head,lane,project,editor);
       $("track-heads").append(head);
       const surface=document.createElement("div");surface.className="track-lane "+lane.kind+"-lane";
+      surface.style.height=laneHeight;
+      surface.classList.toggle("is-compact",compact);
       surface.dataset.track=lane.track;surface.dataset.kind=lane.kind;
       surface.classList.toggle('is-locked', editor.isTrackLocked(lane.track,lane.kind));
       surface.classList.toggle('is-hidden', lane.kind!=="audio" && editor.isTrackHidden(lane.track,lane.kind));
@@ -474,13 +570,18 @@
         surface.append(clipNode(clip,lane,project,selectedId,group));
       }
       paintDensity(surface,tiny,lane.kind);
-    }
+    });
     // Rebuilt headers can lose their scroll offset; level them with the lanes at the next frame
-    // rather than forcing a synchronous layout of the rebuilt timeline here.
-    requestAnimationFrame(()=>{ $("track-heads").scrollTop=$("track-scroll").scrollTop; });
+    // rather than forcing a synchronous layout of the rebuilt timeline here. A newly opened
+    // project centres V1/A1; an edit brings the tracks it changed into view.
+    requestAnimationFrame(()=>{
+      if(opened)centreTracks();
+      else if(changed.size)revealLanes(changed);
+      $("track-heads").scrollTop=$("track-scroll").scrollTop;
+    });
   }
   function renderPreview(state) {
-    const { project, time, duration, playing, activeClip, activeTitle } = state;
+    const { project, time, duration, playing } = state;
     SpliceCaptions.paint(state);
     const fps = project.fps || 30;
     if (!$("viewer-time").querySelector("input")) $("viewer-time").textContent = tc(time);
@@ -490,8 +591,9 @@
       ? '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14M16 5v14"/></svg>'
       : svg(icons["play-toggle"]);
     $("playhead").style.left = `${px(time)}px`;
-    $("preview-empty").style.display =
-      activeClip || activeTitle ? "none" : "flex";
+    // The placeholder is for an empty sequence only. Gaps, and the playhead parked at or past
+    // the end of the sequence, show black, as the program monitor in other editors does.
+    $("preview-empty").style.display = project.clips.length ? "none" : "flex";
   }
   let lastPaint = "", lastScope = -Infinity, monitorState;
   for (const event of ['loadeddata','seeked','canplay','emptied'])
@@ -693,10 +795,48 @@
   $("save-project").onclick = () =>
     busy(() => window.SpliceSession?.save?.("prproj") ?? editor.saveProject("prproj"), "Project saved");
   $("export-video").onclick=()=>SpliceDialogs.exportVideo();
+  // A large scope docked beside the program monitor, for grading. It takes the media pool's
+  // column while open; the inspector's small scope steps aside so only one scope is painted.
+  function toggleScopeDock(open=!document.querySelector(".scope-dock")) {
+    const workspace=document.querySelector(".workspace"), toggle=$("scope-dock-toggle");
+    document.querySelector(".scope-dock")?.remove();
+    workspace.classList.toggle("scope-docked",open);
+    toggle.setAttribute("aria-pressed",String(open));
+    toggle.classList.toggle("active",open);
+    if(open){
+      const dock=document.createElement("section");
+      dock.className="scope-dock panel";
+      dock.setAttribute("aria-label","Video scope");
+      dock.innerHTML='<div class="panel-top"><div class="panel-title">Scopes <span class="monitor-subtitle">/ graded program frame</span></div>'+
+        '<button type="button" class="icon-button scope-dock-close" aria-label="Close the large scope" title="Close the large scope">×</button></div>'+
+        '<div class="scope-dock-body">'+SpliceScopes.markup()+'</div>';
+      workspace.prepend(dock);
+      SpliceScopes.bind(dock);
+      dock.querySelector(".scope-dock-close").onclick=()=>toggleScopeDock(false);
+    }
+    requestAnimationFrame(()=>window.SpliceInspector?.paintScope?.(undefined,true));
+  }
+  $("scope-dock-toggle").onclick=()=>toggleScopeDock();
+  document.addEventListener("click",event=>{
+    if(event.target.closest?.("[data-scope-dock]"))toggleScopeDock(true);
+  });
   $("new-project").onclick=()=>SpliceDialogs.newSequence();
   $("shortcuts").onclick=()=>SpliceDialogs.shortcuts();
   $("save-working").onclick=()=>busy(()=>SpliceSession.saveAs("splice"));
   document.querySelector(".file-menu").addEventListener("click",e=>{if(e.target.closest("button"))document.querySelector(".file-menu").open=false;});
+  // The File and Edit menus close on Escape (focus returns to their title) and on a click elsewhere.
+  const menus=[...document.querySelectorAll(".file-menu,.edit-menu")];
+  document.addEventListener("keydown",e=>{
+    const open=menus.find(menu=>menu.open);
+    if(e.key!=="Escape"||!open)return;
+    e.preventDefault();
+    e.stopPropagation();
+    open.open=false;
+    open.querySelector("summary").focus();
+  },true);
+  document.addEventListener("pointerdown",e=>{
+    for(const menu of menus)if(menu.open&&!menu.contains(e.target))menu.open=false;
+  },true);
   $("add-marker").onclick=()=>editMarker();
   function editMarker(existing){
     const name=prompt('Marker name (leave blank to remove)',existing?.name||'Marker');
@@ -762,14 +902,19 @@
   const lanes=$("track-lanes");
   let scrollFrame=0;
   new ResizeObserver(entries=>{
-    const width=Math.round(entries[0].contentRect.width);
-    if(width===viewport.width)return;
-    viewport.width=width;
+    const width=Math.round(entries[0].contentRect.width), height=Math.round(entries[0].contentRect.height);
+    if(width===viewport.width&&height===viewport.height)return;
+    const newHeight=height!==viewport.height;
+    viewport.width=width;viewport.height=height;
+    // A new timeline height (the first measurement, a resize, the source panel opening) lays
+    // the tracks out again around the ones in use.
+    if(newHeight)layout.opened=-1;
     lastProject="";refresh(editor.get());
   }).observe($("track-scroll"));
   $("track-scroll").addEventListener("scroll",()=>{
     const surface=$("track-scroll");$("track-heads").scrollTop=surface.scrollTop;
     viewport.left=surface.scrollLeft;
+    viewport.top=surface.scrollTop;
     if(scrollFrame||gesture)return;
     scrollFrame=requestAnimationFrame(()=>{
       scrollFrame=0;
@@ -791,14 +936,28 @@
     const below=box.bottom+4, height=84;
     menu.style.top=(below+height<=window.innerHeight-8?below:Math.max(8,box.top-height-4))+"px";
     const dismiss=event=>{if(!menu.contains(event.target))close();};
-    // Escape closes it (focus returns to the timeline); scrolling or resizing anything moves the
-    // badge away from it, so those close it too.
+    // Escape closes it (focus returns to the timeline); a wheel turn or a resize closes it too.
     const onKey=event=>{if(event.key==="Escape"){event.preventDefault();event.stopPropagation();close();}};
+    // A scroll closes it only when it moved the badge away from the menu. Re-rendering the
+    // timeline (selecting the clip does) fires scroll events on its containers without moving
+    // anything, and must not close the menu it was opened with.
+    let scrollCheck=0;
+    const onScroll=()=>{
+      if(scrollCheck)return;
+      scrollCheck=requestAnimationFrame(()=>{
+        scrollCheck=0;
+        const badge=lanes.querySelector('.sync-badge[data-sync="'+CSS.escape(id)+'"]');
+        const now=badge?.getBoundingClientRect();
+        if(!now||Math.abs(now.left-box.left)>1||Math.abs(now.top-box.top)>1)close();
+      });
+    };
     const close=()=>{
       menu.remove();
+      cancelAnimationFrame(scrollCheck);
+      scrollCheck=0;
       window.removeEventListener("pointerdown",dismiss,true);
       window.removeEventListener("keydown",onKey,true);
-      window.removeEventListener("scroll",close,true);
+      window.removeEventListener("scroll",onScroll,true);
       window.removeEventListener("wheel",close,true);
       window.removeEventListener("resize",close);
       if(closeSyncMenu===close)closeSyncMenu=null;
@@ -812,7 +971,7 @@
     }
     window.addEventListener("pointerdown",dismiss,true);
     window.addEventListener("keydown",onKey,true);
-    window.addEventListener("scroll",close,true);
+    window.addEventListener("scroll",onScroll,true);
     window.addEventListener("wheel",close,true);
     window.addEventListener("resize",close);
     document.body.append(menu);
@@ -920,15 +1079,43 @@
   });
   window.addEventListener("pointercancel",()=>{editor.endGesture?.();gesture=null;lastProject="";refresh(editor.get());});
   lanes.addEventListener("click",e=>{if(e.target.classList.contains("track-lane")){selectedEdit=null;editor.seek(positionTime(e,e.target));}});
-  lanes.addEventListener("dragover",e=>{if(e.target.closest(".track-lane"))e.preventDefault();});
+  // Dragging from the source monitor: say where picture and sound will land before the drop.
+  let dropHint=null;
+  function showDropHint(lane) {
+    const kind=lane.dataset.kind==="title"?"video":lane.dataset.kind;
+    const text=SpliceSource.mediaType()==="audio"&&kind!=="audio"?"Drop sound on an audio track":
+      SpliceSource.describeDrop({kind,track:Number(lane.dataset.track)});
+    if(dropHint?.lane===lane&&dropHint.text===text)return;
+    dropHint?.lane.classList.remove("drop-target");
+    lane.classList.add("drop-target");
+    dropHint={lane,text,status:dropHint?.status??$("timeline-status").textContent};
+    $("timeline-status").textContent=text;
+  }
+  function clearDropHint() {
+    if(!dropHint)return;
+    dropHint.lane.classList.remove("drop-target");
+    $("timeline-status").textContent=dropHint.status;
+    dropHint=null;
+  }
+  lanes.addEventListener("dragover",e=>{
+    const lane=e.target.closest(".track-lane");
+    if(!lane)return;
+    e.preventDefault();
+    if(e.dataTransfer.types.includes("application/x-splice-source")&&window.SpliceSource?.isOpen?.())showDropHint(lane);
+  });
+  lanes.addEventListener("dragleave",e=>{if(!lanes.contains(e.relatedTarget))clearDropHint();});
   lanes.addEventListener("drop",e=>{
     const lane=e.target.closest(".track-lane");if(!lane)return;e.preventDefault();
+    clearDropHint();
     const sourceId=e.dataTransfer.getData("application/x-splice-source");
     if(sourceId&&window.SpliceSource?.mediaId?.()===sourceId){
       // From the source monitor: its marked range, overwritten (Ctrl/⌘: inserted) where it was dropped.
+      // A picture drop lands on that video track, its sound on the targeted audio track; a drop
+      // on an audio track places the sound only.
+      clearDropHint();
       const kind=lane.dataset.kind==="title"?"video":lane.dataset.kind;
-      if(SpliceSource.mediaType()!==kind)return notify("Drop "+(kind==="video"?"sound on an audio":"picture on a video")+" track.");
-      SpliceSource.place(e.ctrlKey||e.metaKey?"insert":"overwrite",{track:Number(lane.dataset.track),at:snapTime(positionTime(e,lane))});
+      if(SpliceSource.mediaType()==="audio"&&kind!=="audio")return notify("Drop sound on an audio track.");
+      SpliceSource.place(e.ctrlKey||e.metaKey?"insert":"overwrite",{kind,track:Number(lane.dataset.track),at:snapTime(positionTime(e,lane))});
       return;
     }
     const id=e.dataTransfer.getData("text/plain");
@@ -945,7 +1132,12 @@
   $("versions").onclick=()=>busy(()=>SpliceSession.history());
   $("save-as").onclick=()=>busy(()=>SpliceSession.saveAs("prproj"));
   $("sequence-settings").onclick=()=>sequenceSettings();
-  $("sequence-select").onchange=e=>busy(()=>editor.get().project.resolveTimelines?SpliceResolve.timeline(Number(e.target.value)):SpliceSession.sequence(Number(e.target.value)));
+  $("sequence-select").onchange=e=>{
+    const project=editor.get().project;
+    // Another task holds the workspace: say so and show the open timeline again, instead of a choice that is ignored.
+    if(pending){e.target.value=String(project.resolveTimelines?project.resolveTimeline:project.premiereSequence);notify("Wait for the current task to finish, then choose the timeline again.");return;}
+    busy(()=>project.resolveTimelines?SpliceResolve.timeline(Number(e.target.value)):SpliceSession.sequence(Number(e.target.value)));
+  };
   $("fullscreen-monitor").onclick = () => {
     if (document.fullscreenElement) document.exitFullscreen();
     else $("monitor-frame").requestFullscreen?.();

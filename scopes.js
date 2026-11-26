@@ -358,6 +358,7 @@
       KINDS.map(([kind, title]) => `<button type="button" role="tab" data-scope="${kind}" aria-selected="${kind === state.kind}">${title}</button>`).join('') +
       `</div><canvas class="splice-scope" role="img" aria-label="Video scope of the graded program frame" title="Levels in percent, with 8-bit and 10-bit code values. Amber lines mark the legal range, 16–235 (64–940)." style="height:${state.height}px"></canvas>` +
       `<label class="splice-scope-luma" ${state.kind === 'histogram' ? '' : 'hidden'}><input type="checkbox" aria-label="Show luma" data-scope-luma ${state.luma ? 'checked' : ''}> Show luma curve</label>` +
+      `<button type="button" class="splice-scope-enlarge" data-scope-dock title="Dock a large scope beside the program monitor">Enlarge scope</button>` +
       `<label class="splice-scope-size"><span>Scope height</span><input type="range" aria-label="Scope height" data-scope-height min="${HEIGHT.min}" max="${HEIGHT.max}" step="${HEIGHT.step}" value="${state.height}"></label></div>`;
   }
   // The controls live inside the inspector markup and go away with it; nothing outside is subscribed.

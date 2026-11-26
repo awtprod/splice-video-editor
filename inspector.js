@@ -71,7 +71,9 @@
         label('Exposure', 'exposure', number(color.exposure, 0), -4, 4, .1, ' EV', 'color') +
         label('Temperature', 'temperature', number(color.temperature, 0), -100, 100, 1, '', 'color') +
         label('Tint', 'tint', number(color.tint, 0), -100, 100, 1, '', 'color') +
-        `<div class="splice-lut-row"><button type="button" data-action="import-lut">Import .cube LUT</button><span title="${escape(color.lut?.title || 'No LUT')}">${escape(color.lut?.title || 'No LUT')}</span>${color.lut ? '<button type="button" data-action="remove-lut">Remove</button>' : ''}</div>` +
+        // The LUT name has a row of its own, so it stays readable in a narrow inspector.
+        `<div class="splice-lut"><p class="splice-lut-name" title="${escape(color.lut?.title || 'No LUT')}"><small>LUT</small> ${escape(color.lut?.title || 'None')}</p>` +
+        `<div class="splice-lut-row"><button type="button" data-action="import-lut">${color.lut ? 'Replace .cube LUT' : 'Import .cube LUT'}</button>${color.lut ? '<button type="button" data-action="remove-lut">Remove</button>' : ''}</div></div>` +
         lutNote(color.lut) +
         (color.lut ? label('LUT intensity', 'lutIntensity', number(color.lutIntensity, 100), 0, 100, 1, '%', 'color') : '') +
         '<input type="file" class="splice-lut-input" accept=".cube" hidden>' +
@@ -272,7 +274,8 @@
     requestAnimationFrame(() => { paintQueued = false; paintScope(); });
   }
   // Scopes read the graded program frame; SpliceScopes paces itself.
-  function paintScope(canvas=document.querySelector('.splice-scope'),force=false) {
+  // The large docked scope, when it is open, is the one painted.
+  function paintScope(canvas=document.querySelector('.scope-dock .splice-scope')||document.querySelector('.splice-scope'),force=false) {
     window.SpliceScopes.paint(canvas,force);
   }
   window.SpliceInspector = {render,paintScope,paintMeters};

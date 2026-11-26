@@ -57,14 +57,17 @@ window.SpliceResolve = (() => {
     const node = document.createElement('div');
     node.className = 'toast'; node.setAttribute('role', 'alert'); node.textContent = message;
     document.body.append(node); setTimeout(() => node.remove(), seconds * 1000);
+    return node;
   }
   async function load(project, extra = '') {
     const safe = (project.name || 'Resolve timeline').replace(/[\\/:*?"<>|]/g, '-');
     await SpliceSession.openFile(new File([JSON.stringify(project)], safe + '.splice.json', {type:'application/json'}));
     const issues = project.compatibilityWarnings?.length || 0;
-    const parts = [extra, issues ? 'Opened from Resolve. ' + issues + ' item' + (issues === 1 ? '' : 's') + ' listed in File → Project compatibility.' : ''];
+    // What came in disabled, hidden, muted or locked, and where linked media is: from the importer.
+    const summary = (project.resolveSource?.summary || []).filter(line => typeof line === 'string').slice(0, 4);
+    const parts = [extra, ...summary, issues ? 'Opened from Resolve. ' + issues + ' item' + (issues === 1 ? '' : 's') + ' listed in File → Project compatibility.' : ''];
     const notice = parts.filter(Boolean).join(' ');
-    if (notice) toast(notice, extra ? 12 : 6);
+    if (notice) toast(notice, extra || summary.length ? 12 : 6);
   }
   // A fresh open of a Resolve project: every timeline's working copy belongs to this open.
   function fresh(project) {
@@ -155,13 +158,27 @@ window.SpliceResolve = (() => {
   // Switch to the timeline at ``index`` of the selector. The timeline being left is kept with its
   // edits; the one chosen comes back from its working copy, or is read from Resolve by its id
   // (never by position, which changes when Resolve adds or reorders timelines).
+  // While a switch is under way the selector shows the timeline that is open (it never shows one
+  // that is not) and is disabled, with a notice; editing the open timeline goes on and is kept.
+  let switching = null;
+  function showOpen() {
+    const selector = $('sequence-select'), open = Editor.get().project;
+    if (selector && Array.isArray(open.resolveTimelines)) selector.value = String(open.resolveTimeline);
+  }
   async function timeline(index) {
-    const current = Editor.get().project;
+    const current = Editor.get().project, selector = $('sequence-select');
+    showOpen();
+    if (switching) { toast('“' + switching + '” is still opening; choose again when it is open.'); return; }
+    const label = current.resolveTimelines?.[index] || 'That timeline';
+    switching = label;
+    if (selector) { selector.disabled = true; selector.setAttribute('aria-busy', 'true'); }
+    const note = toast('Opening “' + label + '”… You can keep editing “' + current.name + '”; your edits are kept.', 300);
     try { await switchTimeline(current, index); }
-    catch (error) {
-      // Leave the selector on the timeline that is still open.
-      if (Editor.get().project === current && $('sequence-select')) $('sequence-select').value = String(current.resolveTimeline);
-      throw error;
+    finally {
+      switching = null;
+      note.remove();
+      if (selector) { selector.disabled = false; selector.removeAttribute('aria-busy'); }
+      showOpen();
     }
   }
   async function switchTimeline(current, index) {
@@ -201,6 +218,18 @@ window.SpliceResolve = (() => {
           : error;
       }
       project.resolveSource.openId = source.openId;
+    }
+    // The open timeline may have been edited while the other one was read: keep it as it is now.
+    const open = Editor.get().project;
+    if (open.resolveSource?.openId !== source.openId || open.resolveSource?.timelineId !== source.timelineId)
+      throw Error('Another project was opened while “' + label + '” was loading, so the timeline was not switched.');
+    if (kept) {
+      try { await keepWorking(open); }
+      catch (error) {
+        console.warn('Resolve working copy not kept:', error);
+        if (!confirm('This browser cannot keep the latest edits of “' + open.name + '”. Switch anyway and lose them?'))
+          throw Error('Timeline not switched.');
+      }
     }
     await load(project, extra);
   }

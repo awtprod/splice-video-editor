@@ -69,17 +69,30 @@ class DrpImportTests(Scratch):
         other = resolve.open_drp(F.drp_bytes(self.spec), 1)
         self.assertEqual((other['name'], other['frameRate'], other['fps']), ('Harbor alt', '30000/1001', 30000 / 1001))
         self.assertEqual((other['width'], other['height'], other['startTimecode']), (1920, 1080, 0))
-        # No drop-frame setting in the project: Resolve's default, non-drop, with a note.
+        # The drop-frame setting is not read: Resolve's default, non-drop, with a note.
         self.assertIs(other['dropFrame'], False)
-        self.assertTrue(any('non-drop frame' in w for w in other['compatibilityWarnings']))
+        self.assertIn('Harbor alt: Splice cannot read Resolve’s drop-frame setting; this 29.97 fps timeline opens '
+                      'with non-drop timecode, Resolve’s default. Change it in File → Sequence settings if Resolve '
+                      'shows drop-frame timecode (semicolons).', other['compatibilityWarnings'])
 
-    def test_drop_frame_flag_and_start_frames(self):
-        for drop in (True, False):
+    def test_drop_frame_is_inferred_only_from_a_drop_frame_hour(self):
+        cases = ((30000 / 1001, 107892, True, '01:00:00;00 in drop-frame'),
+                 (30000 / 1001, 108000, False, '(it starts at 01:00:00:00 in non-drop timecode)'),
+                 (60000 / 1001, 2 * 215784, True, '02:00:00;00 in drop-frame'),
+                 (60000 / 1001, 216000, False, 'non-drop timecode'),
+                 (30000 / 1001, 107891, False, 'non-drop timecode, Resolve’s default.'))
+        for fps, start, drop, text in cases:
             spec = F.sample()
-            spec['timelines'][1].update(drop=drop, start=107892 * 1001 / 30000)
-            for p in (resolve.open_drp(F.drp_bytes(spec), 1),):
-                self.assertEqual((p['startTimecode'], p['dropFrame']), (107892, drop))
-                self.assertFalse(any('non-drop frame' in w for w in p['compatibilityWarnings']))
+            spec['timelines'][1].update(fps=fps, start=start / fps)
+            for p in (resolve.open_drp(F.drp_bytes(spec), 1),
+                      resolve.open_library_project(self.library(spec), 1, None, self.dir)):
+                self.assertEqual((p['startTimecode'], p['dropFrame']), (start, drop), (fps, start))
+                lines = [w for w in p['compatibilityWarnings'] if 'drop-frame setting' in w]
+                self.assertEqual(len(lines), 1)
+                self.assertIn(text, lines[0])
+        # 24 fps has no drop-frame timecode: nothing is said.
+        self.assertNotIn('dropFrame', self.project)
+        self.assertFalse(any('drop-frame' in w for w in self.project['compatibilityWarnings']))
 
     def test_tracks_and_clips(self):
         p = self.project
@@ -166,13 +179,6 @@ class LibraryTests(Scratch):
             self.assertEqual(from_db.get('dropFrame'), from_drp.get('dropFrame'))
             self.assertEqual([{k: v for k, v in m.items()} for m in from_db['media']], from_drp['media'])
 
-    def test_library_drop_frame_flag(self):
-        self.spec['timelines'][1]['drop'] = True
-        self.library()
-        projects, _ = resolve.list_library(self.dir / 'library')
-        p = resolve.open_library_project(Path(projects[0]['path']), 1, None, self.dir)
-        self.assertIs(p['dropFrame'], True)
-
     def test_project_folder_or_users_folder_lists(self):
         self.library()
         users = self.dir / 'library' / 'Resolve Projects' / 'Users'
@@ -231,6 +237,15 @@ class LibraryTests(Scratch):
         self.assertGreater(calls['n'], 3)
 
 
+def use(spec, media):
+    """Put a clip of each media pool entry in ``media`` (ids) on the second timeline's audio track."""
+    items = spec['timelines'][1]['tracks'][1]['items']
+    for mid in media:
+        items.append({'id': f'i-use-{len(items)}', 'tag': 'Sm2TiAudioClip', 'name': mid, 'start': 30 * len(items),
+                      'duration': 30, 'in': 0, 'media': mid})
+    return spec
+
+
 def wav(path, seconds=0.05):
     """A tiny real WAV (silence) that FFmpeg probes as audio."""
     import wave
@@ -243,8 +258,8 @@ def wav(path, seconds=0.05):
     return path
 
 
-class MediaTests(Scratch):
-    """Media a project names is referenced in place through the link registry, never copied."""
+class RegistryScratch(Scratch):
+    """A private link registry and media folder for each test."""
 
     def setUp(self):
         super().setUp()
@@ -263,6 +278,10 @@ class MediaTests(Scratch):
 
     def registered(self):
         return sorted(entry['path'] for entry in self.ml._links().values())
+
+
+class MediaTests(RegistryScratch):
+    """Media a project names is referenced in place through the link registry, never copied."""
 
     def test_local_media_is_linked_in_place_and_foreign_paths_stay_offline(self):
         clip = wav(self.dir / 'footage' / 'Day 1' / 'A001.wav')
@@ -292,11 +311,13 @@ class MediaTests(Scratch):
         notes.write_text('hello')
         named = [str(text), str(key), str(notes), '/etc/passwd', str(self.dir / 'gone' / 'A009.mov'),
                  str(self.dir), 'relative/A001.wav', 'E:\\Shoot\\A002.wav']
-        self.assertEqual(link_local(named), [None] * len(named))
+        self.assertEqual([r.get('offline') for r in link_local(named)],
+                         ['not-media', 'not-media', 'not-media', 'not-media', 'missing', 'not-media', 'missing', 'missing'])
         spec = F.sample(str(text), str(self.dir / 'gone' / 'A009.wav'))
         spec['media'] += [dict(spec['media'][1], id=f'm-x{n}', info=f'ai-x{n}', name=Path(path).name,
                                dir=str(Path(path).parent), file=Path(path).name)
                           for n, path in enumerate(('/etc/passwd', str(key), str(notes)))]
+        use(spec, ['m-x0', 'm-x1', 'm-x2'])
         project = resolve.open_drp(F.drp_bytes(spec), 0, link_local)
         self.assertEqual(self.registered(), [])
         by_name = {m['name']: m for m in project['media']}
@@ -311,6 +332,7 @@ class MediaTests(Scratch):
         spec = F.sample(str(clips[0]), str(clips[1]))
         spec['media'] += [dict(spec['media'][1], id=f'm-c{n}', info=f'ai-c{n}', name=clip.name,
                                dir=str(clip.parent), file=clip.name) for n, clip in enumerate(clips[2:])]
+        use(spec, [f'm-c{n}' for n in range(498)])
         writes = []
         real = self.ml._write
         with mock.patch.object(self.ml, '_write', lambda *a: (writes.append(1), real(*a))[1]):
@@ -321,6 +343,137 @@ class MediaTests(Scratch):
         self.assertEqual(len(writes), 1)
         self.assertEqual(len(self.registered()), 500)
         self.assertEqual(sum(1 for m in project['media'] if m.get('linked')), 500)
+
+
+class MediaGuardTests(RegistryScratch):
+    """Each check in resolve/media.py, shown to matter: every test fails when its check is removed."""
+
+    def setUp(self):
+        super().setUp()
+        import resolve.media as media
+        self.media = media
+        self.probed = []
+        real = media.decodable
+
+        def recording(path, name):
+            self.probed.append(str(path))
+            return real(path, name)
+        patcher = mock.patch.object(media, 'decodable', recording)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_bad_text_never_reaches_the_filesystem(self):
+        clip = wav(self.dir / 'card' / 'A001.wav')
+        looked = []
+        real = self.media._look
+        with mock.patch.object(self.media, '_look', lambda path: (looked.append(str(path)), real(path))[1]):
+            results = link_local([5, None, b'/x.wav', '', '/' + 'a' * 5000 + '.wav', str(clip) + '\x00.wav',
+                                  str(clip).replace('/', '//', 1) + '\x00'])
+        self.assertEqual(looked, [])
+        self.assertEqual([r['offline'] for r in results], ['missing'] * 7)
+        self.assertEqual(self.probed, [])
+
+    def test_a_relative_path_is_not_looked_up_from_the_server_folder(self):
+        wav(self.dir / 'footage' / 'A001.wav')
+        here = os.getcwd()
+        os.chdir(self.dir)
+        self.addCleanup(os.chdir, here)
+        self.assertEqual(link_local(['footage/A001.wav']), [{'offline': 'missing'}])
+        self.assertEqual((self.probed, self.registered()), ([], []))
+
+    def test_a_fifo_is_never_probed(self):
+        fifo = self.dir / 'stream.wav'
+        os.mkfifo(fifo)
+        self.assertEqual(link_local([str(fifo)]), [{'offline': 'missing'}])
+        self.assertEqual(self.probed, [])
+
+    def test_every_folder_on_the_way_must_exist(self):
+        clip = wav(self.dir / 'card' / 'A001.wav')
+        # Lexically this is the clip; the operating system refuses it, as "gone" does not exist.
+        dotted = str(self.dir / 'card' / 'gone' / '..' / 'A001.wav')
+        self.assertFalse(os.path.exists(dotted))
+        self.assertEqual(link_local([dotted]), [{'offline': 'missing'}])
+        self.assertEqual(self.probed, [])
+        self.assertEqual(link_local([str(clip)])[0]['sourcePath'], str(clip.resolve()))
+
+    def test_each_real_file_is_probed_once(self):
+        clip = wav(self.dir / 'card' / 'A001.wav')
+        alias = self.dir / 'alias.wav'
+        alias.symlink_to(clip)
+        twice = self.dir / 'card' / 'twice.wav'
+        os.link(clip, twice)
+        results = link_local([str(clip), str(alias), str(clip), str(twice), str(alias)])
+        self.assertEqual(len(self.probed), 1)
+        self.assertEqual(len({r['src'] for r in results}), 1)
+        self.assertEqual(self.registered(), [str(clip.resolve())])
+
+    def test_the_file_limit(self):
+        clips = [str(wav(self.dir / 'card' / f'c{n}.wav')) for n in range(5)]
+        results = link_local(clips + clips[:1], max_files=3)
+        self.assertEqual([('src' in r, r.get('offline')) for r in results],
+                         [(True, None)] * 3 + [(False, 'unchecked')] * 2 + [(True, None)])
+        self.assertIn('at most 3 files', results[3]['message'])
+        self.assertEqual(len(self.probed), 3)
+
+    def test_one_deadline_for_a_hung_drive(self):
+        import threading
+        import time
+        release = threading.Event()
+        self.addCleanup(release.set)
+        real = self.media._look
+        hung = lambda path: (release.wait(30), real(path))[1] if 'hung' in str(path) else real(path)
+        clip = wav(self.dir / 'card' / 'A001.wav')
+        paths = [f'/hung/{n}.mov' for n in range(17)]
+        with mock.patch.object(self.media, '_look', hung):
+            began = time.monotonic()
+            results = link_local(paths + [str(clip)], seconds=0.5)
+            elapsed = time.monotonic() - began
+        self.assertLess(elapsed, 3)
+        self.assertEqual([r['offline'] for r in results[:17]], ['unchecked'] * 17)
+        stuck = [t for t in threading.enumerate() if t.name == 'splice-resolve-link']
+        self.assertTrue(stuck and all(t.daemon for t in stuck))
+        release.set()
+        for thread in stuck:
+            thread.join(10)
+
+    def test_a_probe_timeout_is_not_called_unplayable(self):
+        clip = wav(self.dir / 'card' / 'A001.wav')
+        from media_proxy import ProbeTimeout
+
+        def slow(path, name):
+            raise ProbeTimeout('Reading A001.wav timed out after 25 s.')
+        with mock.patch.object(self.media, 'decodable', slow):
+            self.assertEqual(link_local([str(clip)]),
+                             [{'offline': 'unchecked', 'message': 'Reading A001.wav timed out after 25 s.'}])
+
+
+class LibraryListingGuardTests(Scratch):
+    def test_symlinked_folders_are_not_followed(self):
+        self.library()
+        outside = self.dir / 'library'
+        root = self.dir / 'root'
+        root.mkdir()
+        (root / 'elsewhere').symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(resolve.ResolveError, 'No Resolve projects were found'):
+            resolve.list_library(root)
+        self.assertEqual(len(resolve.list_library(outside)[0]), 1)
+
+    def test_scanned_entries_are_capped(self):
+        self.library()
+        for n in range(6):
+            (self.dir / 'library' / f'note-{n}.txt').write_text('x')
+        with mock.patch.object(source, 'MAX_SCANNED', 4):
+            found, truncated = source._project_files(self.dir / 'library')
+        self.assertEqual((found, truncated), ([], True))
+        self.assertEqual(len(source._project_files(self.dir / 'library')[0]), 1)
+
+    def test_listed_projects_are_capped(self):
+        for n in range(3):
+            F.write_library(dict(F.sample(), name=f'Project {n}'), self.dir / 'library')
+        with mock.patch.object(source, 'MAX_LISTED', 2):
+            projects, truncated = resolve.list_library(self.dir / 'library')
+        self.assertEqual((len(projects), truncated), (2, True))
+        self.assertEqual(len(resolve.list_library(self.dir / 'library')[0]), 3)
 
 
 class DesktopPackageTests(unittest.TestCase):
@@ -884,7 +1037,12 @@ class MarkerAndFlagTests(Scratch):
         project = resolve.open_drp(F.drp_bytes(self.nested_spec()))
         self.assertEqual([(m['name'], m['time'], m['color']) for m in project['markers']],
                          [('Wide shot', 0.5, 'Green'), ('Pickup', 1.25, 'Red')])
-        self.assertIn('Harbor cut · Picture · A001.mp4 at 01:00:00:00: 2 clip marker(s) are not imported.',
+        self.assertIn('Harbor cut · Picture · A001.mp4 at 01:00:00:00: 2 clip marker(s) are not imported. Where '
+                      'Resolve places a clip marker is not settled: Resolve 19 stores it as a frame of the source '
+                      'media, and a Resolve 21 project stores twice the frame number the scripting API reports.',
+                      project['compatibilityWarnings'])
+        self.assertIn('Harbor cut: timeline markers are placed as frames from the timeline start, as Resolve 19 '
+                      'stores them; this is not yet confirmed for projects saved by later versions of Resolve.',
                       project['compatibilityWarnings'])
 
     def test_both_layouts_and_the_library_agree(self):
@@ -897,22 +1055,240 @@ class MarkerAndFlagTests(Scratch):
             self.assertEqual(other['markers'], nested['markers'])
             self.assertEqual(other['compatibilityWarnings'], nested['compatibilityWarnings'])
 
-    def test_enabled_state_is_reported_not_guessed(self):
+    def test_a_timeline_without_markers_says_nothing_about_them(self):
+        project = resolve.open_drp(F.drp_bytes(F.sample()), 1)
+        self.assertEqual(project['markers'], [])
+        self.assertFalse(any('marker' in w for w in project['compatibilityWarnings']))
+
+
+class ResolveStateTests(Scratch):
+    """Enabled, hidden, muted and locked state, clip volume and position, as measured in Resolve 21.1
+    calibration projects (one setting changed at a time) and rebuilt here synthetically."""
+
+    def both(self, spec, index=0):
+        return (resolve.open_drp(F.drp_bytes(spec), index),
+                resolve.open_library_project(self.library(spec), index, None, self.dir))
+
+    def tracks(self, spec):
+        return {t['id']: t for t in spec['timelines'][0]['tracks']}
+
+    def items(self, spec):
+        return {i['id']: i for t in spec['timelines'][0]['tracks'] for i in t['items']}
+
+    def test_a_disabled_picture_clip_opens_disabled_and_transparent(self):
         spec = F.sample()
-        spec['timelines'][0]['tracks'][2]['flags'] = 32
-        spec['timelines'][0]['tracks'][0]['items'][2]['flags'] = 4
-        for project in (resolve.open_drp(F.drp_bytes(spec)),
-                        resolve.open_library_project(self.library(spec), 0, None, self.dir)):
+        self.items(spec)['i-v1']['flags'] = 2
+        for project in self.both(spec):
+            picture, sound = by_title(project, 'i-v1'), by_title(project, 'i-a1')
+            self.assertEqual((picture['enabled'], picture['opacity'], picture['resolveFlags']), (False, 0, 2))
+            # Its linked sound is a clip of its own, unchanged (Resolve leaves it enabled too).
+            self.assertNotIn('enabled', sound)
+            self.assertEqual((sound['volume'], picture['linkGroup']), (100, sound['linkGroup']))
+            self.assertNotIn('enabled', by_title(project, 'i-v2'))
+            self.assertIn('Harbor cut · Picture · A001.mp4 at 01:00:00:00: the clip is disabled in Resolve. It opens '
+                          'marked disabled (exports leave it out or mark it off) and transparent, as Splice has no '
+                          'disabled switch yet; set its opacity back to 80 % to show it.', project['compatibilityWarnings'])
+            self.assertFalse(any('flags' in w for w in project['compatibilityWarnings']))
+            self.assertEqual(project['resolveSource']['summary'], ['From Resolve: 1 disabled clip.'])
+
+    def test_disabled_tracks_hide_or_mute_and_locked_tracks_lock(self):
+        spec = F.sample()
+        tracks = self.tracks(spec)
+        tracks['tr-v1']['flags'], tracks['tr-v2']['flags'], tracks['tr-a1']['flags'] = 2, 1, 3
+        for project in self.both(spec):
+            self.assertEqual(project['trackState'], {'video:1': {'hidden': True}, 'video:2': {'locked': True},
+                                                     'audio:-1': {'locked': True}})
+            self.assertEqual(project['trackMix'], {'-1': {'mute': True}})
+            self.assertEqual(project['resolveTrackFlags'], {'video:1': 2, 'video:2': 1, 'audio:-1': 3})
+            self.assertFalse(any('flags' in w for w in project['compatibilityWarnings']))
+            self.assertEqual(project['resolveSource']['summary'],
+                             ['From Resolve: 1 hidden track, 1 muted track, 2 locked tracks.'])
+        # Nothing set: no track state, no mixer settings, no summary.
+        plain = resolve.open_drp(F.drp_bytes(F.sample()))
+        self.assertEqual((plain['trackState'], 'trackMix' in plain, plain['resolveSource']['summary']), ({}, False, []))
+
+    def test_unexplained_flags_are_listed_with_their_value(self):
+        spec = F.sample()
+        tracks, items = self.tracks(spec), self.items(spec)
+        tracks['tr-a1']['flags'] = 32
+        tracks['tr-v2']['flags'] = 34
+        items['i-v2']['flags'] = 4 | 2
+        items['i-a2']['flags'] = 2  # no sample has a disabled sound clip: listed, not interpreted
+        items['i-gen']['flags'] = 2
+        for project in self.both(spec):
             warnings = project['compatibilityWarnings']
-            self.assertIn('Harbor cut: clip and track enabled state, and track lock and mute, are not read from '
-                          'Resolve yet; every clip and track opens enabled, unlocked and unmuted.', warnings)
-            self.assertTrue(any(w.startswith('Harbor cut · Dialogue: the track carries Resolve flags 32') for w in warnings))
-            self.assertTrue(any(w.startswith('Harbor cut · Picture · A001.mp4 at 01:00:01:00: the clip carries '
-                                             'Resolve flags 4') for w in warnings))
-            self.assertEqual(sum('Resolve flags' in w for w in warnings), 2)
-            self.assertEqual(project['resolveTrackFlags'], {'video:1': 0, 'video:2': 0, 'audio:-1': 32})
-            self.assertEqual(by_title(project, 'i-v2')['resolveFlags'], 4)
-            self.assertEqual(by_title(project, 'i-v1')['resolveFlags'], 0)
+            self.assertIn('Harbor cut · Dialogue: the track carries other Resolve track flags (32) that Splice does '
+                          'not interpret.', warnings)
+            self.assertIn('Harbor cut · Video 2: the track carries other Resolve track flags (32) that Splice does '
+                          'not interpret.', warnings)
+            self.assertIn('Harbor cut · Picture · A001.mp4 at 01:00:01:00: the clip carries other Resolve clip flags '
+                          '(4) that Splice does not interpret.', warnings)
+            self.assertIn('Harbor cut · Dialogue · A002.wav at 01:00:01:00: the clip carries Resolve clip flags (2) '
+                          'that Splice does not interpret (it may be disabled in Resolve; it opens enabled).', warnings)
+            self.assertTrue(any(w.startswith('Harbor cut · Video 2 · Solid Color at 01:00:00:00: the clip carries '
+                                             'Resolve clip flags (2)') for w in warnings))
+            self.assertEqual(project['trackState'], {'video:2': {'hidden': True}})
+            self.assertNotIn('trackMix', project)
+            self.assertIs(by_title(project, 'i-v2')['enabled'], False)
+            self.assertNotIn('enabled', by_title(project, 'i-a2'))
+            self.assertEqual(by_title(project, 'i-a2')['resolveFlags'], 2)
+
+    def test_clip_volume_in_decibels(self):
+        cases = ((6.0, 199.526, None), (-6.0, 50.119, None), (0.0, 100.0, None), (-120.0, 0.0, None),
+                 (12.0, 200.0, 'its clip volume (+12.00 dB) is above the +6.02 dB Splice plays and is clamped'))
+        for db, volume, warning in cases:
+            spec = F.sample()
+            self.items(spec)['i-a2']['effects'] = F.effects((124, {95: db}), compress=False)
+            for project in self.both(spec):
+                clip = by_title(project, 'i-a2')
+                self.assertEqual(clip['volume'], volume, db)
+                lines = [w for w in project['compatibilityWarnings'] if 'A002.wav at 01:00:01:00' in w
+                         and 'Fusion' not in w]
+                self.assertEqual(lines, [f'Harbor cut · Dialogue · A002.wav at 01:00:01:00: {warning} to +6.02 dB.']
+                                 if warning else [], db)
+                self.assertEqual(by_title(project, 'i-a1')['volume'], 100)
+        # A pan or other setting in the same effect is listed; another sound effect is listed with its type.
+        spec = F.sample()
+        self.items(spec)['i-a2']['effects'] = F.effects((124, {95: -3.0, 96: 0.5}), (130, {1: 1.0}), compress=False)
+        project = resolve.open_drp(F.drp_bytes(spec))
+        self.assertEqual(by_title(project, 'i-a2')['volume'], 70.795)
+        self.assertIn('Harbor cut · Dialogue · A002.wav at 01:00:01:00: clip audio settings other than volume (such as '
+                      'pan) are not imported.', project['compatibilityWarnings'])
+        self.assertIn('Harbor cut · Dialogue · A002.wav at 01:00:01:00: clip audio adjustments other than volume (pan '
+                      'or Fairlight clip settings, Resolve effect type 130) are not imported.', project['compatibilityWarnings'])
+
+    def test_position_x_is_measured_and_the_rest_is_marked_approximate(self):
+        spec = F.sample()
+        items = self.items(spec)
+        # As Resolve 21.1 writes +200 px on a 1920-wide timeline: an uncompressed envelope, Position X
+        # in the fourth parameter slot, as a fraction of the width.
+        items['i-v1']['effects'] = F.effects((4, {40: 200 / 1920}), compress=False, slot={40: 3})
+        items['i-v2']['effects'] = F.effects((4, {40: -0.25, 41: 0.1, 42: 1.5, 43: 1.5}))
+        for project in self.both(spec):
+            first, second = by_title(project, 'i-v1'), by_title(project, 'i-v2')
+            self.assertEqual(first['transform'], {'x': 10.416667, 'y': 0, 'scale': 100, 'rotation': 0})
+            self.assertAlmostEqual(first['transform']['x'] / 100 * 1280 * 1920 / 1280, 200, places=3)
+            self.assertEqual(second['transform'], {'x': -25.0, 'y': -10.0, 'scale': 150.0, 'rotation': 0})
+            warnings = project['compatibilityWarnings']
+            self.assertFalse(any(w.startswith('Harbor cut · Picture · A001.mp4 at 01:00:00:00') and 'approximate' in w
+                                 for w in warnings))
+            self.assertIn('Harbor cut · Picture · A001.mp4 at 01:00:01:00: its zoom (150 %) and vertical position '
+                          '(-10 %) are approximate: Resolve’s units for them are inferred, not measured. Check the '
+                          'picture.', warnings)
+            self.assertIn('Harbor cut · Picture · A001.mp4 at 01:00:01:00: its speed (200 %) is approximate: it is read '
+                          'from Resolve’s retime curve, which has not been measured against Resolve’s own speed '
+                          'setting.', warnings)
+
+    def test_a_timeline_that_starts_before_zero(self):
+        spec = F.sample()
+        spec['timelines'][0]['start'] = -48 / 24
+        for track in spec['timelines'][0]['tracks']:
+            for item in track['items']:
+                item['start'] -= 86400 + 48
+        for project in self.both(spec):
+            self.assertEqual((project['startFrame'], project['startTimecode']), (-48, 0))
+            self.assertIn('Harbor cut: the timeline starts before 00:00:00:00 (at -00:00:02:00). Splice’s timecode '
+                          'cannot go below zero, so the timeline opens at 00:00:00:00 and every timecode reads '
+                          '00:00:02:00 later than in Resolve.', project['compatibilityWarnings'])
+            self.assertEqual(sorted(c['start'] for c in project['clips'])[:2], [0.0, 0.0])
+
+    def test_only_media_some_timeline_uses_is_imported_and_looked_for(self):
+        spec = F.sample()
+        spare = dict(spec['media'][1], id='m-spare', info='ai-spare', name='Spare.wav', file='Spare.wav')
+        other = dict(spec['media'][1], id='m-other', info='ai-other', name='Other.wav', file='Other.wav')
+        spec['media'] += [spare, other]
+        spec['timelines'][1]['tracks'][1]['items'].append(
+            {'id': 'i2-a1', 'tag': 'Sm2TiAudioClip', 'name': 'Other.wav', 'start': 0, 'duration': 30, 'in': 0,
+             'media': 'm-other'})
+        asked = []
+        link = lambda paths: (asked.extend(paths), [{'offline': 'missing'}] * len(paths))[1]
+        project = resolve.open_drp(F.drp_bytes(spec), 0, link)
+        names = sorted(m['name'] for m in project['media'])
+        self.assertEqual(names, ['A001.mp4', 'A002.wav', 'Other.wav', 'Resolve generator (Solid Color)'])
+        self.assertNotIn('E:\\Shoot\\Day 1\\Spare.wav', asked)
+        self.assertEqual(len(asked), 3)
+        self.assertIn('1 media pool file(s) that no timeline of this project uses are not imported.',
+                      project['compatibilityWarnings'])
+        self.assertIn('3 media file(s) are offline on this computer: nothing is at the path the project names (it may '
+                      'be on another computer or have moved). Relink them without copying with File → Link media in '
+                      'place → Relink offline from folder; Windows and Mac paths are matched by folder and file name.',
+                      project['compatibilityWarnings'])
+        self.assertFalse(any('Relink from folder' in w for w in project['compatibilityWarnings']))
+
+    def test_offline_reasons_are_told_apart(self):
+        spec = F.sample()
+        spec['media'] += [dict(spec['media'][1], id=f'm-{n}', info=f'ai-{n}', name=f'{n}.wav', file=f'{n}.wav')
+                          for n in ('a', 'b', 'c')]
+        spec['timelines'][1]['tracks'][1]['items'] += [
+            {'id': f'i2-{n}', 'tag': 'Sm2TiAudioClip', 'name': n, 'start': 0, 'duration': 30, 'in': 0, 'media': f'm-{n}'}
+            for n in ('a', 'b', 'c')]
+        answers = iter([{'offline': 'missing'}, {'offline': 'not-media', 'message': 'cannot decode'},
+                        {'offline': 'unchecked', 'message': 'Splice looks for at most 2 files'},
+                        {'offline': 'refused', 'message': 'The linked media list is full'}, {'offline': 'missing'}])
+        project = resolve.open_drp(F.drp_bytes(spec), 0, lambda paths: [next(answers) for _ in paths])
+        warnings = project['compatibilityWarnings']
+        self.assertTrue(any(w.startswith('2 media file(s) are offline on this computer: nothing is at the path') for w in warnings))
+        self.assertIn('1 file(s) the project names were found on this computer but are not media Splice can play (not '
+                      'a media file, or FFmpeg cannot decode it); they stay offline.', warnings)
+        self.assertTrue(any(w.startswith('1 media file(s) were not looked for (Splice looks for at most 2 files); they '
+                                         'stay offline. Relink them without copying') for w in warnings))
+        self.assertIn('1 media file(s) could not be linked (The linked media list is full); they stay offline.', warnings)
+        with self.assertRaisesRegex(resolve.ResolveError, 'unexpected result'):
+            resolve.open_drp(F.drp_bytes(spec), 0, lambda paths: [])
+
+
+class ResolveExportTests(Scratch):
+    """A Resolve project with a disabled clip and a disabled (hidden) video track, imported and
+    exported: neither shows in the picture."""
+
+    def frame_brightness(self, project, seconds):
+        import statistics
+        import subprocess
+        from render_movie import render_to_file
+        out = self.dir / 'export.mp4'
+        render_to_file(project, out)
+        raw = subprocess.check_output(['ffmpeg', '-nostdin', '-v', 'error', '-ss', str(seconds), '-i', str(out),
+                                       '-frames:v', '1', '-vf', 'scale=32:18,format=gray', '-f', 'rawvideo', '-'],
+                                      timeout=60)
+        return statistics.mean(raw)
+
+    def project(self):
+        spec = F.sample(str(ROOT / 'assets' / 'valley.mp4'), str(ROOT / 'assets' / 'score.wav'), generator=False)
+        start = 86400
+        clip = lambda identity, at, **extra: dict({'id': identity, 'tag': 'Sm2TiVideoClip', 'name': 'valley.mp4',
+                                                  'start': start + at, 'duration': 24, 'in': 24, 'media': 'm-video'},
+                                                 **extra)
+        spec['timelines'][0]['size'] = (64, 36)
+        spec['timelines'][0]['markers'] = []
+        spec['timelines'][0]['tracks'] = [
+            # V1: a disabled clip for the first second, an enabled one for the next.
+            {'id': 'tr-v1', 'type': 0, 'name': '', 'items': [clip('off', 0, flags=2), clip('on', 24)]},
+            # V2, disabled in Resolve: a clip in the third second only.
+            {'id': 'tr-v2', 'type': 0, 'name': '', 'flags': 2, 'items': [clip('hidden', 48)]},
+            {'id': 'tr-a1', 'type': 1, 'name': '', 'items': []},
+        ]
+        project = resolve.open_drp(F.drp_bytes(spec))
+        self.assertEqual((by_title(project, 'off')['enabled'], project['trackState']),
+                         (False, {'video:2': {'hidden': True}}))
+        for media in project['media']:  # relinked to the bundled copies of the same files
+            media.update(src='assets/' + media['name'], offline=False)
+        return project
+
+    def test_a_disabled_clip_leaves_no_picture(self):
+        project = self.project()
+        project['clips'] = [c for c in project['clips'] if c['track'] == 1]
+        self.assertLess(self.frame_brightness(project, 0.5), 24, 'the disabled clip was drawn')
+        self.assertGreater(self.frame_brightness(project, 1.5), 60, 'the enabled clip beside it was not drawn')
+
+    def test_a_hidden_track_leaves_no_picture(self):
+        import subprocess
+        probe = subprocess.run([sys.executable, str(ROOT / 'tests' / 'hidden_render_probe.py')], capture_output=True,
+                               text=True, timeout=120, check=True).stdout.strip()
+        self.assertIn(probe, ('honors', 'ignores'))
+        if probe == 'ignores':
+            self.skipTest('the renderer on this tree draws hidden tracks (the renderer change that honours '
+                          'trackState[...].hidden is in another pull request); tests/hidden_render_probe.py decides')
+        self.assertLess(self.frame_brightness(self.project(), 2.5), 24, 'the hidden track was drawn')
 
 
 class TimelineIdTests(Scratch):
