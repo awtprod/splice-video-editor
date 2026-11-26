@@ -310,6 +310,25 @@ async function main() {
     await page.locator(`${dialog} .export-open-queue`).click();
     await page.locator(queueDialog).waitFor();
     await shot(page, 'delivery-queue-small');
+    await page.locator(`${queueDialog} footer button`).click();
+    await page.locator(`${dialog} [data-cancel]`).click();
+    await page.evaluate(() => Editor.editProject(p => { p.captions = [{start:0, duration:1, text:'Sidecar test'}]; }));
+    await openExport(page);
+    await page.locator(`${dialog} .export-output summary`).click();
+    for (const [name, extension] of [['Web captions', 'mp4'], ['MXF captions', 'mxf']]) {
+      if (extension === 'mp4') {
+        await page.locator(`${dialog} [name=captionVtt]`).check();
+      } else {
+        await page.locator(`${dialog} select[name=preset]`).selectOption('broadcast-dnxhr');
+      }
+      await page.locator(`${dialog} [name=outputName]`).fill(name);
+      await page.locator(`${dialog} [type=submit]`).click();
+      const row = page.locator(`${queueDialog} .queue-job`, {hasText:name});
+      await row.locator('.queue-state', {hasText:'Done'}).waitFor({timeout:120000});
+      assert.ok(fs.existsSync(path.join(out, name + '.' + extension)));
+      assert.match(fs.readFileSync(path.join(out, name + (extension === 'mp4' ? '.vtt' : '.srt')), 'utf8'), /Sidecar test/);
+      await page.locator(`${queueDialog} footer button`).click();
+    }
     assert.deepEqual(errors, []);
     console.log('Delivery queue passed.');
   } finally {

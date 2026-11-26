@@ -1,5 +1,6 @@
 """Render a Splice timeline to a deterministic MP4 with FFmpeg."""
 import collections
+import heapq
 import json
 import math
 import os
@@ -2809,7 +2810,6 @@ def _window_burn(burn, clips, a_frame, skip, fps):
     first_out = a_frame + skip
     rows = []
     media = burn['media']
-    top = {}
     for clip in clips:
         if clip.get('type') != 'video' or clip.get('mediaId') == DISABLED_MEDIA:
             continue
@@ -2824,9 +2824,32 @@ def _window_burn(burn, clips, a_frame, skip, fps):
             if start_tc is not None:
                 source = start_tc + round((float(clip.get('in', 0)) + (begin + skip - float(clip['start'])*fps)/fps) * fps)
         rows.append((clip.get('track', 0), begin, end, str(item.get('name') or 'Clip')[:120], source))
-    rows.sort(key=lambda row: (-row[0], row[1]))
+    # Sweep only clip edges. Each interval has one label, from its uppermost active track.
+    starts = collections.defaultdict(list)
+    edges = set()
+    for index, (track, begin, end, _, _) in enumerate(rows):
+        starts[begin].append((-track, -index, end))
+        edges.update((begin, end))
+    active, spans = [], []
+    previous = None
+    boundaries = sorted(edges)
+    for begin, end in zip(boundaries, boundaries[1:]):
+        for entry in starts.get(begin, ()):
+            heapq.heappush(active, entry)
+        while active and active[0][2] <= begin:
+            heapq.heappop(active)
+        if not active:
+            previous = None
+            continue
+        index = -active[0][1]
+        if index == previous:
+            spans[-1][1] = end
+        else:
+            _, original, _, name, source = rows[index]
+            spans.append([begin, end, name, None if source is None else source + begin - original])
+        previous = index
     return dict(settings=burn['settings'], timecode=burn['timecode'] + first_out, drop=burn['drop'], font=burn['font'],
-                frame=first_out, clips=[row[1:] for row in rows][:64])
+                frame=first_out, clips=spans)
 
 
 def _media_timecode(item, fps):

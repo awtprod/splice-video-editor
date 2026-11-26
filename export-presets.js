@@ -377,7 +377,8 @@ window.SpliceDelivery = (() => {
     }
     context.validate = () => blocking.length ? blocking[0] : '';
     context.deliveryOptions = options;
-    context.queueOnly = () => info()?.kind === 'images';
+    context.queueOnly = () => info()?.kind === 'images' || (codec.value !== 'wav' && context.captionsInRange() &&
+      (srt.checked || vtt.checked || container.value === 'mxf'));
     context.renderViaQueue = () => addQueue.onclick();
 
     /* Queue, batch and presets. */

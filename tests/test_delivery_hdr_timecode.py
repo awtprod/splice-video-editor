@@ -288,6 +288,31 @@ class BurnIns(Case):
         render_to_file(project, plain, options=dict(codec='prores'))
         self.assertEqual(self.frame(plain, 10), self.frame(self.out / 'plain-prores.mov', 10), 'no burn-in unless asked')
 
+    def test_upper_track_owns_name_and_source_timecode_only_during_overlap(self):
+        burn = dict(media={'a': dict(name='Base', _timecode=120), 'b': dict(name='Insert', _timecode=900)},
+                    settings=dict(fields=['clipName', 'sourceTimecode']), timecode=0, drop=False, font='')
+        clips = [dict(type='video', mediaId='a', track=1, start=0, duration=3),
+                 dict(type='video', mediaId='b', track=2, start=1, duration=1)]
+        spans = render_movie._window_burn(burn, clips, 0, 0, 24)['clips']
+        self.assertEqual([tuple(span) for span in spans],
+                         [(0, 24, 'Base', 120), (24, 48, 'Insert', 900), (48, 72, 'Base', 168)])
+
+    def test_hidden_lower_clip_name_does_not_change_exported_pixels(self):
+        source = self.media / 'plates.mkv'
+        ffmpeg('-f', 'lavfi', '-i', f'color=gray:s={W}x{H}:r=24:d=1', '-c:v', 'ffv1', str(source))
+        project = self.project(source)
+        project['media'].append(dict(project['media'][0], id='top', name='Cutaway'))
+        project['clips'].append(dict(type='video', track=2, mediaId='top', start=.25, duration=.5))
+        frames = []
+        for label in ('Long lower plate', 'X'):
+            project['media'][0]['name'] = label
+            target = self.out / (label + '.mov')
+            render_to_file(project, target, options=dict(codec='prores', burnIns=dict(fields=['clipName'])))
+            frames.append([self.frame(target, index) for index in (3, 12, 21)])
+        self.assertNotEqual(frames[0][0], frames[1][0])
+        self.assertEqual(frames[0][1], frames[1][1])
+        self.assertNotEqual(frames[0][2], frames[1][2])
+
     def test_burn_in_timecode_advances_frame_by_frame(self):
         clip = self.media / 'grey2.mp4'
         ffmpeg('-f', 'lavfi', '-i', f'color=c=0x404040:s={W}x{H}:r=24:d=1', '-c:v', 'libx264', '-crf', '0', str(clip))

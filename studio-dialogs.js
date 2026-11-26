@@ -104,7 +104,7 @@ window.SpliceDialogs = (() => {
     };
     let controller, renderWarnings=[], renderReport={}, deliveryFields=null;
     // Delivery formats, presets, timecode, burn-ins and the render queue (export-presets.js).
-    const delivery={state,syncFormat:()=>syncFormat(),prepareProject:()=>Editor.prepareExport(),requestOptions:()=>buildOptions(),
+    const delivery={state,captionsInRange,syncFormat:()=>syncFormat(),prepareProject:()=>Editor.prepareExport(),requestOptions:()=>buildOptions(),
       status:text=>{status.textContent=text;},formProblem:()=>{syncAudio();return form.checkValidity()?'':(form.querySelector(':invalid')?.validationMessage||'Check the highlighted field.');}};
     const formatName=()=>{
       const options=delivery.deliveryOptions?.()||{}, codec=form.elements.codec.value;
@@ -187,7 +187,7 @@ window.SpliceDialogs = (() => {
       try {
         const opts=buildOptions();
         if(delivery.queueOnly?.()){
-          // An image sequence is a folder of files: it renders through the queue into the output folder.
+          // Deliver multi-file exports together in the selected output folder.
           await delivery.renderViaQueue();progress.hidden=true;return;
         }
         const result=await Editor.exportVideo(opts,job=>{
