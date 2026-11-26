@@ -414,7 +414,11 @@ def open_project(data, index=0, _seen=()):
             kind = 'audio' if clip_data['type'] == 'audio' else 'video'
             tracks = sequence.audio_tracks if kind == 'audio' else sequence.video_tracks
             number, position = clip_data['premiereTrack'], clip_data['premiereIndex']
-            native_clip_ids[tracks[number].clips[position]._element.get('ObjectID')] = clip_data
+            native_item = tracks[number].clips[position]
+            native_clip_ids[native_item._element.get('ObjectID')] = clip_data
+            # Premiere's Clip > Enable off: the clip keeps everything but plays and renders nothing.
+            if native_item.is_disabled:
+                clip_data['enabled'] = False
         for link_ref in sequence._element.findall('PersistentGroupContainer/LinkContainer/Links/Link'):
             link = project._document.resolve(link_ref)
             members = [native_clip_ids.get(ref.get('ObjectRef'))
@@ -970,6 +974,12 @@ def save_project(data):
             item = {**item, 'fadeIn': 0, 'fadeOut': 0, 'pan': 0,
                     'keyframes': {key: points for key, points in (item.get('keyframes') or {}).items() if key != 'volume'}}
         placed_clips[item.get('id')] = clip
+        # A disabled Splice clip is a disabled Premiere track item; so is the camera sound placed
+        # with it, since a disabled clip contributes no sound either.
+        disabled = item.get('enabled') is False
+        for native in (clip, companion):
+            if native is not None and native.is_disabled != disabled:
+                native.is_disabled = disabled
         premiere_effects.apply(clip, item.get('color') or {}, float(item.get('volume', 100)))
         premiere_effects.apply_extended(clip, item)
         if item.get('transition') in TRANSITIONS and not is_audio:
