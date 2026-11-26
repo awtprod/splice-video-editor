@@ -148,6 +148,35 @@ class WindowsNames(unittest.TestCase):
         self.assertIsNone(media.invalid_on_target('/mnt/shoot/CON.mov', ('/mnt/shoot', '/Volumes/Shoot')))
 
 
+class TestedInReport(unittest.TestCase):
+    def test_each_format_section_states_what_real_applications_did(self):
+        from interchange_fixtures import synthetic_project
+        paths = {name: Path('/fuzz/card') / f'{name}.mov' for name in ('camera_a', 'camera_b', 'drop', 'plain', 'tone')}
+        report = api.export_timeline(synthetic_project(paths), {'formats': list(api.FORMATS),
+                                                                'unknownTimecode': 'zero'})['report']
+        sections = {}
+        for block in report.split('\n\n'):
+            heading = block.split('\n', 1)[0]
+            sections[heading] = block
+        expected = {
+            'Final Cut Pro 7 XML (Premiere Pro, Resolve, Avid):': [
+                "Adobe Premiere Pro 27 imported Splice's Final Cut 7 XML for three test timelines with zero cut differences.",
+                "A reversed linked pair arrives unlinked in Premiere (Premiere's own export does the same).",
+                'Premiere shows its own Link Media dialog when mapped paths do not exist.'],
+            'FCPXML 1.10 (DaVinci Resolve, Final Cut Pro):': ['DaVinci Resolve 21.1 imported the FCPXML frame-exact.'],
+            'CMX3600 EDL:': ['DaVinci Resolve 21.1 conforms EDLs by timecode only and refuses audio-only EDLs.'],
+            'OpenTimelineIO:': ['DaVinci Resolve 21.1 cancelled an OTIO import in the one attempt made (unverified since '
+                                'the OTIO writer was changed to match OpenTimelineIO 0.18).'],
+        }
+        for heading, facts in expected.items():
+            section = sections[heading]
+            self.assertIn('  Tested in other applications:\n', section, heading)
+            for fact in facts:
+                self.assertIn('    ' + fact + '\n', section + '\n', heading)
+        only_fcpxml = api.export_timeline(synthetic_project(paths), {'unknownTimecode': 'zero'})['report']
+        self.assertNotIn('Premiere Pro 27 imported', only_fcpxml, 'facts appear only for the formats exported')
+
+
 class LinkBudget(unittest.TestCase):
     """The link step of an import runs under its own LINK_SECONDS budget, separate from parsing."""
 

@@ -172,6 +172,28 @@ async function main() {
     assert.ok(mappedReport.includes('linked original ' + fs.realpathSync(camera) + ', written as X:\\Shoot\\ridge.mp4'), mappedReport);
     await exportDialog.locator('[data-close]').click();
     console.log('Export with a path mapping writes file:///X:/Shoot/ridge.mp4 and records the rule in the report.');
+
+    // A lone timeline In mark: the export runs from In to the end of the sequence.
+    const marked = await page.evaluate(() => {
+      Editor.clearMarks(); Editor.setMark('in', 10);
+      const {project, duration} = Editor.get();
+      return {fps: project.fps, duration, marks: {...project.marks}};
+    });
+    assert.deepEqual(Object.keys(marked.marks), ['in']);
+    await fileMenu('#export-timeline');
+    assert.equal(await exportDialog.locator('[name=rangeMode]').inputValue(), 'custom');
+    assert.equal(Number(await exportDialog.locator('[name=rangeStart]').inputValue()), marked.marks.in);
+    assert.equal(Number(await exportDialog.locator('[name=rangeEnd]').inputValue()), Number(marked.duration.toFixed(6)),
+      'with no Out mark the range ends at the end of the sequence');
+    await exportDialog.locator('[type=submit]').click();
+    await exportDialog.locator('[role=status]').filter({hasText: /Exported/}).waitFor();
+    const inOnlyReport = await exportDialog.locator('.interchange-report pre').textContent();
+    const first = Math.round(marked.marks.in * marked.fps), last = Math.round(marked.duration * marked.fps);
+    assert.match(inOnlyReport, new RegExp(`\\(${last - first} frames, starting ${first} frames into the Splice timeline\\)`),
+      inOnlyReport.split('\n').find(line => line.startsWith('Range')));
+    await exportDialog.locator('[data-close]').click();
+    await page.evaluate(() => Editor.clearMarks());
+    console.log('An In mark alone exports from In to the end of the sequence.');
     assert.deepEqual(errors, []);
   } finally {
     await browser?.close();
