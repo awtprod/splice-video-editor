@@ -1520,3 +1520,20 @@ body{min-width:1024px}
   .viewer-scale{display:none}
   .viewer-bottom{gap:8px;padding-left:12px;padding-right:12px}
 }
+/* Export video: the Audio group, the finished export's report, and a footer that stays in view. */
+.export-dialog{width:min(560px,90vw)}
+.export-dialog form>footer{position:sticky;bottom:-22px;margin:20px -22px -22px;padding:12px 22px 22px;background:#1c211d;border-top:1px solid #2e372e}
+.export-audio{border:1px solid #3a4538;border-radius:6px;margin:16px 0 4px;padding:2px 12px 10px}
+.export-audio legend{padding:0 6px;font-weight:600;color:#c9d6c4}
+.export-audio label{margin:10px 0}
+.studio-dialog .export-audio input[type=checkbox]{justify-self:start;width:16px;height:16px;margin:0;accent-color:#bde773}
+.studio-dialog .export-audio label.export-check{grid-template-columns:auto 1fr;align-items:start}
+.export-audio label.export-check input{order:-1;margin-top:2px}
+.studio-dialog input:disabled{opacity:.5}
+.export-help{margin:-6px 0 10px;font-size:12px;line-height:1.35;color:#a5b3a1}
+.export-help[hidden],.export-report[hidden]{display:none}
+.export-audio label.export-check+.export-help{padding-left:26px}
+.export-report{margin:6px 0 10px;font-size:13px;line-height:1.4}
+.export-measured{margin:0 0 4px;color:#dfe9da;font-variant-numeric:tabular-nums}
+.export-warnings{margin:0;padding:0 0 0 18px;color:#ffcf64}
+.export-warnings li+li{margin-top:3px}
