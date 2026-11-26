@@ -824,6 +824,19 @@
   $("shortcuts").onclick=()=>SpliceDialogs.shortcuts();
   $("save-working").onclick=()=>busy(()=>SpliceSession.saveAs("splice"));
   document.querySelector(".file-menu").addEventListener("click",e=>{if(e.target.closest("button"))document.querySelector(".file-menu").open=false;});
+  // The File and Edit menus close on Escape (focus returns to their title) and on a click elsewhere.
+  const menus=[...document.querySelectorAll(".file-menu,.edit-menu")];
+  document.addEventListener("keydown",e=>{
+    const open=menus.find(menu=>menu.open);
+    if(e.key!=="Escape"||!open)return;
+    e.preventDefault();
+    e.stopPropagation();
+    open.open=false;
+    open.querySelector("summary").focus();
+  },true);
+  document.addEventListener("pointerdown",e=>{
+    for(const menu of menus)if(menu.open&&!menu.contains(e.target))menu.open=false;
+  },true);
   $("add-marker").onclick=()=>editMarker();
   function editMarker(existing){
     const name=prompt('Marker name (leave blank to remove)',existing?.name||'Marker');

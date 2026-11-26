@@ -1513,3 +1513,10 @@ button svg {
 /* The smallest supported window is 1024 × 640. Below it the page keeps that layout and scrolls,
    rather than squeezing panels past the point where they work. */
 body{min-width:1024px}
+/* A narrow program monitor (large scope or source panel beside it) keeps its transport on one row. */
+.viewer{container:viewer/inline-size}
+.viewer-info{white-space:nowrap}
+@container viewer (max-width:500px){
+  .viewer-scale{display:none}
+  .viewer-bottom{gap:8px;padding-left:12px;padding-right:12px}
+}

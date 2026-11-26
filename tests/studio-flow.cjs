@@ -76,7 +76,7 @@ async function main() {
       const dlg=page.getByRole('dialog');
       await dlg.locator('[name=name]').fill(name);
       await dlg.locator('[name=size]').selectOption('1280x720');
-      await dlg.getByRole('button',{name:'Create sequence'}).click();
+      await dlg.getByRole('button',{name:'Create project'}).click();
       await waitState(n=>Editor.get().project.name===n,name);
       await click('[data-library=media]');
       await page.locator('#media-input').setInputFiles(pass===1?path.join(root,'assets/ridge.mp4'):cameraOriginal);
