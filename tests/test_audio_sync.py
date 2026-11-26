@@ -65,6 +65,58 @@ class WaveformSync(unittest.TestCase):
         self.assertAlmostEqual(result['driftPpm'], -400, delta=60)
         self.assertIn('drift', result['note'])
 
+    def test_long_take_drift_both_directions_beyond_ten_ms_and_no_drift_baseline(self):
+        recorder = speech_like(self.directory/'long65.wav', 65, seed=19)
+        camera = camera_take(recorder, self.directory/'cam60.mp4', 2.0, 60, fps=24, gain_db=-24, hiss=.002)
+        # No-drift baseline on a 60 s noisy take must accept cleanly.
+        baseline = audio_sync.waveform_offset(camera, recorder, picture_seconds=60, search_seconds=6, fps=24)
+        self.assertTrue(baseline['ok'], baseline)
+        self.assertNotIn('drift', baseline)
+        self.assertAlmostEqual(baseline['driftPpm'], 0.0, delta=15)
+        self.assertLessEqual(abs(baseline['offsetSamples']-round(2.0*48000)), 8)
+        # Both directions of drift well beyond +-10 ms (24 ms and 60 ms over 60 s).
+        for ppm in (-400, 400, -1000, 1000):
+            with self.subTest(ppm=ppm):
+                rate = 48000/(1+ppm*1e-6)
+                drifted = self.directory/f'drifted_{ppm}.wav'
+                ffmpeg('-i', str(recorder), '-af', f'asetrate={rate:.4f},aresample=48000', '-c:a', 'pcm_s16le', str(drifted))
+                result = audio_sync.waveform_offset(camera, drifted, picture_seconds=60, search_seconds=6, fps=24)
+                self.assertTrue(result.get('drift'), result)
+                self.assertFalse(result['ok'], result)
+                self.assertAlmostEqual(result['driftPpm'], ppm, delta=max(40, abs(ppm)*.08), msg=result)
+                self.assertAlmostEqual(result['driftSeconds'], ppm*1e-6*60, delta=.004, msg=result)
+                expected_start = 2.0*(1+ppm*1e-6)
+                self.assertAlmostEqual(result['offsetSeconds'], expected_start, delta=.004, msg=result)
+                self.assertIn('drift', result['note'])
+
+    def test_short_and_long_unrelated_recordings_are_refused_without_drift(self):
+        short = speech_like(self.directory/'short.wav', 1.2, seed=31)
+        too_short = audio_sync.waveform_offset(short, self.recorder, search_seconds=6)
+        self.assertFalse(too_short['ok'])
+        self.assertIn('under 2 seconds', too_short['note'])
+        other_a = speech_like(self.directory/'unrelated_a.wav', 50, seed=101)
+        other_b = speech_like(self.directory/'unrelated_b.wav', 50, seed=202)
+        unrelated = audio_sync.waveform_offset(other_a, other_b, picture_seconds=50, search_seconds=6)
+        self.assertFalse(unrelated['ok'])
+        self.assertNotIn('drift', unrelated)
+        self.assertIn('Not synced', unrelated['note'])
+
+    def test_differing_sample_rates_sync_cleanly_and_catch_drift(self):
+        recorder = speech_like(self.directory/'sr_rec.wav', 56, seed=23, rate=48000)
+        cam_441 = self.directory/'sr_cam_441.wav'
+        ffmpeg('-ss', '1.25', '-t', '50', '-i', str(recorder), '-ar', '44100', '-c:a', 'pcm_s16le', str(cam_441))
+        ok_res = audio_sync.waveform_offset(cam_441, recorder, picture_seconds=50, search_seconds=6, fps=24)
+        self.assertTrue(ok_res['ok'], ok_res)
+        self.assertNotIn('drift', ok_res)
+        self.assertAlmostEqual(ok_res['offsetSeconds'], 1.25, delta=.0005)
+        self.assertAlmostEqual(ok_res['driftPpm'], 0.0, delta=15)
+        drift_441 = self.directory/'sr_drift_441.wav'
+        ffmpeg('-i', str(recorder), '-af', 'asetrate=47980.8,aresample=44100', '-c:a', 'pcm_s16le', str(drift_441))
+        bad_res = audio_sync.waveform_offset(cam_441, drift_441, picture_seconds=50, search_seconds=6, fps=24)
+        self.assertTrue(bad_res.get('drift'), bad_res)
+        self.assertFalse(bad_res['ok'], bad_res)
+        self.assertAlmostEqual(bad_res['driftPpm'], 400, delta=45)
+
 
 class TimecodeSync(unittest.TestCase):
     def test_bwf_time_reference_against_the_picture_timecode(self):
