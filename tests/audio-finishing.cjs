@@ -96,7 +96,7 @@ async function main() {
   const splice = await startSplice('splice-audio-');
   try {
     const media = makeMedia(splice.temp);
-    for (const viewport of [{width: 1440, height: 900}, {width: 1180, height: 780}]) {
+    for (const viewport of process.env.AUDIO_CASES ? [] : [{width: 1440, height: 900}, {width: 1180, height: 780}]) {
       const live = await meterWhilePlaying(splice, media, viewport);
       console.log('meter', viewport.width, JSON.stringify(live.snapshot));
     }

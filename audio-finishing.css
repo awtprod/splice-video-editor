@@ -63,8 +63,8 @@
 .automation-point{fill:#141714;stroke:#f4d35e;stroke-width:2;cursor:grab}
 .automation-point.eased{fill:#f4d35e}
 .automation-point:focus-visible{outline:none;stroke:#fff;stroke-width:3}
-.automation-tag{position:absolute;left:4px;top:2px;z-index:4}
-.automation-tag select{font-size:10px;padding:1px 2px}
+.automation-tag{position:absolute;left:2px;top:1px;z-index:4;line-height:0}
+.automation-tag select{font-size:9px;padding:0 1px;height:14px;opacity:.85}
 .automation-entry{position:fixed;z-index:1000;width:80px}
 .audio-sync-dialog form{display:flex;flex-direction:column;gap:8px;min-width:min(560px,90vw)}
 .audio-sync-dialog label{display:flex;flex-direction:column;gap:2px}

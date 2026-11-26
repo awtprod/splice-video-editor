@@ -119,13 +119,17 @@ def cross_correlation(a, b):
     return lags, [full[lag % size] for lag in lags]
 
 
-def _refine(pic, snd, coarse_offset, centre):
-    """Offset (seconds) at sub-sample precision around ``coarse_offset``, using
-    REFINE_SECONDS of picture sound around ``centre`` (seconds); None if out of range."""
-    first = max(0, int((centre-REFINE_SECONDS/2)*DECODE_RATE))
-    window = pic[first:first+REFINE_SECONDS*DECODE_RATE]
+def _refine(pic, snd, coarse_offset, centre, begin=0.0, end=math.inf):
+    """Offset (seconds) at sub-sample precision around ``coarse_offset``, using up to
+    REFINE_SECONDS of picture sound around ``centre``, inside the overlap begin..end
+    (picture seconds); None when there is not half a second to compare."""
+    margin = (REFINE_LAGS+1)/DECODE_RATE
+    low = max(0.0, begin+margin, centre-REFINE_SECONDS/2)
+    high = min(len(pic)/DECODE_RATE, end-margin, low+REFINE_SECONDS)
+    first, last = int(low*DECODE_RATE), int(high*DECODE_RATE)
+    window = pic[first:last]
     base = first+round(coarse_offset*DECODE_RATE)
-    if base-REFINE_LAGS < 0 or base+REFINE_LAGS+len(window) > len(snd) or len(window) < DECODE_RATE:
+    if base-REFINE_LAGS < 0 or base+REFINE_LAGS+len(window) > len(snd) or len(window) < DECODE_RATE//2:
         return None, 0.0
     norm_a = math.sqrt(sum(value*value for value in window)) or 1e-9
     scores = []
@@ -172,13 +176,19 @@ def waveform_offset(picture_path, sound_path, *, picture_stream=0, sound_stream=
     best_lag, best = max(allowed, key=lambda row: row[1])
     guard = ENVELOPE_RATE//5
     competing = max((value for lag, value in allowed if abs(lag-best_lag) > guard), default=0.0)
-    overlap = sum(1 for n in range(len(env_pic)) if 0 <= n+best_lag < len(env_snd))
-    confidence = max(0.0, best/max(1, overlap))
+    # Confidence: the envelopes' correlation coefficient over their overlap at the best lag.
+    pairs = [(env_pic[n], env_snd[n+best_lag]) for n in range(len(env_pic)) if 0 <= n+best_lag < len(env_snd)]
+    confidence = 0.0
+    if len(pairs) > ENVELOPE_RATE:
+        mean_a = sum(a for a, _ in pairs)/len(pairs); mean_b = sum(b for _, b in pairs)/len(pairs)
+        covariance = sum((a-mean_a)*(b-mean_b) for a, b in pairs)
+        spread = math.sqrt(sum((a-mean_a)**2 for a, _ in pairs)*sum((b-mean_b)**2 for _, b in pairs))
+        confidence = max(0.0, covariance/spread) if spread > 1e-12 else 0.0
     ratio = best/competing if competing > 1e-9 else math.inf
     coarse = best_lag/ENVELOPE_RATE
     # The overlap in picture seconds, for the refine windows and the drift check.
     begin = max(0.0, -coarse); end = min(len(pic)/DECODE_RATE, len(snd)/DECODE_RATE-coarse)
-    offset, score = _refine(pic, snd, coarse, _loudest(pic, begin, begin+min(end-begin, 30)))
+    offset, score = _refine(pic, snd, coarse, _loudest(pic, begin, begin+min(end-begin, 30)), begin, end)
     result = dict(method='waveform', confidence=round(confidence, 3), peakRatio=round(min(ratio, 99), 2),
                   coarseOffsetSeconds=round(coarse, 4))
     if offset is None:
@@ -186,7 +196,7 @@ def waveform_offset(picture_path, sound_path, *, picture_stream=0, sound_stream=
     result.update(offsetSeconds=round(offset, 6), offsetSamples=round(offset*48000), offsetFrames=round(offset*fps, 2),
                   refineCorrelation=round(score, 3))
     if end-begin >= 40:
-        late, _ = _refine(pic, snd, offset, _loudest(pic, end-20, end))
+        late, _ = _refine(pic, snd, offset, _loudest(pic, end-20, end), begin, end)
         if late is not None:
             drift = late-offset
             result['driftSeconds'] = round(drift, 6)

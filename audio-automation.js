@@ -78,22 +78,23 @@
           dot.setAttribute('cx', px(time)); dot.setAttribute('cy', y(value));
           title.textContent = `${time.toFixed(2)} s · ${describe(key, value)}`;
         };
-        dot.onpointerup = () => { dot.onpointermove = dot.onpointerup = null; if (moved) replace(moved); };
+        dot.onpointerup = () => { dot.onpointermove = dot.onpointerup = null; if (moved) { refocus = {track: lane.track, time: moved.time}; replace(moved); } };
       };
       dot.ondblclick = event => { event.stopPropagation(); entry(svg, dot, point, spec, value => replace({value})); };
       dot.onkeydown = event => {
         const handled = ['Delete','Backspace','ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Enter','e','E'].includes(event.key);
         if (!handled) return;
         event.preventDefault(); event.stopPropagation();
+        // Set before the edit: the lane is redrawn synchronously when the project changes.
+        refocus = {track: lane.track, time: point.time};
         const step = event.shiftKey ? 10 : spec.step;
         if (event.key === 'Delete' || event.key === 'Backspace') commit(list.filter((_, at) => at !== index));
         else if (event.key === 'ArrowUp' || event.key === 'ArrowDown') replace({value: Math.max(spec.low, Math.min(spec.high, point.value + (event.key === 'ArrowUp' ? step : -step)))});
         else if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
           const time = Math.round((point.time + (event.key === 'ArrowRight' ? 1 : -1)*(event.shiftKey ? 5 : 1)/fps)*fps)/fps;
-          if (time >= 0 && !list.some((other, at) => at !== index && Math.abs(other.time - time) < .5/fps)) replace({time});
+          if (time >= 0 && !list.some((other, at) => at !== index && Math.abs(other.time - time) < .5/fps)) { refocus.time = time; replace({time}); }
         } else if (event.key === 'Enter') entry(svg, dot, point, spec, value => replace({value}));
         else replace({ease: !point.ease});
-        refocus = {track: lane.track, time: point.time};
       };
       svg.append(dot);
     });
@@ -104,8 +105,8 @@
       const time = Math.max(0, Math.round((event.clientX - box.left)/px(1)*fps)/fps);
       if (list.some(point => Math.abs(point.time - time) < .5/fps)) return;
       const value = list.length ? Math.round(curve(list, time, base)) : valueAt(event.clientY - box.top);
-      commit([...list, {time, value}]);
       refocus = {track: lane.track, time};
+      commit([...list, {time, value}]);
     };
     // A label and the property switch, at the lane's left edge.
     const label = document.createElement('div');
@@ -130,13 +131,16 @@
     input.className = 'automation-entry';
     input.setAttribute('aria-label', `${spec.label} value${spec.unit ? ' (' + spec.unit + ')' : ''}`);
     input.style.left = Math.min(window.innerWidth - 90, box.left) + 'px'; input.style.top = Math.max(4, box.top - 34) + 'px';
+    let finished = false;
     const finish = save => {
+      if (finished) return;   // removing the field blurs it, which would finish it again
+      finished = true;
       const value = Number(input.value);
       input.remove();
       if (save && Number.isFinite(value) && value >= spec.low && value <= spec.high) done(value);
     };
     input.onkeydown = event => { if (event.key === 'Enter') finish(true); else if (event.key === 'Escape') finish(false); event.stopPropagation(); };
-    input.onblur = () => input.isConnected && finish(true);
+    input.onblur = () => finish(true);
     document.body.append(input);
     input.focus(); input.select();
   }

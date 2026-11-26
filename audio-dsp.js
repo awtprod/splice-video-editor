@@ -311,20 +311,25 @@
   // ---- AudioWorklet processors ----
   if (typeof registerProcessor==='function' && typeof AudioWorkletProcessor!=='undefined') {
     class DynamicsProcessor extends AudioWorkletProcessor {
-      constructor() {
+      // Settings arrive with the node (processorOptions, so the first quantum is already
+      // processed) and later through the port when the user edits them.
+      constructor(options) {
         super();
         this.stages=[]; this.alive=true; this.sent=0;
+        this.configure(options && options.processorOptions);
         this.port.onmessage=({data})=>{
           if (data==='dispose') { this.alive=false; this.port.close(); return; }
-          if (data && data.type==='settings') {
-            const stages=[];
-            if (data.gate) stages.push(gateState(data.gate,sampleRate));
-            if (data.comp) stages.push(compressorState(data.comp,sampleRate));
-            // Keep the detector state of an unchanged stage kind so edits do not click.
-            for (const stage of stages) { const prior=this.stages.find(s=>s.kind===stage.kind); if (prior) stage.lin=prior.lin; }
-            this.stages=stages;
-          }
+          if (data && data.type==='settings') this.configure(data);
         };
+      }
+      configure(data) {
+        if (!data) return;
+        const stages=[];
+        if (data.gate) stages.push(gateState(data.gate,sampleRate));
+        if (data.comp) stages.push(compressorState(data.comp,sampleRate));
+        // Keep the detector state of an unchanged stage kind so edits do not click.
+        for (const stage of stages) { const prior=this.stages.find(s=>s.kind===stage.kind); if (prior) stage.lin=prior.lin; }
+        this.stages=stages;
       }
       process(inputs, outputs) {
         const input=inputs[0], output=outputs[0];

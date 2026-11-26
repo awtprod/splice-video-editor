@@ -9,7 +9,7 @@
 (() => {
   const dsp = window.SpliceAudioDSP;
   let context = null, ready = null, workletLoaded = false;
-  let master = null, meterNode = null, meterSnapshot = null;
+  let master = null, meterNode = null, meterSnapshot = null, configured = null;
   const tracks = new Map();
   const reductions = new Map();
   const listeners = new Set();
@@ -74,8 +74,8 @@
     node.connect(bus.output);
   }
   function dynamicsNode(bus, settings) {
-    const node = new AudioWorkletNode(context, 'splice-dynamics', {numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [2]});
-    node.port.postMessage({type: 'settings', ...settings});
+    const node = new AudioWorkletNode(context, 'splice-dynamics', {numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [2],
+      processorOptions: settings});
     node.port.onmessage = ({data}) => {
       if (data?.type !== 'reduction') return;
       reductions.set(bus.owner, {...(reductions.get(bus.owner) || {}), ...data.reduction});
@@ -90,14 +90,22 @@
       bus.input.connect(bus.output);
       bus.output.connect(master.input);
       tracks.set(key, bus);
+      build(bus, configured?.trackMix?.[key]?.fx);
     }
     return bus;
   }
   // Called whenever the project changes: track and master effects.
   function configure(project) {
     if (!context) return;
+    configured = project;
     build(master, project.masterFx);
-    for (const [key, bus] of tracks) build(bus, project.trackMix?.[key]?.fx);
+    const used = new Set(project.clips.filter(clip => clip.type !== 'title').map(clip => String(clip.track)));
+    for (const [key, bus] of tracks) {
+      if (used.has(key)) { build(bus, project.trackMix?.[key]?.fx); continue; }
+      // A track that no longer has clips: its bus and effects go (a clip moved back rebuilds it).
+      bus.input.disconnect(); bus.output.disconnect(); disposeNodes(bus);
+      tracks.delete(key);
+    }
   }
   // The clip part of the chain, rebuilt only when the clip's effects or mapping change.
   const MAPS = {left: [[1,0],[1,0]], right: [[0,1],[0,1]], mono: [[.5,.5],[.5,.5]], swap: [[0,1],[1,0]]};
