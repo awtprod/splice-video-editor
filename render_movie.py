@@ -16,6 +16,8 @@ from pathlib import Path
 from premiere import MEDIA_ROOT, STILL_IMAGES, _media_path
 from media_proxy import AVC_REC709, HDR_LINEAR_REC709, HDR_TONE_MAP, HDR_TRANSFERS, HDR_TO_REC709, REC709, tempo_filters
 from splice_platform import data_directory, font_roots, installed_font
+import audio_dsp
+import audio_loudness
 
 
 PQ = ('bt2020','smpte2084','bt2020nc')
@@ -655,22 +657,31 @@ def _mask_alpha(expression, alpha_format, full_alpha):
     return f",format={full_alpha},geq=lum='p(X,Y)':cb='p(X,Y)':cr='p(X,Y)':a='p(X,Y)*({expression})',format={alpha_format}"
 
 
-def _trim_audio(filters, label, index, streams, start, length, reverse):
-    # A stream can start later than the video's source clock. Preserve the gap.
-    clock = f'PTS-({start:.9f})/TB'
-    trim = f'atrim=start={start:.9f}:end={start+length:.9f},asetpts={clock},aresample=48000:first_pts=0'
-    if len(streams)>1:
+def _trim_audio(filters, label, index, streams, start, length, reverse, rates=None, offset=0.0):
+    """Trim a source span. ``start`` is relative to the input's seek ``offset``
+    (whole seconds); both ends are snapped to the stream's own sample grid, so
+    the same source sample starts the slice however the input was shared."""
+    rates = rates or {}
+
+    def grid(number, value):
+        rate = rates.get(number) or AUDIO_RATE
+        return round((offset+value)*rate)/rate-offset
+    if len(streams) > 1:
         from media_proxy import stereo_mix_filters
-        sources = [f'[{index}:a:{number}]{trim}' for number in streams]
-        filters.extend(stereo_mix_filters(sources,label,list(streams.values()),length))
+        sources = []
+        for number in streams:
+            first, last = grid(number, start), grid(number, start+length)
+            # A stream can start later than the video's source clock. Preserve the gap.
+            sources.append(f'[{index}:a:{number}]atrim=start={first:.12f}:end={last:.12f},asetpts=PTS-({first:.12f})/TB,'
+                           'aresample=48000:first_pts=0')
+        filters.extend(stereo_mix_filters(sources, label, list(streams.values()), length))
         result = f'[{label}]'
     else:
-        result = f'[{index}:a:{next(iter(streams))}]{trim},'
+        number = next(iter(streams))
+        first, last = grid(number, start), grid(number, start+length)
+        result = (f'[{index}:a:{number}]atrim=start={first:.12f}:end={last:.12f},asetpts=PTS-({first:.12f})/TB,'
+                  'aresample=48000:first_pts=0,')
     return result + ('areverse,' if reverse else '')
-
-
-def _audio_transition_gain(clip, expression):
-    return f'sin(PI*({expression})/2)' if clip.get('transitionMatchName')=='Constant Power' else expression
 
 
 def _horizontal_position(clip, width, overlay_width, clock):
@@ -1351,121 +1362,330 @@ def _color_tags(profile, codec):
     return tags
 
 
-def _audio_events(clips, media_by_id, fps, probes, track_mix, solo, span, heartbeat=None):
-    """Describe each audible clip, and each crossfade tail, as a timeline event.
+SOUND_TRANSITIONS = {'dissolve': 'crossfade', 'wipe': 'crossfade', 'fade': 'dip'}
+SOUND_OVERRIDES = ('auto', 'cut', 'crossfade', 'dip')
+CHANNEL_MAPS = {
+    'stereo': None,
+    'left': 'pan=stereo|c0=c0|c1=c0',
+    'right': 'pan=stereo|c0=c1|c1=c1',
+    'mono': 'pan=stereo|c0=0.5*c0+0.5*c1|c1=0.5*c0+0.5*c1',
+    'swap': 'pan=stereo|c0=c1|c1=c0',
+}
+# Where a track sits in a 5.1 program (SMPTE order L R C LFE Ls Rs). A mono
+# sum (0.7071*(L+R)) gives a centre-panned mono clip its own level.
+TRACK_ROUTES = {
+    'front': 'c0=c0|c1=c1|c2=0*c0|c3=0*c0|c4=0*c0|c5=0*c0',
+    'center': 'c0=0*c0|c1=0*c0|c2=0.70710678*c0+0.70710678*c1|c3=0*c0|c4=0*c0|c5=0*c0',
+    'lfe': 'c0=0*c0|c1=0*c0|c2=0*c0|c3=0.70710678*c0+0.70710678*c1|c4=0*c0|c5=0*c0',
+    'surround': 'c0=0*c0|c1=0*c0|c2=0*c0|c3=0*c0|c4=c0|c5=c1',
+}
+AUDIO_LAYOUTS = ('stereo', '5.1', '5.1-downmix')
+AUDIO_ONLY_CODECS = ('wav', 'stems', 'loudness')
+# ITU-R BS.775 stereo fold-down of a 5.1 program (LFE omitted).
+DOWNMIX = 'pan=stereo|c0=c0+0.70710678*c2+0.70710678*c4|c1=c1+0.70710678*c2+0.70710678*c5'
+MAX_TRACK_KEYFRAMES = 2000
+# Stateful events (tempo, resampling, effects) are pre-rendered from a point
+# on this event-local grid, so the result does not depend on chunking.
+PRERENDER_ANCHOR_SECONDS = 60
+PRERENDER_WORKERS = 4
+
+
+def _sound_transition(clip, pictures, fps):
+    """How a clip's sound enters at its start. One rule for embedded and linked
+    sound: dissolve and wipe crossfade, a dip fades the outgoing sound out over
+    the part before the cut and the incoming one in over the part after it, a
+    cut cuts. A linked sound clip without a transition of its own follows its
+    picture; ``audioTransition`` (cut, crossfade or dip) overrides the rule."""
+    override = clip.get('audioTransition', 'auto')
+    if override not in SOUND_OVERRIDES:
+        raise ValueError('Invalid sound transition: use auto, cut, crossfade or dip')
+    source = clip
+    if clip.get('type') == 'audio' and clip.get('transition') not in SOUND_TRANSITIONS and clip.get('linkGroup'):
+        source = pictures.get((clip['linkGroup'], round(float(clip['start'])*fps)), clip)
+    kind = SOUND_TRANSITIONS.get(source.get('transition'))
+    if override == 'cut':
+        return None
+    if override in ('crossfade', 'dip'):
+        kind = override
+    if kind is None:
+        return None
+    duration = _number(source.get('transitionDuration', .5), 'transition duration', 1/float(fps))
+    before = min(_number(source.get('transitionBefore', 0), 'transition lead'), duration)
+    return dict(kind=kind, duration=duration, before=before, power=source.get('transitionMatchName') == 'Constant Power')
+
+
+def _transition_curve(power, expression):
+    return f'sin(PI*({expression})/2)' if power else expression
+
+
+def _automation(points, key, low, high, limit):
+    """Validated keyframes [(time, value, ease)] sorted by time."""
+    if not points:
+        return []
+    if not isinstance(points, list): raise ValueError(f'Invalid {key} keyframes')
+    if len(points) > limit: raise ValueError(f'More than {limit} {key} keyframes, the export limit')
+    ordered = []
+    for point in points:
+        if not isinstance(point, dict): raise ValueError(f'Invalid {key} keyframe')
+        ease = point.get('ease', False)
+        if not isinstance(ease, bool): raise ValueError(f'Invalid {key} keyframe: ease must be true or false')
+        ordered.append((_number(point.get('time'), f'{key} keyframe time', 0, MAX_TIMELINE_SECONDS),
+                        _number(point.get('value'), f'{key} keyframe value', low, high), ease))
+    ordered.sort()
+    if any(b[0] <= a[0] for a, b in zip(ordered, ordered[1:])): raise ValueError(f'Duplicate {key} keyframes')
+    return ordered
+
+
+def _curve_expr(ordered, clock, base):
+    """FFmpeg expression of a keyframe curve at ``clock``: linear or eased
+    (smoothstep 3u^2-2u^3) segments, held before the first and after the last key.
+    Mirrors engine.js curveValue."""
+    if not ordered:
+        return f'{base:.6f}'
+    expr = f'{ordered[-1][1]:.9f}'
+    for (at, value, ease), (next_at, next_value, _) in reversed(list(zip(ordered, ordered[1:]))):
+        fraction = f'(({clock})-{at:.9f})/{next_at-at:.9f}'
+        if ease:
+            fraction = f'({fraction})*({fraction})*(3-2*({fraction}))'
+        expr = f'if(lte({clock},{next_at:.9f}),{value:.9f}+({next_value-value:.9f})*{fraction},{expr})'
+    return f'if(lte({clock},{ordered[0][0]:.9f}),{ordered[0][1]:.9f},{expr})'
+
+
+def _curve_window(ordered, begin, end):
+    """Only the keys that shape begin..end (one either side): short expressions per event."""
+    if not ordered:
+        return ordered
+    first = max(0, next((index for index, point in enumerate(ordered) if point[0] >= begin), len(ordered))-1)
+    last = next((index for index, point in enumerate(ordered) if point[0] > end), len(ordered)-1)
+    return ordered[first:last+1]
+
+
+def _pan_expressions(pan_expr, mono):
+    """Web Audio StereoPannerNode for a time-varying pan (-1..1) as aeval channels."""
+    p = f'({pan_expr})'
+    if mono:
+        return (f'cos(({p}+1)*PI/4)*val(0)', f'sin(({p}+1)*PI/4)*val(0)')
+    return (f'if(lte({p},0),val(0)+cos(({p}+1)*PI/2)*val(1),cos({p}*PI/2)*val(0))',
+            f'if(lte({p},0),sin(({p}+1)*PI/2)*val(1),val(1)+sin({p}*PI/2)*val(0))')
+
+
+def _track_settings(track_mix, track):
+    mix = track_mix.get(str(track)) or {}
+    if not isinstance(mix, dict): raise ValueError('Invalid track mix')
+    return mix
+
+
+def track_plan(track_mix, track):
+    """Validated processing of one audio track (cached per export by the caller)."""
+    mix = _track_settings(track_mix, track)
+    fx = audio_dsp.normalize(mix.get('fx'), label=f'track A{abs(int(track))} effects')
+    keys = mix.get('keyframes') or {}
+    if not isinstance(keys, dict) or any(key not in ('volume', 'pan') for key in keys):
+        raise ValueError('Invalid track automation: use volume and pan keyframes')
+    route = mix.get('route', 'front')
+    if route not in TRACK_ROUTES: raise ValueError('Invalid track routing: use ' + ', '.join(TRACK_ROUTES))
+    channels = mix.get('channels', 'stereo')
+    if channels not in ('stereo', 'mono'): raise ValueError('Invalid track channels: use stereo or mono')
+    stem = mix.get('stem', '')
+    if not isinstance(stem, str) or len(stem) > 32 or any(ord(char) < 32 for char in stem):
+        raise ValueError('Invalid stem name: use up to 32 printable characters')
+    return dict(fx=fx, dynamics=audio_dsp.has_dynamics(fx), route=route, mono=channels == 'mono', stem=stem.strip(),
+                gain=_number(mix.get('gain', 100), 'track gain', 0, 200)/100,
+                pan=_number(mix.get('pan', 0), 'track pan', -100, 100),
+                volume_keys=_automation(keys.get('volume'), 'track volume', 0, 200, MAX_TRACK_KEYFRAMES),
+                pan_keys=_automation(keys.get('pan'), 'track pan', -100, 100, MAX_TRACK_KEYFRAMES))
+
+
+def _audio_events(clips, media_by_id, fps, probes, track_mix, solo, span, heartbeat=None, *, layout='stereo', tracks=None,
+                  plans=None):
+    """Describe each audible clip as one timeline event: its body, any crossfade
+    lead-in before its start and any crossfade tail after its end, rendered by
+    one chain (one tempo filter), so a speed change never restarts at the cut.
 
     Only events that overlap ``span`` (timeline seconds) are returned, so a
-    range export probes and reads only the media it needs.
+    range export probes and reads only the media it needs. ``tracks`` limits
+    the events to those audio track keys (stems, track groups).
     """
     begin, end = span
+    fps = float(fps)
+    pictures = {(clip['linkGroup'], round(float(clip['start'])*fps)): clip for clip in clips
+                if clip.get('type') == 'video' and clip.get('linkGroup')}
     upcoming = {}
     for candidate in clips:
-        if candidate.get('type') in ('audio','video') and candidate.get('transition') in ('dissolve','wipe'):
-            upcoming.setdefault((candidate['type'], candidate.get('track'), round(float(candidate['start'])*fps)), candidate)
+        if candidate.get('type') in ('audio', 'video'):
+            sound = _sound_transition(candidate, pictures, fps)
+            if sound:
+                upcoming.setdefault((candidate['type'], candidate.get('track'), round(float(candidate['start'])*fps)),
+                                    (candidate, sound))
+    plans = {} if plans is None else plans
     events = []
     for clip in clips:
-        if clip.get('type') not in ('audio','video') or not clip_enabled(clip):
+        if clip.get('type') not in ('audio', 'video') or not clip_enabled(clip):
             # A disabled clip is silent (its embedded sound too). It stays in
             # `upcoming`, so a neighbour's crossfade still fades against it.
             continue
         item = media_by_id.get(clip.get('mediaId'))
         if item is None:
             raise ValueError('A clip references missing media')
-        if item.get('nativeGenerator') in (1112293707,1414680150): continue
-        mix = track_mix.get(str(clip.get('track', -1))) or {}
-        if not isinstance(mix, dict): raise ValueError('Invalid track mix')
+        if item.get('nativeGenerator') in (1112293707, 1414680150): continue
+        key = str(clip.get('track', -1))
+        if tracks is not None and key not in tracks: continue
+        mix = _track_settings(track_mix, key)
         if mix.get('mute') or (solo and not mix.get('solo')): continue
         if clip['type'] == 'video' and clip.get('embeddedAudio') is False: continue
+        if key not in plans: plans[key] = track_plan(track_mix, key)
+        plan = plans[key]
         source_in = float(clip.get('in', 0)); length = float(clip['duration']); start = float(clip['start'])
-        speed = _number(clip.get('speed',1),'speed',.1,16)
-        before = _number(clip.get('transitionBefore',0),'transition lead')
+        speed = _number(clip.get('speed', 1), 'speed', .1, 16)
         reverse = bool(clip.get('reverse'))
+        sound = _sound_transition(clip, pictures, fps)
+        before = sound['before'] if sound and sound['kind'] == 'crossfade' else 0.0
+        # A dip starts the incoming sound at the cut; only a crossfade pre-rolls it.
         render_length = length+before
-        next_clip = upcoming.get((clip['type'], clip.get('track'), round((start+length)*fps)))
-        if next_clip is clip: next_clip = None
-        fade_out = min(length,_number(clip.get('fadeOut',0),'fade out',0,MAX_TIMELINE_SECONDS))
-        after = 0
-        if next_clip:
-            next_before=_number(next_clip.get('transitionBefore',0),'transition lead')
-            next_duration=_number(next_clip.get('transitionDuration',.5),'transition duration',1/float(fps))
-            next_duration=min(next_duration,next_before+float(next_clip['duration']))
-            if not fade_out:
-                after = max(0,next_duration-next_before)
-        if start-before >= end or start+length+(after if after>=1/float(fps) else 0) <= begin:
+        following = upcoming.get((clip['type'], clip.get('track'), round((start+length)*fps)))
+        if following and following[0] is clip: following = None
+        fade_out = min(length, _number(clip.get('fadeOut', 0), 'fade out', 0, MAX_TIMELINE_SECONDS))
+        after = 0.0
+        if following:
+            next_clip, next_sound = following
+            next_duration = min(next_sound['duration'], next_sound['before']+float(next_clip['duration']))
+            if next_sound['kind'] == 'crossfade' and not fade_out:
+                after = max(0.0, next_duration-next_sound['before'])
+        if after < 1/fps: after = 0.0
+        if start-before >= end or start+length+after <= begin:
             continue
         _check_clip(clip, media_by_id, probes, heartbeat)
         if 'audio' not in item['_kinds']:
             continue
-        volume_keys=(clip.get('keyframes') or {}).get('volume')
-        gain = (100 if volume_keys else _number(clip.get('volume',100),'volume',0,200)) * _number(mix.get('gain',100),'track gain',0,200) / 10000
-        pan = max(-1,min(1,(_number(clip.get('pan', 0), 'pan', -100, 100) + _number(mix.get('pan',0),'track pan',-100,100))/100))
+        clip_keys = _automation((clip.get('keyframes') or {}).get('volume'), 'volume', 0, 200, MAX_KEYFRAMES)
+        # Keyframes replace the static level they animate (clip volume, track volume).
+        static = ((1.0 if clip_keys else _number(clip.get('volume', 100), 'volume', 0, 200)/100) *
+                  (1.0 if plan['volume_keys'] else plan['gain']))
         streams = dict(enumerate(item['_audioStreams']))
-        selection = clip.get('audioStream',item.get('audioStream'))
+        selection = clip.get('audioStream', item.get('audioStream'))
         if selection is not None:
             if type(selection) is not int or selection not in streams:
                 raise ValueError('The selected source audio stream is unavailable')
-            streams = {selection:streams[selection]}
-        panner = _stereo_pan(pan,2 if len(streams)>1 else next(iter(streams.values())))
-        fade_in = min(length,_number(clip.get('fadeIn',0),'fade in',0,MAX_TIMELINE_SECONDS))
-        processing=','.join([*tempo_filters(speed),f'volume={gain:.4f}',panner])
-        envelope=[]
+            streams = {selection: streams[selection]}
+        rates = item.get('_audioRates') or []
+        stream_rates = {number: (rates[number] if number < len(rates) and rates[number] else AUDIO_RATE) for number in streams}
+        mapping = clip.get('channelMap', 'stereo')
+        if mapping not in CHANNEL_MAPS: raise ValueError('Invalid channel mapping: use ' + ', '.join(CHANNEL_MAPS))
+        source_channels = 2 if len(streams) > 1 else next(iter(streams.values()))
+        mono = source_channels == 1 or plan['mono']
+        if source_channels == 1:
+            mapping_filter = None
+        elif plan['mono']:
+            mapping_filter = 'aformat=channel_layouts=stereo,pan=mono|c0=0.5*c0+0.5*c1'
+        elif CHANNEL_MAPS[mapping]:
+            mapping_filter = 'aformat=channel_layouts=stereo,' + CHANNEL_MAPS[mapping]
+        else:
+            mapping_filter = None
+        clip_pan = _number(clip.get('pan', 0), 'pan', -100, 100)
+        fx = audio_dsp.normalize(clip.get('audioFx'), label='clip audio effects')
+        processing = [*([mapping_filter] if mapping_filter else []),
+                      *tempo_filters(speed), *audio_dsp.ffmpeg_filters(fx), f'volume={static:.6f}']
+        timeline0 = start-before   # timeline time of event-local t = 0
+        pan_keys = _curve_window(plan['pan_keys'], timeline0, start+length+after)
+        pan = None
+        if pan_keys:
+            pan = (lambda t, keys=pan_keys, offset=timeline0, own=clip_pan, mono=mono:
+                   _pan_expressions(f'max(-1,min(1,({own:.6f}+{_curve_expr(keys, f"({t}+{offset:.9f})", 0)})/100))', mono))
+            processing.append('aformat=channel_layouts=stereo' if not mono else 'aformat=channel_layouts=mono')
+        else:
+            processing.append(_stereo_pan(max(-1, min(1, (clip_pan+plan['pan'])/100)), 1 if mono else 2))
+        envelope = []
+        if clip_keys:
+            window = _curve_window(clip_keys, -before, length+after)
+            envelope.append(lambda t, keys=window, before=before: f"({_curve_expr(keys, f'({t}-{before:.9f})', 100)})/100")
+        volume_keys = _curve_window(plan['volume_keys'], timeline0, start+length+after)
         if volume_keys:
-            envelope.append(lambda t, clip=clip, before=before: '({})/100'.format(
-                _keyframe_expr(clip,'volume',float(clip.get('volume',100)),0,200,f'({t}-{before:.6f})')))
-        if clip.get('transition') in ('dissolve','wipe','fade'):
-            incoming=min(_number(clip.get('transitionDuration',.5),'transition duration',1/float(fps)),render_length)
-            envelope.append(lambda t, clip=clip, incoming=incoming: _audio_transition_gain(clip,f'min(1,{t}/{incoming:.9f})'))
-        if next_clip:
-            fade_start=before+length-next_before
-            envelope.append(lambda t, n=next_clip, s=fade_start, d=next_duration:
-                            _audio_transition_gain(n,f'max(0,min(1,1-({t}-{s:.9f})/{d:.9f}))'))
+            envelope.append(lambda t, keys=volume_keys, offset=timeline0: f"({_curve_expr(keys, f'({t}+{offset:.9f})', 100)})/100")
+        if sound:
+            if sound['kind'] == 'crossfade':
+                incoming = min(sound['duration'], render_length)
+            else:
+                incoming = min(sound['duration']-sound['before'], length)
+            if incoming > 1e-9:
+                envelope.append(lambda t, power=sound['power'], incoming=incoming:
+                                _transition_curve(power, f'min(1,max(0,{t})/{incoming:.9f})'))
+        if following:
+            next_clip, next_sound = following
+            if next_sound['kind'] == 'crossfade':
+                fade_start = before+length-next_sound['before']
+                next_duration = min(next_sound['duration'], next_sound['before']+float(next_clip['duration']))
+                envelope.append(lambda t, power=next_sound['power'], s=fade_start, d=next_duration:
+                                _transition_curve(power, f'max(0,min(1,1-({t}-{s:.9f})/{d:.9f}))'))
+            elif next_sound['before'] > 1e-9:
+                cut, lead = before+length, next_sound['before']
+                envelope.append(lambda t, power=next_sound['power'], cut=cut, lead=lead:
+                                _transition_curve(power, f'max(0,min(1,({cut:.9f}-{t})/{lead:.9f}))'))
+        fade_in = min(length, _number(clip.get('fadeIn', 0), 'fade in', 0, MAX_TIMELINE_SECONDS))
         if fade_in or fade_out:
             head = (lambda t, b=before, f=fade_in: f'max(0,({t}-{b:.9f})/{f:.9f})') if fade_in else (lambda t: '1')
             tail = (lambda t, r=render_length, f=fade_out: f'max(0,({r:.9f}-{t})/{f:.9f})') if fade_out else (lambda t: '1')
             envelope.append(lambda t, head=head, tail=tail: f'min(1,min({head(t)},{tail(t)}))')
-        rates = item.get('_audioRates') or []
-        # Tempo and resampling carry state from sample to sample: such an event
-        # is rendered in one piece when a chunk seam falls inside it.
-        stateful = abs(speed-1) > 1e-9 or any((rates[number] if number < len(rates) else 0) != AUDIO_RATE for number in streams)
-        events.append(dict(path=item['_path'], streams=streams, source=source_in if reverse else source_in-before*speed,
-                           length=render_length, speed=speed, reverse=reverse, start=start-before,
-                           processing=processing, envelope=envelope, stateful=stateful))
-        if after>=1/float(fps):
-            available=(source_in/speed if reverse else (item['_actualDuration']-source_in-length*speed)/speed)
-            if available+1e-3<after: raise ValueError('Audio crossfade needs more outgoing source footage')
-            tail_processing=processing
-            if volume_keys:
-                terminal=sorted(volume_keys,key=lambda point:point['time'])[-1]['value']
-                tail_processing+=f",volume={_number(terminal,'volume keyframe',0,200)/100:.6f}"
-            events.append(dict(path=item['_path'], streams=streams, stateful=stateful,
-                               source=source_in-after*speed if reverse else source_in+length*speed,
-                               length=after, speed=speed, reverse=reverse, start=start+length, processing=tail_processing,
-                               envelope=[lambda t, n=next_clip, b=next_before, d=next_duration:
-                                         _audio_transition_gain(n,f'max(0,1-({b:.9f}+{t})/{d:.9f})')]))
+        post = []
+        if not plan['dynamics']:
+            post.extend(audio_dsp.ffmpeg_filters(plan['fx']))
+        if layout != 'stereo':
+            post.append('aformat=channel_layouts=stereo,pan=5.1|' + TRACK_ROUTES[plan['route']])
+        total = render_length+after
+        if before and not item.get('_renderStill'):
+            if not reverse and source_in-before*speed < -.01:
+                raise ValueError('Incoming sound lacks pre-cut footage for its crossfade')
+            if reverse and source_in+(length+before)*speed > item['_actualDuration']+.05:
+                raise ValueError('Incoming sound lacks pre-cut footage for its crossfade')
+        if after:
+            available = (source_in/speed if reverse else (item['_actualDuration']-source_in-length*speed)/speed)
+            if available+1e-3 < after: raise ValueError('Audio crossfade needs more outgoing source footage')
+        # Tempo, resampling and effects carry state from sample to sample: such an
+        # event is always rendered in one piece (see _audio_schedule).
+        stateful = (abs(speed-1) > 1e-9 or any(rate != AUDIO_RATE for rate in stream_rates.values())
+                    or bool(fx) or (bool(plan['fx']) and not plan['dynamics']))
+        events.append(dict(path=item['_path'], streams=streams, rates=stream_rates,
+                           source=source_in-after*speed if reverse else source_in-before*speed,
+                           length=total, speed=speed, reverse=reverse, start=timeline0,
+                           processing=','.join(processing), envelope=envelope, pan=pan, post=','.join(post),
+                           stateful=stateful, track=key))
     events.sort(key=lambda event: event['start'])
     return events
 
 
-def _limiter_filter(limiter):
-    """``limiter`` is None or (ceiling dBFS, true_peak).
-
-    Sample-peak limiting leaves material below the ceiling bit-exact (PCM
-    deliveries). True-peak limiting runs the limiter at 4x the sample rate so
-    peaks between samples are held too (lossy deliveries).
-    """
-    if limiter is None:
-        return ''
-    ceiling, true_peak = limiter
-    limit = f'alimiter=limit={10**(ceiling/20):.9f}:level=0:latency=1'
-    if true_peak:
-        return f',aresample={TRUE_PEAK_OVERSAMPLE*AUDIO_RATE},{limit},aresample={AUDIO_RATE}'
-    return ','+limit
+def _layout_channels(layout):
+    return 2 if layout == 'stereo' else 6
 
 
-def _render_audio_chunk(events, origin_sample, keep_from, keep_samples, limiter, target, directory, cancelled, heartbeat):
+def _layout_name(layout):
+    return 'stereo' if layout == 'stereo' else '5.1'
+
+
+def _envelope_filter(event, clock):
+    """The event's gain envelope and any pan automation as one aeval."""
+    terms = [term(clock) for term in event['envelope']]
+    gain = '*'.join(terms)
+    if event.get('pan'):
+        left, right = event['pan'](clock)
+        if gain:
+            left, right = f'({left})*{gain}', f'({right})*{gain}'
+        return f",aeval=exprs='{left}|{right}':channel_layout=stereo"
+    if gain:
+        return f",aeval=exprs='val(ch)*{gain}':channel_layout=stereo"
+    return ''
+
+
+def _seek_offset(low):
+    """Inputs are seeked to whole seconds (on every sample grid), so a slice's
+    first sample is the same whichever slices share the input."""
+    return float(max(0, math.floor(low-.25)))
+
+
+def _render_audio_chunk(events, origin_sample, keep_from, keep_samples, target, directory, cancelled, heartbeat,
+                        layout='stereo'):
     """Mix the events that touch one chunk into a float WAV of exactly keep_samples samples."""
     origin = origin_sample/AUDIO_RATE
     chunk_end = (origin_sample+keep_from+keep_samples)/AUDIO_RATE+AUDIO_POSTROLL_SECONDS
+    channels, name = _layout_channels(layout), _layout_name(layout)
     slices = []
     for event in events:
         u0 = max(0.0, origin-event['start'])
@@ -1488,10 +1708,10 @@ def _render_audio_chunk(events, origin_sample, keep_from, keep_samples, limiter,
         run['numbers'].append(number)
     arguments = []
     for run in inputs:
-        offset = math.floor(max(0.0, run['low']-.25)*1_000_000)/1_000_000
+        offset = _seek_offset(run['low'])
         for number in run['numbers']:
             offsets[number] = (run['index'], offset)
-        seek = ['-ss', f'{offset:.6f}'] if offset > 0 else []
+        seek = ['-ss', f'{offset:.0f}'] if offset > 0 else []
         path = slices[run['numbers'][0]][0]['path']
         arguments.append([*seek, '-t', f"{run['high']-offset+.25:.6f}", '-protocol_whitelist', 'file', '-i', str(path)])
     filters, labels = [], []
@@ -1499,30 +1719,30 @@ def _render_audio_chunk(events, origin_sample, keep_from, keep_samples, limiter,
     # over from the loop above (a stale end silenced speed-changed clips).
     for number, (event, u0, u1, low, high) in enumerate(slices):
         index, offset = offsets[number]
-        chain = _trim_audio(filters, f'mix{number}', index, event['streams'], low-offset, high-low, event['reverse'])
+        chain = _trim_audio(filters, f'mix{number}', index, event['streams'], low-offset, high-low, event['reverse'],
+                            event.get('rates'), offset)
         chain += event['processing']
         delay = round((event['start']+u0-origin)*AUDIO_RATE)
         if abs(event['speed']-1) > 1e-9:
             # The tempo filter was given extra source past the slice (it drops
             # its last fragment); keep exactly the slice's own samples.
             chain += f",apad,atrim=end_sample={max(1, round((event['start']+u1-origin)*AUDIO_RATE)-max(0, delay))}"
-        clock = f'(t+{u0:.9f})' if u0 else 't'
-        envelope = [term(clock) for term in event['envelope']]
-        if envelope:
-            chain += f",aeval=exprs='val(ch)*{'*'.join(envelope)}':channel_layout=stereo"
-        filters.append(chain + f',adelay={max(0, delay)}S:all=1[audio{number}]')
+        chain += _envelope_filter(event, f'(t+{u0:.9f})' if u0 else 't')
+        if event.get('post'):
+            chain += ',' + event['post']
+        filters.append(chain + f',aformat=channel_layouts={name},adelay={max(0, delay)}S:all=1[audio{number}]')
         labels.append(f'[audio{number}]')
     total = keep_from+keep_samples
     if labels:
         mix = f"{''.join(labels)}amix=inputs={len(labels)}:duration=longest:normalize=0"
     else:
-        mix = f'anullsrc=r={AUDIO_RATE}:cl=stereo'
-    filters.append(f'{mix},aformat=sample_fmts=flt:sample_rates={AUDIO_RATE}:channel_layouts=stereo{_limiter_filter(limiter)},'
+        mix = f'anullsrc=r={AUDIO_RATE}:cl={name}'
+    filters.append(f'{mix},aformat=sample_fmts=flt:sample_rates={AUDIO_RATE}:channel_layouts={name},'
                    f'apad,atrim=start_sample={keep_from}:end_sample={total},asetpts=PTS-STARTPTS[aout]')
     command = ['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
                *(argument for entry in arguments for argument in entry),
                *_graph_args(';'.join(filters), directory, Path(target).stem), '-map', '[aout]',
-               '-c:a', 'pcm_f32le', '-ar', str(AUDIO_RATE), '-ac', '2', str(target)]
+               '-c:a', 'pcm_f32le', '-ar', str(AUDIO_RATE), '-ac', str(channels), str(target)]
     _run_ffmpeg(command, cancelled, heartbeat)
 
 
@@ -1541,28 +1761,31 @@ def _event_source_span(event, u0, u1):
     return low, high
 
 
-def _prerender_event(event, u0, u1, target, directory, cancelled, heartbeat):
-    """Render event-local u0..u1 of a stateful event (tempo, resampling) in one
-    FFmpeg run, reading only that span of its source. Returns a plain 48 kHz
-    stereo event that chunks can slice without restarting any filter state."""
+def _prerender_event(event, u0, u1, target, directory, cancelled, heartbeat, layout='stereo'):
+    """Render event-local u0..u1 of a stateful event (tempo, resampling, effects)
+    in one FFmpeg run, reading only that span of its source, envelope and
+    track processing included. Returns a plain 48 kHz event that chunks can
+    slice without restarting any filter state."""
     low, high = _event_source_span(event, u0, u1)
-    offset = math.floor(max(0.0, low-.25)*1_000_000)/1_000_000
-    seek = ['-ss', f'{offset:.6f}'] if offset > 0 else []
+    offset = _seek_offset(low)
+    seek = ['-ss', f'{offset:.0f}'] if offset > 0 else []
+    channels, name = _layout_channels(layout), _layout_name(layout)
     filters = []
-    chain = _trim_audio(filters, 'pre', 0, event['streams'], low-offset, high-low, event['reverse'])
+    chain = _trim_audio(filters, 'pre', 0, event['streams'], low-offset, high-low, event['reverse'], event.get('rates'), offset)
     samples = math.ceil((u1-u0)*AUDIO_RATE)+2
-    filters.append(chain + event['processing'] +
-                   f',aformat=sample_fmts=flt:sample_rates={AUDIO_RATE}:channel_layouts=stereo,apad,atrim=end_sample={samples},'
-                   'asetpts=PTS-STARTPTS[aout]')
+    chain += event['processing'] + f',aformat=sample_fmts=flt:sample_rates={AUDIO_RATE},apad,atrim=end_sample={samples}'
+    chain += _envelope_filter(event, f'(t+{u0:.9f})' if u0 else 't')
+    if event.get('post'):
+        chain += ',' + event['post']
+    filters.append(chain + f',aformat=sample_fmts=flt:sample_rates={AUDIO_RATE}:channel_layouts={name},asetpts=PTS-STARTPTS[aout]')
     command = ['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
                *seek, '-t', f'{high-offset+.25:.6f}', '-protocol_whitelist', 'file', '-i', str(event['path']),
                *_graph_args(';'.join(filters), directory, Path(target).stem), '-map', '[aout]',
-               '-c:a', 'pcm_f32le', '-ar', str(AUDIO_RATE), '-ac', '2', str(target)]
+               '-c:a', 'pcm_f32le', '-ar', str(AUDIO_RATE), '-ac', str(channels), str(target)]
     _run_ffmpeg(command, cancelled, heartbeat)
-    shift = u0
-    envelope = [(lambda t, term=term, shift=shift: term(f'({t}+{shift:.9f})')) for term in event['envelope']]
-    return dict(path=Path(target), streams={0: 2}, source=0.0, length=u1-u0, speed=1.0, reverse=False,
-                start=event['start']+u0, processing='anull', envelope=envelope, stateful=False, prerendered=True)
+    return dict(path=Path(target), streams={0: channels}, rates={0: AUDIO_RATE}, source=0.0, length=u1-u0, speed=1.0,
+                reverse=False, start=event['start']+u0, processing='anull', envelope=[], pan=None, post='',
+                stateful=False, prerendered=True, track=event.get('track'))
 
 
 def _audio_chunk_spans(events, first_sample, stop_sample):
@@ -1588,12 +1811,14 @@ def _audio_chunk_spans(events, first_sample, stop_sample):
 def _audio_schedule(events, first_sample, stop_sample):
     """Walk the chunks in render order. Yields (number, begin, end, origin,
     arrivals, chunk count): arrivals are (event, prerender span or None) for the
-    events that join at this chunk. A stateful event (tempo, resampling) that
-    crosses a seam is pre-rendered from u0 to u1 when it arrives."""
+    events that join at this chunk. Every stateful event (tempo, resampling,
+    effects) is pre-rendered when it arrives, from a point on a fixed
+    event-local grid, so its waveform does not depend on where chunks fall."""
     chunks = _audio_chunk_spans(events, first_sample, stop_sample)
     preroll = round(AUDIO_PREROLL_SECONDS*AUDIO_RATE)
     origins = [max(0, begin-preroll) for begin, _ in chunks]
     last_needed = stop_sample/AUDIO_RATE+AUDIO_POSTROLL_SECONDS
+    first_needed = origins[0]/AUDIO_RATE if origins else 0.0
     pointer = 0
     for number, (begin, end) in enumerate(chunks):
         origin = origins[number]
@@ -1601,10 +1826,10 @@ def _audio_schedule(events, first_sample, stop_sample):
         while pointer < len(events) and events[pointer]['start'] < end/AUDIO_RATE+AUDIO_POSTROLL_SECONDS:
             event = events[pointer]; pointer += 1
             span = None
-            u0 = max(0.0, origin/AUDIO_RATE-event['start'])
-            spans_seam = number+1 < len(origins) and event['start']+event['length'] > origins[number+1]/AUDIO_RATE
             reversed_span = event['length']*event['speed'] if event['reverse'] else 0
-            if event.get('stateful') and (u0 > 0 or spans_seam) and reversed_span <= AUDIO_REVERSE_PRERENDER_SECONDS:
+            if event.get('stateful') and reversed_span <= AUDIO_REVERSE_PRERENDER_SECONDS:
+                needed = max(0.0, first_needed-event['start'])
+                u0 = math.floor(needed/PRERENDER_ANCHOR_SECONDS)*PRERENDER_ANCHOR_SECONDS
                 u1 = min(event['length'], last_needed-event['start'])
                 if u1-u0 > 1/AUDIO_RATE:
                     span = (u0, u1)
@@ -1612,12 +1837,12 @@ def _audio_schedule(events, first_sample, stop_sample):
         yield number, begin, end, origin, arrivals, len(chunks)
 
 
-def _prerender_bytes(u0, u1):
-    """Size of a pre-rendered event file (32-bit float stereo WAV)."""
-    return (math.ceil((u1-u0)*AUDIO_RATE)+2)*2*4 + 4096
+def _prerender_bytes(u0, u1, channels=2):
+    """Size of a pre-rendered event file (32-bit float WAV)."""
+    return (math.ceil((u1-u0)*AUDIO_RATE)+2)*channels*4 + 4096
 
 
-def _prerender_peak_bytes(events, first_sample, stop_sample):
+def _prerender_peak_bytes(events, first_sample, stop_sample, channels=2):
     """Most pre-rendered event bytes on disk at once, following _render_audio's
     order exactly: files are made as their events arrive and deleted once a
     chunk starts after their end."""
@@ -1625,36 +1850,143 @@ def _prerender_peak_bytes(events, first_sample, stop_sample):
     for _, _, _, origin, arrivals, _ in _audio_schedule(events, first_sample, stop_sample):
         for event, span in arrivals:
             if span:
-                alive.append((event['start']+span[1], _prerender_bytes(*span)))
+                alive.append((event['start']+span[1], _prerender_bytes(*span, channels)))
         peak = max(peak, sum(size for _, size in alive))
         alive = [(finish, size) for finish, size in alive if finish > origin/AUDIO_RATE]
     return peak
 
 
-def _render_audio(events, first_sample, stop_sample, limiter, directory, cancelled, heartbeat, progress=None):
-    """Render the mix as consecutive chunk files; returns their paths in order."""
+def _render_audio(events, first_sample, stop_sample, directory, cancelled, heartbeat, progress=None, layout='stereo',
+                  prefix='audio'):
+    """Render the mix as consecutive chunk files; returns their paths in order.
+    Pre-renders that arrive together run in parallel (bounded)."""
+    from concurrent.futures import ThreadPoolExecutor
     paths, active = [], []
     prerendered = 0
-    for number, begin, end, origin, arrivals, count in _audio_schedule(events, first_sample, stop_sample):
-        if cancelled and cancelled.is_set(): raise InterruptedError('Export cancelled')
-        for event, span in arrivals:
-            if span:
-                target = Path(directory)/f'event-{prerendered:06d}.wav'; prerendered += 1
-                event = _prerender_event(event, *span, target, directory, cancelled, heartbeat)
-            active.append(event)
-        for event in active:
-            if event.get('prerendered') and event['start']+event['length'] <= origin/AUDIO_RATE:
-                Path(event['path']).unlink(missing_ok=True)
-        active = [event for event in active if event['start']+event['length'] > origin/AUDIO_RATE]
-        target = Path(directory)/f'audio-{number:05d}.wav'
-        _render_audio_chunk([event for event in active if event['start'] < end/AUDIO_RATE+AUDIO_POSTROLL_SECONDS], origin, begin-origin, end-begin,
-                            limiter, target, directory, cancelled, heartbeat)
-        paths.append(target)
-        if progress: progress((number+1)/count)
+    with ThreadPoolExecutor(max_workers=PRERENDER_WORKERS) as pool:
+        for number, begin, end, origin, arrivals, count in _audio_schedule(events, first_sample, stop_sample):
+            if cancelled and cancelled.is_set(): raise InterruptedError('Export cancelled')
+            jobs = []
+            for event, span in arrivals:
+                if span:
+                    target = Path(directory)/f'{prefix}-event-{prerendered:06d}.wav'; prerendered += 1
+                    jobs.append(pool.submit(_prerender_event, event, *span, target, directory, cancelled, heartbeat, layout))
+                else:
+                    jobs.append(None)
+            for (event, _), job in zip(arrivals, jobs):
+                active.append(job.result() if job else event)
+            for event in active:
+                if event.get('prerendered') and event['start']+event['length'] <= origin/AUDIO_RATE:
+                    Path(event['path']).unlink(missing_ok=True)
+            active = [event for event in active if event['start']+event['length'] > origin/AUDIO_RATE]
+            target = Path(directory)/f'{prefix}-{number:05d}.wav'
+            _render_audio_chunk([event for event in active if event['start'] < end/AUDIO_RATE+AUDIO_POSTROLL_SECONDS], origin,
+                                begin-origin, end-begin, target, directory, cancelled, heartbeat, layout)
+            paths.append(target)
+            if progress: progress((number+1)/count)
     for event in active:
         if event.get('prerendered'):
             Path(event['path']).unlink(missing_ok=True)
     return paths
+
+
+def _audio_options(options, codec):
+    layout = options.get('audioLayout', 'stereo')
+    if layout not in AUDIO_LAYOUTS:
+        raise ValueError('Invalid audio layout: use stereo, 5.1 or 5.1-downmix')
+    iso = options.get('isoTracks', False)
+    if not isinstance(iso, bool): raise ValueError('Invalid isoTracks setting: use true or false')
+    if codec != 'stems' and iso: raise ValueError('Track isos are part of the stems export')
+    return layout, audio_loudness.normalization_options(options), iso
+
+
+def _concat_input(directory, name, paths):
+    return ['-f', 'concat', '-safe', '0', '-i', str(_concat_list(directory, name, paths))]
+
+
+def _program_bus(events, plans, master_fx, first_sample, stop_sample, layout, directory, cancelled, heartbeat, progress,
+                 name='mix', master_linear_only=False):
+    """Mix ``events`` into the program bus. Tracks with dynamics (compressor,
+    gate, de-noise) are mixed on their own and processed as a whole; the
+    master effects follow. Returns FFmpeg input arguments of the float program."""
+    mixed = 'stereo' if layout == 'stereo' else '5.1'
+    dynamic = sorted({event['track'] for event in events if plans[event['track']]['dynamics']}, key=lambda key: abs(int(key)))
+    groups = [(None, [event for event in events if event['track'] not in dynamic])]
+    groups += [(track, [event for event in events if event['track'] == track]) for track in dynamic]
+    inputs, chains = [], []
+    for number, (track, members) in enumerate(groups):
+        if track is not None or members or len(groups) == 1:
+            share = (lambda fraction, number=number: progress((number+fraction)/len(groups))) if progress else None
+            chunks = _render_audio(members, first_sample, stop_sample, directory, cancelled, heartbeat, share, mixed,
+                                   prefix=f'{name}-{number:03d}')
+            inputs.append(_concat_input(directory, f'{name}-{number:03d}.txt', chunks))
+            chains.append(audio_dsp.ffmpeg_filters(plans[track]['fx']) if track is not None else [])
+    master = audio_dsp.ffmpeg_filters({key: value for key, value in master_fx.items()
+                                       if not master_linear_only or key == 'eq'})
+    downmix = [DOWNMIX] if layout == '5.1-downmix' else []
+    if len(inputs) == 1 and not chains[0] and not master and not downmix:
+        return inputs[0]
+    total = stop_sample-first_sample
+    graph = [f"[{index}:a]{','.join(chain) or 'anull'}[g{index}]" for index, chain in enumerate(chains)]
+    labels = ''.join(f'[g{index}]' for index in range(len(chains)))
+    tail = ','.join([*master, *downmix, f"aformat=sample_fmts=flt:channel_layouts={'stereo' if layout != '5.1' else '5.1'}",
+                     f'atrim=end_sample={total}'])
+    graph.append(f'{labels}amix=inputs={len(chains)}:duration=longest:normalize=0,{tail}[out]' if len(chains) > 1 else
+                 f'[g0]{tail}[out]')
+    target = Path(directory)/f'{name}-program.wav'
+    _run_ffmpeg(['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
+                 *(argument for entry in inputs for argument in entry),
+                 *_graph_args(';'.join(graph), directory, f'{name}-program'), '-map', '[out]',
+                 '-c:a', 'pcm_f32le', '-ar', str(AUDIO_RATE), str(target)], cancelled, heartbeat)
+    for entry in inputs:
+        for chunk in Path(entry[-1]).read_text(encoding='utf-8').splitlines():
+            (Path(directory)/chunk[6:-1]).unlink(missing_ok=True)
+    return ['-i', str(target)]
+
+
+def _program_audio(project, events, plans, codec, options, settings, first_sample, stop_sample, directory, cancelled,
+                   heartbeat, progress, output):
+    """Mix, finish (normalize, limit) and encode the program sound, measured as
+    delivered. Returns (FFmpeg input args for the mux, or None when ``output``
+    itself was written; the audio report)."""
+    layout, normalization, limiter, peak_safe = settings
+    channels = 6 if layout == '5.1' else 2
+    total = stop_sample-first_sample
+    master_fx = audio_dsp.normalize(project.get('masterFx'), audio_dsp.MASTER_KINDS, 'master effects')
+    share = lambda low, high: (lambda fraction: progress(low+(high-low)*fraction)) if progress else None
+    program = _program_bus(events, plans, master_fx, first_sample, stop_sample, layout, directory, cancelled, heartbeat,
+                           share(0, .7))
+    finished, report, finished_measurement = audio_loudness.finish(
+        program, total, directory, ceiling=limiter, normalization=normalization, channels=channels,
+        cancelled=cancelled, heartbeat=heartbeat, progress=share(.7, .85))
+    report = {'container': {'wav': 'WAV', 'prores': 'MOV (PCM)', 'h264': 'MP4 (AAC)', 'loudness': 'analysis'}.get(codec, codec),
+              'layout': layout, 'channels': channels, **report}
+    pcm = ['-c:a', 'pcm_s24le', '-ar', str(AUDIO_RATE), '-ac', str(channels)]
+    if codec in ('wav', 'prores'):
+        target = Path(output) if codec == 'wav' else Path(directory)/'delivery.wav'
+        _run_ffmpeg(['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y', *finished, *pcm, str(target)],
+                    cancelled, heartbeat)
+        delivered = audio_loudness.measure(['-i', str(target)], cancelled, heartbeat, channels=channels)
+        report['output'] = audio_loudness.public(delivered)
+        _legacy_report(report, delivered, limiter)
+        if progress: progress(1.0)
+        return (None if codec == 'wav' else ['-i', str(target)]), report
+    bitrate = int(_number(options.get('audioBitrate', 192), 'audio bitrate', 64, 320))*(2 if channels == 6 else 1)
+    audio_file, measured = _encode_aac(finished, f'{bitrate}k', limiter, peak_safe, directory, cancelled, heartbeat, channels)
+    report['output'] = audio_loudness.public(measured['measurement'])
+    report['aacPeakSafe'] = peak_safe
+    report['aacGainDb'] = measured['gainDb']
+    report['gainDb'] = round((report.get('gainDb') or 0)+measured['gainDb'], 3)
+    _legacy_report(report, measured['measurement'], limiter)
+    if progress: progress(1.0)
+    return ['-i', str(audio_file)], report
+
+
+def _legacy_report(report, delivered, ceiling):
+    """The keys the export dialog has always shown (decoded = as delivered)."""
+    finite = lambda value: round(value, 2) if math.isfinite(value) else None
+    report.update(ceilingDb=ceiling, decodedTruePeakDb=finite(delivered['truePeak']), loudnessLufs=finite(delivered['integrated']))
+
 
 
 def _concat_list(directory, name, paths):
@@ -1718,7 +2050,7 @@ def _track_hidden(track_state, kind, track):
 
 def _export_settings(options):
     codec = options.get('codec','h264')
-    if codec not in ('h264','prores','wav'): raise ValueError('Unsupported export codec')
+    if codec not in ('h264','prores','wav','stems','loudness'): raise ValueError('Unsupported export codec')
     color_space = options.get('colorSpace','source')
     if color_space!='source' and (codec!='prores' or color_space not in ('rec709','pq')):
         raise ValueError('Invalid export color space')
@@ -1773,7 +2105,7 @@ def _validate_timeline(project):
 
 def _estimated_bytes(width, height, fps, seconds, codec):
     bits_per_pixel = 3.6 if codec == 'prores' else .3
-    video = 0 if codec == 'wav' else width*height*fps*seconds*bits_per_pixel/8
+    video = 0 if codec in AUDIO_ONLY_CODECS else width*height*fps*seconds*bits_per_pixel/8
     return video, seconds*AUDIO_RATE*2*4
 
 
@@ -1783,10 +2115,14 @@ def _render_prepared(project, output_path, *, options=None, progress=None, cance
     import copy
     options = dict(options or {})
     codec, color_space, limiter, language, peak_safe = _export_settings(options)
+    layout, normalization, iso = _audio_options(options, codec)
+    if normalization and normalization[1] == 'limit' and limiter is None:
+        raise ValueError('Normalizing with limiting needs the limiter: turn it on or choose linear normalization')
+    audio_only = codec in AUDIO_ONLY_CODECS
     # One private copy: probe results are cached on its media items.
     project = copy.deepcopy(project)
     total = _validate_timeline(project)
-    width, height = _frame_size(project) if codec != 'wav' else (16, 16)
+    width, height = _frame_size(project) if not audio_only else (16, 16)
     fps_fraction = _sequence_fps(project)
     fps = float(fps_fraction)
     total = math.ceil((total-1e-9)*fps)/fps
@@ -1820,7 +2156,7 @@ def _render_prepared(project, output_path, *, options=None, progress=None, cance
     profiles = set()
     video_clips = sorted((clip for clip in picture_clips if clip.get('type')=='video'),
                          key=lambda clip:(clip.get('track',0),float(clip['start'])))
-    if codec!='wav' and not muted.get('video'):
+    if not audio_only and not muted.get('video'):
         for identity in _picture_range_media(video_clips,media_by_id,fps,first,stop):
             item = media_by_id.get(identity)
             if item is None or item.get('nativeGenerator') is not None: continue
@@ -1857,22 +2193,28 @@ def _render_prepared(project, output_path, *, options=None, progress=None, cance
     solo=any(v.get('solo') for v in track_mix.values() if isinstance(v,dict))
     first_sample = round(Fraction(first)*AUDIO_RATE/fps_fraction)
     stop_sample = round(Fraction(stop)*AUDIO_RATE/fps_fraction)
+    plans = {}
     if muted.get('audio'):
         events = []
     else:
         events = _audio_events(project['clips'], media_by_id, fps, probes, track_mix, solo,
-                               (max(0, out_start-AUDIO_PREROLL_SECONDS), out_end), heartbeat)
+                               (max(0, out_start-AUDIO_PREROLL_SECONDS), out_end), heartbeat, layout=layout, plans=plans)
+    channels = 2 if layout == 'stereo' else 6
     root = Path(work_directory) if work_directory else work_root()
     video_bytes, audio_bytes = _estimated_bytes(width, height, fps, out_duration, codec)
     # A speed-changed or resampled clip that crosses a chunk seam is rendered
     # whole first (32-bit float stereo). Count the most of those files that are
     # on disk at once, following the mix's own schedule (overlapping ones add up).
     # Lossy deliveries also keep an AAC file until the mux.
-    audio_bytes += _prerender_peak_bytes(events, first_sample, stop_sample)
+    # Chunks, the program bus, the finished program and the delivered PCM (float, float, float, 24-bit).
+    audio_bytes = audio_bytes*channels/2*3.75 + _prerender_peak_bytes(events, first_sample, stop_sample, channels)
+    if codec == 'stems':
+        audio_bytes += out_duration*AUDIO_RATE*channels*3*(len({plan['stem'] for plan in plans.values()})+
+                                                           (len(plans) if iso else 0)+1)
     if codec == 'h264':
         audio_bytes += out_duration*40_000
     output = Path(output_path)
-    final_bytes = video_bytes + (out_duration*AUDIO_RATE*2*3 if codec != 'h264' else out_duration*40_000)
+    final_bytes = video_bytes + (out_duration*AUDIO_RATE*channels*3 if codec != 'h264' else out_duration*40_000)
     same_volume = output.parent.exists() and os.stat(output.parent).st_dev == os.stat(root).st_dev
     _ensure_space(root, video_bytes+audio_bytes+(final_bytes if same_volume else 0), 'this export')
     if not same_volume and output.parent.exists():
@@ -1880,28 +2222,27 @@ def _render_prepared(project, output_path, *, options=None, progress=None, cance
     def stage(low, high):
         return (lambda fraction: progress(low+(high-low)*fraction)) if progress else None
     with WorkDirectory('splice-segments-', root) as directory:
-        if codec=='wav':
-            chunks = _render_audio(events, first_sample, stop_sample, None if limiter is None else (limiter, False),
-                                   directory, cancelled, heartbeat, stage(0, .95))
-            _run_ffmpeg(['ffmpeg','-nostdin','-hide_banner','-loglevel','error','-y','-f','concat','-safe','0',
-                         '-i',str(_concat_list(directory,'audio.txt',chunks)),'-c:a','pcm_s24le','-ar',str(AUDIO_RATE),
-                         str(output)],cancelled,heartbeat)
+        settings = (layout, normalization, limiter, peak_safe)
+        if codec in ('wav', 'loudness', 'stems'):
+            if codec == 'loudness':
+                result = _analyze_program(project, events, plans, settings, first_sample, stop_sample, directory, cancelled,
+                                          heartbeat, progress, output)
+            elif codec == 'stems':
+                result = _render_stems(project, events, plans, settings, iso, first_sample, stop_sample, directory, cancelled,
+                                       heartbeat, progress, output)
+            else:
+                result = _program_audio(project, events, plans, codec, options, settings, first_sample, stop_sample,
+                                        directory, cancelled, heartbeat, progress, output)[1]
+            if report is not None:
+                report['audio'] = result
             if progress: progress(1.0)
             return output.stat().st_size
         segments = _render_picture(project, picture_clips, first, stop, total_frames, fps, width, height, codec, options,
                                    directory, suffix, cancelled, heartbeat, stage(0, .8))
-        lossy = codec != 'prores'
-        mix_limiter = None if limiter is None else (limiter, lossy)
-        chunks = _render_audio(events, first_sample, stop_sample, mix_limiter, directory, cancelled, heartbeat, stage(.8, .92))
-        audio_list = _concat_list(directory,'audio.txt',chunks)
-        if lossy:
-            bitrate = str(int(_number(options.get('audioBitrate',192),'audio bitrate',64,320)))+'k'
-            audio_file, measured = _encode_aac(audio_list, bitrate, limiter, peak_safe, directory, cancelled, heartbeat)
-            if report is not None and measured:
-                report['audio'] = measured
-            audio_input = ['-i',str(audio_file)]
-        else:
-            audio_input = ['-f','concat','-safe','0','-i',str(audio_list)]
+        audio_input, audio_report = _program_audio(project, events, plans, codec, options, settings, first_sample, stop_sample,
+                                                   directory, cancelled, heartbeat, stage(.8, .95), None)
+        if report is not None:
+            report['audio'] = audio_report
         if progress: progress(.96)
         command=['ffmpeg','-nostdin','-hide_banner','-loglevel','error','-y',
                  '-f','concat','-safe','0','-i',str(_concat_list(directory,'segments.txt',segments)),
@@ -1914,10 +2255,7 @@ def _render_prepared(project, output_path, *, options=None, progress=None, cance
         command.extend(['-map','0:v:0','-map','1:a:0'])
         if with_captions: command.extend(['-map','2:s:0'])
         command.extend(['-c:v','copy'])
-        if codec=='prores':
-            command.extend(['-c:a','pcm_s24le','-ar',str(AUDIO_RATE)])
-        else:
-            command.extend(['-c:a','copy'])
+        command.extend(['-c:a','copy'])
         if with_captions:
             command.extend(['-c:s','mov_text','-metadata:s:s:0',f'language={language}','-disposition:s:0','default'])
         command.extend(_color_tags(profile, codec))
@@ -1932,75 +2270,158 @@ def _render_prepared(project, output_path, *, options=None, progress=None, cance
         return output.stat().st_size
 
 
-def _measure_decoded(path, cancelled, heartbeat):
-    """Decoded true peak (dBTP, 4x oversampled) and integrated loudness (LUFS), ITU-R BS.1770."""
-    report = _run_ffmpeg(['ffmpeg','-nostdin','-hide_banner','-nostats','-loglevel','info','-i',str(path),
-                          '-af','ebur128=peak=true:framelog=quiet','-f','null','-'],cancelled,heartbeat)
-    import re
-    summary = report[report.rfind('Integrated loudness:'):]
-    peak = re.search(r'True peak:\s+Peak:\s+(-?[0-9.]+|-inf)\s+dBFS', summary)
-    loudness = re.search(r'I:\s+(-?[0-9.]+|-inf|nan)\s+LUFS', summary)
-    if not peak:
-        raise ValueError('Could not measure the exported audio peak')
-    value = lambda text: -math.inf if text == '-inf' else float(text)
-    return value(peak.group(1)), (value(loudness.group(1)) if loudness and loudness.group(1) != 'nan' else -math.inf)
-
-
-def _true_peak_db(path, cancelled, heartbeat):
-    """Decoded true peak (dBTP, 4x oversampled, ITU-R BS.1770) of an audio file."""
-    return _measure_decoded(path, cancelled, heartbeat)[0]
-
-
 def _db_text(value):
     return f'{value:+.1f}'.replace('+', '+' if value > 0 else '').replace('-', '\u2212') if math.isfinite(value) else '-inf'
 
 
-def _encode_aac(audio_list, bitrate, ceiling, peak_safe, directory, cancelled, heartbeat):
-    """Encode the limited mix to AAC once at unity gain and measure the decoded file.
+def _analyze_program(project, events, plans, settings, first_sample, stop_sample, directory, cancelled, heartbeat,
+                     progress, output):
+    """Analyze program: the real mix (master bus included, before normalization
+    and limiting) measured to BS.1770 / EBU R128. Writes the numbers as JSON."""
+    layout = settings[0]
+    master_fx = audio_dsp.normalize(project.get('masterFx'), audio_dsp.MASTER_KINDS, 'master effects')
+    share = (lambda fraction: progress(.8*fraction)) if progress else None
+    program = _program_bus(events, plans, master_fx, first_sample, stop_sample, layout, directory, cancelled, heartbeat, share)
+    measured = audio_loudness.measure_full(program, cancelled, heartbeat, channels=6 if layout == '5.1' else 2,
+                                           directory=directory)
+    result = {'container': 'analysis', 'layout': layout, 'seconds': round((stop_sample-first_sample)/AUDIO_RATE, 6),
+              'startSeconds': round(first_sample/AUDIO_RATE, 6), 'program': audio_loudness.public(measured)}
+    Path(output).write_text(json.dumps(result, indent=2), encoding='utf-8')
+    return result
 
-    Returns (path, measurements). Without a ceiling (limiter off) nothing is
-    measured. By default the program level is never changed here: a decoded
-    true peak over the ceiling (AAC overshoot) is reported with a warning.
-    With ``peak_safe`` (export option aacPeakSafe) the whole program is
-    re-encoded quieter until the decoded true peak fits: the first gain is the
-    measured excess rounded up to the next AAC_PEAK_STEP_DB, then one step more
-    per attempt. Every step depends only on the decoded measurements, so the
-    same mix always gets the same gain.
+
+def _render_stems(project, events, plans, settings, iso, first_sample, stop_sample, directory, cancelled, heartbeat,
+                  progress, output):
+    """Stems: one WAV per stem (tracks grouped by their stem name), the finished
+    mix and optional per-track isos, full length and sample-aligned, in one
+    uncompressed zip. Stems carry the master EQ and the program gain but no
+    master compressor and no limiter, so with a linear master they sum to the
+    mix as long as the limiter does not act."""
+    import zipfile
+    layout, normalization, limiter, _ = settings
+    channels = 6 if layout == '5.1' else 2
+    total = stop_sample-first_sample
+    master_fx = audio_dsp.normalize(project.get('masterFx'), audio_dsp.MASTER_KINDS, 'master effects')
+    stems = {}
+    for key in sorted(plans, key=lambda key: abs(int(key))):
+        stems.setdefault(plans[key]['stem'] or 'Other', []).append(key)
+    steps = len(stems)+2+(len(plans) if iso else 0)
+    done = [0]
+
+    def step():
+        done[0] += 1
+        if progress: progress(done[0]/steps)
+    buses = {}
+    for number, (name, tracks) in enumerate(stems.items()):
+        buses[name] = _program_bus([event for event in events if event['track'] in tracks], plans, {}, first_sample,
+                                   stop_sample, '5.1' if layout != 'stereo' else 'stereo', directory, cancelled, heartbeat,
+                                   None, name=f'stem{number:02d}')
+        step()
+    master = audio_dsp.ffmpeg_filters(master_fx)
+    linear_master = audio_dsp.ffmpeg_filters({key: value for key, value in master_fx.items() if key == 'eq'})
+    downmix = [DOWNMIX] if layout == '5.1-downmix' else []
+    name = 'stereo' if layout != '5.1' else '5.1'
+    sources = list(buses.values()) or [_program_bus([], plans, {}, first_sample, stop_sample, layout, directory, cancelled,
+                                                    heartbeat, None, name='silence')]
+    labels = ''.join(f'[{index}:a]' for index in range(len(sources)))
+    mixed = f'{labels}amix=inputs={len(sources)}:duration=longest:normalize=0,' if len(sources) > 1 else '[0:a]'
+    program = Path(directory)/'stems-program.wav'
+    tail = ','.join([*master, *downmix, f'aformat=sample_fmts=flt:channel_layouts={name}', f'atrim=end_sample={total}'])
+    _run_ffmpeg(['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y', *(a for entry in sources for a in entry),
+                 *_graph_args(f'{mixed}{tail}[out]', directory, 'stems-program'), '-map', '[out]', '-c:a', 'pcm_f32le',
+                 str(program)], cancelled, heartbeat)
+    finished, report, _ = audio_loudness.finish(['-i', str(program)], total, directory, ceiling=limiter,
+                                                normalization=normalization, channels=channels, cancelled=cancelled,
+                                                heartbeat=heartbeat)
+    step()
+    gain = report.get('gainDb') or 0.0
+    pcm = ['-c:a', 'pcm_s24le', '-ar', str(AUDIO_RATE), '-ac', str(channels)]
+    files = []
+
+    def deliver(arguments, filters, target):
+        chain = ','.join([*filters, f'aformat=channel_layouts={name}']) if filters else f'aformat=channel_layouts={name}'
+        _run_ffmpeg(['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y', *arguments, '-af', chain, *pcm,
+                     str(target)], cancelled, heartbeat)
+        files.append(target)
+    mix_file = Path(directory)/'mix.wav'
+    deliver(finished, [], mix_file)
+    delivered = audio_loudness.measure(['-i', str(mix_file)], cancelled, heartbeat, channels=channels)
+    report.update(container='stems', layout=layout, channels=channels, output=audio_loudness.public(delivered))
+    _legacy_report(report, delivered, limiter)
+    gain_filter = [f'volume={gain!r}dB:precision=double'] if gain else []
+    report['stems'] = []
+    for number, (stem, source) in enumerate(buses.items()):
+        safe = ''.join(char if char.isalnum() or char in '-_' else '_' for char in stem)
+        target = Path(directory)/f'stem-{number+1:02d}-{safe}.wav'
+        deliver(source, [*linear_master, *downmix, *gain_filter], target)
+        report['stems'].append({'name': stem, 'file': target.name, 'tracks': [f'A{abs(int(key))}' for key in stems[stem]]})
+    report['stemsSumToMix'] = 'comp' not in master_fx and not (report.get('limiter') or {}).get('acted')
+    if not report['stemsSumToMix']:
+        report['stemsNote'] = ('Stems are taken before the master compressor and the limiter, which acted on this mix, '
+                               'so they do not sum exactly to it.')
+    if iso:
+        report['isos'] = []
+        for key in sorted(plans, key=lambda key: abs(int(key))):
+            bus = _program_bus([event for event in events if event['track'] == key], plans, {}, first_sample, stop_sample,
+                               '5.1' if layout != 'stereo' else 'stereo', directory, cancelled, heartbeat, None,
+                               name=f'iso{abs(int(key)):02d}')
+            target = Path(directory)/f'iso-A{abs(int(key))}.wav'
+            deliver(bus, downmix, target)
+            report['isos'].append({'track': f'A{abs(int(key))}', 'file': target.name})
+            step()
+    report['startSeconds'] = round(first_sample/AUDIO_RATE, 6)
+    with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
+        for path in files:
+            archive.write(path, path.name)
+            path.unlink()
+        archive.writestr('report.json', json.dumps(report, indent=2))
+    return report
+
+
+def _encode_aac(finished, bitrate, ceiling, peak_safe, directory, cancelled, heartbeat, channels=2):
+    """Encode the finished mix to AAC once at unity gain and measure the decoded file.
+
+    Returns (path, {'measurement', 'gainDb'}). By default the program level is
+    never changed here: a decoded true peak over the ceiling (AAC overshoot) is
+    reported with a warning. With ``peak_safe`` (export option aacPeakSafe) the
+    whole program is re-encoded quieter until the decoded true peak fits: the
+    first gain is the measured excess rounded up to the next AAC_PEAK_STEP_DB,
+    then one step more per attempt. Every step depends only on the decoded
+    measurements, so the same mix always gets the same gain.
     """
     import warnings
     target = Path(directory)/'audio.m4a'
 
     def encode(gain):
         volume = ['-af', f'volume={gain:.2f}dB'] if gain else []
-        _run_ffmpeg(['ffmpeg','-nostdin','-hide_banner','-loglevel','error','-y','-f','concat','-safe','0',
-                     '-i',str(audio_list),*volume,'-c:a','aac','-b:a',bitrate,str(target)],cancelled,heartbeat)
+        _run_ffmpeg(['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y', *finished, *volume,
+                     '-c:a', 'aac', '-b:a', bitrate, '-ac', str(channels), str(target)], cancelled, heartbeat)
+
+    def decoded():
+        return audio_loudness.measure(['-i', str(target)], cancelled, heartbeat, channels=channels)
     encode(0)
-    if ceiling is None:
-        return target, None
-    peak, loudness = _measure_decoded(target, cancelled, heartbeat)
-    # JSON has no infinities: silence reports null peak and loudness.
-    finite = lambda value: round(value, 2) if math.isfinite(value) else None
-    measured = {'ceilingDb': ceiling, 'decodedTruePeakDb': finite(peak), 'loudnessLufs': finite(loudness),
-                'aacPeakSafe': peak_safe, 'gainDb': 0.0}
-    if peak <= ceiling:
-        return target, measured
+    measurement = decoded()
+    gain = 0.0
+    peak, loudness = measurement['truePeak'], measurement['integrated']
+    if ceiling is None or peak <= ceiling:
+        return target, {'measurement': measurement, 'gainDb': gain}
     if not peak_safe:
         warnings.warn(f'The MP4 audio peaks at {_db_text(peak)} dBTP once decoded, above the {_db_text(ceiling)} dBTP ceiling: '
                       'the mix is limited to the ceiling, and AAC encoding adds the overshoot. Program loudness was left '
                       f'unchanged ({_db_text(loudness)} LUFS). To deliver under the ceiling, lower the limiter ceiling, export with '
                       'the aacPeakSafe option (it lowers the whole program until the decoded peak fits), or export WAV or ProRes.',
                       stacklevel=2)
-        return target, measured
+        return target, {'measurement': measurement, 'gainDb': gain}
     excess = peak-ceiling
     gain = -math.ceil(excess/AAC_PEAK_STEP_DB-1e-9)*AAC_PEAK_STEP_DB
     for attempt in range(AAC_PEAK_ATTEMPTS):
         encode(gain)
-        peak, loudness = _measure_decoded(target, cancelled, heartbeat)
+        measurement = decoded()
+        peak, loudness = measurement['truePeak'], measurement['integrated']
         if peak <= ceiling:
             break
         if attempt+1 < AAC_PEAK_ATTEMPTS:
             gain -= AAC_PEAK_STEP_DB
-    measured.update(decodedTruePeakDb=finite(peak), loudnessLufs=finite(loudness), gainDb=round(gain, 2))
     if peak <= ceiling:
         warnings.warn(f'aacPeakSafe lowered the whole program by {-gain:.1f} dB '
                       f'(now {_db_text(loudness)} LUFS) so the decoded MP4 audio peaks at {_db_text(peak)} dBTP, '
@@ -2008,7 +2429,7 @@ def _encode_aac(audio_list, bitrate, ceiling, peak_safe, directory, cancelled, h
     else:
         warnings.warn(f'aacPeakSafe lowered the whole program by {-gain:.1f} dB, but the decoded MP4 audio still '
                       f'peaks at {_db_text(peak)} dBTP, above the {_db_text(ceiling)} dBTP ceiling.', stacklevel=2)
-    return target, measured
+    return target, {'measurement': measurement, 'gainDb': round(gain, 2)}
 
 
 def _render_picture(project, picture, first, stop, total_frames, fps, width, height, codec, options, directory,

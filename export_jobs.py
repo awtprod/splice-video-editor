@@ -27,7 +27,8 @@ import warnings
 JOB_STALL_GRACE = 120
 
 FORMATS = {'h264':('mp4','video/mp4',True), 'prores':('mov','video/quicktime',False),
-           'wav':('wav','audio/wav',True)}
+           'wav':('wav','audio/wav',True), 'stems':('zip','application/zip',False),
+           'loudness':('json','application/json',False)}
 
 
 def _worker(project, options, output, progress, beat, cancelled, connection):
