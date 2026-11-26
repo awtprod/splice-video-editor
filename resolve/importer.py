@@ -8,9 +8,8 @@ Anything Splice does not represent is listed in ``compatibilityWarnings`` with t
 track and clip it belongs to; nothing is dropped without a line there.
 """
 import math
-import re
 from fractions import Fraction
-from pathlib import PureWindowsPath
+from pathlib import PurePath, PureWindowsPath
 
 from . import blobs
 from .blobs import BlobError
@@ -27,10 +26,28 @@ _MEDIA_TYPES = {'Sm2MpVideoClip': 'video', 'Sm2MpAudioClip': 'audio', 'Sm2MpStil
 _NESTED = {'timeline': 'nested timeline', 'compound': 'compound clip', 'multicam': 'multicam clip'}
 _AUDIO_FADES = {'Cross Fade 0DB': 'Constant Gain', 'Cross Fade +3DB': 'Constant Power',
                 'Cross Fade +3 dB': 'Constant Power', 'Cross Fade 0 dB': 'Constant Gain'}
-# EffectFiltersBA: effect type 4 is the Inspector's Transform, 2 its Composite (opacity).
-_TRANSFORM, _COMPOSITE = 4, 2
+# EffectFiltersBA: effect type 4 is the Inspector's Transform, 2 its Composite (opacity), 124 a
+# sound clip's Volume. Measured in projects saved by Resolve 21.1 with one setting changed at a
+# time: Transform parameter 40 (Position X) holds a fraction of the timeline width (+200 px on a
+# 1920-wide timeline is 0.1041667), Volume parameter 95 holds decibels (+6 dB is 6.0). Position
+# Y (41), Zoom (42, 43) and Opacity (Composite 1) were not measured: their units are inferred and
+# every clip that uses them says so.
+_TRANSFORM, _COMPOSITE, _AUDIO_VOLUME = 4, 2, 124
 _POSITION_X, _POSITION_Y, _ZOOM_X, _ZOOM_Y = 40, 41, 42, 43
 _OPACITY = 1
+_VOLUME_DB = 95
+# Splice's clip volume is a linear gain in percent, 0 to 200 (+6.02 dB).
+MAX_VOLUME = 200.0
+# Sm2TiTrack/Flags and Sm2TiVideoClip/Flags, measured the same way: a track's Flags go 0 -> 1 when
+# it is locked and 0 -> 2 when it is disabled (a video track) or muted (an audio track); a picture
+# clip's go 0 -> 2 when it is disabled (its linked sound keeps 0). The two settings sit in
+# different bits, so Flags is read as bits; any other bit (one real track holds 32) is listed with
+# its value. No sample has a disabled sound clip or generator, so their Flags are only listed.
+_TRACK_LOCKED, _TRACK_OFF, _CLIP_OFF = 0x1, 0x2, 0x2
+# Drop-frame timecode: frames in one hour of 29.97 and 59.94 fps timecode, drop and non-drop.
+_DROP_HOUR = {30000: 107892, 60000: 215784}
+_NON_DROP_HOUR = {30000: 108000, 60000: 216000}
+MAX_SUMMARY_FOLDERS = 4
 _LOCKABLE_KINDS = {'Sm2SequenceLockableBlob': 'timeline', 'Sm2TiItemLockableBlob': 'item'}
 
 
@@ -115,40 +132,6 @@ def _is_drop_rate(numerator, denominator):
 
 def fps_label(numerator, denominator):
     return f'{numerator / denominator:.3f}'.rstrip('0').rstrip('.')
-
-
-_DROP_KEY = re.compile(r'drop[ _]?frame', re.I)
-
-
-def _drop_flag(fields):
-    """Resolve's "use drop frame timecode" setting from a decoded settings blob, or None.
-
-    The flag is looked up by name (a key containing "DropFrame", as in the scripting API's
-    ``timelineDropFrameTimecode``) at the timeline first, then in the project's settings."""
-    for key, value in (fields or {}).items():
-        if isinstance(key, str) and _DROP_KEY.search(key):
-            if isinstance(value, bool):
-                return value
-            if isinstance(value, int):
-                return value != 0
-            if isinstance(value, (str, bytes)):
-                text = value.decode('latin-1') if isinstance(value, bytes) else value
-                if text.strip() in ('0', '1', 'true', 'false', 'True', 'False'):
-                    return text.strip() in ('1', 'true', 'True')
-    return None
-
-
-def _config_fields(project):
-    if project is None:
-        return {}
-    for config in project.iter('SM_Config'):
-        data = _raw(config, 'FieldsBlob')
-        try:
-            if data and blobs.is_keyed_dict(data):
-                return blobs.keyed_dict(data)
-        except BlobError:
-            return {}
-    return {}
 
 
 def timecode(frame, numerator, denominator):
@@ -354,6 +337,11 @@ class Model:
         if len(found) > MAX_TIMELINES:
             raise ResolveError('The project has more timelines than Splice lists.')
         self.timelines = found
+        # The media some timeline of the project uses: only these are looked for on this computer.
+        self.used_media = {_text(item, 'MediaRef') for timeline in found for vec in timeline['container']
+                           if vec.tag.endswith('TrackVec') for holder in vec for track in holder
+                           for items in track.findall('Items') for item_holder in items for item in item_holder}
+        self.used_media.discard(None)
 
     def labels(self):
         out = []
@@ -386,6 +374,15 @@ class _Warnings:
     def result(self):
         return self.lines + ([f'{self.extra} more items are not imported; they are kept in the Resolve project.']
                              if self.extra else [])
+
+
+def volume_percent(db):
+    """Splice's clip volume (linear gain in percent) for a Resolve clip volume in decibels, and
+    whether it had to be clamped to the 0-200 % Splice plays."""
+    if not math.isfinite(db):
+        return (0.0, False) if db < 0 else (MAX_VOLUME, True)
+    gain = 100 * 10 ** (min(db, 60.0) / 20)
+    return (MAX_VOLUME, True) if gain > MAX_VOLUME + 1e-9 else (round(gain, 3), False)
 
 
 def _effects(model, data, where, warn, clip, is_video):
@@ -421,32 +418,52 @@ def _effects(model, data, where, warn, clip, is_video):
             if is_video and kind == _TRANSFORM:
                 zoom = [params.get(_ZOOM_X), params.get(_ZOOM_Y)]
                 transform = {'x': 0, 'y': 0, 'scale': 100, 'rotation': 0}
+                approximate = []
                 if any(isinstance(z, float) for z in zoom):
                     zx, zy = (z if isinstance(z, float) else 1.0 for z in zoom)
                     transform['scale'] = round(100 * (zx + zy) / 2, 4)
+                    approximate.append(f'zoom ({transform["scale"]:g} %)')
                     if abs(zx - zy) > 1e-6:
                         warn(where + ': uneven zoom is imported as an even zoom.')
                 if isinstance(params.get(_POSITION_X), float):
-                    transform['x'] = round(params[_POSITION_X] * 100, 4)
+                    # Measured: a fraction of the timeline width; Splice's x is a percentage of it.
+                    transform['x'] = round(params[_POSITION_X] * 100, 6)
                 if isinstance(params.get(_POSITION_Y), float):
-                    transform['y'] = round(-params[_POSITION_Y] * 100, 4)
+                    transform['y'] = round(-params[_POSITION_Y] * 100, 6)
+                    approximate.append(f'vertical position ({transform["y"]:g} %)')
                 if not 10 <= transform['scale'] <= 400 or abs(transform['x']) > 100 or abs(transform['y']) > 100:
                     warn(where + ': its transform is outside the range Splice edits and is clamped.')
                     transform['scale'] = min(400, max(10, transform['scale']))
                     transform['x'] = min(100, max(-100, transform['x']))
                     transform['y'] = min(100, max(-100, transform['y']))
                 clip['transform'] = transform
+                if approximate:
+                    one = len(approximate) == 1
+                    warn(f'{where}: its {" and ".join(approximate)} {"is" if one else "are"} approximate: Resolve’s '
+                         f'{"unit for it is" if one else "units for them are"} inferred, not measured. Check the picture.')
                 if set(params) - {_POSITION_X, _POSITION_Y, _ZOOM_X, _ZOOM_Y}:
                     warn(where + ': rotation, anchor, pitch, yaw or flip settings are not imported.')
             elif is_video and kind == _COMPOSITE:
                 if isinstance(params.get(_OPACITY), float) and 0 <= params[_OPACITY] <= 100:
                     clip['opacity'] = round(params[_OPACITY], 4)
+                    warn(f'{where}: its opacity ({clip["opacity"]:g} %) is approximate: Resolve’s unit for it is '
+                         'inferred, not measured.')
                 if set(params) - {_OPACITY}:
                     warn(where + ': its composite mode is not imported.')
             elif plugin:
                 warn(f'{where}: the effect {plugin} is not imported.')
+            elif not is_video and kind == _AUDIO_VOLUME:
+                db = params.get(_VOLUME_DB)
+                if isinstance(db, float) and not math.isnan(db):
+                    clip['volume'], clamped = volume_percent(db)
+                    if clamped:
+                        warn(f'{where}: its clip volume ({db:+.2f} dB) is above the +6.02 dB Splice plays and is '
+                             'clamped to +6.02 dB.')
+                if set(params) - {_VOLUME_DB}:
+                    warn(where + ': clip audio settings other than volume (such as pan) are not imported.')
             elif not is_video:
-                warn(where + ': clip audio adjustments (volume, pan or Fairlight clip settings) are not imported.')
+                warn(f'{where}: clip audio adjustments other than volume (pan or Fairlight clip settings, Resolve '
+                     f'effect type {kind}) are not imported.')
             elif kind == 6:
                 warn(where + ': its cropping is not imported.')
             else:
@@ -510,12 +527,36 @@ def timeline_index(model, timeline_id):
                        'since the project was opened.')
 
 
+def _drop_frame(tl_name, start_frame, num, den, warnings):
+    """Whether a 29.97 or 59.94 fps timeline uses drop-frame timecode, from what can be defended.
+
+    Resolve keeps the setting in the project's ``SetupBA`` (unnamed numbered fields; no sample has
+    drop-frame switched on, so the field is not known). A start on a whole hour of drop-frame
+    timecode that is not a whole hour of non-drop timecode (107892 frames is 01:00:00;00 drop-frame
+    and 00:59:56:12 non-drop) is taken as drop-frame; anything else opens as non-drop, Resolve's
+    default."""
+    rate = fps_label(num, den)
+    drop_hour, plain_hour = _DROP_HOUR[num], _NON_DROP_HOUR[num]
+    if start_frame > 0 and start_frame % drop_hour == 0 and start_frame % plain_hour != 0:
+        warnings.add(f'{tl_name}: Splice cannot read Resolve’s drop-frame setting. This {rate} fps timeline starts '
+                     f'at {start_frame // drop_hour:02d}:00:00;00 in drop-frame timecode, a whole hour only in '
+                     'drop-frame, so drop-frame is assumed. Change it in File → Sequence settings if that is wrong.')
+        return True
+    reason = (f' (it starts at {start_frame // plain_hour:02d}:00:00:00 in non-drop timecode)'
+              if start_frame > 0 and start_frame % plain_hour == 0 else '')
+    warnings.add(f'{tl_name}: Splice cannot read Resolve’s drop-frame setting; this {rate} fps timeline opens with '
+                 f'non-drop timecode, Resolve’s default{reason}. Change it in File → Sequence settings if Resolve '
+                 'shows drop-frame timecode (semicolons).')
+    return False
+
+
 def to_splice(model, index=0, link_media=None, source_ref=None):
     """Splice's project for timeline ``index`` of ``model``.
 
-    ``link_media(paths)`` is called once with every media path the timeline names and returns one
-    result per path: a dict with ``src`` (and ``fingerprint``) when the file was found here, else a
-    falsy value; that media stays offline with its original path for relinking.
+    ``link_media(paths)`` is called once with the path of every file some timeline of the project
+    uses and returns one result per path: a dict with ``src`` (and ``fingerprint``) when the file
+    was linked here, else ``{'offline': reason}`` (see :func:`resolve.media.link_local`); that
+    media stays offline with its original path for relinking.
     """
     if not model.timelines:
         raise ResolveError('This Resolve project has no timelines.')
@@ -561,6 +602,10 @@ def to_splice(model, index=0, link_media=None, source_ref=None):
     if start_frame is None or abs(start_frame) > 10 ** 9:
         start_frame = 0
         warnings.add(f'{tl_name}: the start timecode is unknown; 00:00:00:00 is assumed.')
+    elif start_frame < 0:
+        warnings.add(f'{tl_name}: the timeline starts before 00:00:00:00 (at {timecode(start_frame, num, den)}). '
+                     'Splice’s timecode cannot go below zero, so the timeline opens at 00:00:00:00 and every '
+                     f'timecode reads {timecode(-start_frame, num, den)} later than in Resolve.')
     if timeline['kind'] != 'timeline':
         warnings.add(f'{tl_name} is a Resolve {_NESTED[timeline["kind"]]}; its angles or layers are opened '
                      'as ordinary tracks.')
@@ -572,18 +617,9 @@ def to_splice(model, index=0, link_media=None, source_ref=None):
             fields = {}
         if fields.get('FLStudioModelBA'):
             warnings.add(f'{tl_name}: Fairlight mixer settings, buses and track automation are not imported.')
-    else:
-        fields = {}
     drop_frame = None
     if _is_drop_rate(num, den):
-        drop_frame = _drop_flag(fields)
-        if drop_frame is None:
-            drop_frame = _drop_flag(_config_fields(model.source.project))
-        if drop_frame is None:
-            drop_frame = False
-            warnings.add(f'{tl_name}: the project does not say whether this {fps_label(num, den)} fps timeline '
-                         'uses drop-frame timecode; non-drop frame (Resolve’s default) is assumed. Change it '
-                         'in File → Sequence settings.')
+        drop_frame = _drop_frame(tl_name, start_frame, num, den, warnings)
 
     def seconds(frames, fraction=0.0):
         return (frames + fraction) * den / num
@@ -625,10 +661,8 @@ def to_splice(model, index=0, link_media=None, source_ref=None):
         return identity
 
     clips, by_item, links, track_names, track_flags = [], {}, {}, {}, {}
-    # Where Resolve keeps clip enabled/disabled and track enabled, lock and mute has not been
-    # located yet; the raw Flags values are kept (resolveFlags, resolveTrackFlags) for later.
-    warnings.add(f'{tl_name}: clip and track enabled state, and track lock and mute, are not read from '
-                 'Resolve yet; every clip and track opens enabled, unlocked and unmuted.')
+    track_state, track_mix = {}, {}
+    states = {'disabled clips': 0, 'hidden tracks': 0, 'muted tracks': 0, 'locked tracks': 0}
     counts = {'video': 0, 'audio': 0}
     transitions = []
     for vec in timeline['container']:
@@ -654,18 +688,29 @@ def to_splice(model, index=0, link_media=None, source_ref=None):
                     continue
                 splice_track = number if kind == 'video' else -number
                 track_names[f'{kind}:{splice_track}'] = label
+                key = f'{kind}:{splice_track}'
                 flags = blobs.parse_int(_text(track, 'Flags'))
                 if flags is not None:
-                    track_flags[f'{kind}:{splice_track}'] = flags
+                    track_flags[key] = flags
+                if flags and flags > 0:
+                    if flags & _TRACK_LOCKED:
+                        track_state.setdefault(key, {})['locked'] = True
+                        states['locked tracks'] += 1
+                    if flags & _TRACK_OFF and kind == 'video':
+                        track_state.setdefault(key, {})['hidden'] = True
+                        states['hidden tracks'] += 1
+                    elif flags & _TRACK_OFF:
+                        track_mix[str(splice_track)] = {'mute': True}
+                        states['muted tracks'] += 1
+                    flags &= ~(_TRACK_LOCKED | _TRACK_OFF)
                 if flags:
-                    warnings.add(f'{tl_name} · {label}: the track carries Resolve flags {flags}, which Splice does '
-                                 'not interpret yet (the track may be disabled, locked or muted in Resolve; it '
-                                 'opens enabled and unlocked).')
+                    warnings.add(f'{tl_name} · {label}: the track carries other Resolve track flags ({flags}) that '
+                                 'Splice does not interpret.')
                 items = track.find('Items')
                 for item_holder in items if items is not None else []:
                     for item in item_holder:
                         _item(model, item, kind, splice_track, label, tl_name, start_frame, num, den, seconds,
-                              media_for, clips, by_item, links, transitions, warnings)
+                              media_for, clips, by_item, links, transitions, warnings, states)
 
     # Linked picture/sound partners become Splice link groups.
     parent = {}
@@ -699,29 +744,81 @@ def to_splice(model, index=0, link_media=None, source_ref=None):
         markers.append({'id': f'marker-{len(markers) + 1}', 'name': marker['name'] or marker['note'] or 'Marker',
                         'time': time, 'color': marker['color'], 'note': marker['note'],
                         'duration': seconds(marker['duration']) if marker['duration'] else 0})
+    if markers:
+        warnings.add(f'{tl_name}: timeline markers are placed as frames from the timeline start, as Resolve 19 '
+                     'stores them; this is not yet confirmed for projects saved by later versions of Resolve.')
     for clip in clips:
         found = model.markers.get(clip.get('resolveItemId'), [])
         if found:
-            warnings.add(f'{clip["_where"]}: {len(found)} clip marker(s) are not imported.')
+            # Resolve 19 projects store a clip marker as a frame of the source media (markers sit on
+            # source in-points, and every clip cut from one file carries the same ones); a Resolve
+            # 21.1 project stores a marker the scripting API put at clip frame 10 as 20.
+            warnings.add(f'{clip["_where"]}: {len(found)} clip marker(s) are not imported. Where Resolve places a '
+                         'clip marker is not settled: Resolve 19 stores it as a frame of the source media, and a '
+                         'Resolve 21 project stores twice the frame number the scripting API reports.')
     for clip in clips:
         clip.pop('_where', None)
 
+    # The media pool: what some timeline of the project uses. Media no timeline uses is left out.
+    unused = 0
     for entry in model.media.values():
         if entry['kind'] in ('video', 'audio', 'still') and entry['id'] not in media_ids and entry.get('path'):
-            media_for(entry['id'], None, entry['kind'], entry['name'])
+            if entry['id'] in model.used_media:
+                media_for(entry['id'], None, entry['kind'], entry['name'])
+            else:
+                unused += 1
+    if unused:
+        warnings.add(f'{unused} media pool file(s) that no timeline of this project uses are not imported.')
 
     # One call for the whole project, so the link registry is written once.
     pending = [m for m in media_out if m.get('path')]
-    found = link_media([m['path'] for m in pending]) if link_media and pending else []
+    found = list(link_media([m['path'] for m in pending])) if link_media and pending else []
+    if len(found) != (len(pending) if link_media else 0):
+        raise ResolveError('Linking the project’s media gave an unexpected result.')
+    offline = {'missing': 0, 'not-media': 0, 'unchecked': 0, 'refused': 0}
+    reasons = {}
     for entry, result in zip(pending, found):
-        if result:
+        if isinstance(result, dict) and result.get('src'):
             entry.update(src=result['src'], offline=False, linked=True, sourcePath=result.get('sourcePath'),
                          sourceFingerprint=result.get('fingerprint'))
-    linked = sum(1 for m in media_out if m.get('path') and not m.get('offline'))
-    offline = [m for m in media_out if m.get('offline')]
-    if offline:
-        warnings.add(f'{len(offline)} media file(s) are offline on this computer. Use Relink from folder; '
-                     'Windows and Mac paths are matched by folder and file name.')
+            continue
+        reason = result.get('offline') if isinstance(result, dict) else None
+        reason = reason if reason in offline else 'missing'
+        offline[reason] += 1
+        if isinstance(result, dict) and isinstance(result.get('message'), str):
+            reasons.setdefault(reason, result['message'][:300])
+    relink = ('Relink them without copying with File → Link media in place → Relink offline from folder; '
+              'Windows and Mac paths are matched by folder and file name.')
+    if pending and not link_media:
+        warnings.add(f'{len(pending)} media file(s) are offline: Splice did not look for them on this computer. '
+                     + relink)
+    if offline['missing']:
+        warnings.add(f'{offline["missing"]} media file(s) are offline on this computer: nothing is at the path the '
+                     'project names (it may be on another computer or have moved). ' + relink)
+    if offline['not-media']:
+        warnings.add(f'{offline["not-media"]} file(s) the project names were found on this computer but are not '
+                     'media Splice can play (not a media file, or FFmpeg cannot decode it); they stay offline.')
+    if offline['unchecked']:
+        warnings.add(f'{offline["unchecked"]} media file(s) were not looked for ({reasons.get("unchecked", "time ran out")}); '
+                     'they stay offline. ' + relink)
+    if offline['refused']:
+        warnings.add(f'{offline["refused"]} media file(s) could not be linked ({reasons.get("refused", "refused")}); '
+                     'they stay offline.')
+    linked = [m for m in media_out if m.get('linked')]
+    summary = []
+    if any(states.values()):
+        summary.append('From Resolve: ' + ', '.join(f'{n} {what}' if n != 1 else f'1 {what[:-1]}'
+                                                    for what, n in states.items() if n) + '.')
+    if linked:
+        folders = []
+        for m in linked:
+            parent = PurePath(m.get('sourcePath') or m['path']).parent
+            top = str(PurePath(*parent.parts[:3])) if parent.parts else str(parent)
+            if top not in folders:
+                folders.append(top)
+        shown = folders[:MAX_SUMMARY_FOLDERS]
+        more = f' and {len(folders) - len(shown)} more folder(s)' if len(folders) > len(shown) else ''
+        summary.append(f'{len(linked)} local file(s) linked in place from {", ".join(shown)}{more}.')
     project = {
         'name': tl_name, 'width': size[0], 'height': size[1], 'fps': fps,
         'frameRate': f'{num}/{den}', 'startFrame': start_frame,
@@ -730,8 +827,8 @@ def to_splice(model, index=0, link_media=None, source_ref=None):
         # frame 0 (negative Resolve starts) there is no timecode, so 0 is used.
         'startTimecode': max(0, start_frame) % (24 * 3600 * max(1, round(num / den))),
         'media': media_out, 'clips': clips, 'captions': [], 'markers': markers,
-        'trackState': {}, 'trackCounts': {'video': max(1, min(MAX_TRACKS, counts['video'])),
-                                          'audio': max(1, min(MAX_TRACKS, counts['audio']))},
+        'trackState': track_state, 'trackCounts': {'video': max(1, min(MAX_TRACKS, counts['video'])),
+                                                   'audio': max(1, min(MAX_TRACKS, counts['audio']))},
         'trackNames': track_names,
         'compatibilityWarnings': warnings.result(),
         'duration': max((c['start'] + c['duration'] for c in clips), default=0),
@@ -740,14 +837,17 @@ def to_splice(model, index=0, link_media=None, source_ref=None):
         'resolveSource': dict(source_ref or {}, kind=model.source.kind, sha256=model.source.sha256,
                               project=model.name, timelineId=timeline['id']),
     }
+    if track_mix:
+        project['trackMix'] = track_mix
     if drop_frame is not None:
         project['dropFrame'] = drop_frame
-    project['resolveSource']['linkedMedia'] = linked
+    project['resolveSource']['linkedMedia'] = len(linked)
+    project['resolveSource']['summary'] = summary
     return project
 
 
 def _item(model, item, kind, track, label, tl_name, start_frame, num, den, seconds, media_for,
-          clips, by_item, links, transitions, warnings):
+          clips, by_item, links, transitions, warnings, states):
     tag = item.tag
     name = _text(item, 'Name') or ''
     try:
@@ -792,9 +892,14 @@ def _item(model, item, kind, track, label, tl_name, start_frame, num, den, secon
     flags = blobs.parse_int(_text(item, 'Flags'))
     if flags is not None:
         clip['resolveFlags'] = flags
+    disabled = False
+    if flags and tag == 'Sm2TiVideoClip' and flags > 0:
+        disabled = bool(flags & _CLIP_OFF)
+        flags &= ~_CLIP_OFF
     if flags:
-        warnings.add(f'{where}: the clip carries Resolve flags {flags}, which Splice does not interpret yet '
-                     '(the clip may be disabled in Resolve; it opens enabled).')
+        what = 'other Resolve clip flags' if tag == 'Sm2TiVideoClip' else 'Resolve clip flags'
+        warnings.add(f'{where}: the clip carries {what} ({flags}) that Splice does not interpret'
+                     + ('' if tag == 'Sm2TiVideoClip' else ' (it may be disabled in Resolve; it opens enabled)') + '.')
     pretty = _text(item, 'PrettyType')
     if tag == 'Sm2TiGenerator' or (tag == 'Sm2TiVideoClip' and pretty == 'Fusion Title'):
         what = 'Fusion title' if pretty == 'Fusion Title' else f'generator ({pretty or "unknown"})'
@@ -847,6 +952,9 @@ def _item(model, item, kind, track, label, tl_name, start_frame, num, den, secon
                     clip['reverse'] = ratio < 0
                     if not 0.1 <= abs(ratio) <= 16:
                         warnings.add(f'{where}: its speed is outside the 10–1600% Splice plays and is clamped.')
+                    warnings.add(f'{where}: its speed ({clip["speed"] * 100:g} %{", reversed" if clip["reverse"] else ""}) '
+                                 'is approximate: it is read from Resolve’s retime curve, which has not been measured '
+                                 'against Resolve’s own speed setting.')
         except BlobError as error:
             warnings.add(f'{where}: its speed could not be decoded ({error}); it plays at 100%.')
     effects = _raw(item, 'EffectFiltersBA')
@@ -858,6 +966,18 @@ def _item(model, item, kind, track, label, tl_name, start_frame, num, den, secon
         warnings.add(f'{where}: its Fusion composition is not imported.')
     if _clip_fx(model, item):
         warnings.add(f'{where}: its Fairlight clip effects are not imported.')
+    if disabled:
+        # Splice's own representation of a disabled clip (as from FCPXML, Final Cut 7 XML and OTIO):
+        # ``enabled: false``, which the interchange exports keep. Splice's player and renderer have
+        # no disabled switch yet, so the picture is also made transparent: a Resolve picture clip
+        # has no sound of its own, so it then plays as nothing, as in Resolve.
+        clip['enabled'] = False
+        before = clip.get('opacity', 100)
+        clip['opacity'] = 0
+        states['disabled clips'] += 1
+        warnings.add(f'{where}: the clip is disabled in Resolve. It opens marked disabled (exports leave it out or '
+                     f'mark it off) and transparent, as Splice has no disabled switch yet; set its opacity back to '
+                     f'{before:g} % to show it.')
     partners = _links(model, item)
     if partners and clip['resolveItemId']:
         links[clip['resolveItemId']] = partners
