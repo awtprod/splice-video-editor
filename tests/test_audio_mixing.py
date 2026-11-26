@@ -244,6 +244,23 @@ class Stems(AudioCase):
         with self.assertRaisesRegex(ValueError, 'Track isos are part of the stems export'):
             self.render(clips, media, codec='wav', isoTracks=True)
 
+    def test_delivery_normalization_preserves_nested_mix_balance(self):
+        quiet = self.source('quiet.wav', "aevalsrc='0.025*sin(2*PI*500*t)|0.025*sin(2*PI*500*t)':s=48000", 2)
+        loud = self.source('loud.wav', "aevalsrc='0.2*sin(2*PI*900*t)|0.2*sin(2*PI*900*t)':s=48000", 2)
+        child = dict(width=32, height=18, fps=25, media=[dict(id='a', src=self.src(quiet))],
+                     clips=[dict(type='audio', track=-1, mediaId='a', start=0, duration=2)])
+        media = [dict(id='n', nestedProject=child), dict(id='b', src=self.src(loud))]
+        clips = [dict(type='video', track=1, mediaId='n', start=0, duration=2),
+                 dict(type='audio', track=-1, mediaId='b', start=0, duration=2)]
+        for mode in ('linear', 'limit'):
+            with self.subTest(mode=mode):
+                report = {}
+                output = self.render(clips, media, normalize=-23, normalizeMode=mode, report=report)
+                samples = pcm(output)
+                ratio = tone_level(samples, 500, .5, 1.5) / tone_level(samples, 900, .5, 1.5)
+                self.assertAlmostEqual(ratio, .125, delta=.003)
+                self.assertAlmostEqual(report['audio']['output']['integratedLufs'], -23, delta=.2)
+
     def test_a_master_compressor_is_named_when_stems_cannot_sum(self):
         clips, media, project = self.project()
         project['masterFx']['comp'] = {'threshold': -30, 'ratio': 4}

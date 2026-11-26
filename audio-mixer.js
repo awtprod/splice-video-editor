@@ -1,5 +1,5 @@
 // Splice preview mixer: the Web Audio side of the audio finishing chain.
-//   clip:   media element -> channel map -> clip EQ -> clip gate/compressor -> clip gain (fades,
+//   clip:   media element -> channel map -> track channel layout -> clip effects -> clip gain (fades,
 //           keyframes, track volume) -> pan -> track bus
 //   track:  bus -> track EQ -> track gate/compressor -> master bus
 //   master: bus -> master EQ -> master compressor -> loudness meter -> speakers
@@ -136,10 +136,10 @@
         merge.connect(route.fxBus.input);
         route.mapNodes.push(split, merge);
       } else route.input.connect(route.fxBus.input);
+      // Dynamics must hear the same mono sum as the renderer, after channel mapping.
+      route.fxBus.input.channelCount = mono ? 1 : 2;
+      route.fxBus.input.channelCountMode = mono ? 'explicit' : 'max';
       build(route.fxBus, clip.audioFx);
-      // A mono track sums the clip to one channel and pans it with the mono law (as the renderer does).
-      route.pan.channelCount = mono ? 1 : 2;
-      route.pan.channelCountMode = mono ? 'explicit' : 'clamped-max';
     }
     const target = trackBus(clip.track).input;
     if (route.bus !== target) {

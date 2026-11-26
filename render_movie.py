@@ -2033,8 +2033,8 @@ def render_to_file(project, output_path, *, options=None, progress=None, cancell
             suffix='.mov' if options.get('codec')=='prores' else '.mp4'
             target=Path(directory)/f'nested-{index}{suffix}'
             child_options={**options,'codec':'prores' if suffix=='.mov' else 'h264'}
-            child_options.pop('range',None)
-            child_options.pop('isoTracks',None)
+            for key in ('range', 'isoTracks', 'normalize', 'normalizeMode'):
+                child_options.pop(key, None)
             render_to_file(child,target,options=child_options,cancelled=cancelled,heartbeat=heartbeat,work_directory=work_directory,
                            _nested_depth=_nested_depth+1)
             item['src']='/media/'+str(target.relative_to(MEDIA_ROOT))

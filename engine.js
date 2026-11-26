@@ -668,7 +668,8 @@
     if (out?.sound.kind==='crossfade') {
       const length=Math.min(out.sound.duration,out.sound.before+out.next.duration);
       fade*=curve(out.sound,1-(time-out.next.start+out.sound.before)/length);
-    } else if (out && out.sound.before>1e-9) fade*=curve(out.sound,(clip.start+clip.duration-time)/out.sound.before);
+    } else if (time>=clip.start+clip.duration) return 0;
+    else if (out && out.sound.before>1e-9) fade*=curve(out.sound,(clip.start+clip.duration-time)/out.sound.before);
     return clamp(animated(clip,'volume',Number(clip.volume??100))/100,0,2) * trackLevel(clip.track) * clamp(fade,0,1);
   };
   const filterFor = (clip) => {

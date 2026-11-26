@@ -386,30 +386,65 @@ print(json.dumps(out))`, effects));
   await page.context().close();
 }
 
-// A mono signal stays mono through clip dynamics until it reaches the stereo panner.
+async function embeddedSoundCut(splice, media) {
+  const {page} = await openPage(splice);
+  await lazy().project(page, media);
+  const gains = await page.evaluate(() => {
+    const routes = new Map(), routeClip = SpliceMixer.routeClip;
+    SpliceMixer.routeClip = (route, clip, ...args) => {
+      routes.set(clip.id, route);
+      routeClip(route, clip, ...args);
+    };
+    Editor.editProject(p => {
+      for (const clip of p.clips.filter(clip => clip.type === 'video')) clip.embeddedAudio = true;
+      p.clips.find(clip => clip.id === 'v2').audioTransition = 'cut';
+    });
+    const outgoingGain = time => {
+      routes.clear();
+      Editor.seek(time);
+      return routes.get('v1').gainLevel;
+    };
+    const cut = [3.88, 4, 4.12].map(outgoingGain);
+    Editor.editProject(p => { p.clips.find(clip => clip.id === 'v2').audioTransition = 'crossfade'; });
+    return {cut, crossfade:outgoingGain(4.12)};
+  });
+  record('embeddedSoundCut', gains);
+  assert.deepEqual(gains.cut, [1, 0, 0]);
+  assert.ok(Math.abs(gains.crossfade - .26) < .001, String(gains.crossfade));
+  await page.context().close();
+}
+
+// A mono input stays mono, and a mono track sums a stereo input before compression.
 async function monoDynamics(splice) {
   const {page} = await openPage(splice);
-  await page.goto(new URL('audio-mixer.js', page.url()).href);
-  await page.addScriptTag({url:'audio-dsp.js'});
-  await page.addScriptTag({url:'audio-mixer.js'});
-  const levels = await page.evaluate(async () => {
-    const ctx = new OfflineAudioContext(2, 2048, 48000);
-    await SpliceMixer.attach(ctx);
-    const route = {source:ctx.createGain(), input:ctx.createGain(), gain:ctx.createGain(), pan:ctx.createStereoPanner(), analyser:ctx.createAnalyser()};
-    route.source.connect(route.input);
-    route.gain.connect(route.pan).connect(route.analyser);
-    const clip = {id:'mono', track:-1, channelMap:'right', audioFx:{comp:{ratio:1, makeup:0}}};
-    const project = {clips:[clip]};
-    SpliceMixer.configure(project);
-    SpliceMixer.routeClip(route, clip, project, 1);
-    const source = ctx.createConstantSource();
-    source.offset.value = .1;
-    source.connect(route.source);
-    source.start();
-    const result = await ctx.startRendering();
-    return [0,1].map(channel => result.getChannelData(channel)[1500]);
-  });
-  for (const level of levels) assert.ok(Math.abs(level - .1*Math.SQRT1_2) < .0001, String(levels));
+  for (const channels of [1, 2]) {
+    await page.goto(new URL('audio-mixer.js', page.url()).href);
+    await page.addScriptTag({url:'audio-dsp.js'});
+    await page.addScriptTag({url:'audio-mixer.js'});
+    const levels = await page.evaluate(async channels => {
+      const ctx = new OfflineAudioContext(2, 2048, 48000);
+      await SpliceMixer.attach(ctx);
+      const route = {source:ctx.createGain(), input:ctx.createGain(), gain:ctx.createGain(), pan:ctx.createStereoPanner(), analyser:ctx.createAnalyser()};
+      route.source.connect(route.input);
+      route.gain.connect(route.pan).connect(route.analyser);
+      const clip = {id:'mono', track:-1, channelMap:channels === 1 ? 'right' : 'stereo',
+        audioFx:{comp:{threshold:-20, ratio:channels === 1 ? 1 : 4, attack:1}}};
+      const project = {clips:[clip], trackMix:{'-1':{channels:channels === 1 ? 'stereo' : 'mono'}}};
+      SpliceMixer.configure(project);
+      SpliceMixer.routeClip(route, clip, project, channels);
+      const source = ctx.createBufferSource();
+      source.buffer = ctx.createBuffer(channels, 2048, 48000);
+      source.buffer.getChannelData(0).fill(channels === 1 ? .1 : .8);
+      source.connect(route.source);
+      source.start();
+      const result = await ctx.startRendering();
+      return [0,1].map(channel => result.getChannelData(channel)[1500]);
+    }, channels);
+    // A .8 left-only signal sums to .4. At -20 dBFS and 4:1 this becomes .14142 before center pan.
+    const expected = channels === 1 ? .1*Math.SQRT1_2 : .1;
+    record('monoDynamics' + channels, levels);
+    for (const level of levels) assert.ok(Math.abs(level - expected) < .0001, String(levels));
+  }
   await page.context().close();
 }
 
@@ -490,6 +525,7 @@ async function performance12(splice, media) {
   await page.context().close();
 }
 
-exports.cases = (process.env.AUDIO_CASES ? process.env.AUDIO_CASES.split(',') : null) ?
-  [eqParity, dynamicsParity, monoDynamics, auditionEffects, busEffects, inspectorAudio, automation, exportDialog, syncCommand, performance12].filter(fn => process.env.AUDIO_CASES.split(',').includes(fn.name)) :
-  [eqParity, dynamicsParity, monoDynamics, auditionEffects, busEffects, inspectorAudio, automation, exportDialog, syncCommand, performance12];
+const cases = [eqParity, dynamicsParity, monoDynamics, embeddedSoundCut, auditionEffects, busEffects,
+  inspectorAudio, automation, exportDialog, syncCommand, performance12];
+const selectedCases = process.env.AUDIO_CASES && process.env.AUDIO_CASES.split(',');
+exports.cases = selectedCases ? cases.filter(fn => selectedCases.includes(fn.name)) : cases;
