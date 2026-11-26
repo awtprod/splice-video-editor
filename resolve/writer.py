@@ -722,6 +722,13 @@ class Writer:
             report.add(NOT_WRITTEN, f'Clips whose media-pool entry cannot be read ({error.message[:200]})', where)
             return None
         picture = 'picture' if kind == 'video' else 'sound'
+        media_start, why = items.media_start(view, [r for _k, _t, r in timeline.items.values()])
+        if media_start is None:
+            report.add(NOT_WRITTEN, 'New clips from media whose picture timecode and sound start differ (Resolve '
+                       'stores either as the clip\'s start and nothing shows which a new clip gets, so a wrong guess '
+                       'would show other frames): place one clip of it on this timeline in Resolve first',
+                       f'{where} — {view.name} ({why})')
+            return None
         item_id = self.fresh()
         stream = clip.get('audioStream')
         if kind == 'audio' and isinstance(stream, int) and stream > 0:
@@ -733,6 +740,7 @@ class Writer:
         except mediapool.MediaPoolError as error:
             report.add(NOT_WRITTEN, f'New clips the item writer refuses ({error.message[:200]})', where)
             return None
+        row['MediaStartTime'] = media_start
         if rounded:
             report.add(EXACT, ROUNDED, where)
         if kind == 'video' and clip.get('enabled') is False:

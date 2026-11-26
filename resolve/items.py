@@ -169,10 +169,53 @@ def media_view(clip):
     name_value = clip.media.get('Name')
     if not isinstance(name_value, str):
         raise _bad_media('Sm2MpMedia.Name is not text')
+    sound_start = None
+    if clip.video is not None and clip.audio:
+        value = _first_track(clip.audio[0]).get('StartTime')
+        sound_start = float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
     return MediaView(media_id=clip.media_id, name=name_value, path=path, picture=clip.video is not None,
                      channels=channels, rate_bytes=rate_data, rate=rate, start_seconds=start, last_seconds=last,
+                     sound_start=sound_start,
                      frames=picture_frames, sound_seconds=sound_seconds,
                      sound_frames=None if sound_samples is None else math.ceil(sound_samples * rate))
+
+
+#: Seconds within which a clip's picture timecode and sound start count as the same start.
+SAME_START = 1e-6
+
+
+def start_conflict(view):
+    """Whether ``view`` is a picture clip whose sound track starts elsewhere than its picture
+    timecode. Resolve stores either value as its items' ``MediaStartTime``: on the real samples
+    the same pool clips hold the picture timecode on the items of some timelines and the sound
+    start on those of another, and nothing in the clip's rows says which a new item gets."""
+    if not view.picture or view.sound_start is None:
+        return False
+    return not math.isfinite(view.sound_start) or abs(view.sound_start - view.start_seconds) > SAME_START
+
+
+def media_start(view, timeline_items):
+    """``(MediaStartTime, None)`` for a new item playing ``view`` on a timeline whose items are
+    ``timeline_items`` (seed rows), or ``(None, why)`` when the value cannot be known.
+
+    The value the clip's other items on the same timeline hold, when they agree (Resolve keeps
+    one start per clip and timeline: on the real samples items of a timeline imported from
+    FCPXML hold the exact quotient of the timecode and the rate, one unit in the last place
+    from the pool's value, and the items of one timeline hold a clip's sound start where its
+    other timelines hold its picture timecode); otherwise the rule (the picture timecode over
+    the rate, or a sound file's own start), unless the clip's picture timecode and sound start
+    differ: then nothing shows which a new item gets, and the item is refused."""
+    held = {row.get('MediaStartTime') for row in timeline_items
+            if row.get('MediaRef') == view.media_id and row.get('DbType') in (PICTURE, SOUND)}
+    value = next(iter(held)) if len(held) == 1 else None
+    usable = isinstance(value, float) and math.isfinite(value)
+    if usable and (start_conflict(view) or abs(value - view.start_seconds) <= SAME_START):
+        return value, None
+    if not start_conflict(view):
+        return view.start_seconds, None
+    why = ('its other items on this timeline hold different starts' if len(held) > 1 else
+           'no item of it is on this timeline to take the start from')
+    return None, why
 
 
 def timemap(seconds):
@@ -367,5 +410,6 @@ def transition_payload_ok():
 
 
 __all__ = ['ITEM_COLUMNS', 'ITEM_CONSTANTS', 'LATER_COLUMNS', 'ItemError', 'MediaView', 'author_item',
-           'author_transition', 'fresh_fields', 'links_of', 'media_view', 'picture_tail', 'relink', 'timemap',
+           'author_transition', 'fresh_fields', 'links_of', 'media_start', 'media_view', 'picture_tail', 'relink',
+           'start_conflict', 'timemap',
            'transition_problem']

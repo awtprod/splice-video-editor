@@ -1066,3 +1066,71 @@ class EveryFeatureTests(SaveCase):
         project.update(fps=25, frameRate='25/1')
         with self.assertRaises(writer.WriteError):
             self.run_save(self.payload(project, confirm=False))
+
+
+class MediaStartTests(unittest.TestCase):
+    def view(self, start, sound):
+        return items.MediaView(media_id='m', picture=True, start_seconds=start, sound_start=sound)
+
+    def test_the_rule_unless_picture_timecode_and_sound_start_differ(self):
+        rows = [{'MediaRef': 'other', 'DbType': items.PICTURE, 'MediaStartTime': 5.0}]
+        self.assertEqual(items.media_start(self.view(3600.0, 3600.0), rows), (3600.0, None))
+        self.assertEqual(items.media_start(self.view(3600.0, None), rows), (3600.0, None))
+        value, why = items.media_start(self.view(3599.9964, 931.5973333333334), rows)
+        self.assertIsNone(value)
+        self.assertIn('no item of it is on this timeline', why)
+
+    def test_the_value_the_clips_items_on_the_timeline_hold(self):
+        rows = [{'MediaRef': 'm', 'DbType': items.PICTURE, 'MediaStartTime': 931.5973333333334},
+                {'MediaRef': 'm', 'DbType': items.SOUND, 'MediaStartTime': 931.5973333333334}]
+        self.assertEqual(items.media_start(self.view(3599.9964, 931.5973333333334), rows), (931.5973333333334, None))
+        rows[1]['MediaStartTime'] = 3599.9964
+        value, why = items.media_start(self.view(3599.9964, 931.5973333333334), rows)
+        self.assertIsNone(value)
+        self.assertIn('different starts', why)
+        # A neighbouring double the clip's items hold (a timeline imported from FCPXML) is kept.
+        import math
+        near = math.nextafter(3600.0, 0)
+        self.assertEqual(items.media_start(self.view(3600.0, 3600.0), [{'MediaRef': 'm', 'DbType': items.SOUND,
+                                                                         'MediaStartTime': near}]), (near, None))
+        # A far value on a clip without a conflict is not taken: the rule stands.
+        self.assertEqual(items.media_start(self.view(3600.0, 3600.0), [{'MediaRef': 'm', 'DbType': items.SOUND,
+                                                                         'MediaStartTime': 12.0}]), (3600.0, None))
+
+
+class MediaStartSaveTests(SaveCase):
+    def test_inserts_from_media_with_two_starts_are_refused_and_reported_per_clip(self):
+        project = self.opened()
+        fps = project['fps']
+        pic_media = next(m for m in project['media'] if m.get('path') == PIC)
+        end = max(c['start'] + c['duration'] for c in project['clips'])
+        project['clips'].append({'id': 'ins', 'type': 'video', 'track': 1, 'start': end, 'duration': 4 / fps,
+                                 'in': 0, 'mediaId': pic_media['id']})
+        real = items.media_view
+
+        def two_starts(clip):
+            view = real(clip)
+            if view.picture:
+                view.sound_start = view.start_seconds + 2668.4
+            return view
+        conn = sqlite3.connect(self.kept)
+        conn.execute('UPDATE Sm2TiItem SET MediaStartTime = MediaStartTime + ? WHERE Sm2TiItem_id = ?',
+                     (1.0, self.ids['pictures'][0]))
+        conn.commit()
+        conn.close()
+        with mock.patch.object(items, 'media_view', two_starts):
+            result = self.run_save(self.payload(project, confirm=False))
+        line = next(line for line in result['lines'] if line['what'].startswith('New clips from media whose picture'))
+        self.assertEqual((line['status'], line['count']), (writer.NOT_WRITTEN, 1))
+        self.assertIn('different starts', line['all'][0])
+        # When the clip's items on the timeline agree, the new item takes their value.
+        shutil.copyfile(self.db, self.kept)
+        with mock.patch.object(items, 'media_view', two_starts):
+            result = self.run_save(self.payload(project))
+        conn = sqlite3.connect(f'file:{result["project"]["path"]}?mode=ro', uri=True)
+        try:
+            held = {r[0] for r in conn.execute('SELECT MediaStartTime FROM Sm2TiItem WHERE DbType = ? AND MediaRef = ?',
+                                               (items.PICTURE, pic_media['resolveMediaId']))}
+        finally:
+            conn.close()
+        self.assertEqual(len(held), 1)
