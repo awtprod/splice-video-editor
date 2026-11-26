@@ -274,8 +274,8 @@ class BurnIns(Case):
         for name in ('h264.mp4', 'png'):
             for box in (bottom, top):
                 difference = [abs(a - b) for a, b in zip(deltas['prores.mov'][box], deltas[name][box])]
-                # H.264 is lossy 4:2:0 even at CRF 14: its text edges round a little more.
-                self.assertLess(sum(difference) / len(difference), 4 if name == 'h264.mp4' else 2, f'{name} burn-in matches ProRes')
+                # H.264 is lossy 4:2:0 even at CRF 14; the RGB PNG goes through one more conversion to luma.
+                self.assertLess(sum(difference) / len(difference), 4 if name == 'h264.mp4' else 3, f'{name} burn-in matches ProRes')
         plain = self.out / 'plain-again.mov'
         render_to_file(project, plain, options=dict(codec='prores'))
         self.assertEqual(self.frame(plain, 10), self.frame(self.out / 'plain-prores.mov', 10), 'no burn-in unless asked')
