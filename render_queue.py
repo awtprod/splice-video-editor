@@ -46,7 +46,7 @@ class ConflictError(ValueError):
 def default_folder():
     override = os.environ.get('SPLICE_EXPORT_DIR')
     if override:
-        return Path(override).expanduser().resolve()
+        return Path(override).expanduser().absolute()
     from splice_platform import data_directory
     return data_directory() / 'Exports'
 
@@ -62,18 +62,18 @@ def _clean_name(name):
 
 
 def _folder(value):
-    if value in (None, ''):
-        folder = default_folder()
-        folder.mkdir(parents=True, exist_ok=True)
-        value = str(folder)
+    create = value in (None, '')
+    if create:
+        value = str(default_folder())
     if not isinstance(value, str) or len(value) > 4096 or '\x00' in value:
         raise ValueError('Invalid output folder')
     folder = Path(value).expanduser()
-    if not folder.is_absolute():
+    if not folder.is_absolute() or '..' in folder.parts:
         raise ValueError('Choose the output folder as a full path')
     if any(part.is_symlink() for part in (folder, *folder.parents)):
         raise ValueError('The output folder is a link: choose its actual path')
-    folder = folder.resolve()
+    if create:
+        folder.mkdir(parents=True, exist_ok=True)
     if not folder.is_dir():
         raise ValueError(f'The output folder {folder} does not exist')
     if not os.access(folder, os.W_OK | os.X_OK):
