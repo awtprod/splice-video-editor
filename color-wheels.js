@@ -284,7 +284,15 @@
         editor.editProject(project => { for (const target of project.clips) if (targets.some(item => item.id === target.id)) target.color = structuredCloneGrade(color); });
         rerender();
       },
-      reset() { editor.updateClip(current().id, {color:{brightness:100, contrast:100, saturation:100}}); rerender(); },
+      reset() {
+        const clip = current(), patch = {color:{brightness:100, contrast:100, saturation:100}};
+        if (clip.keyframes) {
+          patch.keyframes = {...clip.keyframes};
+          for (const key of Object.keys(G.animated)) delete patch.keyframes[key];
+        }
+        editor.updateClip(clip.id, patch);
+        rerender();
+      },
       cube() {
         const active = current(), text = G.cubeText(active.color || {}, 33, `${active.title || 'Splice'} grade`);
         const link = document.createElement('a'), url = URL.createObjectURL(new Blob([text], {type:'text/plain'}));

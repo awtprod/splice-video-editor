@@ -28,9 +28,21 @@ async function main() {
       await gain.fill('1.25');
       await gain.press('Tab');
       assert.equal((await color(0)).grade.gain[0], 1.25);
+      const originalKeys = await page.evaluate(() => {
+        const keyframes = {opacity:[{time:0, value:75}]};
+        for (const [key, [, high]] of Object.entries(SpliceGrade.animated)) keyframes[key] = [{time:0, value:high}];
+        Editor.updateClip('test-0', {keyframes});
+        return keyframes;
+      });
+      const keys = () => page.evaluate(() => Editor.get().project.clips[0].keyframes);
       await action('copy');
       await action('reset');
       assert.equal((await color(0)).grade, undefined);
+      assert.deepEqual(await keys(), {opacity:originalKeys.opacity});
+      await page.evaluate(() => Editor.undo());
+      assert.deepEqual(await keys(), originalKeys);
+      assert.equal((await color(0)).grade.gain[0], 1.25);
+      await action('reset');
       await action('paste');
       assert.equal((await color(0)).grade.gain[0], 1.25);
       await action('source');
