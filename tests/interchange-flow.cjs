@@ -1,4 +1,4 @@
-/* Browser flow: edit, export FCPXML and EDL from File > Export timeline…, import them back. */
+/* Browser flow: edit, export FCPXML, FCP 7 XML and EDL from File > Export timeline…, import them back. */
 const assert = require('node:assert/strict');
 const {spawn} = require('node:child_process');
 const fs = require('node:fs');
@@ -60,12 +60,14 @@ async function main() {
     await fileMenu('#export-timeline');
     const exportDialog = page.locator('.interchange-dialog');
     await exportDialog.locator('[name=edl]').check();
+    assert.ok(await exportDialog.locator('[data-edl-note]').isVisible(), 'EDL limits are shown next to the EDL option');
+    await exportDialog.locator('[name=xmeml]').check();
     const downloads = [];
     page.on('download', d => downloads.push(d));
     await exportDialog.locator('[type=submit]').click();
-    await exportDialog.locator('[role=status]').filter({hasText: /Exported 2 files/}).waitFor();
-    for (let i = 0; i < 50 && downloads.length < 2; i++) await page.waitForTimeout(100);
-    assert.equal(downloads.length, 2, 'FCPXML and EDL downloads');
+    await exportDialog.locator('[role=status]').filter({hasText: /Exported 3 files/}).waitFor();
+    for (let i = 0; i < 50 && downloads.length < 3; i++) await page.waitForTimeout(100);
+    assert.equal(downloads.length, 3, 'FCPXML, FCP 7 XML and EDL downloads');
     const saved = {};
     for (const download of downloads) {
       const target = path.join(temp, download.suggestedFilename());
@@ -74,7 +76,11 @@ async function main() {
     }
     assert.match(fs.readFileSync(saved['.fcpxml'], 'utf8'), /<fcpxml version="1\.10">/);
     assert.match(fs.readFileSync(saved['.edl'], 'utf8'), /^FCM: NON-DROP FRAME$/m);
-    assert.match(await exportDialog.locator('.interchange-report pre').textContent(), /FCPXML:/);
+    assert.match(fs.readFileSync(saved['.xml'], 'utf8'), /<xmeml version="5">/);
+    const reportText = await exportDialog.locator('.interchange-report pre').textContent();
+    assert.match(reportText, /FCPXML 1\.10 \(DaVinci Resolve, Final Cut Pro\):/);
+    assert.match(reportText, /Final Cut Pro 7 XML \(Premiere Pro, Resolve, Avid\):/);
+    assert.match(reportText, /CONFORM WARNING/);
     await exportDialog.locator('[data-close]').click();
 
     const importFile = async (file, extra) => {
@@ -100,6 +106,25 @@ async function main() {
     assert.match(state.label, /Project compatibility \(\d+\)/);
     await page.waitForFunction(() => Editor.get().video?.readyState >= 2);
     console.log('FCPXML export and import through the File menu keep the cut list:', imported.clips.length, 'clips.');
+
+    await importFile(saved['.xml']);
+    const fromXml = await cutList();
+    assert.deepEqual(fromXml.clips.filter(c => c[0] !== 'audio'), expected.clips.filter(c => c[0] !== 'audio'));
+    assert.deepEqual(fromXml.markers, expected.markers);
+    console.log('FCP 7 XML export and import keep the picture cut list and the marker.');
+
+    // A rejected file leaves its error; choosing another file clears it.
+    const junk = path.join(temp, 'junk.edl');
+    fs.writeFileSync(junk, 'not an edit decision list\n');
+    await fileMenu('#import-timeline');
+    const importDialog = page.locator('.interchange-dialog');
+    await importDialog.locator('[name=file]').setInputFiles(junk);
+    await importDialog.locator('[type=submit]').click();
+    await importDialog.locator('[role=status]').filter({hasText: /no events|could not|EDL/}).waitFor();
+    await importDialog.locator('[name=file]').setInputFiles(saved['.fcpxml']);
+    assert.equal(await importDialog.locator('[role=status]').textContent(), '', 'a new file clears the old error');
+    await importDialog.locator('[data-close]').click();
+    await importDialog.waitFor({state: 'detached'});
 
     await importFile(saved['.edl'], dialog => dialog.locator('[name=fps]').selectOption('25'));
     const fromEdl = await cutList();

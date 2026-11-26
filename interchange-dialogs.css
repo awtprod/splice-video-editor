@@ -5,3 +5,4 @@
 .interchange-dialog label.interchange-sub{margin-left:26px}
 .interchange-dialog .interchange-report pre{max-height:240px;overflow:auto;white-space:pre-wrap;font-size:12px;background:#121612;border:1px solid #333d33;padding:8px}
 .interchange-dialog .interchange-report summary{cursor:pointer;margin:8px 0}
+.interchange-dialog .interchange-note{margin:0 0 6px 26px;font-size:12px;color:#b9c4b5}

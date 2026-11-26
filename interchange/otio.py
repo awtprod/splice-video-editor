@@ -1,16 +1,20 @@
 """OpenTimelineIO JSON (``.otio``) written and read without the ``opentimelineio`` package.
 
-Schemas: ``Timeline.1`` > ``Stack.1`` > ``Track.1`` (``kind`` ``Video`` or ``Audio``) holding
-``Clip.1``, ``Gap.1`` and ``Transition.1``. Times are ``RationalTime.1`` at exact NTSC rates
-(``24000/1001`` as the double 23.976023976023978, which is how OTIO stores rates); clip source
-ranges count from the media's start timecode, the same origin as each ``ExternalReference.1``'s
-``available_range``. A transition sits between two items with ``in_offset`` (frames before the
-cut) and ``out_offset`` (after it). Speed is a ``LinearTimeWarp.1`` effect (negative
-``time_scalar`` for reverse) and the clip's ``source_range`` duration is its record duration, the
-convention of OTIO's Premiere and Resolve adapters. Sound that plays from a picture clip is
-written again on an ``Audio`` track marked ``metadata.splice.embeddedFrom`` so audio-only readers
-hear it. Everything else Splice knows (volume, fades, transforms, keyframes, links, titles) is kept
-under ``metadata.splice``.
+The writer emits exactly what OpenTimelineIO 0.17/0.18 serializes, field for field and in its
+order, so the real package loads the file with no schema upgrade and writes it back unchanged:
+``Timeline.1`` > ``Stack.1`` > ``Track.1`` (``kind`` ``Video`` or ``Audio``) holding ``Clip.2``
+(``media_references`` with ``DEFAULT_MEDIA`` and ``active_media_reference_key``), ``Gap.1`` and
+``Transition.1``. Times are ``RationalTime.1`` at exact NTSC rates (``24000/1001`` as the double
+23.976023976023978, which is how OTIO stores rates); clip source ranges count from the media's
+start timecode, the same origin as each ``ExternalReference.1``'s ``available_range``. A
+transition sits between two items with ``in_offset`` (frames before the cut) and ``out_offset``
+(after it). Speed is a ``LinearTimeWarp.1`` effect (negative ``time_scalar`` for reverse) and the
+clip's ``source_range`` duration is its record duration, the convention of OTIO's Premiere and
+Resolve adapters. The top-level ``Stack`` carries the timeline's name, because Premiere Pro names
+the imported sequence after it. Sound that plays from a picture clip is written again on an
+``Audio`` track marked ``metadata.splice.embeddedFrom`` so audio-only readers hear it. Everything
+else Splice knows (volume, fades, transforms, keyframes, links, titles) is kept under
+``metadata.splice``, which other applications ignore; the report lists each such clip.
 """
 from __future__ import annotations
 
@@ -25,19 +29,56 @@ from .timecode import frames_timecode, rate_text, snap_rate
 
 FORMAT = 'OTIO'
 MAX_OTIO_BYTES = 30 * 1024 * 1024
+#: OTIO's own marker colours; anything else is written as RED
+MARKER_COLORS = ('PINK', 'RED', 'ORANGE', 'YELLOW', 'GREEN', 'CYAN', 'BLUE', 'PURPLE', 'MAGENTA', 'BLACK', 'WHITE')
+#: field order of each schema as OpenTimelineIO 0.18 writes it
+FIELDS = {
+    'Timeline.1': ('OTIO_SCHEMA', 'metadata', 'name', 'global_start_time', 'tracks'),
+    'Stack.1': ('OTIO_SCHEMA', 'metadata', 'name', 'source_range', 'effects', 'markers', 'enabled', 'color', 'children'),
+    'Track.1': ('OTIO_SCHEMA', 'metadata', 'name', 'source_range', 'effects', 'markers', 'enabled', 'color', 'children', 'kind'),
+    'Clip.2': ('OTIO_SCHEMA', 'metadata', 'name', 'source_range', 'effects', 'markers', 'enabled', 'color', 'media_references',
+               'active_media_reference_key'),
+    'Gap.1': ('OTIO_SCHEMA', 'metadata', 'name', 'source_range', 'effects', 'markers', 'enabled', 'color'),
+    'Transition.1': ('OTIO_SCHEMA', 'metadata', 'name', 'in_offset', 'out_offset', 'transition_type'),
+    'LinearTimeWarp.1': ('OTIO_SCHEMA', 'metadata', 'name', 'effect_name', 'enabled', 'time_scalar'),
+    'ExternalReference.1': ('OTIO_SCHEMA', 'metadata', 'name', 'available_range', 'available_image_bounds', 'target_url'),
+    'GeneratorReference.1': ('OTIO_SCHEMA', 'metadata', 'name', 'available_range', 'available_image_bounds', 'generator_kind',
+                             'parameters'),
+    'Marker.2': ('OTIO_SCHEMA', 'metadata', 'name', 'color', 'marked_range', 'comment'),
+    'TimeRange.1': ('OTIO_SCHEMA', 'duration', 'start_time'),
+    'RationalTime.1': ('OTIO_SCHEMA', 'rate', 'value'),
+}
+
+
+def _object(schema: str, **values) -> dict:
+    return {'OTIO_SCHEMA': schema, **{key: values[key] for key in FIELDS[schema][1:]}}
 
 
 def rational(value: Fraction | int, rate: Fraction) -> dict:
-    return {'OTIO_SCHEMA': 'RationalTime.1', 'rate': float(rate), 'value': float(value)}
+    return _object('RationalTime.1', rate=float(rate), value=float(value))
 
 
 def time_range(start, duration, rate) -> dict:
-    return {'OTIO_SCHEMA': 'TimeRange.1', 'duration': rational(duration, rate), 'start_time': rational(start, rate)}
+    return _object('TimeRange.1', duration=rational(duration, rate), start_time=rational(start, rate))
 
 
 def _gap(frames, rate):
-    return {'OTIO_SCHEMA': 'Gap.1', 'name': '', 'source_range': time_range(0, frames, rate),
-            'effects': [], 'markers': [], 'enabled': True, 'metadata': {}}
+    return _object('Gap.1', metadata={}, name='', source_range=time_range(0, frames, rate), effects=[], markers=[],
+                   enabled=True, color=None)
+
+
+def _json_safe(value):
+    """Metadata as plain JSON types OTIO keeps exactly (floats stay floats, no NaN), with keys sorted
+    the way OTIO writes a metadata dictionary."""
+    if isinstance(value, dict):
+        return {str(k): _json_safe(value[k]) for k in sorted(value, key=str)}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, Fraction):
+        return float(value)
+    return value
 
 
 class _Writer:
@@ -61,18 +102,21 @@ class _Writer:
         if source.reel:
             metadata['splice']['reel'] = source.reel
         start = source.start * rate
-        return {'OTIO_SCHEMA': 'ExternalReference.1', 'name': source.name, 'target_url': url,
-                'available_range': time_range(start, (source.duration * rate) if not source.still else 0, rate),
-                'available_image_bounds': None, 'metadata': metadata}
+        return _object('ExternalReference.1', metadata=_json_safe(metadata), name=source.name,
+                       available_range=time_range(start, (source.duration * rate) if not source.still else 0, rate),
+                       available_image_bounds=None, target_url=url)
 
     def clip(self, event: Event, sound_copy=False):
         metadata = {'trackNumber': event.track, 'clipId': event.id}
+        name = event.name
         if event.kind == 'title':
+            first = (event.text.splitlines() or ['Title'])[0].strip()[:120] or 'Title'
+            name = first
             metadata.update(title=event.text, titleStyle=event.title_style)
-            self.note(event, 'titles are written as a GeneratorReference (generator_kind "SpliceTitle"); most readers show a placeholder.')
-            reference = {'OTIO_SCHEMA': 'GeneratorReference.1', 'name': 'Title', 'generator_kind': 'SpliceTitle',
-                         'parameters': {'text': event.text}, 'available_range': None, 'available_image_bounds': None,
-                         'metadata': {}}
+            self.note(event, f'title "{first}" is a GeneratorReference (generator_kind "SpliceTitle"); Premiere Pro and '
+                             'Resolve show it as an offline placeholder named after its text. Recreate the title there.')
+            reference = _object('GeneratorReference.1', metadata={}, name=f'Splice title: {first}', available_range=None,
+                                available_image_bounds=None, generator_kind='SpliceTitle', parameters=_json_safe({'text': event.text}))
             source_range = time_range(0, event.frames, self.rate)
         else:
             source = event.source
@@ -80,15 +124,21 @@ class _Writer:
             reference = self.reference(source)
             start = (source.start + event.source_in) * rate
             source_range = time_range(start, Fraction(event.frames) / self.rate * rate, rate)
+        lost = []
         for key, value, default in (('volume', event.volume, 100), ('opacity', event.opacity, 100),
                                     ('fadeIn', event.fade_in, 0), ('fadeOut', event.fade_out, 0)):
             if value != default:
-                metadata[key] = value if key in ('volume', 'opacity') else float(Fraction(value) / self.rate)
+                metadata[key] = float(value) if key in ('volume', 'opacity') else float(Fraction(value) / self.rate)
+                lost.append({'volume': f'gain {value:g} %', 'opacity': f'opacity {value:g} %',
+                             'fadeIn': f'fade in {value} frames', 'fadeOut': f'fade out {value} frames'}[key])
         if any(abs(event.transform.get(k, d) - d) > 1e-9 for k, d in (('x', 0), ('y', 0), ('scale', 100), ('rotation', 0))):
-            metadata['transform'] = event.transform
+            metadata['transform'] = dict(event.transform)
+            tf = event.transform
+            lost.append(f'scale {tf["scale"]:g} %, position {tf["x"]:g} / {tf["y"]:g}, rotation {tf["rotation"]:g}°')
         if event.keyframes:
-            metadata['keyframes'] = {k: [{'time': float(Fraction(f) / self.rate), 'value': v} for f, v in points]
+            metadata['keyframes'] = {k: [{'time': float(Fraction(f) / self.rate), 'value': float(v)} for f, v in points]
                                      for k, points in event.keyframes.items()}
+            lost.append('keyframes on ' + ', '.join(sorted(event.keyframes)))
         if event.link_group:
             metadata['linkGroup'] = event.link_group
         if event.kind == 'video':
@@ -98,20 +148,22 @@ class _Writer:
         effects = []
         if event.speed != 1 or event.reverse:
             scalar = float(event.speed) * (-1 if event.reverse else 1)
-            effects.append({'OTIO_SCHEMA': 'LinearTimeWarp.1', 'name': 'Speed', 'effect_name': 'LinearTimeWarp',
-                            'time_scalar': scalar, 'metadata': {}})
-        if metadata.get('transform') or metadata.get('keyframes') or event.volume != 100 or event.fade_in or event.fade_out:
-            self.note(event, 'volume, fades, transform and keyframes are kept under metadata.splice; other apps ignore them.')
-        return {'OTIO_SCHEMA': 'Clip.1', 'name': event.name, 'source_range': source_range, 'effects': effects,
-                'markers': [], 'enabled': event.enabled, 'media_reference': reference, 'metadata': {'splice': metadata}}
+            effects.append(_object('LinearTimeWarp.1', metadata={}, name='Speed', effect_name='LinearTimeWarp', enabled=True,
+                                   time_scalar=scalar))
+        if lost and not sound_copy:
+            self.note(event, '; '.join(lost) + ': kept only in metadata.splice; Premiere Pro and Resolve do not apply it, '
+                             'so set it again there (FCPXML and FCP 7 XML carry it).')
+        return _object('Clip.2', metadata=_json_safe({'splice': metadata}), name=name, source_range=source_range,
+                       effects=effects, markers=[], enabled=event.enabled, color=None,
+                       media_references={'DEFAULT_MEDIA': reference}, active_media_reference_key='DEFAULT_MEDIA')
 
     def transition(self, event):
         tr = event.transition
         if tr.kind != 'dissolve':
             self.note(event, f'{"dip to black" if tr.kind == "fade" else "wipe"} written as an SMPTE dissolve.')
-        return {'OTIO_SCHEMA': 'Transition.1', 'name': 'Cross Dissolve', 'transition_type': 'SMPTE_Dissolve',
-                'in_offset': rational(tr.before, self.rate), 'out_offset': rational(tr.frames - tr.before, self.rate),
-                'metadata': {'splice': {'kind': tr.kind, 'constantPower': tr.power}}}
+        return _object('Transition.1', metadata={'splice': {'constantPower': tr.power, 'kind': tr.kind}}, name='Cross Dissolve',
+                       in_offset=rational(tr.before, self.rate), out_offset=rational(tr.frames - tr.before, self.rate),
+                       transition_type='SMPTE_Dissolve')
 
     def track(self, name, kind, events, sound_copy=False):
         children, cursor = [], 0
@@ -122,8 +174,8 @@ class _Writer:
                 children.append(self.transition(event))
             children.append(self.clip(event, sound_copy))
             cursor = event.record_out
-        return {'OTIO_SCHEMA': 'Track.1', 'name': name, 'kind': kind, 'source_range': None, 'effects': [],
-                'markers': [], 'enabled': True, 'children': children, 'metadata': {}}
+        return _object('Track.1', metadata={}, name=name, source_range=None, effects=[], markers=[], enabled=True, color=None,
+                       children=children, kind=kind)
 
     def document(self) -> dict:
         cut, tracks = self.cut, []
@@ -136,20 +188,23 @@ class _Writer:
             embedded = [e for e in cut.events if e.kind == 'video' and e.track == track and e.embedded_audio]
             if embedded:
                 tracks.append(self.track(f'V{track} sound', 'Audio', embedded, sound_copy=True))
-        markers = [{'OTIO_SCHEMA': 'Marker.2', 'name': m.name, 'color': (m.color or 'RED').upper(), 'comment': '',
-                    'marked_range': time_range(m.frame, m.duration, self.rate), 'metadata': {}} for m in cut.markers]
-        return {'OTIO_SCHEMA': 'Timeline.1', 'name': cut.name,
-                'global_start_time': rational(cut.tc_start, self.rate),
-                'metadata': {'splice': {'width': cut.width, 'height': cut.height, 'rate': rate_text(self.rate),
-                                        'dropFrame': cut.drop, 'startTimecode': frames_timecode(cut.tc_start, self.rate, cut.drop)}},
-                'tracks': {'OTIO_SCHEMA': 'Stack.1', 'name': 'tracks', 'source_range': None, 'effects': [],
-                           'markers': markers, 'enabled': True, 'children': tracks, 'metadata': {}}}
+        markers = [_object('Marker.2', metadata={}, name=m.name,
+                           color=m.color.upper() if m.color.upper() in MARKER_COLORS else 'RED',
+                           marked_range=time_range(m.frame, m.duration, self.rate), comment='') for m in cut.markers]
+        metadata = {'splice': {'width': cut.width, 'height': cut.height, 'rate': rate_text(self.rate),
+                               'dropFrame': cut.drop, 'startTimecode': frames_timecode(cut.tc_start, self.rate, cut.drop)}}
+        stack = _object('Stack.1', metadata={}, name=cut.name, source_range=None, effects=[], markers=markers, enabled=True,
+                        color=None, children=tracks)
+        return _object('Timeline.1', metadata=_json_safe(metadata), name=cut.name, global_start_time=rational(cut.tc_start, self.rate),
+                       tracks=stack)
 
 
 def write(cut: Cut) -> str:
+    """The document exactly as ``opentimelineio`` 0.18 would serialize it (4-space indent, UTF-8,
+    no trailing newline)."""
     if cut.frames <= 0:
         raise ValueError('The timeline is empty')
-    return json.dumps(_Writer(cut).document(), indent=4, ensure_ascii=False) + '\n'
+    return json.dumps(_Writer(cut).document(), indent=4, ensure_ascii=False)
 
 
 # -- import -------------------------------------------------------------------------------------
@@ -175,7 +230,7 @@ def _range(value, what):
     return _seconds(value.get('start_time'), what), _seconds(value.get('duration'), what)
 
 
-def read(data: bytes) -> dict:
+def read(data: bytes, budget=None) -> dict:
     from .project import build_project
     if len(data) > MAX_OTIO_BYTES:
         raise ValueError('The OTIO file is larger than 30 MB')
@@ -203,7 +258,12 @@ def read(data: bytes) -> dict:
         number = int(named.group(1)) if named else counts.get(track.get('kind', 'Video'), 1)
         cursor, pending = Fraction(0), None
         for item in (track.get('children') or [])[:20000]:
-            schema = str(item.get('OTIO_SCHEMA', '')) if isinstance(item, dict) else ''
+            if budget is not None:
+                budget.tick()
+            if not isinstance(item, dict):
+                warnings.append('A track item that is not an object was skipped.')
+                continue
+            schema = str(item.get('OTIO_SCHEMA', ''))
             if schema.startswith('Transition.'):
                 pending = item
                 continue

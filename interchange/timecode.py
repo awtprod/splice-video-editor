@@ -167,3 +167,21 @@ def parse_fcpxml_time(value: str) -> Fraction:
         raise ValueError(f'{value!r} is not an FCPXML rational time such as 1001/24000s')
     result = Fraction(int(match.group(2)), int(match.group(3) or 1))
     return -result if match.group(1) else result
+
+
+def convert_label(frames: int, from_rate: Fraction, from_drop: bool, to_rate: Fraction, to_drop: bool) -> int:
+    """Frame ``frames`` (a timecode at ``from_rate``) as the same label read at ``to_rate``: hours,
+    minutes and seconds are kept and the frame digits scaled, the way an edit system shows a
+    29.97 source's timecode in a 23.976 list. A label drop-frame skips moves to the next valid one."""
+    if from_rate == to_rate and from_drop == to_drop:
+        return frames
+    label = frames_timecode(frames, from_rate, from_drop)
+    hours, minutes, seconds, frame = (int(part) for part in re.split(r'[:;]', label))
+    top = nominal(to_rate)
+    frame = min(top - 1, round(Fraction(frame * top, nominal(from_rate))))
+    if to_drop:
+        skip = top // 15
+        if seconds == 0 and frame < skip and minutes % 10:
+            frame = skip
+    separator = ';' if to_drop else ':'
+    return timecode_frames(f'{hours:02d}:{minutes:02d}:{seconds:02d}{separator}{frame:02d}', to_rate, to_drop)

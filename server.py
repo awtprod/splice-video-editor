@@ -161,7 +161,7 @@ class Handler(BaseHTTPRequestHandler):
             except KeyError:
                 self._json(404, {'error': 'Unknown export'})
             return
-        if route not in ('/api/exports', '/api/media/nested-preview','/api/media/proxy', '/api/premiere/sequence', '/api/premiere/open', '/api/premiere/save', '/api/media/upload', '/api/render', '/api/interchange/export', '/api/interchange/import'):
+        if route not in ('/api/exports', '/api/media/nested-preview','/api/media/proxy', '/api/premiere/sequence', '/api/premiere/open', '/api/premiere/save', '/api/media/upload', '/api/render', '/api/interchange/export', '/api/interchange/import', '/api/interchange/cancel'):
             self.send_error(404)
             return
         try:

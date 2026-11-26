@@ -1,11 +1,14 @@
 """Timeline interchange entry points for the loopback server.
 
-``export_timeline(project, options)`` returns the timeline files, a plain-text report of what each
-format could not carry, and with ``options['package']`` a turnover zip of both. The report lists
-every clip-level loss; nothing is dropped without a line in it.
+``export_timeline(project, options)`` returns the timeline files (FCPXML 1.10, CMX3600 EDLs,
+OpenTimelineIO, Final Cut Pro 7 XML), a plain-text report of what each format could not carry, and
+with ``options['package']`` a turnover zip of both. The report lists every clip-level loss; nothing
+is dropped without a line in it.
 
-``import_timeline(filename, text, options)`` reads FCPXML, a CMX3600 EDL or OTIO into a new Splice
-project whose ``compatibilityWarnings`` list everything that was not imported.
+``import_timeline(filename, text, options)`` reads FCPXML, FCP 7 XML, a CMX3600 EDL or OTIO into a
+new Splice project whose ``compatibilityWarnings`` list everything that was not imported. An
+import is bounded in time and in the timeline items it may visit (:mod:`.budget`) and can be
+stopped with ``handle('cancel', {'jobId': ...})`` using the ``options['jobId']`` it was started with.
 
 ``REFERENCE_MOVIE_OPTION``: the turnover hook for a reference movie with burnt-in timecode. This
 module does not render; when the option is set the package carries
@@ -20,11 +23,15 @@ import re
 import zipfile
 from datetime import datetime, timezone
 
-from . import edl, fcpxml, otio
+from . import edl, fcpxml, otio, xmeml
+from .budget import Budget, BudgetExceeded, cancel
 from .cut import InterchangeError, build_cut
 from .timecode import frames_timecode, rate_text
 
-FORMATS = ('fcpxml', 'edl', 'otio')
+FORMATS = ('fcpxml', 'edl', 'otio', 'xmeml')
+TITLES = {'fcpxml': 'FCPXML', 'edl': 'EDL', 'otio': 'OTIO', 'xmeml': 'XML'}
+HEADINGS = {'fcpxml': 'FCPXML 1.10 (DaVinci Resolve, Final Cut Pro)', 'edl': 'CMX3600 EDL',
+            'otio': 'OpenTimelineIO', 'xmeml': 'Final Cut Pro 7 XML (Premiere Pro, Resolve, Avid)'}
 REFERENCE_MOVIE_OPTION = 'referenceMovie'
 MAX_IMPORT_BYTES = 30 * 1024 * 1024
 
@@ -45,17 +52,27 @@ def report_text(cut, formats, files) -> str:
              '', 'Files:'] + [f'  {name}' for name, _ in files]
     lines += ['', 'Not carried by any format (all formats):']
     lines += [f'  - {entry}' for entry in report.general] or ['  (nothing)']
-    titles = {'fcpxml': 'FCPXML', 'edl': 'EDL', 'otio': 'OTIO'}
     for fmt in formats:
-        key = titles[fmt]
-        lines += ['', f'{key}:']
+        key = TITLES[fmt]
+        lines += ['', f'{HEADINGS[fmt]}:']
         lines += [f'  - {entry}' for entry in report.by_format.get(key, [])] or ['  (everything above aside, nothing further)']
     return '\n'.join(lines) + '\n'
 
 
+def _options(options) -> dict:
+    if options is None:
+        return {}
+    if not isinstance(options, dict):
+        raise InterchangeError('Interchange options must be an object')
+    return dict(options)
+
+
 def export_timeline(project: dict, options: dict | None = None) -> dict:
-    options = dict(options or {})
-    formats = [f for f in options.get('formats') or ['fcpxml'] if f in FORMATS]
+    options = _options(options)
+    requested = options.get('formats') or ['fcpxml']
+    if not isinstance(requested, list):
+        raise InterchangeError('Choose the timeline formats as a list')
+    formats = [f for f in FORMATS if f in requested]
     if not formats:
         raise InterchangeError('Choose at least one timeline format')
     cut = build_cut(project, options)
@@ -70,6 +87,8 @@ def export_timeline(project: dict, options: dict | None = None) -> dict:
             files.append((f'{base}-{suffix}.edl', text))
     if 'otio' in formats:
         files.append((f'{base}.otio', otio.write(cut)))
+    if 'xmeml' in formats:
+        files.append((f'{base}.xml', xmeml.write(cut)))
     report = report_text(cut, formats, files)
     result = {'files': [{'name': name, 'content': text} for name, text in files], 'report': report,
               'issues': len(cut.report.general) + sum(len(v) for v in cut.report.by_format.values())}
@@ -91,41 +110,66 @@ def export_timeline(project: dict, options: dict | None = None) -> dict:
 
 def detect(filename: str, data: bytes) -> str:
     name = filename.lower()
-    head = data[:2048].lstrip()
+    head = data[:4096].lstrip(b'\xef\xbb\xbf \t\r\n')
     if name.endswith(('.fcpxml', '.xml')) or head.startswith(b'<'):
-        return 'fcpxml'
+        return 'xmeml' if re.search(rb'<xmeml[\s>]', head) else 'fcpxml'
     if name.endswith('.otio') or head.startswith(b'{'):
         return 'otio'
     if name.endswith('.edl') or b'FCM:' in data[:4096].upper() or b'TITLE:' in data[:4096].upper():
         return 'edl'
-    raise InterchangeError('Choose an .fcpxml, .edl or .otio timeline file')
+    raise InterchangeError('Choose an .fcpxml, .xml, .edl or .otio timeline file')
+
+
+def _dimension(value, default):
+    if value is None or value == '':
+        return default
+    try:
+        number = int(float(value))
+    except (TypeError, ValueError, OverflowError):
+        raise InterchangeError(f'Frame size {str(value)[:20]!r} is not a whole number of pixels') from None
+    if not 16 <= number <= 16384:
+        raise InterchangeError(f'Frame size {number} is outside 16-16384 pixels')
+    return number
 
 
 def import_timeline(filename: str, text: str, options: dict | None = None) -> dict:
+    options = _options(options)
     if not isinstance(text, str) or not isinstance(filename, str):
         raise InterchangeError('Invalid timeline upload')
     data = text.encode('utf-8')
     if len(data) > MAX_IMPORT_BYTES:
         raise InterchangeError('The timeline file is larger than 30 MB')
     kind = detect(filename, data)
-    if kind == 'fcpxml':
-        project = fcpxml.read(data)
-    elif kind == 'otio':
-        project = otio.read(data)
-    else:
-        project = edl.read(data, options or {})
+    with Budget(job=options.get('jobId')) as budget:
+        if kind == 'fcpxml':
+            project = fcpxml.read(data, budget)
+        elif kind == 'xmeml':
+            project = xmeml.read(data, budget)
+        elif kind == 'otio':
+            project = otio.read(data, budget)
+        else:
+            if options.get('fps') in (None, ''):
+                raise InterchangeError('An EDL does not say its frame rate; choose it (options.fps) and import again')
+            edl_options = dict(options, width=_dimension(options.get('width'), 1920),
+                               height=_dimension(options.get('height'), 1080))
+            project = edl.read(data, edl_options, budget)
+        budget.check()
     if not project['clips']:
         raise InterchangeError('The timeline file contains no clips Splice can import')
-    project['compatibilityWarnings'].insert(0, f'Imported from {filename[:120]} ({kind.upper()}).')
+    label = {'xmeml': 'FCP 7 XML'}.get(kind, kind.upper())
+    project['compatibilityWarnings'].insert(0, f'Imported from {filename[:120]} ({label}).')
     return project
 
 
 def handle(action: str, payload: dict) -> dict:
-    """Server entry: ``export`` -> files and report, ``import`` -> ``{'project': ...}``."""
+    """Server entry: ``export`` -> files and report, ``import`` -> ``{'project': ...}``,
+    ``cancel`` -> ``{'cancelled': bool}`` for a running import's ``jobId``."""
     if not isinstance(payload, dict):
         raise InterchangeError('Invalid request')
     if action == 'export':
-        return export_timeline(payload.get('project'), payload.get('options') or {})
+        return export_timeline(payload.get('project'), payload.get('options'))
     if action == 'import':
-        return {'project': import_timeline(payload.get('filename', ''), payload.get('text', ''), payload.get('options') or {})}
+        return {'project': import_timeline(payload.get('filename', ''), payload.get('text', ''), payload.get('options'))}
+    if action == 'cancel':
+        return {'cancelled': cancel(payload.get('jobId'))}
     raise InterchangeError('Unknown interchange action')

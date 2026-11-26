@@ -27,6 +27,7 @@ from .cut import Cut, Event
 from .media import file_url, path_from_url, base_name
 from .timecode import fcpxml_time, frames_timecode, parse_fcpxml_time, rate_text, snap_rate
 from . import xmlsafe
+from .budget import Budget
 
 VERSION = '1.10'
 READ_VERSIONS = ('1.9', '1.10', '1.11')
@@ -138,8 +139,6 @@ class _Writer:
             if source.has_video and source.kind == 'video':
                 element.set('hasVideo', '1')
                 element.set('format', attrs['format'])
-                if source.timecode and source.drop:
-                    element.set('tcFormat', 'DF')
             if source.has_audio:
                 element.set('hasAudio', '1')
                 element.set('audioSources', str(max(1, len(source.audio_streams))))
@@ -171,6 +170,9 @@ class _Writer:
                      duration=self.t(self.frames(event.frames)))
         if not event.enabled:
             attrs['enabled'] = '0'
+        if source.has_video and source.kind == 'video' and source.timecode and not source.still:
+            # the DTD puts tcFormat on the clip, not the asset; Final Cut Pro writes it there too
+            attrs['tcFormat'] = 'DF' if source.drop else 'NDF'
         partner = self.merged.get(event.id)
         sound = event
         if event.kind == 'audio' and source.has_video:
@@ -258,14 +260,14 @@ class _Writer:
             adjust.set('amount', db(event.volume))
         if keys or event.fade_in or event.fade_out:
             param = ET.SubElement(adjust, 'param', name='amount')
-            if event.fade_in:
+            if event.fade_in:  # DTD order: fadeIn?, fadeOut?, keyframeAnimation?
                 ET.SubElement(param, 'fadeIn', type='linear', duration=self.t(self.frames(event.fade_in)))
+            if event.fade_out:
+                ET.SubElement(param, 'fadeOut', type='linear', duration=self.t(self.frames(event.fade_out)))
             if keys:
                 animation = ET.SubElement(param, 'keyframeAnimation')
                 for frame, value in keys:
                     ET.SubElement(animation, 'keyframe', time=self.t_any(origin + self.frames(frame)), value=db(value))
-            if event.fade_out:
-                ET.SubElement(param, 'fadeOut', type='linear', duration=self.t(self.frames(event.fade_out)))
             if event.fade_in or event.fade_out:
                 self.note(event, 'audio fades are fadeIn/fadeOut on the clip volume; Resolve imports them as volume keyframes.')
 
@@ -357,7 +359,15 @@ class _Writer:
         self._markers(items)
         if cut.height > cut.width:
             self.report.add(FORMAT, 'Vertical timeline: Resolve may switch the project resolution to match on import; check it.')
-        self.report.add(FORMAT, 'Premiere Pro does not import FCPXML natively; give Premiere the EDLs or the OTIO file.')
+        self.report.add(FORMAT, 'Premiere Pro does not import FCPXML 1.x; give Premiere the FCP 7 XML (.xml), the OTIO file or the EDLs.')
+        used = sorted({e.track for e in cut.events if e.kind != 'audio'})
+        if used and used != list(range(1, len(used) + 1)):
+            moves = ', '.join(f'V{track} -> V{index}' for index, track in enumerate(used, 1) if index != track)
+            self.report.add(FORMAT, f'DaVinci Resolve drops empty video tracks when it imports FCPXML, so tracks move down: {moves}.')
+        titles = [e for e in cut.events if e.kind == 'title']
+        if titles:
+            self.report.add(FORMAT, 'DaVinci Resolve imports each title as a Text generator named "Text"; its text is carried, '
+                                    'the clip name is not: ' + ', '.join(f'"{(e.text.splitlines() or ["Title"])[0][:40]}"' for e in titles[:20]) + '.')
         for video_id, audio in self.merged.items():
             self.report.add(FORMAT, f'{self.cut.label(audio)}: linked to its picture, so it is written inside that A/V clip '
                                     '(a J/L cut via audioStart); the receiving app shows it with the picture, not on its own track.')
@@ -466,16 +476,30 @@ def file_url_relative(name: str) -> str:
     return quote(base_name(name), safe='')
 
 
-_ORDER = {'note': 0, 'conform-rate': 1, 'timeMap': 2, 'adjust-conform': 3, 'adjust-transform': 4, 'adjust-blend': 5,
-          'adjust-volume': 6, 'text': 7, 'text-style-def': 8, 'spine': 9, 'asset-clip': 9, 'title': 9, 'gap': 9,
-          'marker': 10, 'filter-video': 11, 'filter-audio': 12, 'metadata': 13}
+_STORY_TAGS = ('audio', 'video', 'clip', 'title', 'caption', 'mc-clip', 'ref-clip', 'sync-clip', 'asset-clip', 'audition', 'spine')
+_ADJUST = ('adjust-crop', 'adjust-corners', 'adjust-conform', 'adjust-transform', 'adjust-blend', 'adjust-stabilization',
+           'adjust-volume', 'adjust-panner')
+
+
+def _ranks(*groups):
+    return {tag: rank for rank, group in enumerate(groups) for tag in (group if isinstance(group, tuple) else (group,))}
+
+
+#: Child order per parent, from the FCPXML 1.10 DTD content models of the elements written here.
+_ORDER = {
+    'asset-clip': _ranks('note', 'conform-rate', 'timeMap', *_ADJUST, _STORY_TAGS, 'marker',
+                         'audio-channel-source', 'filter-video', 'filter-audio', 'metadata'),
+    'gap': _ranks('note', _STORY_TAGS, 'marker', 'metadata'),
+    'title': _ranks('param', 'text', 'text-style-def', 'note', *_ADJUST[:6], _STORY_TAGS, 'marker', 'filter-video', 'metadata'),
+}
 
 
 def _reorder(root):
-    """Children in DTD order: note, timing, adjustments, title text, anchored items, markers, metadata."""
+    """Children in the DTD order of their parent (a stable sort, so same-rank siblings keep their order)."""
     for element in root.iter():
-        if element.tag in ('asset-clip', 'gap', 'title'):
-            element[:] = sorted(element, key=lambda child: _ORDER.get(child.tag, 9))
+        order = _ORDER.get(element.tag)
+        if order:
+            element[:] = sorted(element, key=lambda child: order.get(child.tag, 1000))
 
 
 def _indent(element, level=0):
@@ -506,9 +530,10 @@ INFINITE = Fraction(10 ** 9)
 
 
 class _Reader:
-    def __init__(self, root):
+    def __init__(self, root, budget=None):
+        self.budget = budget or Budget()
         if root.tag == 'xmeml':
-            raise ValueError('This is Final Cut Pro 7 XML (xmeml), which Splice does not import; export FCPXML 1.9 or later, an EDL or OTIO')
+            raise ValueError('This is Final Cut Pro 7 XML (xmeml); open it as an .xml timeline so the FCP 7 XML reader reads it')
         if root.tag != 'fcpxml':
             raise ValueError('This is not an FCPXML document')
         self.warnings = []
@@ -524,6 +549,12 @@ class _Reader:
                 raise ValueError(f'FCPXML resource id {rid!r} is defined twice')
             self.resources[rid] = element
         self._root = root
+        # Drop-frame is a property of the clip in FCPXML (asset-clip@tcFormat); the DTD has no tcFormat on
+        # an asset. The first clip that names it decides for the asset's timecode label.
+        self.tc_formats = {}
+        for clip in root.iter('asset-clip'):
+            if clip.get('tcFormat') in ('DF', 'NDF'):
+                self.tc_formats.setdefault(clip.get('ref', ''), clip.get('tcFormat'))
         self.media, self.clips, self.markers = {}, [], []
         self.links = 0
         self.skipped = {}
@@ -583,6 +614,7 @@ class _Reader:
             return
         pending = None
         for child in children:
+            self.budget.tick()
             tag = child.tag
             if tag == 'transition':
                 pending = (to_record(self.time(child, 'offset')), self.time(child, 'duration'), child)
@@ -596,10 +628,17 @@ class _Reader:
             if tag == 'spine':
                 self.walk(list(child), lambda offset, base=record: base + offset, child_lane, window, depth + 1, stack)
                 continue
+            if tag != 'gap' and child.get('duration') is not None:
+                length = self.time(child, 'duration')
+                if record >= window[1] or record + length <= window[0]:
+                    # outside the visible range of its container: nothing under it can show
+                    pending = None
+                    continue
             produced = self.element(child, record, child_lane, window, depth, stack)
             if pending is not None:
                 start, length, element = pending
-                if produced and start + length > record:
+                # a dissolve may end exactly on the cut (all of it before the edit point)
+                if produced and start <= record <= start + length:
                     self.attach_transition(produced, record - start, length, element)
                 else:
                     self.warnings.append(f'Transition "{element.get("name") or "transition"}" at {float(start):.2f} s '
@@ -607,7 +646,8 @@ class _Reader:
                 pending = None
             local_start = self.local_start(child)
             for sub in child:
-                if sub.tag in STORY and (sub.tag == 'spine' or sub.get('lane') is not None or tag not in CONTAINERS):
+                # a container's own storyline (children without a lane, a spine included) was read by element()
+                if sub.tag in STORY and (sub.get('lane') is not None or tag not in CONTAINERS):
                     self.walk([sub], lambda offset, r=record, s=local_start: r + offset - s, child_lane, (Fraction(0), INFINITE),
                               depth + 1, stack)
                 elif sub.tag in ('marker', 'chapter-marker'):
@@ -659,7 +699,12 @@ class _Reader:
             if len(self.clips) > before:
                 self.warnings.append(f'Compound clip {element.get("name") or ref} was flattened onto the timeline.')
             return self.clips[before:]
-        self.skip({'mc-clip': 'multicam clips were', 'live-drawing': 'drawings were', 'caption': 'captions were'}.get(tag, f'{tag} items were'))
+        what = {'mc-clip': 'multicam clip', 'live-drawing': 'drawing', 'caption': 'caption'}.get(tag, f'{tag} item')
+        self.skip(f'{what}s were')
+        if self.skipped[f'{what}s were'] <= 50:
+            self.warnings.append(f'{what.capitalize()} "{element.get("name") or element.get("ref") or tag}" at '
+                                 f'{float(record):.2f} s on lane {lane} was not imported; '
+                                 + ('switch it to its active angle and export again.' if tag == 'mc-clip' else 'Splice has no equivalent.'))
         return []
 
     def media_key(self, asset):
@@ -680,7 +725,7 @@ class _Reader:
                   'duration': float(self.time(asset, 'duration', Fraction(0))) or None,
                   'start': start, 'rate': rate_text(rate) if rate else None}
         if rate is not None and asset.get('hasVideo') == '1':
-            drop = asset.get('tcFormat') == 'DF'
+            drop = self.tc_formats.get(rid) == 'DF'
             try:
                 record['timecode'] = frames_timecode(round(start * rate), rate, drop and rate in (Fraction(30000, 1001), Fraction(60000, 1001)))
                 record['dropFrame'] = drop
@@ -731,8 +776,10 @@ class _Reader:
         if kind == 'video':
             clip['embeddedAudio'] = has_audio
             self.picture(element, clip, start)
-        if kind == 'video' and has_audio and audio_start is not None:
-            a_start = parse_fcpxml_time(audio_start)
+        # a split edit (audioStart), or Splice's own linked pair written as one A/V clip (com.splice.audioTrack):
+        # either way the sound comes back as its own clip, linked to the picture
+        if kind == 'video' and has_audio and (audio_start is not None or meta.get('audioTrack')):
+            a_start = parse_fcpxml_time(audio_start) if audio_start is not None else start
             a_duration = self.time(element, 'audioDuration', duration)
             sound = self.placed(dict(base, kind='audio'), record + a_start - start, a_duration, a_start, source, window)
             if sound is not None:
@@ -911,10 +958,10 @@ class _Reader:
             clip['transition'] = {'transition': kind, 'transitionDuration': float(length), 'transitionBefore': float(max(Fraction(0), before))}
 
 
-def read(data: bytes) -> dict:
+def read(data: bytes, budget: Budget | None = None) -> dict:
     from .project import build_project
     root = xmlsafe.parse(data)
-    reader = _Reader(root).run()
+    reader = _Reader(root, budget).run()
     clips = []
     for clip in reader.clips:
         clip = dict(clip)

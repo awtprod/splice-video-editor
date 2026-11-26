@@ -2,8 +2,11 @@
 about itself (start timecode, rate, reel, audio layout).
 
 A media item may already carry the metadata contract fields (``sourcePath``, ``rate``,
-``timecode``, ``dropFrame``, ``reel``, ``vfr``, ``audioStreams`` as a list); when it does not,
-the original file is probed with ffprobe, bounded by a timeout, so an export is right on its own.
+``timecode``, ``dropFrame``, ``reel``, ``vfr``, ``audioStreams`` as an integer count of audio
+streams and ``audioStreamDetails`` as ``[{index, channels, layout, codec}]``). The original file is
+probed with ffprobe only for fields that are genuinely missing, and all probes of one export
+share a :class:`ProbeBudget` (a count and a total time), so an export is right on its own and
+never stalls a request. A list in ``audioStreams`` (an earlier draft of the contract) is read too.
 """
 from __future__ import annotations
 
@@ -19,6 +22,8 @@ from .timecode import is_drop_frame, parse_rate, snap_rate, timecode_frames
 
 PROBE_TIMEOUT = 20
 MAX_PROBES = 500
+#: total seconds of probing one export may spend; sources past it are listed in the report
+PROBE_SECONDS = 60.0
 STILL_EXTENSIONS = frozenset({'.png', '.bmp', '.jpg', '.jpeg', '.tif', '.tiff'})
 _CONTROL = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
 _DRIVE = re.compile(r'^([A-Za-z]):[\\/](.*)$', re.S)
@@ -145,14 +150,37 @@ def parse_probe(data: dict) -> Probe:
     return result
 
 
-def probe_file(path: Path) -> Probe:
+class ProbeBudget:
+    """Probes one export may still run: at most ``count`` files and ``seconds`` in total."""
+
+    def __init__(self, count: int = MAX_PROBES, seconds: float = PROBE_SECONDS):
+        import time
+        self._clock = time.monotonic
+        self.count = max(0, int(count))
+        self.deadline = self._clock() + max(0.0, float(seconds))
+        self.seconds = seconds
+        self.skipped = []       # names of sources left unprobed because the budget ran out
+
+    def remaining(self) -> float:
+        return max(0.0, self.deadline - self._clock())
+
+    def take(self) -> float | None:
+        """Seconds the next probe may take, or None when the budget is spent."""
+        left = self.remaining()
+        if self.count <= 0 or left < 0.5:
+            return None
+        self.count -= 1
+        return min(PROBE_TIMEOUT, left)
+
+
+def probe_file(path: Path, timeout: float = PROBE_TIMEOUT) -> Probe:
     """ffprobe one local regular file. Raises ``ValueError`` when it is unreadable."""
     if not path.is_file():
         raise ValueError(f'{path.name} is not a readable file')
     try:
         result = subprocess.run(['ffprobe', '-v', 'error', '-protocol_whitelist', 'file',
                                  '-show_streams', '-show_format', '-of', 'json', 'file:' + str(path)],
-                                capture_output=True, timeout=PROBE_TIMEOUT, stdin=subprocess.DEVNULL)
+                                capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
     except (subprocess.TimeoutExpired, OSError) as error:
         raise ValueError(f'Could not probe {path.name}: {error}') from None
     if result.returncode:
@@ -214,9 +242,35 @@ def _local_candidates(item: dict):
                 continue
 
 
-def resolve_source(item: dict, sequence_rate: Fraction, probe_budget: list) -> Source:
-    """Describe one Splice media item. ``probe_budget`` is a one-element list counting the
-    probes still allowed for this export."""
+def _stream_list(value) -> list | None:
+    if not isinstance(value, list):
+        return None
+    streams = []
+    for index, stream in enumerate(value[:64]):
+        if isinstance(stream, dict):
+            try:
+                channels = max(0, min(64, int(stream.get('channels') or 0)))
+            except (TypeError, ValueError):
+                channels = 0
+            streams.append({'index': stream.get('index', index), 'channels': channels,
+                            'layout': clean(stream.get('layout'), 40), 'codec': clean(stream.get('codec'), 40)})
+    return streams
+
+
+def _dimension(value) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
+        return None
+    return int(value) if 1 <= value <= 16384 else None
+
+
+def _stream_count(value) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return max(0, min(64, int(value)))
+
+
+def resolve_source(item: dict, sequence_rate: Fraction, budget: ProbeBudget) -> Source:
+    """Describe one Splice media item; probing, when a field is missing, spends ``budget``."""
     name = clean(item.get('name') or item.get('id') or 'Media') or 'Media'
     source = Source(id=str(item.get('id')), name=name, path=None, local=None,
                     kind='audio' if item.get('type') == 'audio' else 'video')
@@ -237,14 +291,26 @@ def resolve_source(item: dict, sequence_rate: Fraction, probe_budget: list) -> S
         source.path = item['path']
     suffix = Path(base_name(source.path or name)).suffix.lower()
     source.still = bool(item.get('still')) or suffix in STILL_EXTENSIONS
+    details = _stream_list(item.get('audioStreamDetails'))
+    if details is None:
+        details = _stream_list(item.get('audioStreams'))      # earlier draft: the list itself
+    count = _stream_count(item.get('audioStreams'))
+    # a count with no per-stream list leaves the channel layout open: probe it when the file is here
+    audio_known = details is not None or count == 0
+    rate_known = bool(snap_rate(item.get('rate'))) or source.kind == 'audio' or source.still
+    timecode_known = 'timecode' in item
     probe = None
-    needs_probe = not (item.get('rate') and isinstance(item.get('audioStreams'), list) and 'timecode' in item)
-    if needs_probe and local is not None and probe_budget[0] > 0:
-        probe_budget[0] -= 1
-        try:
-            probe = probe_file(local)
-        except ValueError as error:
-            source.notes.append(str(error))
+    needs_probe = not (rate_known and audio_known and timecode_known)
+    if needs_probe and local is not None:
+        timeout = budget.take()
+        if timeout is None:
+            budget.skipped.append(name)
+            source.notes.append(f'not probed: this export\'s probe budget ({budget.seconds:g} s, {MAX_PROBES} files) ran out')
+        else:
+            try:
+                probe = probe_file(local, timeout)
+            except ValueError as error:
+                source.notes.append(str(error))
     elif needs_probe and local is None:
         source.notes.append('the original file is not on this machine, so its metadata could not be read')
     # rate
@@ -254,22 +320,27 @@ def resolve_source(item: dict, sequence_rate: Fraction, probe_budget: list) -> S
         source.notes.append('variable frame rate source' + (f' ({probe.raw_rate})' if probe and probe.raw_rate else ''))
     source.has_video = source.kind == 'video' and not (probe is not None and not probe.has_video)
     source.rate = rate if source.has_video and not source.still else None
-    # audio layout
-    streams = item.get('audioStreams')
-    if isinstance(streams, list):
-        source.audio_streams = [s for s in streams if isinstance(s, dict)][:64]
-    elif probe is not None:
+    # audio layout: the per-stream list when there is one, else the count, else the probe
+    if details:
+        source.audio_streams = details
+    elif probe is not None and probe.audio_streams and not audio_known:
         source.audio_streams = probe.audio_streams
+    elif count:
+        channels = _stream_count(item.get('audioChannels')) or 2
+        source.audio_streams = [{'index': i, 'channels': channels, 'layout': '', 'codec': ''} for i in range(count)]
+        if not _stream_count(item.get('audioChannels')):
+            source.notes.append(f'{count} audio stream{"s" if count > 1 else ""} with no channel layout on record; '
+                                'written as stereo')
     elif isinstance(item.get('audioStreamChannels'), list):
-        source.audio_streams = [{'index': i, 'channels': int(c or 0), 'layout': '', 'codec': ''}
+        source.audio_streams = [{'index': i, 'channels': _stream_count(c) or 0, 'layout': '', 'codec': ''}
                                 for i, c in enumerate(item['audioStreamChannels'][:64])]
-    elif item.get('audioChannels'):
-        source.audio_streams = [{'index': 0, 'channels': int(item['audioChannels']), 'layout': '', 'codec': ''}]
+    elif _stream_count(item.get('audioChannels')):
+        source.audio_streams = [{'index': 0, 'channels': _stream_count(item['audioChannels']), 'layout': '', 'codec': ''}]
     source.has_audio = bool(source.audio_streams) or source.kind == 'audio'
     source.audio_rate = probe.audio_rate if probe else None
     # size and length
-    source.width = item.get('width') or (probe.width if probe else None)
-    source.height = item.get('height') or (probe.height if probe else None)
+    source.width = _dimension(item.get('width')) or (_dimension(probe.width) if probe else None)
+    source.height = _dimension(item.get('height')) or (_dimension(probe.height) if probe else None)
     duration = (probe.duration if probe else None) or Fraction(repr(float(item.get('duration') or 0)))
     source.duration = duration
     source.reel = clean((item.get('reel') if isinstance(item.get('reel'), str) else None) or (probe.reel if probe else None) or '', 64) or None

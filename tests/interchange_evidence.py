@@ -3,8 +3,9 @@
 Usage: python3 tests/interchange_evidence.py OUTPUT_DIR
 
 Writes the bundled "Alpine Passage" project, a synthetic 23.976 timeline cut from generated
-timecoded media, and a 29.97 drop-frame timeline, each as FCPXML, EDLs (picture and sound),
-OTIO and a report, with the media beside them and a NOTES.txt saying what an importer should show.
+timecoded media, and a 29.97 drop-frame timeline, each as FCPXML, Final Cut Pro 7 XML, EDLs
+(picture and sound), OTIO and a report, with the media beside them and a NOTES.txt saying what an
+importer should show.
 """
 import shutil
 import sys
@@ -26,17 +27,31 @@ bundled Splice clips and score). The file URLs point at this folder on the machi
 it; after copying elsewhere, relink to media/ (Resolve: Relink Clips / Change Source Folder;
 Premiere: Link Media; Final Cut Pro: Relink Files).
 
-Each folder holds TIMELINE.fcpxml, one EDL per picture track (-V1.edl ...), sound EDLs
-(-A1.edl ...; -V1-sound.edl is the camera sound under V1), TIMELINE.otio and REPORT.txt,
-which lists everything each format could not carry.
+Each folder holds TIMELINE.fcpxml (FCPXML 1.10: Resolve, Final Cut Pro), TIMELINE.xml
+(Final Cut Pro 7 XML, xmeml 5: Premiere Pro, Resolve, Avid), one EDL per picture track
+(-V1.edl ...), sound EDLs (-A1.edl ...; -V1-sound.edl is the camera sound under V1),
+TIMELINE.otio (OpenTimelineIO) and REPORT.txt, which lists everything each format could not
+carry, clip by clip.
+
+Which file to give which application:
+- DaVinci Resolve: TIMELINE.fcpxml (or TIMELINE.xml). Not the EDLs for these sources: Resolve
+  conforms an EDL by source timecode only, and sources without embedded timecode (the Alpine
+  clips, plain_25.mp4) or with overlapping timecode cannot be told apart; REPORT.txt names them
+  under "CONFORM WARNING". Resolve refuses the sound-only EDLs (-A1.edl ...).
+- Premiere Pro: TIMELINE.xml (File > Import). Premiere does not read FCPXML 1.x. The .otio
+  imports too, but clip gain, opacity and scale live only in its metadata there. Premiere's
+  own "EDL information" and "New Sequence" dialogs on an EDL import are normal.
 
 1. alpine-passage/ (25 fps, 1920x1080, starts 01:00:00:00, 32 s)
    V1: The Ridge, Into the Valley, Forest Light, The Lake, 8 s each, joined by three
        12-frame cross dissolves starting on the cut. Every clip's source in is frame 13
        (Splice's 0.5 s rounds to 0.52 s, reported).
-   V4: title "ALPINE PASSAGE" from 01:00:00:20 for 3 s (FCPXML: Basic Title; not in EDLs).
+   V4: title "ALPINE PASSAGE" from 01:00:00:20 for 3 s (FCPXML: Basic Title named after its
+       text, which Resolve still calls "Text" and puts on V2 because it drops the empty V2/V3;
+       XML: Text generator; OTIO: placeholder clip "ALPINE PASSAGE"; not in EDLs).
    A1: Ambient score for 32 s at -5.19 dB (55 %).
-   Sources have no embedded timecode, so every asset starts at 00:00:00:00.
+   Sources have no embedded timecode, so every asset starts at 00:00:00:00 and an EDL conform
+   in Resolve links all four events to one file (the report says so).
 
 2. synthetic-23976/ (23.976 fps, 1920x1080, starts 01:00:00:00, 264 frames = 11.011 s)
    Sources: A001_C001_tc1h.mov (23.976, TC 01:00:00:00, stereo), A001_C002_tc2h.mov
@@ -51,11 +66,15 @@ which lists everything each format could not carry.
        01:00:05:00-01:00:07:00  A001_C001 at 50 % from 01:00:01:00
        01:00:07:00-01:00:08:00  A001_C002 at 200 % from 02:00:00:00
        01:00:08:00-01:00:09:00  A001_C001 reversed, source 01:00:00:12-01:00:01:12
-   V2  01:00:01:00-01:00:03:00  B001_C001 (29.97 DF source, from 01:00:00;04 source TC),
-                                50 % opacity rising from 20 %, moved right and up, 80 % scale
+   V2  01:00:01:00-01:00:03:00  B001_C001 (29.97 DF source, from 01:00:00;04 source TC; the
+                                FCPXML clip carries tcFormat="DF"), 50 % opacity rising from
+                                20 %, moved right and up, 80 % scale. In the 23.976 EDL the
+                                source timecode counts at 23.976: 01:00:00:03-01:00:02:03
+                                (start label 00:59:59;28 read as 00:59:59:22, plus 5 frames).
        01:00:03:08-01:00:04:04  plain_25 DISABLED (FCPXML enabled="0"; left out of EDLs)
    V3  01:00:09:00-01:00:11:00  A001_C001 picture from 01:00:02:00 with its sound starting
-                                12 frames earlier on A1 (J-cut; FCPXML audioStart)
+                                12 frames earlier on A1 (J-cut; FCPXML audioStart; XML: linked
+                                picture and two sound clipitems)
    V4  title "SYNTHETIC TURNOVER" for the first 2 s
    A2  room_tone 01:00:00:00-01:00:05:00 at 70 % with 12-frame fade in, 24-frame fade out
        and volume keys 70 % -> 35 %; then room_tone again to 01:00:08:08 with a 12-frame
@@ -71,7 +90,14 @@ which lists everything each format could not carry.
 Known importer behaviour to check (see each REPORT.txt):
 - Resolve ignores FCPXML srcEnable; audio-only uses of A/V files may also bring picture.
 - Resolve imports FCPXML fades as volume keyframes and few or no FCPXML markers.
-- Premiere Pro does not import FCPXML natively; use the EDLs or OTIO there.
+- Resolve drops empty video tracks from FCPXML (V4 lands on V2 when V2 and V3 are empty).
+- EDL: every FCM line sets the source frame code mode of the events after it; the first FCM is
+  the record mode. M2 timecode uses colons only. Reel names longer than eight characters are
+  mapped in a "* REEL" comment inside the first event that uses them.
+- XML: stereo sound is two mono tracks per Splice track (Premiere recombines them); a clip next
+  to a transition has start or end -1; pproTicksIn/Out give the exact source position.
+- OTIO: written exactly as OpenTimelineIO 0.18 writes it (Clip.2, media_references); the
+  top-level stack carries the timeline name, which Premiere uses for the sequence.
 """
 
 
@@ -86,7 +112,7 @@ def drop_project(paths):
 
 def write(folder: Path, project: dict, options: dict):
     folder.mkdir(parents=True, exist_ok=True)
-    result = export_timeline(project, {'formats': ['fcpxml', 'edl', 'otio'], 'audioEdl': True, **options})
+    result = export_timeline(project, {'formats': ['fcpxml', 'xmeml', 'edl', 'otio'], 'audioEdl': True, **options})
     for file in result['files']:
         (folder / file['name']).write_text(file['content'])
     (folder / 'REPORT.txt').write_text(result['report'])

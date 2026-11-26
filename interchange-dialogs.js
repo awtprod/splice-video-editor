@@ -1,4 +1,4 @@
-// File > Export timeline… and File > Import timeline…: FCPXML, CMX3600 EDL and OpenTimelineIO.
+// File > Export timeline… and File > Import timeline…: FCPXML, CMX3600 EDL, OpenTimelineIO and Final Cut Pro 7 XML.
 window.SpliceInterchange = (() => {
   const RATES = ['24000/1001', '24', '25', '30000/1001', '30', '50', '60000/1001', '60'];
   const DROP_RATES = [30000 / 1001, 60000 / 1001];
@@ -20,10 +20,11 @@ window.SpliceInterchange = (() => {
     Object.assign(document.createElement('a'), { href: url, download: name }).click();
     setTimeout(() => URL.revokeObjectURL(url), 60000);
   }
-  async function post(route, payload) {
+  async function post(route, payload, signal) {
+    const timeout = AbortSignal.timeout(300000);
     const response = await fetch('/api/interchange/' + route, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload), signal: AbortSignal.timeout(300000),
+      body: JSON.stringify(payload), signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
     });
     const body = await response.json().catch(() => ({ error: 'The server returned an unreadable reply.' }));
     if (!response.ok) throw Error(body.error || 'Timeline interchange failed.');
@@ -37,8 +38,10 @@ window.SpliceInterchange = (() => {
     form.innerHTML = `<p class="export-spec"></p>
       <fieldset class="interchange-formats"><legend>Formats</legend>
         <label><input type="checkbox" name="fcpxml" checked> FCPXML 1.10 · Resolve, Final Cut Pro</label>
+        <label><input type="checkbox" name="xmeml"> Final Cut Pro 7 XML (.xml) · Premiere Pro, Resolve, Avid</label>
         <label><input type="checkbox" name="edl"> CMX3600 EDL · one per picture track</label>
         <label class="interchange-sub"><input type="checkbox" name="audioEdl"> Sound EDLs as well</label>
+        <p class="interchange-note" data-edl-note hidden>Resolve links EDL events by source timecode only, so sources without embedded timecode can link to the wrong file; the report names them. Resolve refuses sound-only EDLs, and Premiere asks about every EDL in its own dialogs.</p>
         <label><input type="checkbox" name="otio"> OpenTimelineIO (.otio)</label>
       </fieldset>
       <label>Range<select name="rangeMode"><option value="all">Entire sequence</option><option value="custom">In to out (seconds)</option></select></label>
@@ -59,14 +62,17 @@ window.SpliceInterchange = (() => {
     fields.rangeMode.onchange = () => {
       for (const field of range) { field.closest('label').hidden = fields.rangeMode.value !== 'custom'; field.required = !field.closest('label').hidden; }
     };
-    const syncSound = () => { fields.audioEdl.closest('label').hidden = !fields.edl.checked; };
+    const syncSound = () => {
+      fields.audioEdl.closest('label').hidden = !fields.edl.checked;
+      form.querySelector('[data-edl-note]').hidden = !fields.edl.checked;
+    };
     fields.edl.onchange = syncSound; syncSound();
     form.querySelector('[data-close]').onclick = () => node.close();
     let report = '';
     form.querySelector('[data-report]').onclick = () => save(new Blob([report], { type: 'text/plain' }), 'timeline-report.txt');
     form.onsubmit = async event => {
       event.preventDefault();
-      const formats = ['fcpxml', 'edl', 'otio'].filter(name => fields[name].checked);
+      const formats = ['fcpxml', 'xmeml', 'edl', 'otio'].filter(name => fields[name].checked);
       if (!formats.length) { status.textContent = 'Choose at least one format.'; return; }
       const submit = form.querySelector('[type=submit]'); submit.disabled = true;
       status.textContent = 'Reading source timecode…';
@@ -101,31 +107,50 @@ window.SpliceInterchange = (() => {
   function importTimeline() {
     const project = Editor.get().project, node = dialog('Import timeline');
     const form = document.createElement('form');
-    form.innerHTML = `<p>Opens an FCPXML, CMX3600 EDL or OpenTimelineIO file as a new project. Media found in Splice plays at once; other sources arrive offline for relinking. Anything not imported is listed under Project compatibility.</p>
+    form.innerHTML = `<p>Opens an FCPXML, Final Cut Pro 7 XML, CMX3600 EDL or OpenTimelineIO file as a new project. Media found in Splice plays at once; other sources arrive offline for relinking. Anything not imported is listed under Project compatibility.</p>
       <label>Timeline file<input type="file" name="file" accept=".fcpxml,.xml,.edl,.otio" required></label>
       <label hidden>EDL frame rate<select name="fps"></select></label>
       <p role="status" class="render-state"></p>
       <footer><button type="button" data-close>Cancel</button><button type="submit" class="primary">Import</button></footer>`;
     const fields = form.elements, status = form.querySelector('[role=status]');
+    const submit = form.querySelector('[type=submit]');
     for (const rate of RATES) fields.fps.append(new Option(rateLabel(rate), rate));
     fields.fps.value = nearestRate(project.fps);
-    fields.file.onchange = () => { fields.fps.closest('label').hidden = !/\.edl$/i.test(fields.file.files[0]?.name || ''); };
-    form.querySelector('[data-close]').onclick = () => node.close();
+    let running = null;
+    fields.file.onchange = () => {
+      fields.fps.closest('label').hidden = !/\.edl$/i.test(fields.file.files[0]?.name || '');
+      status.textContent = '';   // a new file clears the last file's error
+      submit.disabled = false;
+    };
+    const stop = () => {
+      if (!running) return;
+      running.controller.abort();
+      // the server keeps working after the browser gives up unless it is told to stop
+      fetch('/api/interchange/cancel', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jobId: running.jobId }) }).catch(() => {});
+      running = null;
+    };
+    form.querySelector('[data-close]').onclick = () => { stop(); node.close(); };
+    node.addEventListener('cancel', stop);
     form.onsubmit = async event => {
       event.preventDefault();
       const file = fields.file.files[0];
       if (!file) return;
       if (file.size > 30 * 1024 * 1024) { status.textContent = 'The timeline file is larger than 30 MB.'; return; }
-      const submit = form.querySelector('[type=submit]'); submit.disabled = true; status.textContent = 'Reading timeline…';
+      submit.disabled = true; status.textContent = 'Reading timeline…';
+      const jobId = 'import-' + crypto.randomUUID();
+      running = { jobId, controller: new AbortController() };
       try {
         const result = await post('import', { filename: file.name, text: await file.text(),
-          options: { fps: fields.fps.value, width: project.width, height: project.height } });
+          options: { fps: fields.fps.value, width: project.width, height: project.height, jobId } }, running.controller.signal);
+        running = null;
         const name = (result.project.name || 'Imported').replace(/[^a-z0-9_-]+/gi, '-') + '.splice.json';
         const opened = new File([JSON.stringify(result.project)], name, { type: 'application/json' });
         await (window.SpliceSession?.openFile ? SpliceSession.openFile(opened) : Editor.openProject(opened));
         node.close();
       } catch (error) {
-        status.textContent = error.message; submit.disabled = false;
+        running = null;
+        if (node.open) { status.textContent = error.name === 'AbortError' ? 'Import cancelled.' : error.message; submit.disabled = false; }
       }
     };
     node.append(form); node.showModal();

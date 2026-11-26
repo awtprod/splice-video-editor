@@ -12,7 +12,7 @@ import math
 from dataclasses import dataclass, field
 from fractions import Fraction
 
-from .media import MAX_PROBES, Source, clean, resolve_source
+from .media import MAX_PROBES, PROBE_SECONDS, ProbeBudget, Source, clean, resolve_source
 from .timecode import frames_timecode, seconds_frames, sequence_rate, timecode_frames
 
 MAX_CLIPS = 20_000
@@ -151,11 +151,16 @@ def build_cut(project: dict, options: dict | None = None) -> Cut:
     except ValueError as error:
         raise InterchangeError(f'Sequence start timecode: {error}') from None
     report = Report()
-    budget = [min(MAX_PROBES, max(0, int(_number(options.get('maxProbes'), MAX_PROBES))))]
+    budget = ProbeBudget(min(MAX_PROBES, max(0, int(_number(options.get('maxProbes'), MAX_PROBES)))),
+                         min(PROBE_SECONDS, _number(options.get('probeSeconds'), PROBE_SECONDS, 0)))
     sources = {}
     for item in project['media']:
         if isinstance(item, dict) and item.get('id') is not None:
             sources[str(item['id'])] = resolve_source(item, rate, budget)
+    if budget.skipped:
+        shown = ', '.join(budget.skipped[:20]) + (f' and {len(budget.skipped) - 20} more' if len(budget.skipped) > 20 else '')
+        report.note(f'Probing stopped after {budget.seconds:g} s or {MAX_PROBES} files; not probed: {shown}. '
+                    'Their start timecode, rate and audio layout come only from what Splice already knew.')
     total = max((_span(c, rate)[1] for c in project['clips'] if isinstance(c, dict)), default=0)
     first, last = 0, total
     span = options.get('range')
@@ -224,6 +229,9 @@ def _event(cut: Cut, clip: dict) -> Event | None:
                   name=name, rate=rate)
     event.enabled = clip.get('enabled') is not False and clip.get('disabled') is not True
     event.speed = _speed(clip.get('speed', 1))
+    asked = _number(clip.get('speed', 1), 1)
+    if abs(asked - float(event.speed)) > 1e-6:
+        report.note(f'{label}: speed {asked:g}x is outside the 0.1x-16x timeline interchange carries; written as {float(event.speed):g}x.')
     event.reverse = bool(clip.get('reverse'))
     event.link_group = clip.get('linkGroup') if isinstance(clip.get('linkGroup'), str) else None
     if source is not None:
@@ -276,6 +284,8 @@ def _event(cut: Cut, clip: dict) -> Event | None:
         report.note(f'{label}: its Splice grade{" and LUT" if color.get("lut") else ""} is not carried; grade from the source media.')
     if clip.get('pan') not in (None, 0):
         report.note(f'{label}: clip pan is not carried by timeline interchange.')
+    if clip.get('nativeVolumeOutsideTrim'):
+        report.note(f'{label}: its Premiere volume keyframes outside the trimmed part of the clip are not carried.')
     if clip.get('nativeTimeRemap'):
         report.note(f'{label}: its Premiere time-remapping curve is exported as a constant {float(event.speed):g}x speed.')
     if clip.get('audioStream') is not None or (source is not None and len(source.audio_streams) > 1 and kind != 'title'):

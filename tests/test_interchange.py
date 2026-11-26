@@ -21,6 +21,7 @@ from interchange.media import file_url, path_from_url  # noqa: E402
 from interchange.timecode import (fcpxml_time, frames_timecode, parse_fcpxml_time, snap_rate,  # noqa: E402
                                   timecode_frames)
 from interchange_fixtures import DF, RATE, alpine_project, make_media, synthetic_project  # noqa: E402
+import fcpxml_dtd_rules  # noqa: E402
 
 NTSC24, NTSC30, NTSC60 = Fraction(24000, 1001), Fraction(30000, 1001), Fraction(60000, 1001)
 
@@ -196,11 +197,7 @@ class FcpxmlExport(InterchangeCase):
                     if element.get(attribute):
                         self.assertEqual((parse_fcpxml_time(element.get(attribute)) / step).denominator, 1,
                                          f'{element.tag} {attribute} {element.get(attribute)} is off the frame grid')
-        order = fcpxml._ORDER
-        for element in root.iter():
-            if element.tag in ('asset-clip', 'gap', 'title'):
-                ranks = [order.get(child.tag, 9) for child in element]
-                self.assertEqual(ranks, sorted(ranks), f'children of {element.tag} out of DTD order')
+        self.assertEqual(fcpxml_dtd_rules.problems(root), [], 'element order and attributes follow the FCPXML 1.10 DTD')
         spine = sequence.find('spine')
         cursor = parse_fcpxml_time(sequence.get('tcStart'))
         for element in spine:
@@ -231,7 +228,10 @@ class FcpxmlExport(InterchangeCase):
                     self.assertEqual(parse_fcpxml_time(start), Fraction(timecode_frames(label, rate)) / rate)
                 else:
                     self.assertEqual(parse_fcpxml_time(start), Fraction(int(reference), 48000))
-        self.assertEqual(root.find("resources/asset[@name='B001_C001_df.mov']").get('tcFormat'), 'DF')
+        # the DTD has tcFormat on the clip, not the asset
+        self.assertIsNone(root.find("resources/asset[@name='B001_C001_df.mov']").get('tcFormat'))
+        self.assertEqual({c.get('tcFormat') for c in root.iter('asset-clip') if c.get('name') == 'B001_C001_df.mov'}, {'DF'})
+        self.assertEqual({c.get('tcFormat') for c in root.iter('asset-clip') if c.get('name') == 'A001_C001_tc1h.mov'}, {'NDF'})
 
     def test_unknown_timecode_is_a_visible_decision(self):
         project = self.project()
@@ -336,8 +336,9 @@ class EdlExport(InterchangeCase):
         self.assertIn('M2   A001_C00       -23.976                01:00:00:12', lines)  # reverse
         self.assertIn('* SOURCE FILE: ' + str(self.paths['camera_a']), lines)
         self.assertIn('* LOC: 01:00:01:06 RED     Picture lock note', lines)
-        self.assertTrue(any(line.startswith('001  B001_C00 V     C        01:00:00;04 01:00:02;04 01:00:01:00 01:00:03:00') for line in files['V2'].splitlines()))
-        self.assertNotIn('plain_25', files['V2'].split('* REEL')[0])
+        # the 29.97 DF source counts at the list's 23.976: start label 00:59:59;28 -> 00:59:59:22, in 6 frames -> 5
+        self.assertTrue(any(line.startswith('001  B001_C00 V     C        01:00:00:03 01:00:02:03 01:00:01:00 01:00:03:00') for line in files['V2'].splitlines()), files['V2'])
+        self.assertNotIn('plain_25', files['V2'])
         self.assertTrue(any('disabled' in line for line in cut.report.by_format['EDL']))
         for name, text in files.items():
             for line in text.splitlines():
@@ -410,7 +411,7 @@ class OtioExport(InterchangeCase):
         kinds = [(t['name'], t['kind']) for t in stack['children']]
         self.assertEqual(kinds, [('V1', 'Video'), ('V2', 'Video'), ('V3', 'Video'), ('V4', 'Video'),
                                  ('A1', 'Audio'), ('A2', 'Audio'), ('V1 sound', 'Audio')])
-        fields = {'Clip.1': {'name', 'source_range', 'media_reference', 'effects', 'markers', 'metadata', 'enabled'},
+        fields = {'Clip.2': {'name', 'source_range', 'media_references', 'active_media_reference_key', 'effects', 'markers', 'metadata', 'enabled'},
                   'Gap.1': {'name', 'source_range', 'effects', 'markers', 'metadata'},
                   'Transition.1': {'name', 'transition_type', 'in_offset', 'out_offset', 'metadata'}}
         for track in stack['children']:
@@ -420,15 +421,15 @@ class OtioExport(InterchangeCase):
                 self.assertLessEqual(fields[item['OTIO_SCHEMA']], set(item))
                 if item['OTIO_SCHEMA'] == 'Transition.1':
                     self.assertNotEqual(items[index + 1]['OTIO_SCHEMA'], 'Transition.1')
-                if item['OTIO_SCHEMA'] == 'Clip.1' and item['media_reference']['OTIO_SCHEMA'] == 'ExternalReference.1':
-                    ref = item['media_reference']
+                if item['OTIO_SCHEMA'] == 'Clip.2' and item['media_references']['DEFAULT_MEDIA']['OTIO_SCHEMA'] == 'ExternalReference.1':
+                    ref = item['media_references']['DEFAULT_MEDIA']
                     self.assertTrue(ref['target_url'].startswith('file:///'))
                     self.assertEqual(ref['available_range']['OTIO_SCHEMA'], 'TimeRange.1')
                     start = ref['available_range']['start_time']
                     self.assertLessEqual(start['value'], item['source_range']['start_time']['value'])
                     self.assertEqual(start['rate'], item['source_range']['start_time']['rate'])
         camera = next(i for t in stack['children'] for i in t['children'] if i.get('name') == 'A001_C001_tc1h.mov')
-        self.assertEqual(camera['media_reference']['available_range']['start_time']['value'], 86400.0)
+        self.assertEqual(camera['media_references']['DEFAULT_MEDIA']['available_range']['start_time']['value'], 86400.0)
         speeds = sorted(e['time_scalar'] for t in stack['children'] if t['kind'] == 'Video'
                         for i in t['children'] for e in i.get('effects', []))
         self.assertEqual(speeds, [-1.0, 0.5, 2.0])
@@ -579,14 +580,19 @@ class ServerRoutes(InterchangeCase):
             request = urllib.request.Request(base + route, json.dumps(payload).encode(), {'Content-Type': 'application/json'})
             with urllib.request.urlopen(request, timeout=30) as response:
                 return json.load(response)
-        result = post('export', {'project': self.project(), 'options': {'formats': ['fcpxml', 'edl', 'otio'], 'package': True}})
-        self.assertEqual([f['name'].rsplit('.', 1)[1] for f in result['files']], ['fcpxml', 'edl', 'edl', 'edl', 'otio'])
-        self.assertIn('FCPXML:', result['report'])
+        result = post('export', {'project': self.project(), 'options': {'formats': ['fcpxml', 'edl', 'otio', 'xmeml'], 'package': True}})
+        self.assertEqual([f['name'].rsplit('.', 1)[1] for f in result['files']], ['fcpxml', 'edl', 'edl', 'edl', 'otio', 'xml'])
+        self.assertIn('FCPXML 1.10 (DaVinci Resolve, Final Cut Pro):', result['report'])
+        self.assertIn('Final Cut Pro 7 XML (Premiere Pro, Resolve, Avid):', result['report'])
         import base64
         import io
         import zipfile
         names = zipfile.ZipFile(io.BytesIO(base64.b64decode(result['package']['base64']))).namelist()
         self.assertIn('Synthetic-23976-turnover/Synthetic-23976-turnover-REPORT.txt', names)
+        self.assertIn('Synthetic-23976-turnover/Synthetic-23976-turnover.xml', names)
+        self.assertEqual(post('cancel', {'jobId': 'no-such-import-1'}), {'cancelled': False})
+        from_xml = post('import', {'filename': 'x.xml', 'text': result['files'][-1]['content']})['project']
+        self.assertIn('(FCP 7 XML)', from_xml['compatibilityWarnings'][0])
         imported = post('import', {'filename': 'x.fcpxml', 'text': result['files'][0]['content']})['project']
         self.assertEqual(len(imported['clips']), len(self.project()['clips']))
         with self.assertRaises(urllib.error.HTTPError) as caught:
