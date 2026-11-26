@@ -553,9 +553,10 @@ def _drop_frame(tl_name, start_frame, num, den, warnings):
 def to_splice(model, index=0, link_media=None, source_ref=None):
     """Splice's project for timeline ``index`` of ``model``.
 
-    ``link_media(paths)`` is called once with every media path the timeline names and returns one
-    result per path: a dict with ``src`` (and ``fingerprint``) when the file was found here, else a
-    falsy value; that media stays offline with its original path for relinking.
+    ``link_media(paths)`` is called once with the path of every file some timeline of the project
+    uses and returns one result per path: a dict with ``src`` (and ``fingerprint``) when the file
+    was linked here, else ``{'offline': reason}`` (see :func:`resolve.media.link_local`); that
+    media stays offline with its original path for relinking.
     """
     if not model.timelines:
         raise ResolveError('This Resolve project has no timelines.')
