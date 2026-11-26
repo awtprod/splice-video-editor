@@ -178,6 +178,8 @@ class RenderQueue:
                 claimed = {Path(t).as_posix() for job in self.jobs if job['state'] in ACTIVE + ('rendering',) for t in job['targets']}
             if any(Path(t).as_posix() in claimed for t in targets[:1]):
                 raise ValueError(f'Another queued export already writes {targets[0].name} in that folder')
+            if targets[0].is_symlink():
+                raise ValueError(f'{targets[0].name} in that folder is a link: Splice does not write through links')
             if targets[0].exists() and not overwrite:
                 conflicts.append(targets[0].name)
             prepared.append(dict(options=options, spec=spec, name=name, preset=preset, targets=targets))
@@ -274,6 +276,8 @@ class RenderQueue:
         folder = _folder(job['folder'])
         target = folder / f'{job["name"]}-turnover.zip'
         notes = []
+        if target.is_symlink():
+            raise ValueError(f'{target} is a link: Splice does not write through links')
         if target.exists() and not job['overwrite']:
             for number in range(2, 1000):
                 candidate = folder / f'{job["name"]}-turnover ({number}).zip'
@@ -441,7 +445,7 @@ class RenderQueue:
                        cancelRequested=False)
             self._save()
         try:
-            identifier = self.exports.start(project, job['options'], folder_name=job['name'] if spec['kind'] == 'images' else 'frames')
+            identifier = self.exports.start(project, job['options'], folder_name=_frame_name(job['name']) if spec['kind'] == 'images' else 'frames')
         except ValueError as error:
             with self.lock:
                 job.update(state='failed', error=str(error), finished=time.time())
@@ -510,6 +514,8 @@ class RenderQueue:
                 raise ValueError(f'{targets[0].name} already exists in {folder}')
             targets = _targets(folder, name, spec)
         main = targets[0]
+        if main.is_symlink():
+            raise ValueError(f'{main} is a link: Splice does not write through links')
         if spec['kind'] == 'images':
             if main.exists():
                 shutil.rmtree(main) if main.is_dir() and not main.is_symlink() else main.unlink()
@@ -530,6 +536,12 @@ class RenderQueue:
         self.closing.set()
         self.wake.set()
         self.thread.join(timeout=10)
+
+
+def _frame_name(name):
+    """The image files' base name: the job name in letters, digits, space, _ . - (what ExportJobs accepts)."""
+    clean = re.sub(r'[^A-Za-z0-9 _.\-]+', '-', name).strip(' .-')[:80]
+    return clean if clean and clean[0].isalnum() else 'frames'
 
 
 def _summary(spec, options):

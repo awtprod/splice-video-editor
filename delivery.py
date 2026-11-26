@@ -302,8 +302,7 @@ def normalize(options):
                     f'audio format for {CONTAINERS[container]["label"]}')
     spec['audio'] = audio
     spec['audio_lossy'] = AUDIO_CODECS[audio]['lossy']
-    spec['audio_bitrate'] = _int(options, 'audioBitrate', 192, 64, 512 if audio == 'aac' and 'audioCodec' in options else 320,
-                                 'audio bitrate')
+    spec['audio_bitrate'] = _int(options, 'audioBitrate', 192, 64, 320, 'audio bitrate')
     # Timecode and metadata.
     spec['timecode'] = _bool(options, 'timecode', CONTAINERS[container]['timecode']) and CONTAINERS[container]['timecode']
     spec['reel'] = _text(options, 'reel', 'reel name', 32)

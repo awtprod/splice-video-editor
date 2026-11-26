@@ -139,15 +139,19 @@ class Running(QueueCase):
         queue = self.queue()
         ids = queue.add(self.project, [dict(options=dict(codec='h264', captionFiles=['vtt']), name='film - web', preset='Web'),
                                        dict(options=dict(codec='dnxhr', profile='lb', container='mxf'), name='film - avid', preset='Avid'),
-                                       dict(options=dict(codec='png', profile='8'), name='film - frames', preset='Frames')],
+                                       dict(options=dict(codec='png', profile='8'), name='film - frames (8-bit)', preset='Frames')],
                         folder=str(self.folder))
         jobs = self.wait(queue, ids)
         self.assertTrue(all(job['state'] == 'complete' for job in jobs.values()), [job['error'] for job in jobs.values()])
         names = sorted(path.name for path in self.folder.iterdir())
-        self.assertEqual(names, ['film - avid.mxf', 'film - avid.srt', 'film - frames', 'film - web.mp4', 'film - web.vtt'])
-        frames = sorted((self.folder / 'film - frames').iterdir())
-        self.assertEqual(len([path for path in frames if path.suffix == '.png']), 48)
-        self.assertTrue((self.folder / 'film - frames' / 'film - frames.wav').exists())
+        self.assertEqual(names, ['film - avid.mxf', 'film - avid.srt', 'film - frames (8-bit)', 'film - web.mp4', 'film - web.vtt'])
+        frames = sorted((self.folder / 'film - frames (8-bit)').iterdir())
+        pictures = [path for path in frames if path.suffix == '.png']
+        self.assertEqual(len(pictures), 48)
+        # The files inside are named in plain characters; the captions travel as a sidecar.
+        self.assertEqual(pictures[0].name, 'film - frames -8-bit_0000000.png')
+        self.assertTrue((self.folder / 'film - frames (8-bit)' / 'film - frames -8-bit.srt').exists())
+        self.assertTrue((self.folder / 'film - frames (8-bit)' / 'film - frames -8-bit.wav').exists())
 
 
 class Turnover(QueueCase):
@@ -199,6 +203,15 @@ class Confinement(QueueCase):
             queue.add(self.project, [dict(options=dict(codec='h264'), name='same'), dict(options=dict(codec='h264'), name='same')],
                       folder=str(self.folder))
         self.assertEqual(queue.list()['jobs'], [])
+
+    def test_a_link_in_the_folder_is_never_written_through(self):
+        queue = self.queue()
+        outside = Path(tempfile.mkdtemp(prefix='queue-outside-'))
+        self.addCleanup(shutil.rmtree, outside, True)
+        (self.folder / 'linked.mp4').symlink_to(outside / 'victim.mp4')
+        with self.assertRaisesRegex(ValueError, 'is a link'):
+            queue.add(self.project, [dict(options=dict(codec='h264'), name='linked')], folder=str(self.folder), overwrite=True)
+        self.assertEqual(list(outside.iterdir()), [])
 
     def test_an_existing_file_is_replaced_only_when_confirmed(self):
         queue = self.queue()
