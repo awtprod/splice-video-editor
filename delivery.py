@@ -423,6 +423,11 @@ def light_level_params(spec, levels):
     return f'master-display={display}{luminance}:max-cll={levels[0]},{levels[1]}'
 
 
+def ffmpeg_option_value(value):
+    """Escape a value inside FFmpeg's colon-separated option syntax."""
+    return ''.join('\\' + char if char in "\\':" else char for char in value)
+
+
 def encoder_args(spec, fps, profile_tags, *, light_levels=None, pass_number=None, passlog=None, threads=None):
     """Video encoder options for the delivery (after -i ... -map). ``profile_tags`` is the
     renderer's (primaries, transfer, matrix) for the program."""
@@ -472,7 +477,8 @@ def encoder_args(spec, fps, profile_tags, *, light_levels=None, pass_number=None
             params.append(light_level_params(spec, light_levels or (0, 0)))
         params += [f'colorprim={profile_tags[0]}', f'transfer={profile_tags[1]}', f'colormatrix={profile_tags[2]}', 'range=limited']
         if pass_number:
-            params += [f'pass={pass_number}', f'stats={passlog}.x265']
+            stats = ffmpeg_option_value(f'{passlog}.x265')
+            params += [f'pass={pass_number}', f'stats={stats}']
         args += ['-x265-params', ':'.join(params), '-tag:v', 'hvc1']
     if codec == 'av1':
         # SVT-AV1 takes its colour description (ISO/IEC 23091-2 code points) as its own parameters.

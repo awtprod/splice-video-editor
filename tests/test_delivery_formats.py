@@ -20,6 +20,7 @@ import unittest
 import delivery
 from export_jobs import ExportJobs
 from premiere import MEDIA_ROOT
+from render_movie import render_to_file
 
 W, H, FPS, SECONDS = 256, 144, 24, 2
 
@@ -154,6 +155,19 @@ class DeliveryCase(unittest.TestCase):
 
 
 class LongGop(DeliveryCase):
+    def test_hevc_two_pass_uses_the_selected_scratch_directory(self):
+        # A Windows absolute path already includes a drive colon and backslashes.
+        name = "editor's scratch" if os.name == 'nt' else r"editor's scratch:C\renders"
+        scratch = self.media / name
+        scratch.mkdir()
+        target = self.media / 'two-pass.mp4'
+        options = dict(codec='hevc', rateControl='twopass', videoBitrate=800)
+        if reason := delivery.unavailable_reason(options):
+            self.skipTest(reason)
+        render_to_file(self.project(), target, options=options, work_directory=scratch)
+        self.assertEqual(self.video(probe(target))['codec_name'], 'hevc')
+        self.assertEqual(self.frames(target), FPS * SECONDS)
+
     def test_h264_profiles_and_containers(self):
         for profile, pix, label, depth in (('high', 'yuv420p', 'High', 8), ('high10', 'yuv420p10le', 'High 10', 10),
                                            ('high422', 'yuv422p10le', 'High 4:2:2', 10)):
@@ -317,6 +331,20 @@ class Intra(DeliveryCase):
 
 
 class ImageSequences(DeliveryCase):
+    def test_scaled_clip_keeps_alpha_in_high_depth_sequences(self):
+        project = self.project(alpha_only=True)
+        clip = project['clips'][0]
+        project['clips'] = [dict(clip, duration=2/FPS, transform=dict(scale=73))]
+        for codec, ext in [('png', 'png'), ('tiff', 'tif'), ('exr', 'exr')]:
+            with self.subTest(codec=codec):
+                folder, _ = self.render(project, dict(codec=codec, alpha=True))
+                frames = sorted(folder.glob(f'*.{ext}'))
+                self.assertEqual(len(frames), 2)
+                raw = subprocess.check_output(['ffmpeg', '-v', 'error', '-i', str(frames[0]), '-vf', 'alphaextract',
+                                               '-pix_fmt', 'gray', '-f', 'rawvideo', '-'], timeout=60)
+                self.assertEqual(raw[0], 0)
+                self.assertEqual(raw[(H//2) * W + W//2], 255)
+
     def test_high_precision_sequence_keeps_fine_steps_through_a_composite(self):
         # 4096 distinct legal-range luma codes. A 10-bit composite collapses several steps into one.
         source = self.media / 'fine-ramp.mkv'

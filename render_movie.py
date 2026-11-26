@@ -437,8 +437,7 @@ def _font_path(family):
 
 def _filter_path(path):
     # FFmpeg parses option values, then the filter graph itself.
-    value=path.as_posix()
-    option=''.join('\\'+char if char in "\\':" else char for char in value)
+    option = delivery.ffmpeg_option_value(path.as_posix())
     return ''.join('\\'+char if char in "\\'[],;" else char for char in option)
 
 
@@ -1092,7 +1091,8 @@ def _composite_layer(filters, base, layer, output, position, overlay, first, fra
     timing = f'setpts=PTS-STARTPTS,tpad=start={max(0,first)}:stop={max(0,window_frames-first-frames)}:color=black@0'
     if first < 0:
         timing = f'trim=start_frame={-first},' + timing
-    filters.append(f'[{layer}]format=yuva444p16le,{position},{timing},split[{output}_fg][{output}_a]')
+    # The positioned layer now occupies the square-pixel canvas, including its alpha mask.
+    filters.append(f'[{layer}]format=yuva444p16le,{position},setsar=1,{timing},split[{output}_fg][{output}_a]')
     if alpha:
         # For straight alpha, weight foreground colour by As/Aout, where Aout = As + Ab*(1-As).
         # Use As itself on the alpha plane to blend Ab towards opaque.
@@ -2984,6 +2984,7 @@ def _burn_in_filters(burn, width, height, fps, directory, profile):
     white = graphic('ffffff')
     box = f'fontfile={font}:fontsize={size}:fontcolor={white}:box=1:boxcolor=black@0.6:boxborderw={max(2, size//6)}'
     rate = Fraction(fps).limit_denominator(1001)
+    clock = f'rate={rate.numerator}/{rate.denominator}:tc24hmax=1'
     filters = []
     if settings['safeMargins']:
         for share, color in ((0.93, white), (0.90, graphic('ffff00'))):
@@ -2996,7 +2997,7 @@ def _burn_in_filters(burn, width, height, fps, directory, profile):
     row = 0
     if 'timecode' in fields:
         label = delivery.timecode_label(burn['timecode'], rate, burn['drop']).replace(':', '\\:').replace(';', '\\;')
-        filters.append(f"drawtext={box}:timecode='{label}':rate={rate.numerator}/{rate.denominator}:{place(settings['position'], row)}")
+        filters.append(f"drawtext={box}:timecode='{label}':{clock}:{place(settings['position'], row)}")
         row += 1
     if 'frame' in fields:
         filters.append(f"drawtext={box}:text='%{{frame_num}}':start_number={burn['frame']}:{place(settings['position'], row)}")
@@ -3010,7 +3011,7 @@ def _burn_in_filters(burn, width, height, fps, directory, profile):
             filters.append(f"drawtext={box}:textfile={_filter_path(text)}:expansion=none:{place(settings['clipNamePosition'], name_row)}:{enable}")
         if 'sourceTimecode' in fields and source is not None:
             label = source.replace(':', '\\:').replace(';', '\\;')
-            filters.append(f"drawtext={box}:timecode='{label}':rate={rate.numerator}/{rate.denominator}:"
+            filters.append(f"drawtext={box}:timecode='{label}':{clock}:"
                            f"{place(settings['clipNamePosition'], name_row + ('clipName' in fields))}:{enable}")
     if 'watermark' in fields and settings['watermark']:
         text = Path(directory) / 'burn-watermark.txt'

@@ -271,6 +271,33 @@ class Timecode(Case):
 
 
 class BurnIns(Case):
+    def test_sequence_and_repeated_camera_clip_wrap_at_midnight(self):
+        from fractions import Fraction
+        for rate, midnight, before in [(Fraction(24), '00:00:00:00', '23:59:59:21'),
+                                        (Fraction(30000, 1001), '00:00:00;00', '23:59:59;27')]:
+            with self.subTest(rate=rate):
+                clip = self.media / f'camera-{round(rate)}.mov'
+                ffmpeg('-f', 'lavfi', '-i', f'color=gray:s={W}x{H}:r={rate}:d=0.5',
+                       '-c:v', 'prores_ks', '-timecode', midnight, str(clip))
+                project = self.project(clip, seconds=float(3/rate))
+                project.update(fps=float(rate), dropFrame=';' in midnight)
+                options = dict(codec='prores', burnIns=dict(fields=['sourceTimecode', 'timecode'],
+                               position='bottom-left', clipNamePosition='top-left'))
+                reference = self.out / 'midnight.mov'
+                render_to_file(project, reference, options=options)
+                expected = self.frame(reference, 0)
+                following = self.frame(reference, 1)
+
+                project['startTimecode'] = timecode_frames(before, rate)
+                project['clips'].append(dict(project['clips'][0], start=float(3/rate)))
+                target = self.out / 'across-midnight.mov'
+                render_to_file(project, target, options=options)
+                actual = self.frame(target, 3)
+                for field, region in [('camera', slice(W*H//2)), ('sequence', slice(W*H//2, None))]:
+                    with self.subTest(field=field):
+                        self.assertTrue(expected[region] != following[region], 'The reference burn must advance')
+                        self.assertTrue(actual[region] == expected[region], 'The burn should restart at midnight')
+
     def frame(self, path, number, pix='gray'):
         return subprocess.check_output(['ffmpeg', '-v', 'error', '-i', str(path), '-vf', f'select=eq(n\\,{number}),format={pix}',
                                         '-frames:v', '1', '-f', 'rawvideo', 'pipe:1'], timeout=60)
