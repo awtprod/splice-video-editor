@@ -280,36 +280,38 @@ class LossyLimiter(Case):
                                                               '-f', 'f32le', 'pipe:1'], timeout=60))
                 self.assertLess(max(abs(sample) for sample in samples), 10**(-1/20)+1e-4)
 
-    def test_lossy_mix_limits_true_peak_and_pcm_mix_limits_sample_peak(self):
-        # A 12 kHz tone sampled 45 degrees off its crests: samples peak 3 dB
-        # below its true (between-sample) peak.
+    def test_every_delivery_limits_the_true_peak(self):
+        # Audio finishing, item 2: a full-scale 12 kHz tone sampled 45 degrees
+        # off its crests: samples at -3 dBFS, true peak 0 dBTP. A sample-peak
+        # limiter at -1 dBFS never acted on it, so PCM deliveries left at 0 dBTP;
+        # every container now limits the 4x oversampled peak.
         source = self.directory/'between.wav'
-        ffmpeg('-f', 'lavfi', '-i', "aevalsrc='sin(2*PI*12000*t+PI/4)|sin(2*PI*12000*t+PI/4)':s=48000:d=3",
+        ffmpeg('-f', 'lavfi', '-i', "aevalsrc='sin(2*PI*12000*t+PI/4)|sin(2*PI*12000*t+PI/4)':s=48000:d=8",
                '-c:a', 'pcm_f32le', str(source))
-        events = [dict(path=source, streams={0: 2}, source=0.0, length=2.0, speed=1.0, reverse=False, start=0.0,
-                       processing='anull', envelope=[], stateful=False)]
-        peaks = {}
-        for true_peak_mode in (True, False):
-            chunks = render_movie._render_audio(events, 0, 96000, (-1.0, true_peak_mode), str(self.directory), None, None)
-            peaks[true_peak_mode] = true_peak(chunks[0])
-        self.assertLessEqual(peaks[True], -1.0)
-        self.assertGreater(peaks[False], -.5, 'a sample-peak limiter lets the between-sample peak through')
+        self.assertGreater(true_peak(source), -.5)
+        for codec in ('prores', 'wav'):
+            with self.subTest(codec=codec):
+                report = {}
+                output = self.export(source, codec, report=report)
+                self.assertLessEqual(true_peak(output), -1.0)
+                self.assertLessEqual(report['audio']['output']['truePeakDbtp'], -1.0)
+                self.assertTrue(report['audio']['limiter']['acted'])
 
-    def test_lossy_deliveries_use_the_true_peak_limiter(self):
+    def test_every_delivery_uses_the_one_true_peak_stage(self):
         source = self.program(.5)
         seen = {}
-        real = render_movie._render_audio
+        real = render_movie.audio_loudness.finish
 
-        def spy(events, first, stop, limiter, *arguments, **keywords):
-            seen[codec] = limiter
-            return real(events, first, stop, limiter, *arguments, **keywords)
-        with mock.patch.object(render_movie, '_render_audio', spy):
+        def spy(*arguments, **keywords):
+            seen[codec] = keywords['ceiling']
+            return real(*arguments, **keywords)
+        with mock.patch.object(render_movie.audio_loudness, 'finish', spy):
             for codec in ('h264', 'prores', 'wav'):
                 self.export(source, codec)
-        self.assertEqual(seen, {'h264': (-1.0, True), 'prores': (-1.0, False), 'wav': (-1.0, False)})
+        self.assertEqual(seen, {'h264': -1.0, 'prores': -1.0, 'wav': -1.0})
 
     def test_limiter_off_leaves_aac_untouched(self):
-        # No ceiling, no measuring: the program is encoded once at unity gain.
+        # No ceiling: the program is encoded once at unity gain (and measured for the report).
         full = self.program(.5)
         runs = []
         real = render_movie._run_ffmpeg
@@ -319,7 +321,7 @@ class LossyLimiter(Case):
             return real(command, *arguments, **keywords)
         with mock.patch.object(render_movie, '_run_ffmpeg', spy):
             self.export(full, 'h264', limiter=False)
-        self.assertFalse(any('ebur128' in ' '.join(map(str, command)) for command in runs))
+        self.assertEqual(sum('aac' in command for command in runs), 1)
         self.assertFalse(any('volume=' in ' '.join(map(str, command)) and 'aac' in command for command in runs))
 
 
@@ -370,7 +372,10 @@ class ProgramLoudness(Case):
                     warnings.simplefilter('always')
                     movie = self.export(source, 'h264', duration=11, report=report)
                 loudness, peak = measure(movie)
-                self.assertLessEqual(abs(loudness-wav_loudness), .3, f'MP4 {loudness} LUFS, WAV {wav_loudness} LUFS')
+                # Both are limited by the same true-peak stage now (the WAV keeps the source's
+                # loudness to 0.01 LU); what is left is the AAC encoder's own loss on the
+                # noise-heavy dense program, 0.30 LU at 192 kbit/s.
+                self.assertLessEqual(abs(loudness-wav_loudness), .32, f'MP4 {loudness} LUFS, WAV {wav_loudness} LUFS')
                 audio = report['audio']
                 self.assertEqual((audio['gainDb'], audio['aacPeakSafe'], audio['ceilingDb']), (0, False, -1.0))
                 self.assertAlmostEqual(audio['decodedTruePeakDb'], peak, delta=.15)

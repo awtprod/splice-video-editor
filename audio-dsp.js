@@ -252,7 +252,60 @@
     }
   }
 
-  const api = {biquad,eqBands,eqSections,magnitudeDb,compressorState,compressorGain,gateState,gateGain,runDynamics,
+  // Effect settings: the same bounds as audio_dsp.py (the renderer re-validates).
+  const BOUNDS = {
+    comp: {threshold:[-60,0,-18], ratio:[1,20,3], attack:[.01,2000,10], release:[.01,9000,120], knee:[0,20*Math.log10(8),6], makeup:[0,36,0]},
+    gate: {threshold:[-80,0,-50], ratio:[1,9000,4], attack:[.01,9000,2], release:[.01,9000,120], range:[-90,0,-24]},
+    denoise: {amount:[1,40,12], floor:[-80,-20,-50]},
+    band: {freq:[20,20000,1000], q:[.1,18,.7071], gain:[-24,24,0]},
+  };
+  function validateFx(fx, kinds=['eq','comp','gate','denoise']) {
+    if (fx==null) return;
+    if (typeof fx!=='object' || Array.isArray(fx) || Object.keys(fx).some(key=>!kinds.includes(key)))
+      throw Error('Invalid audio effects: use '+kinds.join(', '));
+    const check=(section,bounds,label)=>{
+      if (!section || typeof section!=='object' || Array.isArray(section)) throw Error(`Invalid ${label} settings`);
+      if (section.enabled!==undefined && typeof section.enabled!=='boolean') throw Error(`Invalid ${label} setting: enabled must be true or false`);
+      for (const [key,[low,high]] of Object.entries(bounds))
+        if (section[key]!==undefined && !(Number.isFinite(section[key]) && section[key]>=low && section[key]<=high))
+          throw Error(`Invalid ${label} ${key}: use a number from ${low} to ${+high.toFixed(2)}`);
+    };
+    if (fx.eq!==undefined) {
+      check(fx.eq,{},'EQ');
+      if (!Array.isArray(fx.eq.bands) || fx.eq.bands.length>8) throw Error('Invalid EQ: use at most 8 bands');
+      for (const band of fx.eq.bands) {
+        check(band,BOUNDS.band,'EQ band');
+        if (!EQ_TYPES.includes(band.type)) throw Error('Invalid EQ band type');
+        if (!Number.isFinite(band.freq)) throw Error('Invalid EQ band frequency');
+      }
+    }
+    for (const kind of ['comp','gate','denoise']) if (fx[kind]!==undefined) check(fx[kind],BOUNDS[kind],kind==='comp'?'compressor':kind==='denoise'?'de-noise':'gate');
+  }
+  // Automation points: [{time, value, ease?}] within bounds, at distinct times.
+  function validateAutomation(points, low, high, limit, label) {
+    if (!Array.isArray(points) || points.length>limit) throw Error(`Invalid ${label} keyframes: at most ${limit}`);
+    const times=new Set();
+    for (const point of points) {
+      if (!point || !Number.isFinite(point.time) || point.time<0 || !Number.isFinite(point.value) || point.value<low || point.value>high ||
+          (point.ease!==undefined && typeof point.ease!=='boolean') || times.has(point.time))
+        throw Error(`Invalid ${label} keyframe: value ${low} to ${high}, one per time`);
+      times.add(point.time);
+    }
+  }
+  // Keyframe curve (engine.js and the renderer's _curve_expr): linear or eased (smoothstep) segments.
+  function curveValue(points, local, base) {
+    if (!points.length) return base;
+    if (local<=points[0].time) return points[0].value;
+    for (let i=1;i<points.length;i++) if (local<=points[i].time) {
+      const a=points[i-1], b=points[i];
+      let u=(local-a.time)/(b.time-a.time);
+      if (a.ease) u=u*u*(3-2*u);
+      return a.value+(b.value-a.value)*u;
+    }
+    return points[points.length-1].value;
+  }
+
+  const api = {biquad,validateFx,validateAutomation,curveValue,BOUNDS,eqBands,eqSections,magnitudeDb,compressorState,compressorGain,gateState,gateGain,runDynamics,
     kWeighting,LoudnessMeter,EQ_TYPES,energyToLufs};
 
   // ---- AudioWorklet processors ----
@@ -297,8 +350,11 @@
           if (data==='dispose') { this.alive=false; this.port.close(); }
         };
       }
-      process(inputs) {
-        const input=inputs[0];
+      process(inputs, outputs) {
+        const input=inputs[0], output=outputs[0];
+        for (let c=0;c<output.length;c++) {
+          if (input.length) output[c].set(input[Math.min(c,input.length-1)]); else output[c].fill(0);
+        }
         if (input.length) {
           const channels=[]; for (let c=0;c<this.channels;c++) channels.push(input[Math.min(c,input.length-1)]);
           this.meter.process(channels,channels[0].length);

@@ -196,7 +196,12 @@
     state.end=end;
   }
   function routeAudio(element) {
-    if (!audioContext) audioContext = new AudioContext();
+    if (!audioContext) {
+      // 48 kHz, the renderer's rate: EQ coefficients and dynamics timing are the export's own.
+      try { audioContext = new AudioContext({sampleRate:48000,latencyHint:'playback'}); }
+      catch { audioContext = new AudioContext(); }
+      window.SpliceMixer?.attach(audioContext);
+    }
     let route = audioNodes.get(element);
     if (!route) {
       const source = audioContext.createMediaElementSource(element);
@@ -204,13 +209,16 @@
       const pan = audioContext.createStereoPanner();
       const analyser=audioContext.createAnalyser();
       analyser.fftSize=256;
-      source.connect(gain).connect(pan).connect(analyser).connect(audioContext.destination);
+      // The mixer inserts the clip's channel map and effects before `gain` and sends `analyser` to its track bus.
+      source.connect(gain).connect(pan).connect(analyser);
       route={source,gain,pan,analyser,samples:new Float32Array(analyser.fftSize)};
+      if (!window.SpliceMixer) analyser.connect(audioContext.destination);
       audioNodes.set(element,route);
     }
     element.volume=1;
     return route;
   }
+  let mixerConfigured=null;
   let meterSampleAt=-Infinity, meterValues={};
   function meters() {
     const now=performance.now();
@@ -231,15 +239,19 @@
   function disconnectAudio(element) {
     const route=audioNodes.get(element);
     if(!route)return;
+    window.SpliceMixer?.releaseRoute(route);
     route.source.disconnect();route.gain.disconnect();route.pan.disconnect();route.analyser.disconnect();
     audioNodes.delete(element);
   }
   function setAudio(element,clip) {
     if (!element || !clip) return;
     const route=routeAudio(element);
-    const mix=trackSettings(clip.track);
+    if (window.SpliceMixer) {
+      if (mixerConfigured!==project) { window.SpliceMixer.configure(project); mixerConfigured=project; }
+      window.SpliceMixer.routeClip(route,clip,project);
+    }
     const gain=clip.type==='video' && clip.embeddedAudio===false ? 0 : audibility(clip);
-    const pan=clamp(((Number(clip.pan)||0)+(Number(mix.pan)||0))/100,-1,1);
+    const pan=clamp(((Number(clip.pan)||0)+trackPan(clip.track))/100,-1,1);
     if (gain!==route.gainLevel) {
       route.gain.gain.setTargetAtTime(gain,audioContext.currentTime,.012);
       route.gainLevel=gain;
@@ -516,15 +528,59 @@
     return Number(clip.in||0)+(clip.reverse ? clip.duration-local : local)*speed-(clip.reverse?1e-6:0);
   };
   const trackSettings = track => project.trackMix?.[String(track)] || {};
+  // Track automation (timeline seconds): volume (%) and pan, linear or eased, as the renderer evaluates it.
+  const trackCurve = (track, key) => {
+    const points=trackSettings(track).keyframes?.[key];
+    return points?.length ? [...points].sort((a,b)=>a.time-b.time) : null;
+  };
+  const trackLevel = track => {
+    const points=trackCurve(track,'volume');
+    return clamp((points ? curveValue(points,time,100) : (trackSettings(track).gain??100))/100,0,2);
+  };
+  const trackPan = track => {
+    const points=trackCurve(track,'pan');
+    return points ? curveValue(points,time,0) : Number(trackSettings(track).pan)||0;
+  };
   const soloActive = () => Object.values(project.trackMix || {}).some(m => m.solo);
   let transitionFollowers=new Map();
   let videoDipFollowers=new Map();
+  let soundIn=new Map(), soundOut=new Map();
   const followingTransition = clip => transitionFollowers.get(clip.id);
+  // How a clip's sound enters (render_movie._sound_transition is the same rule): dissolve and
+  // wipe crossfade; a dip fades the outgoing sound out over the part before the cut and the
+  // incoming one in over the part after it; a cut cuts. A linked sound clip without a transition
+  // of its own follows its picture, embedded sound follows its clip; audioTransition overrides.
+  const SOUND_KINDS={dissolve:'crossfade',wipe:'crossfade',fade:'dip'};
+  function soundTransitionOf(clip, pictures) {
+    const override=clip.audioTransition||'auto';
+    let source=clip;
+    if (clip.type==='audio' && !SOUND_KINDS[clip.transition] && clip.linkGroup)
+      source=pictures.get(clip.linkGroup+':'+Math.round(clip.start*project.fps))||clip;
+    if (override==='cut') return null;
+    const kind=override==='crossfade'||override==='dip' ? override : SOUND_KINDS[source.transition];
+    if (!kind) return null;
+    const duration=clamp(Number(source.transitionDuration||.5),1/project.fps,7200);
+    return {kind,duration,before:clamp(Number(source.transitionBefore)||0,0,duration),power:source.transitionMatchName==='Constant Power'};
+  }
+  const soundTransition = clip => (indexTransitions(), soundIn.get(clip.id)||null);
   function indexTransitions() {
     duration();
     if (indexedFor===project) return;
     indexedFor=project;
     const cuts=new Map();transitionFollowers=new Map();videoDipFollowers=new Map();
+    const pictures=new Map(), soundCuts=new Map();soundIn=new Map();soundOut=new Map();
+    for(const clip of project.clips) if(clip.type==='video' && clip.linkGroup) pictures.set(clip.linkGroup+':'+Math.round(clip.start*project.fps),clip);
+    for(const clip of project.clips) if(clip.type!=='title') {
+      const sound=soundTransitionOf(clip,pictures);
+      if(!sound) continue;
+      soundIn.set(clip.id,sound);
+      const key=`${clip.type}:${clip.track}:${Math.round(clip.start*project.fps)}`;
+      if(!soundCuts.has(key)) soundCuts.set(key,clip);
+    }
+    for(const clip of project.clips) if(clip.type!=='title') {
+      const next=soundCuts.get(`${clip.type}:${clip.track}:${Math.round((clip.start+clip.duration)*project.fps)}`);
+      if(next && next.id!==clip.id) soundOut.set(clip.id,{next,sound:soundIn.get(next.id)});
+    }
     for(const clip of project.clips) if(['dissolve','wipe'].includes(clip.transition) || (clip.type==='video' && clip.transition==='fade'))
       cuts.set(`${clip.type}:${clip.track}:${Math.round(clip.start*project.fps)}`,clip);
     for(const clip of project.clips) {
@@ -532,10 +588,6 @@
       if(next && next.id!==clip.id) (next.transition==='fade'?videoDipFollowers:transitionFollowers).set(clip.id,next);
     }
   }
-  const audioTransitionGain = (clip, progress) => {
-    const value=clamp(progress,0,1);
-    return clip.transitionMatchName==='Constant Power' ? Math.sin(value*Math.PI/2) : value;
-  };
   const audibility = clip => {
     const mix = trackSettings(clip.track);
     if (mutedTracks.audio || mix.mute || (soloActive() && !mix.solo)) return 0;
@@ -543,10 +595,17 @@
     const fadeIn = clamp(Number(clip.fadeIn)||0,0,clip.duration);
     const fadeOut = clamp(Number(clip.fadeOut)||0,0,clip.duration);
     let fade = Math.min(1, fadeIn ? local/fadeIn : 1, fadeOut ? (clip.duration-local)/fadeOut : 1);
-    if(['dissolve','wipe','fade'].includes(clip.transition)) fade*=audioTransitionGain(clip,(time-clip.start+transitionBefore(clip))/transitionLength(clip));
-    const next=followingTransition(clip);
-    if(next) fade*=audioTransitionGain(next,1-(time-next.start+transitionBefore(next))/transitionLength(next));
-    return clamp(animated(clip,'volume',Number(clip.volume??100))/100,0,2) * clamp((mix.gain??100)/100,0,2) * clamp(fade,0,1);
+    const curve=(sound,value)=>{const u=clamp(value,0,1);return sound.power?Math.sin(u*Math.PI/2):u;};
+    const sound=soundTransition(clip);
+    if (sound?.kind==='crossfade') fade*=curve(sound,(time-clip.start+sound.before)/Math.min(sound.duration,clip.duration+sound.before));
+    else if (local<0) return 0; // only a crossfade plays a sound before its clip starts
+    else if (sound) { const rise=Math.min(sound.duration-sound.before,clip.duration); if(rise>1e-9) fade*=curve(sound,local/rise); }
+    const out=soundOut.get(clip.id);
+    if (out?.sound.kind==='crossfade') {
+      const length=Math.min(out.sound.duration,out.sound.before+out.next.duration);
+      fade*=curve(out.sound,1-(time-out.next.start+out.sound.before)/length);
+    } else if (out && out.sound.before>1e-9) fade*=curve(out.sound,(clip.start+clip.duration-time)/out.sound.before);
+    return clamp(animated(clip,'volume',Number(clip.volume??100))/100,0,2) * trackLevel(clip.track) * clamp(fade,0,1);
   };
   const filterFor = (clip) => {
     const c = clip.color || {};
@@ -725,8 +784,13 @@
       if (item?.nestedProject && !item.src) window.SpliceMedia.prepareNested(item);
     }
     const clip = at("video", time);
-    const audioClips = project.clips.filter(c=>c.type==='audio' && c.start-transitionBefore(c)<=time &&
-      time<c.start+c.duration+(followingTransition(c)?transitionLength(followingTransition(c))-transitionBefore(followingTransition(c)):0));
+    const audioClips = project.clips.filter(c=>{
+      if (c.type!=='audio') return false;
+      const sound=soundIn.get(c.id), out=soundOut.get(c.id);
+      const tail=out?.sound.kind==='crossfade' && !(Number(c.fadeOut)>0) ?
+        Math.min(out.sound.duration,out.sound.before+out.next.duration)-out.sound.before : 0;
+      return c.start-(sound?.kind==='crossfade'?sound.before:0)<=time && time<c.start+c.duration+tail;
+    });
     const mediaItem = clip && mediaOf(clip);
     const source = programSource(clip);
     if (clip && clip.id !== activeVideoId) {
@@ -901,15 +965,8 @@
       auditions.delete(element);
     }
   }
-  function curveValue(points,local,base) {
-    if (!points.length) return base;
-    if (local<=points[0].time) return points[0].value;
-    for (let i=1;i<points.length;i++) if(local<=points[i].time) {
-      const a=points[i-1],b=points[i],u=(local-a.time)/(b.time-a.time);
-      return a.value+(b.value-a.value)*u;
-    }
-    return points.at(-1).value;
-  }
+  // Linear segments, or eased (smoothstep) after a point marked `ease` (audio automation).
+  const curveValue = (points,local,base) => window.SpliceAudioDSP.curveValue(points,local,base);
   function animated(clip,key,base) {
     const points=(clip.keyframes?.[key]||[]).filter(p=>Number.isFinite(p.time)&&Number.isFinite(p.value)).sort((a,b)=>a.time-b.time);
     return curveValue(points,time-clip.start,base);
@@ -1193,6 +1250,17 @@
       throw new Error("This project file has invalid audio mixer settings.");
     if (mix.gain < 0 || mix.gain > 200) throw new Error("Track gain must be between 0% and 200%.");
     if (mix.pan < -100 || mix.pan > 100) throw new Error("Track pan must be between -100 and 100.");
+    const dsp=window.SpliceAudioDSP;
+    dsp.validateFx(mix.fx);
+    if (mix.keyframes!=null) {
+      if (typeof mix.keyframes!=='object' || Array.isArray(mix.keyframes) || Object.keys(mix.keyframes).some(k=>!['volume','pan'].includes(k)))
+        throw new Error("Track automation has volume and pan keyframes only.");
+      if (mix.keyframes.volume) dsp.validateAutomation(mix.keyframes.volume,0,200,2000,'track volume');
+      if (mix.keyframes.pan) dsp.validateAutomation(mix.keyframes.pan,-100,100,2000,'track pan');
+    }
+    if (mix.route!==undefined && !['front','center','lfe','surround'].includes(mix.route)) throw new Error("Invalid track routing.");
+    if (mix.channels!==undefined && !['stereo','mono'].includes(mix.channels)) throw new Error("Invalid track channels.");
+    if (mix.stem!==undefined && (typeof mix.stem!=='string' || mix.stem.length>32)) throw new Error("Stem names are up to 32 characters.");
   }
   // LUT tables are immutable once validated; skip re-checking 100k samples on every edit.
   const validatedLuts = new WeakSet();
@@ -1230,6 +1298,7 @@
         value.trackCounts.video < 1 || value.trackCounts.video > 64 ||
         value.trackCounts.audio < 1 || value.trackCounts.audio > 64))
       throw new Error("This project file has invalid track counts.");
+    if (value.masterFx != null) window.SpliceAudioDSP.validateFx(value.masterFx, ['eq','comp']);
     if (value.trackMix != null) {
       if (typeof value.trackMix !== "object" || Array.isArray(value.trackMix))
         throw new Error("This project file has invalid audio mixer settings.");
@@ -1292,6 +1361,11 @@
         throw new Error("This project file has an invalid clip.");
       if (clip.type === "title" && clip.title != null && typeof clip.title !== "string")
         throw new Error("A title in this project has invalid text.");
+      if (clip.audioFx != null) window.SpliceAudioDSP.validateFx(clip.audioFx);
+      if (clip.channelMap !== undefined && !['stereo','left','right','mono','swap'].includes(clip.channelMap))
+        throw new Error("This project file has an invalid channel mapping.");
+      if (clip.audioTransition !== undefined && !['auto','cut','crossfade','dip'].includes(clip.audioTransition))
+        throw new Error("This project file has an invalid sound transition.");
       if (clip.keyframes != null && (typeof clip.keyframes !== "object" || Array.isArray(clip.keyframes) ||
           Object.values(clip.keyframes).some(points => !Array.isArray(points) ||
             points.some(point => !point || !Number.isFinite(point.time) || !Number.isFinite(point.value)))))
@@ -1349,11 +1423,10 @@
       sound.keyframes = {volume: cloneState(clip.keyframes.volume)};
       delete clip.keyframes.volume;
     }
-    if (["dissolve", "wipe", "fade"].includes(clip.transition)) {
-      sound.transition = "dissolve";
-      sound.transitionDuration = clip.transitionDuration;
-      if (clip.transitionBefore) sound.transitionBefore = clip.transitionBefore;
-    }
+    // The linked sound follows its picture's transition (the same rule as embedded sound);
+    // a sound transition override carries over.
+    if (clip.audioTransition) sound.audioTransition = clip.audioTransition;
+    for (const key of ["channelMap", "audioFx"]) if (key in clip) sound[key] = cloneState(clip[key]);
     clip.embeddedAudio = false;
     clip.linkGroup = group;
     for (const key of ["pan", "fadeIn", "fadeOut"]) delete clip[key];
@@ -1767,12 +1840,31 @@
     updateTrackMix(track, patch) {
       const key=String(track);
       const next={ gain:100, pan:0, mute:false, solo:false, ...project.trackMix?.[key], ...patch };
+      for (const name of Object.keys(next)) if (next[name]===undefined) delete next[name];
       validateTrackMix(key,next);
       if (sameValue(next, project.trackMix?.[key])) return;
       snapshot();
       project.trackMix ||= {};
       project.trackMix[key] = next;
       syncMedia(); notify();
+    },
+    // Master bus EQ and compressor (null removes them).
+    setMasterFx(fx) {
+      window.SpliceAudioDSP.validateFx(fx, ['eq','comp']);
+      if (sameValue(fx ?? undefined, project.masterFx)) return;
+      snapshot();
+      if (fx) project.masterFx = cloneState(fx); else delete project.masterFx;
+      syncMedia(); notify();
+    },
+    // Track automation: points [{time (timeline s), value, ease?}] replace the property's curve.
+    setTrackAutomation(track, key, points) {
+      if (!['volume','pan'].includes(key)) throw Error('Track automation has volume and pan keyframes only.');
+      const mix=project.trackMix?.[String(track)]||{};
+      const sorted=[...points].map(point=>({time:Math.round(Number(point.time)*1e6)/1e6,value:Number(point.value),
+        ...(point.ease?{ease:true}:{})})).sort((a,b)=>a.time-b.time);
+      const keyframes={...(mix.keyframes||{}),[key]:sorted};
+      if (!sorted.length) delete keyframes[key];
+      Editor.updateTrackMix(track,{keyframes:Object.keys(keyframes).length?keyframes:undefined});
     },
     beginGesture() { if (gesture) return; gestureBefore=project; gesture=true; },
     endGesture() {
@@ -2341,6 +2433,15 @@
       if (groups.size) {
         for (const clip of project.clips) if (groups.has(clip.linkGroup)) ensureEditable(clip);
         Editor.editProject((next) => {
+          const pictures=new Map(next.clips.filter(c=>c.type==='video'&&groups.has(c.linkGroup))
+            .map(c=>[c.linkGroup+':'+Math.round(c.start*project.fps),c]));
+          for (const clip of next.clips) {
+            const picture=clip.type==='audio' && !SOUND_KINDS[clip.transition] && pictures.get(clip.linkGroup+':'+Math.round(clip.start*project.fps));
+            if (picture && SOUND_KINDS[picture.transition]) {
+              clip.transition=SOUND_KINDS[picture.transition]==='dip'?'fade':'dissolve';
+              for (const key of ['transitionDuration','transitionBefore']) if (key in picture) clip[key]=picture[key];
+            }
+          }
           for (const clip of next.clips) if (groups.has(clip.linkGroup)) delete clip.linkGroup;
         });
         return "unlinked";
@@ -2581,7 +2682,8 @@
           `${safe}.splice.json`,
         );
     },
-    async exportVideo(options = {}, onProgress = () => {}, signal) {
+    // `download: false` (Analyze program) keeps the result in the job report instead of saving a file.
+    async exportVideo(options = {}, onProgress = () => {}, signal, {download = true} = {}) {
       if (!duration()) throw new Error("Add clips to the timeline before exporting.");
       if (signal?.aborted) throw signal.reason || new DOMException("Export cancelled", "AbortError");
       const prepared = window.SpliceMedia?.forPremiere
@@ -2624,12 +2726,14 @@
           if (job.state === "cancelled") throw new Error("Export cancelled.");
           if (job.state === "complete") {
             const safe = (project.name || "Untitled").replace(/[^a-z0-9_-]+/gi, "-").replace(/^-+|-+$/g, "") || "Untitled";
-            const extension = ["mp4","mov","wav"].includes(job.extension) ? job.extension : "mp4";
+            const extension = ["mp4","mov","wav","zip","json"].includes(job.extension) ? job.extension : "mp4";
             const downloadURL = endpoint + "/file?name=" + encodeURIComponent(safe + "." + extension);
-            const anchor = document.createElement("a");
-            anchor.href = downloadURL;
-            anchor.download = safe + "." + extension;
-            anchor.click();
+            if (download) {
+              const anchor = document.createElement("a");
+              anchor.href = downloadURL;
+              anchor.download = safe + "." + extension;
+              anchor.click();
+            }
             return { id, url: job.previewable === false ? null : endpoint + "/preview", downloadURL,
               extension, mime: job.mime, previewable: job.previewable !== false };
           }

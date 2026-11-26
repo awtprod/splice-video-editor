@@ -1917,8 +1917,9 @@ def _program_bus(events, plans, master_fx, first_sample, stop_sample, layout, di
     for number, (track, members) in enumerate(groups):
         if track is not None or members or len(groups) == 1:
             share = (lambda fraction, number=number: progress((number+fraction)/len(groups))) if progress else None
+            prefix = 'audio' if (name, number) == ('mix', 0) else f'{name}-{number:03d}'
             chunks = _render_audio(members, first_sample, stop_sample, directory, cancelled, heartbeat, share, mixed,
-                                   prefix=f'{name}-{number:03d}')
+                                   prefix=prefix)
             inputs.append(_concat_input(directory, f'{name}-{number:03d}.txt', chunks))
             chains.append(audio_dsp.ffmpeg_filters(plans[track]['fx']) if track is not None else [])
     master = audio_dsp.ffmpeg_filters({key: value for key, value in master_fx.items()
