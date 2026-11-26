@@ -31,6 +31,31 @@ async function typeSafely(page, locator, text) {
   await locator.press('Tab');
 }
 
+async function busEffects(splice, media) {
+  const {workspace} = lazy();
+  const {page} = await workspace(splice, media, VIEWPORTS[0]);
+  const track = page.locator('.audio-track[data-track="-1"]');
+  await track.locator('[data-track-fx]').click();
+  for (const master of [false, true]) {
+    const mount = master ? page.locator('[data-master]') : track.locator('[data-track-mount]');
+    await mount.locator('[data-toggle=comp]').check();
+    for (const [key, value] of [['threshold', '-36'], ['ratio', '6']]) {
+      const input = mount.locator('input[data-kind=comp][data-key=' + key + ']');
+      await input.focus();
+      await input.fill(value);
+      await input.dispatchEvent('change');  // Commit while focused, as with the number field's stepper.
+    }
+    const comp = await page.evaluate(master => {
+      const p = Editor.get().project;
+      return (master ? p.masterFx : p.trackMix['-1'].fx).comp;
+    }, master);
+    assert.ok(comp.enabled);
+    assert.equal(comp.threshold, -36);
+    assert.equal(comp.ratio, 6);
+  }
+  await page.context().close();
+}
+
 async function inspectorAudio(splice, media) {
   const {project, shot, state, waitFor} = lazy();
   for (const viewport of VIEWPORTS) {
@@ -411,5 +436,5 @@ async function performance12(splice, media) {
 }
 
 exports.cases = (process.env.AUDIO_CASES ? process.env.AUDIO_CASES.split(',') : null) ?
-  [eqParity, dynamicsParity, inspectorAudio, automation, exportDialog, syncCommand, performance12].filter(fn => process.env.AUDIO_CASES.split(',').includes(fn.name)) :
-  [eqParity, dynamicsParity, inspectorAudio, automation, exportDialog, syncCommand, performance12];
+  [eqParity, dynamicsParity, busEffects, inspectorAudio, automation, exportDialog, syncCommand, performance12].filter(fn => process.env.AUDIO_CASES.split(',').includes(fn.name)) :
+  [eqParity, dynamicsParity, busEffects, inspectorAudio, automation, exportDialog, syncCommand, performance12];

@@ -117,6 +117,15 @@ class Channels(AudioCase):
         self.assertAlmostEqual(tone_level(samples, 900, 1, 2, channel=0), .15*math.cos(angle), delta=.002)
         self.assertAlmostEqual(tone_level(samples, 900, 1, 2, channel=1), .15*math.sin(angle), delta=.002)
 
+    def test_selected_microphone_on_mono_track(self):
+        media = [dict(id='d', src=self.src(self.dual()))]
+        for mapping, selected, rejected in [('left', 500, 900), ('right', 900, 500)]:
+            clips = [dict(type='audio', mediaId='d', track=-1, start=0, duration=3, channelMap=mapping)]
+            samples = pcm(self.render(clips, media, name=mapping, project={'trackMix': {'-1': {'channels': 'mono'}}}))
+            for channel in (0, 1):
+                self.assertGreater(tone_level(samples, selected, 1, 2, channel=channel), .1)
+                self.assertLess(tone_level(samples, rejected, 1, 2, channel=channel), .001)
+
     def surround_project(self):
         tones = {route: self.source(f'{route}.wav', f"aevalsrc='0.2*sin(2*PI*{f}*t)|0.2*sin(2*PI*{f}*t)':s=48000", 4)
                  for route, f in (('front', 400), ('center', 700), ('lfe', 60), ('surround', 1300))}
@@ -195,6 +204,24 @@ class Stems(AudioCase):
         self.assertTrue(report['audio']['stemsSumToMix'])
         self.assertAlmostEqual(report['audio']['output']['integratedLufs'], -20, delta=.2)
         self.assertEqual([stem['tracks'] for stem in report['audio']['stems']], [['A1', 'A2'], ['A3'], ['A4']])
+
+    def test_camera_and_sound_tracks_have_distinct_isos(self):
+        picture = self.directory/'camera.mov'
+        ffmpeg('-f', 'lavfi', '-i', 'color=s=160x90:d=3', '-f', 'lavfi', '-i', 'sine=f=500:d=3',
+               '-c:v', 'libx264', '-c:a', 'pcm_s16le', str(picture))
+        sound = self.source('sound.wav', 'sine=f=900', 3)
+        media = [dict(id='v', src=self.src(picture)), dict(id='a', src=self.src(sound))]
+        clips = [dict(type='video', track=1, mediaId='v', start=0, duration=3, embeddedAudio=True),
+                 dict(type='audio', track=-1, mediaId='a', start=0, duration=3)]
+        output = self.render(clips, media, codec='stems', name='camera-isos', isoTracks=True)
+        with zipfile.ZipFile(output) as archive:
+            report = json.loads(archive.read('report.json'))
+            self.assertEqual({entry['track']: entry['file'] for entry in report['isos']},
+                             {'A1': 'iso-A1.wav', 'V1': 'iso-V1.wav'})
+            for label, selected, rejected in [('V1', 500, 900), ('A1', 900, 500)]:
+                samples = self.read(archive, f'iso-{label}.wav')
+                self.assertGreater(tone_level(samples, selected, 1, 2), .05)
+                self.assertLess(tone_level(samples, rejected, 1, 2), .001)
 
     def test_a_master_compressor_is_named_when_stems_cannot_sum(self):
         clips, media, project = self.project()

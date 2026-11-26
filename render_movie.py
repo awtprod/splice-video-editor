@@ -1475,10 +1475,15 @@ def _track_settings(track_mix, track):
     return mix
 
 
+def _track_label(track):
+    number = int(track)
+    return f'A{-number}' if number < 0 else f'V{number}'
+
+
 def track_plan(track_mix, track):
     """Validated processing of one audio track (cached per export by the caller)."""
     mix = _track_settings(track_mix, track)
-    fx = audio_dsp.normalize(mix.get('fx'), label=f'track A{abs(int(track))} effects')
+    fx = audio_dsp.normalize(mix.get('fx'), label=f'track {_track_label(track)} effects')
     keys = mix.get('keyframes', {})
     if not isinstance(keys, dict) or any(key not in ('volume', 'pan') for key in keys):
         raise ValueError('Invalid track automation: use volume and pan keyframes')
@@ -1573,14 +1578,14 @@ def _audio_events(clips, media_by_id, fps, probes, track_mix, solo, span, heartb
         if not isinstance(mapping, str) or mapping not in CHANNEL_MAPS: raise ValueError('Invalid channel mapping: use ' + ', '.join(CHANNEL_MAPS))
         source_channels = 2 if len(streams) > 1 else next(iter(streams.values()))
         mono = source_channels == 1 or plan['mono']
-        if source_channels == 1:
-            mapping_filter = None
-        elif plan['mono']:
-            mapping_filter = 'aformat=channel_layouts=stereo,pan=mono|c0=0.5*c0+0.5*c1'
-        elif CHANNEL_MAPS[mapping]:
-            mapping_filter = 'aformat=channel_layouts=stereo,' + CHANNEL_MAPS[mapping]
-        else:
-            mapping_filter = None
+        mapping_filter = None
+        if source_channels != 1 and (plan['mono'] or CHANNEL_MAPS[mapping]):
+            filters = ['aformat=channel_layouts=stereo']
+            if CHANNEL_MAPS[mapping]:
+                filters.append(CHANNEL_MAPS[mapping])
+            if plan['mono']:
+                filters.append('pan=mono|c0=0.5*c0+0.5*c1')
+            mapping_filter = ','.join(filters)
         clip_pan = _number(clip.get('pan', 0), 'pan', -100, 100)
         fx = audio_dsp.normalize(clip.get('audioFx'), label='clip audio effects')
         processing = [*([mapping_filter] if mapping_filter else []),
@@ -2355,7 +2360,7 @@ def _render_stems(project, events, plans, settings, iso, first_sample, stop_samp
         safe = ''.join(char if char.isalnum() or char in '-_' else '_' for char in stem)
         target = Path(directory)/f'stem-{number+1:02d}-{safe}.wav'
         deliver(source, [*linear_master, *downmix, *gain_filter], target)
-        report['stems'].append({'name': stem, 'file': target.name, 'tracks': [f'A{abs(int(key))}' for key in stems[stem]]})
+        report['stems'].append({'name': stem, 'file': target.name, 'tracks': [_track_label(key) for key in stems[stem]]})
     report['stemsSumToMix'] = 'comp' not in master_fx and not (report.get('limiter') or {}).get('acted')
     if not report['stemsSumToMix']:
         report['stemsNote'] = ('Stems are taken before the master compressor and the limiter, which acted on this mix, '
@@ -2363,12 +2368,13 @@ def _render_stems(project, events, plans, settings, iso, first_sample, stop_samp
     if iso:
         report['isos'] = []
         for key in sorted(plans, key=lambda key: abs(int(key))):
+            label = _track_label(key)
             bus = _program_bus([event for event in events if event['track'] == key], plans, {}, first_sample, stop_sample,
                                '5.1' if layout != 'stereo' else 'stereo', directory, cancelled, heartbeat, None,
-                               name=f'iso{abs(int(key)):02d}')
-            target = Path(directory)/f'iso-A{abs(int(key))}.wav'
+                               name=f'iso-{label}')
+            target = Path(directory)/f'iso-{label}.wav'
             deliver(bus, downmix, target)
-            report['isos'].append({'track': f'A{abs(int(key))}', 'file': target.name})
+            report['isos'].append({'track': label, 'file': target.name})
             step()
     report['startSeconds'] = round(first_sample/AUDIO_RATE, 6)
     with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_STORED, allowZip64=True) as archive:

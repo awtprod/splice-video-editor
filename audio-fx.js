@@ -58,7 +58,7 @@
     container.innerHTML = html;
     if (disabled) for (const input of container.querySelectorAll('input,select,button')) input.disabled = true;
     drawCurve(container.querySelector('.fx-curve'), fx.eq);
-    const commit = next => { try { onChange?.(next); } catch (error) { window.alert(error.message || 'These settings are not valid.'); render(container, fx, options); } };
+    const commit = next => { try { onChange?.(next); fx = next; } catch (error) { window.alert(error.message || 'These settings are not valid.'); render(container, fx, options); } };
     const current = () => structuredClone(fx);
     container.querySelectorAll('[data-toggle]').forEach(box => box.onchange = () => {
       const next = current(), kind = box.dataset.toggle;
