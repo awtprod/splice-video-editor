@@ -32,8 +32,9 @@ window.SpliceLink = (() => {
   const asFile = (entry, linked) => ({name: entry.name, splicePath: entry.sourcePath || entry.path,
                                       webkitRelativePath: entry.relativePath || '', spliceLinked: linked ? entry : undefined});
 
-  function openPicker() {
-    const dialog = modal('Link media in place', 'splice-link');
+  // The folder browser both dialogs share: a path bar, places, and one directory's entries.
+  // With `selectFiles`, media files get checkboxes; otherwise only folders can be opened.
+  function folderBrowser({selectFiles, onChange}) {
     const location = element('input', {type: 'text', id: 'link-location', spellcheck: false,
                                        placeholder: 'Folder path', ariaLabel: 'Folder path'});
     const go = element('button', {type: 'button', textContent: 'Go', id: 'link-go'});
@@ -41,34 +42,15 @@ window.SpliceLink = (() => {
     const places = element('nav', {className: 'link-places', ariaLabel: 'Places'});
     const list = element('ul', {className: 'link-entries', id: 'link-entries'});
     const message = element('p', {className: 'link-message', id: 'link-message', role: 'status'});
-    const note = element('p', {className: 'link-note', textContent:
-      'Linked files stay where they are and are not copied. Keep the drive connected while you edit; ' +
-      'if a file moves, Splice marks it offline so you can relink it here.'});
-    const button = (id, text, primary) => element('button', {type: 'button', id, textContent: text, className: primary ? 'primary' : ''});
-    const importSelected = button('link-import', 'Link selected files', true);
-    const importFolder = button('link-import-folder', 'Link whole folder');
-    const relinkSelected = button('link-relink', 'Relink offline from selection');
-    const relinkFolder = button('link-relink-folder', 'Relink offline from folder');
-    const cancel = button('link-cancel', 'Cancel');
-    dialog.append(element('div', {className: 'link-bar'}, up, location, go),
-                  element('div', {className: 'link-body'}, places, list), message, note,
-                  element('footer', {}, cancel, relinkFolder, relinkSelected, importFolder, importSelected));
-    let current = null, shown = 0;
-    const selected = () => [...list.querySelectorAll('input:checked')].map(box => box.closest('li').entry);
-    function refresh() {
-      const files = selected().length;
-      importSelected.disabled = relinkSelected.disabled = !files;
-      importFolder.disabled = relinkFolder.disabled = !current;
-      const offline = window.Editor?.get().project.media.some(item => item.offline);
-      relinkSelected.hidden = relinkFolder.hidden = !offline;
-    }
+    const state = {current: null};
+    let shown = 0;
     async function show(path) {
       const request = ++shown;
       message.textContent = 'Loading…';
       try {
         const data = await api('/api/files?path=' + encodeURIComponent(path || ''));
         if (request !== shown) return;  // A newer folder was chosen meanwhile.
-        current = data.path;
+        state.current = data.path;
         if (data.path) location.value = data.path;  // Keep a path the user is still typing.
         up.disabled = !data.parent; up.dataset.path = data.parent || '';
         places.replaceChildren(...data.places.map(place => element('button', {type: 'button', textContent: place.name,
@@ -79,16 +61,53 @@ window.SpliceLink = (() => {
           if (entry.folder) {
             row.append(element('button', {type: 'button', className: 'link-folder', textContent: '▸ ' + entry.name,
                                           onclick: () => show(entry.path)}));
-          } else {
-            const box = element('input', {type: 'checkbox', disabled: entry.kind === 'raw', onchange: refresh});
+          } else if (selectFiles) {
+            const box = element('input', {type: 'checkbox', disabled: entry.kind === 'raw', onchange: onChange});
             row.append(element('label', {title: entry.kind === 'raw' ? 'Camera RAW needs a transcode from the vendor tool' : entry.path},
               box, element('span', {textContent: entry.name}), element('small', {textContent: size(entry.size)})));
+          } else {
+            row.append(element('label', {title: entry.path}, element('span', {textContent: entry.name}),
+                               element('small', {textContent: size(entry.size)})));
           }
           return row;
         }));
         message.textContent = data.path ? (data.truncated ? 'Showing the first 5,000 items.' : '') : 'Choose a place or type a folder path.';
+        onChange();
+        return true;
       } catch (error) { if (request === shown) message.textContent = error.message; }
-      refresh();
+      onChange();
+      return false;
+    }
+    location.onkeydown = event => { if (event.key === 'Enter') show(location.value.trim()); };
+    go.onclick = () => show(location.value.trim());
+    up.onclick = () => show(up.dataset.path);
+    return {state, show, list, message,
+            nodes: [element('div', {className: 'link-bar'}, up, location, go),
+                    element('div', {className: 'link-body'}, places, list), message]};
+  }
+
+  function openPicker() {
+    const dialog = modal('Link media in place', 'splice-link');
+    const note = element('p', {className: 'link-note', textContent:
+      'Linked files stay where they are and are not copied. Keep the drive connected while you edit; ' +
+      'if a file moves, Splice marks it offline so you can relink it here.'});
+    const button = (id, text, primary) => element('button', {type: 'button', id, textContent: text, className: primary ? 'primary' : ''});
+    const importSelected = button('link-import', 'Link selected files', true);
+    const importFolder = button('link-import-folder', 'Link whole folder');
+    const relinkSelected = button('link-relink', 'Relink offline from selection');
+    const relinkFolder = button('link-relink-folder', 'Relink offline from folder');
+    const cancel = button('link-cancel', 'Cancel');
+    const browser = folderBrowser({selectFiles: true, onChange: () => refresh()});
+    const {state, list, message} = browser;
+    dialog.append(...browser.nodes, note,
+                  element('footer', {}, cancel, relinkFolder, relinkSelected, importFolder, importSelected));
+    const selected = () => [...list.querySelectorAll('input:checked')].map(box => box.closest('li').entry);
+    function refresh() {
+      const files = selected().length;
+      importSelected.disabled = relinkSelected.disabled = !files;
+      importFolder.disabled = relinkFolder.disabled = !state.current;
+      const offline = window.Editor?.get().project.media.some(item => item.offline);
+      relinkSelected.hidden = relinkFolder.hidden = !offline;
     }
     async function run(label, action) {
       message.textContent = label;
@@ -99,7 +118,7 @@ window.SpliceLink = (() => {
       } catch (error) { message.textContent = error.message; refresh(); cancel.disabled = false; }
     }
     async function linkFolder() {
-      const {files, notice} = await post('/api/media/link', {folder: current}, 600000);
+      const {files, notice} = await post('/api/media/link', {folder: state.current}, 600000);
       if (notice) window.alert(notice);
       const failed = files.filter(file => file.error);
       const linked = files.filter(file => !file.error);
@@ -107,17 +126,34 @@ window.SpliceLink = (() => {
       if (failed.length) window.alert(failed.length + ' file(s) were skipped:\n' + failed.slice(0, 8).map(f => f.name + ': ' + f.error).join('\n'));
       return linked.map(entry => asFile(entry, true));
     }
-    location.onkeydown = event => { if (event.key === 'Enter') show(location.value.trim()); };
-    go.onclick = () => show(location.value.trim());
-    up.onclick = () => show(up.dataset.path);
     cancel.onclick = () => dialog.close();
     importSelected.onclick = () => run('Linking…', () => Editor.addMedia(selected().map(entry => asFile(entry))));
     relinkSelected.onclick = () => run('Relinking…', () => Editor.relinkMedia(selected().map(entry => asFile(entry))));
     importFolder.onclick = () => run('Linking folder…', async () => Editor.addMedia(await linkFolder()));
     relinkFolder.onclick = () => run('Relinking from folder…', async () => Editor.relinkFolder(await linkFolder()));
     dialog.showModal();
-    show(null);
+    browser.show(null);
     return dialog;
+  }
+
+  // Choose a folder on this computer (nothing is linked). Resolves to its absolute path, or
+  // null when cancelled. Opens over any dialog already showing.
+  function pickFolder({title = 'Choose a folder', initial = ''} = {}) {
+    return new Promise(resolve => {
+      const dialog = modal(title, 'splice-link splice-folder-pick');
+      const cancel = element('button', {type: 'button', id: 'pick-cancel', textContent: 'Cancel'});
+      const choose = element('button', {type: 'button', id: 'pick-choose', textContent: 'Choose this folder', className: 'primary'});
+      const browser = folderBrowser({selectFiles: false, onChange: () => { choose.disabled = !browser.state.current; }});
+      dialog.append(...browser.nodes, element('footer', {}, cancel, choose));
+      let chosen = null;
+      dialog.addEventListener('close', () => resolve(chosen));
+      cancel.onclick = () => dialog.close();
+      choose.onclick = () => { chosen = browser.state.current; dialog.close(); };
+      choose.disabled = true;
+      dialog.showModal();
+      // A remembered folder that is gone opens the list of places instead.
+      browser.show(initial || null).then(ok => { if (!ok && initial) browser.show(null); });
+    });
   }
 
   // Media cache. Proxies and previews are rebuilt on demand, so unused ones
@@ -209,5 +245,5 @@ window.SpliceLink = (() => {
 
   document.getElementById('link-media')?.addEventListener('click', openPicker);
   document.getElementById('media-cache')?.addEventListener('click', openCache);
-  return {openPicker, openCache};
+  return {openPicker, openCache, pickFolder};
 })();
