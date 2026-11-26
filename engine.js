@@ -2092,7 +2092,10 @@
       if (at === null) delete marks[edge];
       else {
         if (!Number.isFinite(Number(at))) throw new Error("Choose a timeline position.");
-        const frame = Math.max(0, Math.round(Number(at) * project.fps));
+        let frame = Math.max(0, Math.round(Number(at) * project.fps));
+        // The playhead parked at the sequence end sits after the last frame: Out marks that last frame.
+        const lastFrame = Math.ceil((project.duration || 0) * project.fps - 1e-6) - 1;
+        if (edge === "out" && lastFrame >= 0) frame = Math.min(frame, lastFrame);
         marks[edge] = (edge === "out" ? frame + 1 : frame) / project.fps;
         // A new mark that crosses the other one replaces it, as in Premiere.
         if (Number.isFinite(marks.in) && Number.isFinite(marks.out) && marks.out <= marks.in) delete marks[edge === "in" ? "out" : "in"];
@@ -2123,7 +2126,11 @@
     // Ranges come from the source In/Out and the timeline In/Out; with both timeline marks
     // the timeline decides the length (back-timed from a lone source Out, or fit to fill
     // when all four marks disagree); with a lone timeline Out the edit is back-timed.
-    placeSource(id, {mode = "overwrite", track, audioTrack = null, marks} = {}) {
+    // After the edit the playhead moves to the end of the placed clip, so mark-and-insert cycles
+    // build a scene in order. An edit timed by the timeline In and/or Out clears both marks, as
+    // Premiere does (undo brings them back). `at` (a drag onto the timeline) places the source
+    // at that time instead and leaves the timeline marks alone.
+    placeSource(id, {mode = "overwrite", track, audioTrack = null, marks, at = null} = {}) {
       const item = project.media.find((entry) => entry.id === id);
       if (!item) throw new Error("Media is unavailable.");
       if (!["insert", "overwrite", "append"].includes(mode)) throw new Error("Choose insert, overwrite or append.");
@@ -2146,7 +2153,11 @@
       const timelineIn = Number.isFinite(timeline.in) ? timeline.in : null;
       const timelineOut = Number.isFinite(timeline.out) ? timeline.out : null;
       let start, length = range.duration, sourceIn = range.in, speed = 1, method = "playhead";
-      if (mode === "append") {
+      if (at !== null && at !== undefined) {
+        if (!Number.isFinite(Number(at))) throw new Error("Choose a timeline position.");
+        start = Math.max(0, Number(at));
+        method = "drag";
+      } else if (mode === "append") {
         start = Math.max(0, ...project.clips.filter((clip) => lanes.has(laneOf(clip))).map((clip) => clip.start + clip.duration));
         method = "append";
       } else if (timelineIn !== null && timelineOut !== null) {
@@ -2176,14 +2187,18 @@
       const selection = {...range, in: Math.max(0, sourceIn), duration: length};
       if (speed !== 1) selection.speed = speed;
       const placed = [];
+      const usedTimelineMarks = method !== "drag" && mode !== "append" && (timelineIn !== null || timelineOut !== null);
       Editor.editProject((next) => {
         if (mode === "insert") insertSpace(next, lanes, start, length);
         else clearRange(next, lanes, start, start + length);
         const clips = sourceClips(item, selection, start, pictureTrack, soundTrack);
         next.clips.push(...clips);
         placed.push(...clips);
+        if (usedTimelineMarks) delete next.marks;
       });
       selectedId = placed[0]?.id ?? selectedId;
+      time = clamp(snap(start + length), 0, project.duration);
+      syncMedia(true);
       notify();
       return {start, duration: length, speed, method, clips: placed.map((clip) => clip.id)};
     },

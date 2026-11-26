@@ -84,15 +84,16 @@
     committedMarks=JSON.stringify(marks);
     Editor.setSourceSettings(media.id,{sourceMarks:{...marks}});
   }
-  function place(mode) {
+  // `drop` places the marked range where it was dragged on the timeline: {track, at}.
+  function place(mode, drop=null) {
     if (!dialog || dialog.dataset.preparing) return;
     show('');
-    const track=Number(dialog.querySelector('.source-track').value);
+    const track=drop ? Number(drop.track) : Number(dialog.querySelector('.source-track').value);
     if (Editor.isTrackLocked(track, media.type)) return show(`Unlock ${media.type} track ${Math.abs(track)} before editing.`);
     const soundPicker=dialog.querySelector('.source-audio-track');
     const audioTrack=soundPicker && soundPicker.value!=='' ? Number(soundPicker.value) : null;
     let result;
-    try { result=Editor.placeSource(media.id,{mode,track,audioTrack,marks:{...marks}}); }
+    try { result=Editor.placeSource(media.id,{mode,track,audioTrack,marks:{...marks},...(drop?{at:drop.at}:{})}); }
     catch (error) { return show(error.message); }
     if (result.speed!==1) Editor.select(result.clips[0]);
     // The monitor stays open: three-point editing is mark, place, mark, place.
@@ -157,6 +158,14 @@
     const workspace=document.querySelector('.workspace'), viewer=workspace?.querySelector('.viewer');
     if (viewer) { viewer.before(dialog); workspace.classList.add('source-open'); }
     else document.body.append(dialog);
+    // Drag the picture (or the sound's stage) onto a timeline track: overwrite there, Ctrl or ⌘ inserts.
+    const stage=dialog.querySelector('.source-stage');
+    stage.draggable=true;stage.title='Drag onto a timeline track to overwrite there (hold Ctrl or ⌘ to insert)';
+    stage.addEventListener('dragstart',event=>{
+      if(!media){event.preventDefault();return;}
+      event.dataTransfer.setData('application/x-splice-source',media.id);
+      event.dataTransfer.effectAllowed='copy';
+    });
     player=dialog.querySelector('video,audio');player.src=media.src;player.onerror=()=>show('The source file could not be decoded.');player.onended=stopShuttle;
     player.onloadedmetadata=()=>{
       if(!dialog?.open)return;
@@ -271,5 +280,5 @@
       trackPicker.onchange();
     }
   }
-  window.SpliceSource={open,place,isOpen:()=>!!dialog?.open};
+  window.SpliceSource={open,place,isOpen:()=>!!dialog?.open,mediaId:()=>media?.id??null,mediaType:()=>media?.type??null};
 })();

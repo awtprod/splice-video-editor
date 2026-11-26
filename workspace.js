@@ -911,6 +911,14 @@
   lanes.addEventListener("dragover",e=>{if(e.target.closest(".track-lane"))e.preventDefault();});
   lanes.addEventListener("drop",e=>{
     const lane=e.target.closest(".track-lane");if(!lane)return;e.preventDefault();
+    const sourceId=e.dataTransfer.getData("application/x-splice-source");
+    if(sourceId&&window.SpliceSource?.mediaId?.()===sourceId){
+      // From the source monitor: its marked range, overwritten (Ctrl/⌘: inserted) where it was dropped.
+      const kind=lane.dataset.kind==="title"?"video":lane.dataset.kind;
+      if(SpliceSource.mediaType()!==kind)return notify("Drop "+(kind==="video"?"sound on an audio":"picture on a video")+" track.");
+      SpliceSource.place(e.ctrlKey||e.metaKey?"insert":"overwrite",{track:Number(lane.dataset.track),at:snapTime(positionTime(e,lane))});
+      return;
+    }
     const id=e.dataTransfer.getData("text/plain");
     const item=editor.get().project.media.find(m=>m.id===id);
     if(!item||item.type!==(lane.dataset.kind==="title"?"video":lane.dataset.kind))return notify("Choose a "+item?.type+" lane.");
