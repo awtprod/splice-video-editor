@@ -2723,16 +2723,40 @@ def light_level_filter_args(profile, target):
     pixel (a lookup table, linear nits scaled so 65535 = 10,000 nits) and is averaged
     (signalstats YAVG): MaxFALL is the largest frame average.
     """
-    matrix = {'bt2020nc': 'bt2020', 'bt2020c': 'bt2020', 'bt709': 'bt709'}.get(profile[2], 'bt2020')
     lut = (f"65535*pow(max(pow(val/65535\\,1/{_PQ_M2})-{_PQ_C1}\\,0)/({_PQ_C2}-{_PQ_C3}*pow(val/65535\\,1/{_PQ_M2}))\\,1/{_PQ_M1})")
     peak, average = Path(str(target) + '.peak'), Path(str(target) + '.average')
-    graph = (f'scale=in_color_matrix={matrix}:in_range=limited:out_range=full,format=gbrp16le,split=3[g][b][r];'
+    graph = (f'{_to_full_rgb(profile)},format=gbrp16le,split=3[g][b][r];'
              '[r]mergeplanes=0x020202:yuv444p16le[rr];[g]mergeplanes=0x000000:yuv444p16le[gg];'
              '[b]mergeplanes=0x010101:yuv444p16le[bb];[rr][gg]blend=all_mode=lighten[rg];'
              '[rg][bb]blend=all_mode=lighten,split[p][q];'
              f'[p]signalstats,metadata=print:key=lavfi.signalstats.YMAX:file={_filter_path(peak)}[po];'
              f"[q]lutyuv=y='{lut}',signalstats,metadata=print:key=lavfi.signalstats.YAVG:file={_filter_path(average)}[qo]")
     return ['-filter_complex', graph, '-map', '[po]', '-f', 'null', '-', '-map', '[qo]', '-f', 'null', '-']
+
+
+@lru_cache(maxsize=1)
+def _has_zscale():
+    try:
+        result = subprocess.run(['ffmpeg', '-hide_banner', '-filters'], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return any(line.split()[1:2] == ['zscale'] for line in result.stdout.splitlines() if line.strip())
+
+
+def _to_full_rgb(profile):
+    """Legal-range Y'CbCr to full-range R'G'B' with the program's matrix. zscale (zimg) is exact to
+    the last 16-bit code; swscale's limited-to-full path is about 0.4 % low at the top, so it is
+    only the fallback when this FFmpeg has no zscale."""
+    primaries, transfer, matrix = profile
+    if _has_zscale():
+        name = {'bt2020nc': '2020_ncl', 'bt2020c': '2020_cl', 'smpte170m': '170m', 'bt470bg': '470bg'}.get(matrix, '709')
+        # Primaries and transfer stay as they are (stated so zimg needs no guess).
+        prim = {'bt2020': '2020', 'smpte170m': '170m', 'bt470bg': '470bg'}.get(primaries, '709')
+        trc = {'smpte2084': 'smpte2084', 'arib-std-b67': 'arib-std-b67', 'smpte170m': '601'}.get(transfer, '709')
+        return (f'zscale=matrixin={name}:rangein=limited:range=full:primariesin={prim}:primaries={prim}:'
+                f'transferin={trc}:transfer={trc}:dither=none')
+    name = {'bt2020nc': 'bt2020', 'bt2020c': 'bt2020', 'smpte170m': 'smpte170m', 'bt470bg': 'bt470bg'}.get(matrix, 'bt709')
+    return f'scale=in_color_matrix={name}:in_range=limited:out_range=full'
 
 
 def _read_light_levels(target):
@@ -2755,7 +2779,7 @@ def _source_light_levels(project, measured):
         path = next(iter(sources))
         try:
             result = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-read_intervals', '%+#1',
-                                     '-show_entries', 'frame=side_data_list', '-of', 'json', str(path)],
+                                     '-show_frames', '-of', 'json', str(path)],
                                     capture_output=True, text=True, timeout=30, check=True)
             for frame in json.loads(result.stdout).get('frames', []):
                 for side in frame.get('side_data_list', []):
@@ -2839,8 +2863,8 @@ def _delivery_tail(spec, width, height, fps, profile, burn, directory):
         steps.extend(_burn_in_filters(burn, out_w, out_h, fps, directory))
     if spec['mode'] == 'stream' or spec['kind'] == 'images':
         if spec['kind'] == 'images':
-            matrix = {'bt2020nc': 'bt2020', 'bt2020c': 'bt2020', 'smpte170m': 'smpte170m', 'bt470bg': 'bt470bg'}.get(profile[2], 'bt709')
-            steps.append(f'scale=in_color_matrix={matrix}:in_range=limited:out_range=full')
+            # zimg writes planar 16-bit RGB; FFmpeg repacks it into the file's pixel format.
+            steps.append(_to_full_rgb(profile) + (',format=gbrap16le' if spec['alpha'] else ',format=gbrp16le'))
         steps.append(f'format={spec["pix_fmt"]}')
     return ','.join(steps)
 
