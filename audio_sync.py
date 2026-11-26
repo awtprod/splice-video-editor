@@ -34,6 +34,7 @@ DEFAULT_SEARCH_SECONDS = 60
 REFINE_SECONDS = 4
 REFINE_LAGS = 2*BLOCK        # +-10 ms at 8 kHz around the envelope match
 MIN_CONFIDENCE = .35
+DRIFT_PPM = 100
 MIN_PEAK_RATIO = 1.6
 DECODE_TIMEOUT = 120
 MAX_PAIRS = 40
@@ -200,8 +201,11 @@ def waveform_offset(picture_path, sound_path, *, picture_stream=0, sound_stream=
         if late is not None:
             drift = late-offset
             result['driftSeconds'] = round(drift, 6)
-            result['driftPpm'] = round(drift/max(1e-9, end-begin-20)*1e6, 1)
-            if abs(drift) > .5/fps:
+            ppm = drift/max(1e-9, end-begin-20)*1e6
+            result['driftPpm'] = round(ppm, 1)
+            # Flag a clock difference beyond what two good crystals show (DRIFT_PPM), or one
+            # that would move the sound a quarter frame over the take.
+            if abs(ppm) > DRIFT_PPM or abs(ppm)*1e-6*(end-begin) > .25/fps:
                 result['drift'] = True
     ok = confidence >= MIN_CONFIDENCE and ratio >= MIN_PEAK_RATIO
     result['ok'] = ok and not result.get('drift')
