@@ -182,7 +182,8 @@ def timemap(seconds):
 # --------------------------------------------------------------------------- links
 
 def _fields(item):
-    return pb_decode(unwrap(item.get('FieldsBlob'), 'item FieldsBlob'), 'item FieldsBlob')
+    # An item's FieldsBlob can hold Fairlight clip effects of several MB: the reader's own bound.
+    return pb_decode(unwrap(item.get('FieldsBlob'), 'item FieldsBlob', blobs.MAX_BLOB_OUTPUT), 'item FieldsBlob')
 
 
 @guarded('bad_template')
@@ -250,11 +251,30 @@ def _version(blob):
     return parsed[0]
 
 
-def fresh_fields(kind, partners):
+def picture_tail(rows):
+    """The ``FieldsBlob`` #2 the picture items of a project hold (the most common one; it is
+    ``...06...`` on Resolve 21.1's answer-key saves and ``...05...`` on others), or
+    :data:`PICTURE_TAIL` when the project has no picture item."""
+    from collections import Counter
+    found = Counter()
+    for row in rows:
+        if row.get('DbType') != PICTURE:
+            continue
+        try:
+            for number, wire, value in blobs.protobuf(unwrap(row.get('FieldsBlob'), 'item FieldsBlob',
+                                                              blobs.MAX_BLOB_OUTPUT)):
+                if number == 2 and wire == 2 and len(value) == 16:
+                    found[value] += 1
+        except (CodecError, blobs.BlobError):
+            continue
+    return found.most_common(1)[0][0] if found else PICTURE_TAIL
+
+
+def fresh_fields(kind, partners, tail=None):
     """A new item's ``FieldsBlob``: the link list (when linked), ``#1.#4`` = 1, then a picture's
     ``#2`` (:data:`PICTURE_TAIL`) or a sound's ``#15`` = 4, version 2, framed by length."""
     inner = ([[1, 2, pb_encode([[1, 2, link_list(partners)]])]] if partners else []) + [[4, 0, 1]]
-    top = [[1, 2, pb_encode(inner)], [2, 2, PICTURE_TAIL] if kind == 'picture' else [15, 0, 4]]
+    top = [[1, 2, pb_encode(inner)], [2, 2, tail or PICTURE_TAIL] if kind == 'picture' else [15, 0, 4]]
     return envelope(pb_encode(top), version=2, what='item FieldsBlob')
 
 
@@ -273,7 +293,7 @@ def virtual_audio(count):
 
 @guarded('bad_placement')
 def author_item(view, kind, track_id, index, start, duration, src_in, partners=(), item_id=None, columns=ITEM_COLUMNS,
-                name=None):
+                name=None, tail=None):
     """The ``Sm2TiItem`` row and ``Items`` join row of one item playing ``view`` (a
     :class:`MediaView`) at full speed. Every column not derived or placed holds
     :data:`ITEM_CONSTANTS` (what a template item of a supported shape holds; the other
@@ -303,7 +323,7 @@ def author_item(view, kind, track_id, index, start, duration, src_in, partners=(
                Name=name if name is not None else view.name, Start=str(start), Duration=str(duration),
                In=str(src_in) if src_in else None, MediaRef=view.media_id, MediaStartTime=view.start_seconds,
                MediaFilePath=view.path, MediaTimemapBA=timemap(view.last_seconds), MediaFrameRate=view.rate_bytes,
-               Sm2TiTrack_id=track_id, FieldsBlob=fresh_fields(kind, partners), CurrentSelectorIdx=0,
+               Sm2TiTrack_id=track_id, FieldsBlob=fresh_fields(kind, partners, tail), CurrentSelectorIdx=0,
                PreConformMediaExtents=PRECONFORM[kind], MediaTrackIdx=0 if kind == 'sound' else None,
                VirtualAudioTrackBA=virtual_audio(view.channels[0]) if kind == 'sound' else None)
     return row, {'DbOwner': track_id, 'DbAssociate': item_id, 'DbPropertyName': 'Items', 'DbIndex': index}

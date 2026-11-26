@@ -144,8 +144,8 @@ def read_back(path, writer, scratch):
                 if want['disabled'] != (clip.get('enabled') is False):
                     differences.append(f'{where}: disabled is {clip.get("enabled") is False}, meant {want["disabled"]}')
                 row = seed.row('Sm2TiItem', item_id)
-                if row is not None and row['DbType'] in (items.PICTURE, items.SOUND) and \
-                        set(items.links_of(row)) != want['partners']:
+                if row is not None and row['DbType'] in (items.PICTURE, items.SOUND) and want['partners'] is not None \
+                        and set(items.links_of(row)) != want['partners']:
                     differences.append(f'{where}: linked to {sorted(items.links_of(row))}, meant '
                                        f'{sorted(want["partners"])}')
             extra = set(found) - set(expected) - {i for i, (_k, _t, r) in timeline.items.items()}

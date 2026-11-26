@@ -1060,9 +1060,12 @@ def compare_clip(expected, got):
         return [[k, t, n, kd(v, what) if isinstance(v, bytes) and v[:4] == b'\x00\x00\x00\x01' else v]
                 for k, t, n, v in entries]
     pairs = [('Sm2MpMedia.Name', lambda c: c.media.get('Name'))]
+    still = clip_name(expected)[1].rpartition('.')[2].lower() in STILL_EXTENSIONS
     if expected.video is not None:
+        # A still's Time.FrameRate is the project's rate when it was imported, not the file's.
         pairs += [('BtVideoInfo.Clip', lambda c: clip_fields(c.video['Clip'])),
-                  ('BtVideoInfo.Time', lambda c: kd(c.video['Time'], 'Time')),
+                  ('BtVideoInfo.Time', lambda c: [e for e in kd(c.video['Time'], 'Time')
+                                                  if not (still and e[0] == 'FrameRate')]),
                   ('BtVideoInfo.Geometry', lambda c: kd(c.video['Geometry'], 'Geometry'))]
     for i in range(len(expected.audio)):
         pairs += [(f'BtAudioInfo[{i}].Clip', lambda c, i=i: clip_fields(c.audio[i]['Clip'])),

@@ -35,7 +35,7 @@ MAX_CLIPS = 20_000
 EXACT, OPT_IN, NOT_WRITTEN = 'written', 'opt-in', 'not written'
 #: Track Flags bits as the reader interprets them (calibration: 1 locked, 2 disabled or muted).
 TRACK_LOCKED, TRACK_OFF, CLIP_OFF = 0x1, 0x2, 0x2
-_EPSILON = 1e-6
+_EPSILON = 1e-4  # frames: Splice keeps times in seconds as doubles
 
 
 class WriteError(ResolveError):
@@ -192,6 +192,14 @@ def _seed_frames(row, column):
     return frames + (fraction or 0.0)
 
 
+def _whole(row, column):
+    """The whole frames of a stored ``N`` or ``N|fraction`` value (what the reader reports)."""
+    value = row.get(column)
+    if value is None:
+        return 0
+    return blobs.parse_frames(value)[0]
+
+
 def _volume_db(percent):
     return 20 * math.log10(percent / 100)
 
@@ -211,6 +219,14 @@ def _imported(item, kind):
             if kind == 'video' and effect == effects.TRANSFORM:
                 if isinstance(params.get(effects.POSITION_X), float):
                     out['x'] = round(params[effects.POSITION_X] * 100, 6)
+                if isinstance(params.get(effects.POSITION_Y), float):
+                    out['y'] = round(-params[effects.POSITION_Y] * 100, 6)
+                zoom = [params.get(effects.ZOOM_X), params.get(effects.ZOOM_Y)]
+                if any(isinstance(z, float) for z in zoom):
+                    zx, zy = (z if isinstance(z, float) else 1.0 for z in zoom)
+                    out['scale'] = round(100 * (zx + zy) / 2, 4)
+                out['scale'] = min(400, max(10, out['scale']))
+                out['x'], out['y'] = min(100, max(-100, out['x'])), min(100, max(-100, out['y']))
             if kind == 'video' and effect == effects.COMPOSITE and isinstance(params.get(effects.OPACITY), float):
                 out['opacity'] = round(params[effects.OPACITY], 4)
     except (codec.CodecError, blobs.BlobError):
@@ -289,6 +305,7 @@ class Writer:
         self.removed_media = []
         self.operations = set()
         self.delta = 0
+        self.tail = items.picture_tail(seed.rows('Sm2TiItem', "DbType = 'Sm2TiVideoClip'"))
 
     # -- ids -----------------------------------------------------------------------------
     def fresh(self):
@@ -447,7 +464,7 @@ class Writer:
         self._orders(placed, transitions, timeline, start)
         for clip, item_id, kind, track_id, s, d, i, new, view, partners in placed:
             expected[item_id] = {'kind': kind, 'track': track_id, 'start': s - start, 'duration': d, 'in': i,
-                                 'partners': set(partners),
+                                 'partners': None if partners is None else set(partners),
                                  'disabled': kind == 'video' and clip.get('enabled') is False and
                                  'disabled' not in clip.get('_skip', ())}
         self.expected.append((timeline, expected, transitions, start, name))
@@ -554,25 +571,25 @@ class Writer:
             if old[0] is None or abs((old[0] - timeline.start) - exact[0]) > _EPSILON or start != timeline.start:
                 update['Start'] = str(start + rel)
             else:
-                rel = round(old[0] - timeline.start)
+                rel = _whole(row, 'Start') - timeline.start
             if old[1] is None or abs(old[1] - exact[1]) > _EPSILON:
                 if retimed:
                     report.add(NOT_WRITTEN, 'Trims of retimed (speed-changed) Resolve clips (the clip keeps Resolve\'s '
                                'length and in point)', where)
-                    duration = round(old[1])
+                    duration = _whole(row, 'Duration')
                 else:
                     update['Duration'] = str(duration)
             else:
-                duration = round(old[1])
+                duration = _whole(row, 'Duration')
             if old[2] is not None and abs(old[2] - exact[2]) > _EPSILON:
                 if retimed or row['DbType'] not in ('Sm2TiVideoClip', 'Sm2TiAudioClip'):
                     if not retimed:
                         report.add(NOT_WRITTEN, 'Changes to the in point of generators and titles', where)
-                    source_in = round(old[2])
+                    source_in = _whole(row, 'In')
                 else:
                     update['In'] = str(source_in) if source_in else None
             elif old[2] is not None:
-                source_in = round(old[2])
+                source_in = _whole(row, 'In')
             if old_track != track_id:
                 update['Sm2TiTrack_id'] = track_id
             if row['DbType'] == 'Sm2TiVideoClip' and isinstance(row.get('Flags'), int):
@@ -598,8 +615,11 @@ class Writer:
                     self.operations.add('move_items')
                 if set(update) & {'Duration', 'In'}:
                     self.operations.add('trim_items')
-            return (clip, rid, kind, track_id, start + rel, duration, source_in, None, view,
-                    list(items.links_of(row)) if row['DbType'] in ('Sm2TiVideoClip', 'Sm2TiAudioClip') else [])
+            try:
+                current = list(items.links_of(row)) if row['DbType'] in (items.PICTURE, items.SOUND) else []
+            except mediapool.MediaPoolError:
+                current = None  # link data Splice cannot read: the item's links are kept as they are
+            return (clip, rid, kind, track_id, start + rel, duration, source_in, None, view, current)
         # A new item.
         if clip.get('speed', 1) != 1 or clip.get('reverse'):
             report.add(NOT_WRITTEN, 'New clips with a speed change or reversed (speed changes are not written)', where)
@@ -623,7 +643,7 @@ class Writer:
             return None
         try:
             row, join = items.author_item(view, picture, track_id, 0, start + rel, duration, source_in, (), item_id,
-                                          self.seed.columns['Sm2TiItem'])
+                                          self.seed.columns['Sm2TiItem'], tail=self.tail)
         except mediapool.MediaPoolError as error:
             report.add(NOT_WRITTEN, f'New clips the item writer refuses ({error.message[:200]})', where)
             return None
@@ -677,41 +697,72 @@ class Writer:
                     report.add(NOT_WRITTEN, 'Clip pan', where)
 
     def _links(self, placed, timeline, name):
+        """Links follow Splice's link groups. A group whose members are linked in the seed exactly
+        as it groups them (the reader groups linked items transitively) keeps its link lists as
+        they are; a changed group gets lists naming each item's partners of the other kind."""
         groups = {}
         for entry in placed:
-            group = entry[0].get('linkGroup')
-            if group:
-                groups.setdefault(group, []).append(entry)
-        index = {entry[1]: n for n, entry in enumerate(placed)}
+            if entry[0].get('linkGroup'):
+                groups.setdefault(entry[0]['linkGroup'], []).append(entry)
+        component = self._components(placed)
         for n, entry in enumerate(placed):
             clip, item_id, kind = entry[0], entry[1], entry[2]
-            group = groups.get(clip.get('linkGroup'), []) if clip.get('linkGroup') else []
+            where = f'{name} · {clip.get("title") or "Clip"}'
+            group = groups.get(clip.get('linkGroup'), []) if clip.get('linkGroup') else [entry]
+            members = {other[1] for other in group}
+            current = entry[9]
+            if entry[7] is None and current is not None and component.get(item_id) == members:
+                continue  # the seed's own links, unchanged
+            if current is None:
+                self.report.add(EXACT, 'Clips whose link data Splice cannot read keep their Resolve links as they are',
+                                where)
+                continue
             partners = [other[1] for other in sorted(group, key=lambda o: (o[2] != 'video', o[4], o[3]))
                         if other[1] != item_id and other[2] != kind]
             if any(other[2] == kind and other[1] != item_id for other in group):
                 self.report.add(NOT_WRITTEN, 'Links between two pictures or two sounds (Resolve links a picture with '
-                                'its sound)', f'{name} · {clip.get("title") or "Clip"}')
-            current = entry[9]
+                                'its sound)', where)
             placed[n] = entry[:9] + (partners,)
-            if set(current) == set(partners) and entry[7] is None:
-                placed[n] = entry[:9] + (list(current),)
-                continue
             if entry[7] is not None:
-                entry[7]['FieldsBlob'] = items.fresh_fields('picture' if kind == 'video' else 'sound', partners)
+                entry[7]['FieldsBlob'] = items.fresh_fields('picture' if kind == 'video' else 'sound', partners,
+                                                            self.tail)
                 if partners:
                     self.operations.add('add_linked_items')
+                continue
+            if set(current) == set(partners):
+                placed[n] = entry[:9] + (list(current),)
                 continue
             row = self.current.items[item_id][2]
             try:
                 blob = items.relink(row, partners)
             except mediapool.MediaPoolError as error:
                 self.report.add(NOT_WRITTEN, f'Link changes on clips whose link data cannot be edited '
-                                f'({error.message[:120]})', f'{name} · {clip.get("title") or "Clip"}')
+                                f'({error.message[:120]})', where)
                 placed[n] = entry[:9] + (list(current),)
                 continue
             self._update('Sm2TiItem', item_id, {'FieldsBlob': blob})
-            self.report.add(EXACT, 'Clips linked or unlinked', f'{name} · {clip.get("title") or "Clip"}')
-        del index
+            self.report.add(EXACT, 'Clips linked or unlinked', where)
+
+    @staticmethod
+    def _components(placed):
+        """Each placed seed item's group under its current link lists (transitively, as the
+        reader groups them), over the placed items."""
+        ids = {entry[1] for entry in placed}
+        parent = {i: i for i in ids}
+
+        def root(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+        for entry in placed:
+            for partner in entry[9] or ():
+                if partner in ids:
+                    parent[root(entry[1])] = root(partner)
+        out = {}
+        for i in ids:
+            out.setdefault(root(i), set()).add(i)
+        return {i: out[root(i)] for i in ids}
 
     def _update(self, table, rid, values):
         for entry in self.updates:
@@ -725,6 +776,8 @@ class Writer:
             clip, item_id, kind, new_row = entry[0], entry[1], entry[2], entry[7]
             row = new_row if new_row is not None else timeline.items[item_id][2]
             where = f'{name} · {clip.get("title") or "Clip"} at {clip.get("start", 0):.2f} s'
+            if new_row is None and (entry[8] is None or clip.get('nativeUnsupported')):
+                continue  # Splice did not import this clip's effects (a generator, compound or multicam clip)
             before = _imported(row, kind)
             if kind == 'audio':
                 volume = clip.get('volume', 100)
@@ -788,9 +841,17 @@ class Writer:
             if s is not None:
                 s += self.delta
             neighbours = by_track.get(track_id, [])
-            meets = s is not None and d is not None and any(
-                e[4] <= s + d and s <= e[4] and any(o[4] + o[5] == e[4] for o in neighbours if o is not e)
-                for e in neighbours)
+            order = timeline.order.get(track_id, [])
+            at = order.index(item_id) if item_id in order else -1
+            around = [order[at - 1] if at > 0 else None, order[at + 1] if 0 <= at < len(order) - 1 else None]
+            touched = {u[1] for u in self.updates if set(u[2]) & {'Start', 'Duration', 'In', 'Sm2TiTrack_id'}}
+            placed_ids = {e[1] for e in neighbours}
+            if not self.delta and all(n in placed_ids and n not in touched for n in around):
+                meets = True  # both clips it joins are where they were
+            else:
+                meets = s is not None and d is not None and any(
+                    e[4] <= s + d and s <= e[4] and any(o[4] + o[5] == e[4] for o in neighbours if o is not e)
+                    for e in neighbours)
             carrier = carriers.get(item_id)
             removed = carrier is not None and carrier[0].get('transition') in (None, 'none')
             if meets and not removed:
@@ -895,15 +956,19 @@ class Writer:
                 is_clip = row['DbType'] != items.TRANSITION
                 tracks[track_id].append((s if s is not None else -1, 1 if is_clip else 0, item_id,
                                          (s or 0) + (d or 0), is_clip and item_id in kept))
+        touched = {u[1] for u in self.updates if set(u[2]) & {'Start', 'Sm2TiTrack_id'}} | set(self.deletes) | \
+            {row['Sm2TiItem_id'] for _t, row in self.inserts}
         for track_id, entries in tracks.items():
-            entries.sort(key=lambda e: (e[0], e[1], e[2]))
+            seed_order = {item_id: n for n, item_id in enumerate(timeline.order.get(track_id, []))}
+            entries.sort(key=lambda e: (e[0], e[1], seed_order.get(e[2], len(seed_order)), e[2]))
             clips = sorted((e for e in entries if e[1] == 1 and e[0] >= 0), key=lambda e: e[0])
             for a, b in zip(clips, clips[1:]):
                 if b[0] < a[3] - _EPSILON:
                     raise WriteError(f'Two clips overlap on one track of “{timeline.name}” after the edit (at frame '
                                      f'{int(b[0]) - start}); Resolve keeps one clip per place on a track.')
             order = [e[2] for e in entries]
-            if order != timeline.order.get(track_id):
+            seed = timeline.order.get(track_id, [])
+            if order != seed and (set(order) != set(seed) or touched & set(order) or self.delta):
                 self.track_orders[track_id] = order
 
     def _shift(self, item_id, row):
