@@ -7,3 +7,17 @@
 .resolve-library th, .resolve-library td { text-align: left; padding: 6px 8px; border-bottom: 1px solid rgba(255, 255, 255, .08); }
 .resolve-library td:last-child { text-align: right; }
 .resolve-library tbody { max-height: 50vh; overflow: auto; }
+.resolve-save form { display: grid; gap: 10px; }
+.resolve-save fieldset { border: 1px solid rgba(255, 255, 255, .12); border-radius: 6px; padding: 8px 10px; display: grid; gap: 6px; }
+.resolve-save .resolve-check { display: flex; gap: 6px; align-items: baseline; font-size: 13px; }
+.resolve-save textarea { width: 100%; font-family: ui-monospace, monospace; }
+.resolve-report { max-height: 40vh; overflow: auto; font-size: 13px; }
+.resolve-report h3 { font-size: 13px; margin: 10px 0 4px; }
+.resolve-report h3[data-status="opt-in"] { color: #e8b04a; }
+.resolve-report h3[data-status="not written"] { color: #e27a6b; }
+.resolve-report ul { margin: 0; padding-left: 18px; }
+.resolve-report details summary { opacity: .75; cursor: pointer; }
+.resolve-report details ol { max-height: 160px; overflow: auto; }
+.resolve-save footer { display: flex; gap: 8px; justify-content: flex-end; }
+.resolve-report details [data-show-all] { margin: 4px 0 0 18px; font-size: 12px; }
+.toast [data-compatibility] { margin-left: 8px; }
