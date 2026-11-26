@@ -213,6 +213,15 @@ class Confinement(QueueCase):
             queue.add(self.project, [dict(options=dict(codec='h264'), name='linked')], folder=str(self.folder), overwrite=True)
         self.assertEqual(list(outside.iterdir()), [])
 
+    def test_caption_sidecar_needs_overwrite_confirmation(self):
+        queue = self.queue()
+        existing = self.folder / 'film.vtt'
+        existing.write_text('keep me', encoding='utf-8')
+        with self.assertRaisesRegex(ConflictError, 'film.vtt'):
+            queue.add(self.project, [dict(options=dict(codec='h264', captionFiles=['vtt']), name='film')],
+                      folder=str(self.folder))
+        self.assertEqual(existing.read_text(encoding='utf-8'), 'keep me')
+
     def test_an_existing_file_is_replaced_only_when_confirmed(self):
         queue = self.queue()
         existing = self.folder / 'film.mp4'
