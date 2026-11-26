@@ -8,9 +8,9 @@ window.SpliceDialogs = (() => {
     return node;
   }
   async function newSequence() {
-    const node=dialog('New sequence');
+    const node=dialog('New project');
     const form=document.createElement('form');form.method='dialog';
-    form.innerHTML='<label>Project name<input name="name" value="Untitled" maxlength="120" required autofocus></label><label>Frame size<select name="size"><option value="1920x1080">1920 × 1080 · HD</option><option value="3840x2160">3840 × 2160 · UHD</option><option value="1280x720">1280 × 720</option><option value="1080x1920">1080 × 1920 · Portrait</option><option value="1080x1080">1080 × 1080 · Square</option></select></label><label>Frame rate<select name="rate"></select></label><footer><button type="button" data-close>Cancel</button><button class="primary">Create sequence</button></footer>';
+    form.innerHTML='<label>Project name<input name="name" value="Untitled" maxlength="120" required autofocus></label><label>Frame size<select name="size"><option value="1920x1080">1920 × 1080 · HD</option><option value="3840x2160">3840 × 2160 · UHD</option><option value="1280x720">1280 × 720</option><option value="1080x1920">1080 × 1920 · Portrait</option><option value="1080x1080">1080 × 1080 · Square</option></select></label><label>Frame rate<select name="rate"></select></label><footer><button type="button" data-close>Cancel</button><button class="primary">Create project</button></footer>';
     const rate=form.elements.rate;
     for(const x of ['24000/1001','24','25','30000/1001','30','50','60000/1001','60']){
       const [n,d]=x.split('/').map(Number);rate.append(new Option(String(Number((n/(d||1)).toFixed(3)))+' fps',x));
@@ -27,10 +27,12 @@ window.SpliceDialogs = (() => {
   }
   let activeExport=null;
   function exportVideo() {
-    if(activeExport?.isConnected){activeExport.showModal();return;}
+    // An open export dialog comes to the front; a closed one is on its way out (its close
+    // event removes it), so a new one is built.
+    if(activeExport?.isConnected&&activeExport.open){activeExport.showModal();return;}
     const node=dialog('Export video');activeExport=node;
     const state=Editor.get(), form=document.createElement('form');
-    form.innerHTML='<p class="export-spec"></p><label>Format<select name="codec"><option value="h264">H.264 / AAC · MP4</option><option value="prores">ProRes 422 HQ / PCM · MOV</option><option value="wav">Audio mix · WAV</option></select></label><label>Range<select name="rangeMode"><option value="all">Entire sequence</option><option value="custom">Custom range</option></select></label><label hidden>Start (seconds)<input name="rangeStart" type="number" min="0" step="any"></label><label hidden>End (seconds)<input name="rangeEnd" type="number" min="0" step="any"></label><label>Quality<select name="quality"><option value="16">Master · CRF 16</option><option value="20" selected>Delivery · CRF 20</option><option value="26">Review copy · CRF 26</option></select></label><label>Audio bitrate<select name="bitrate"><option>128</option><option selected>192</option><option>320</option></select></label><progress max="1" value="0" hidden></progress><p role="status" class="render-state"></p><footer><button type="button" data-cancel>Close</button><button type="submit" class="primary">Render MP4</button></footer>';
+    form.innerHTML='<p class="export-spec"></p><label>Format<select name="codec"><option value="h264">H.264 / AAC · MP4</option><option value="prores">ProRes 422 HQ / PCM · MOV</option><option value="wav">Audio mix · WAV</option></select></label><label>Range<select name="rangeMode"><option value="all">Entire sequence</option><option value="custom">In to out (seconds)</option></select></label><label hidden>In (seconds)<input name="rangeStart" type="number" min="0" step="any"></label><label hidden>Out (seconds)<input name="rangeEnd" type="number" min="0" step="any"></label><label>Quality<select name="quality"><option value="16">Master · CRF 16</option><option value="20" selected>Delivery · CRF 20</option><option value="26">Review copy · CRF 26</option></select></label><label>Audio bitrate<select name="bitrate"><option>128</option><option selected>192</option><option>320</option></select></label><progress max="1" value="0" hidden></progress><p role="status" class="render-state"></p><footer><button type="button" data-cancel>Close</button><button type="submit" class="primary">Render MP4</button></footer>';
     const rangeFields=[form.elements.rangeStart,form.elements.rangeEnd];
     form.elements.codec.closest('label').insertAdjacentHTML('afterend',
       '<label hidden>Color space<select name="colorSpace"><option value="source">Preserve source color space</option><option value="rec709">Rec. 709 SDR</option><option value="pq">Rec. 2100 PQ HDR</option></select></label>');
@@ -40,13 +42,20 @@ window.SpliceDialogs = (() => {
       const custom=form.elements.rangeMode.value==='custom';
       for(const field of rangeFields){field.closest('label').hidden=!custom;field.required=custom;}
     };
-    // A timeline In/Out range becomes the default custom export range.
+    // Timeline marks become the default custom export range: In to Out, a lone In runs to the
+    // end of the sequence and a lone Out from its start.
     const marks=state.project.marks||{};
-    if(Number.isFinite(marks.in)&&Number.isFinite(marks.out)){
-      rangeFields[0].value=marks.in.toFixed(6);
-      rangeFields[1].value=Math.min(marks.out,state.duration).toFixed(6);
-      form.elements.rangeMode.value='custom';
-      form.elements.rangeMode.onchange();
+    const hasIn=Number.isFinite(marks.in), hasOut=Number.isFinite(marks.out);
+    const sequenceEnd=Math.ceil((state.duration-1e-9)*state.project.fps)/state.project.fps;
+    if(hasIn||hasOut){
+      const start=hasIn?marks.in:0;
+      const end=hasOut?Math.min(marks.out,state.duration):sequenceEnd;
+      if(end>start){
+        rangeFields[0].value=start.toFixed(6);
+        rangeFields[1].value=end.toFixed(6);
+        form.elements.rangeMode.value='custom';
+        form.elements.rangeMode.onchange();
+      }
     }
     form.querySelector('.export-spec').textContent=state.project.name+' · '+state.project.width+' × '+state.project.height+' · '+Number(state.project.fps.toFixed(3))+' fps';
     const nativeBlocks=state.project.clips.filter(c=>c.transition==='native'||c.nativeTimeRemap||c.nativeUnsupported);
