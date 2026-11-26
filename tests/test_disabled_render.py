@@ -1,14 +1,11 @@
 """Exports leave disabled clips out: no picture, no sound (their own camera sound included).
 
 The editor sends ``enabled: false`` to the renderer unchanged; the renderer is the one place that
-decides what a disabled clip contributes to a file. A tiny probe render (``disabled_probe``) tells
-whether the renderer on this tree honours the flag. When it does, a timeline with a disabled
-camera clip over a lower track and a disabled audio clip is rendered and its decoded picture and
-sound are checked. When it does not, the test FAILS, unless SPLICE_PENDING_RENDERER_CHANGE names
-the renderer change that will add it (``impl/render-scale``), so the gap cannot be forgotten.
+decides what a disabled clip contributes to a file. A tiny probe render (``disabled_probe``) checks
+that the renderer honours the flag, and then a timeline with a disabled camera clip over a lower
+track and a disabled audio clip is rendered and its decoded picture and sound are checked.
 """
 import math
-import os
 import statistics
 import struct
 import subprocess
@@ -24,7 +21,6 @@ sys.path.insert(0, str(ROOT))
 import premiere  # noqa: E402
 from render_movie import render_to_file  # noqa: E402
 
-PENDING = 'impl/render-scale'
 FPS = 25
 
 
@@ -93,14 +89,9 @@ class DisabledClipsRender(unittest.TestCase):
 
     def test_disabled_clips_have_no_picture_or_sound(self):
         verdict = disabled_probe()
-        self.assertIn(verdict, ('honors', 'ignores'))
-        if verdict == 'ignores':
-            if os.environ.get('SPLICE_PENDING_RENDERER_CHANGE') == PENDING:
-                self.skipTest(f'the renderer on this tree renders disabled clips; {PENDING} must leave clips with '
-                              '`enabled: false` out of picture and sound (allowed by SPLICE_PENDING_RENDERER_CHANGE)')
-            self.fail('The renderer on this tree renders clips with `enabled: false`. It must leave them out of the '
-                      f'picture and the sound. Set SPLICE_PENDING_RENDERER_CHANGE={PENDING} to allow this while that '
-                      'renderer change is pending.')
+        self.assertEqual(verdict, 'honors',
+                         'The renderer on this tree renders clips with `enabled: false`. It must leave them out of the '
+                         'picture and the sound.')
         clip = lambda identity, media, kind, track, **extra: dict(id=identity, mediaId=media, type=kind, track=track,
                                                                   start=0, duration=2, **{'in': .5}, color={}, volume=100,
                                                                   transition='none', title='', **extra)

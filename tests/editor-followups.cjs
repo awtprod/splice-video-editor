@@ -196,6 +196,11 @@ async function pieces(page) {
   await state(page, () => Editor.deleteClips([Editor.get().project.clips.find(c => c.type === 'video' && !c.linkGroup && c.start < 1.5).id], {ripple: true}));
   assert.deepEqual(await layout(), ['v1:0+25:cam:G1', 'v1:25+26:cam:G2', 'v1:51+24:x:-', 'v1:75+51:cam:G2', 'a-1:0+25:cam:G1', 'a-1:25+101:cam:G2'],
     'ripple delete the inserted clip');
+  // Ripple delete BOTH inserted clips at once: every remaining picture piece stays linked to its sound piece.
+  await setup();
+  await state(page, () => Editor.deleteClips(Editor.get().project.clips.filter(c => c.type === 'video' && !c.linkGroup).map(c => c.id), {ripple: true}));
+  assert.deepEqual(await layout(), ['v1:0+25:cam:G1', 'v1:25+26:cam:G2', 'v1:51+51:cam:G3', 'a-1:0+25:cam:G1', 'a-1:25+26:cam:G2', 'a-1:51+51:cam:G3'],
+    'ripple delete both inserted clips keeps every piece linked');
   // Deleting one of two grouped pieces leaves a lone clip: it is no longer linked.
   await load(page, {clips: [picture('p1', 1, 0, f(25), {linkGroup: 'q'}), picture('p2', 1, f(50), f(25), {linkGroup: 'q', in: f(50)})]});
   await state(page, () => Editor.deleteClips(['p1']));

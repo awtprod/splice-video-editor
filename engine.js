@@ -1486,9 +1486,10 @@
         return piece;
       },
       settle() {
+        const owned = new Set(sides.values());
         const buckets = new Map();
         for (const clip of source.clips) {
-          if (!anchors.has(clip) || !clip.linkGroup) continue;
+          if (!anchors.has(clip) || !clip.linkGroup || !owned.has(clip.linkGroup)) continue;
           const moved = Math.round((syncAnchor(clip) - anchors.get(clip)) * source.fps * 100);
           if (!buckets.has(clip.linkGroup)) buckets.set(clip.linkGroup, new Map());
           const byShift = buckets.get(clip.linkGroup);

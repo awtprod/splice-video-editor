@@ -9,22 +9,20 @@
  * A1 crossfade with the same alignment is compared with the decoded export's sound level.
  *
  * The export goes through the real route (Editor.exportVideo → /api/exports → the renderer on
- * this tree). It runs when that renderer honours `enabled: false` (the probe in
- * tests/test_disabled_render.py). Otherwise it FAILS, unless SPLICE_PENDING_RENDERER_CHANGE
- * names the renderer change that adds it (impl/render-scale). */
+ * this tree). It requires that renderer to honour `enabled: false` (the probe in
+ * tests/test_disabled_render.py). */
 const assert = require('node:assert/strict');
 const {execFileSync} = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
-const {startSplice, openPage, ffmpeg, colorAt} = require('./browser-harness.cjs');
+const {startSplice, openPage, ffmpeg} = require('./browser-harness.cjs');
 
-const PENDING = 'impl/render-scale';
 const FPS = 25;
 const KINDS = ['dissolve', 'fade', 'wipe'];
 const LEADS = [0, .4, .8];          // transitionBefore: after the cut, centred, before the cut
 const LENGTH = .8;
 const BLOCK = 5;                     // seconds per case on the timeline
-const PICTURE_TOLERANCE = 20;        // RGB distance, mean over the frame
+const PICTURE_TOLERANCE = 20;        // RGB distance, mean over each half of the frame
 const GAIN_TOLERANCE = .12;
 
 function rendererVerdict() {
@@ -62,6 +60,13 @@ function toneLevel(pcm, seconds, frequency) {
   return Math.sqrt(Math.max(0, previous * previous + before * before - coefficient * previous * before)) / (to - from);
 }
 
+// Mean RGB of the left and right halves of a decoded export frame (catches mirrored wipes as well as level errors).
+function exportedHalves(file, seconds) {
+  const raw = execFileSync('ffmpeg', ['-nostdin', '-v', 'error', '-ss', seconds.toFixed(4), '-i', file,
+    '-frames:v', '1', '-vf', 'format=rgb24,scale=2:1:flags=area', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-']);
+  return [[raw[0], raw[1], raw[2]], [raw[3], raw[4], raw[5]]];
+}
+
 const cases = KINDS.flatMap(kind => LEADS.map(lead => ({kind, lead})));
 function timeline(ids, off) {
   const picture = (id, mediaId, track, start, duration, extra = {}) => ({id, mediaId, type: 'video', track, start, duration, in: 1,
@@ -86,7 +91,7 @@ function samples(index, lead) {
     .map(time => Math.round(time * FPS) / FPS);
 }
 
-async function previewColor(page, time) {
+async function previewHalves(page, time) {
   await page.evaluate(t => Editor.seek(t), time);
   await page.waitForFunction(() => [...document.querySelectorAll('body > video')].filter(element => element.getAttribute('src'))
     .every(element => element.readyState >= 2 && !element.seeking));
@@ -94,23 +99,25 @@ async function previewColor(page, time) {
   return page.evaluate(() => {
     const canvas = document.getElementById('preview-canvas');
     Editor.drawFrame(canvas);
-    const data = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data;
-    const sum = [0, 0, 0];
-    let count = 0;
-    for (let i = 0; i < data.length; i += 4 * 13, count++) for (let c = 0; c < 3; c++) sum[c] += data[i + c];
-    return sum.map(value => Math.round(value / count));
+    const {width, height} = canvas;
+    const data = canvas.getContext('2d').getImageData(0, 0, width, height).data;
+    const mid = width >> 1;
+    const sums = [[0, 0, 0], [0, 0, 0]], counts = [0, 0];
+    for (let y = 0; y < height; y += 2) {
+      for (let x = 0; x < width; x += 2) {
+        const half = x < mid ? 0 : 1, i = (y * width + x) * 4;
+        for (let c = 0; c < 3; c++) sums[half][c] += data[i + c];
+        counts[half]++;
+      }
+    }
+    return sums.map((sum, half) => sum.map(value => Math.round(value / counts[half])));
   });
 }
 
 async function main() {
   const verdict = rendererVerdict();
   if (verdict !== 'honors') {
-    if (process.env.SPLICE_PENDING_RENDERER_CHANGE === PENDING) {
-      console.log(`Disabled-clip parity: skipped, the renderer on this tree renders disabled clips (${PENDING} pending).`);
-      return;
-    }
-    throw new Error('The renderer on this tree renders clips with `enabled: false`, so preview and export cannot agree. ' +
-      `Set SPLICE_PENDING_RENDERER_CHANGE=${PENDING} to allow this while that renderer change is pending.`);
+    throw new Error('The renderer on this tree renders clips with `enabled: false`, so preview and export cannot agree.');
   }
   const splice = await startSplice('splice-parity-');
   try {
@@ -134,13 +141,15 @@ async function main() {
       assert.ok(reference > 100, 'the enabled tone is heard: ' + reference);
       for (const [index, {kind, lead}] of cases.entries()) {
         for (const time of samples(index, lead)) {
-          const preview = await previewColor(page, time);
+          const preview = await previewHalves(page, time);
           // -ss picks the first frame at or after the time: aim a quarter frame early to get this frame.
-          const exported = colorAt(file, time - .25 / FPS);
-          const distance = Math.hypot(...preview.map((value, channel) => value - exported[channel]));
-          const row = {off, kind, lead, time, preview, exported, distance: Math.round(distance)};
-          if (distance > PICTURE_TOLERANCE) failures.push(row);
-          if (process.env.SPLICE_PARITY_LOG) console.log(JSON.stringify(row));
+          const exported = exportedHalves(file, time - .25 / FPS);
+          for (const [half, side] of [[0, 'left'], [1, 'right']]) {
+            const distance = Math.hypot(...preview[half].map((value, channel) => value - exported[half][channel]));
+            const row = {off, kind, lead, time, side, preview: preview[half], exported: exported[half], distance: Math.round(distance)};
+            if (distance > PICTURE_TOLERANCE) failures.push(row);
+            if (process.env.SPLICE_PARITY_LOG) console.log(JSON.stringify(row));
+          }
           const gains = await page.evaluate(() => Editor.audioGains());
           for (const [id, frequency] of [[`sa${index}`, 1000], [`sb${index}`, 500]]) {
             const heard = Math.min(1.2, toneLevel(pcm, time, frequency) / reference);
@@ -154,7 +163,7 @@ async function main() {
     }
     assert.deepEqual(failures, [], 'preview and export disagree next to a disabled clip');
     assert.deepEqual(errors, []);
-    console.log(`Disabled-clip parity: ${cases.length} picture transitions × A or B disabled and their A1 crossfades match the export.`);
+    console.log(`Disabled-clip parity: ${cases.length} picture transitions × A or B disabled (left/right halves) and their A1 crossfades match the export.`);
   } finally {
     await splice.stop();
   }
