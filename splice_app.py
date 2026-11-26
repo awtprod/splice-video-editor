@@ -3,11 +3,13 @@ import argparse
 import html
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 
 from server import create_server
 from splice_platform import browser_executable, data_directory
@@ -32,6 +34,7 @@ def main():
     except OSError as error:
         sys.exit(f"Could not open Splice on port {args.port}: {error}. Check for an existing window.")
     flags = ["--class=Splice"] if sys.platform.startswith("linux") else []
+    remove_stale_launchers(profile)
     with server:
         launcher = write_launcher(profile, server.launch_url())
         server.on_launch = lambda: launcher.unlink(missing_ok=True)
@@ -47,6 +50,36 @@ def main():
             launcher.unlink(missing_ok=True)
             server.shutdown()
             thread.join()
+
+
+# tempfile.mkstemp(prefix="launch-", suffix=".html") names: eight characters from its alphabet.
+LAUNCHER_NAME = re.compile(r"launch-[a-z0-9_]{8}\.html")
+STALE_LAUNCHER_SECONDS = 60
+
+
+def remove_stale_launchers(directory, min_age=STALE_LAUNCHER_SECONDS):
+    """Delete launch pages an earlier run left behind (it was killed before the link was used).
+    Their links are dead with that server, but each still names a launch secret. Only regular
+    files directly in ``directory`` named exactly like write_launcher's are removed, never a
+    symlink or anything through one, and none younger than ``min_age`` seconds (another Splice
+    starting on a different port may be using its own). Returns the names removed."""
+    directory = Path(directory)
+    if directory.is_symlink() or not directory.is_dir():
+        return []
+    removed, now = [], time.time()
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            if not LAUNCHER_NAME.fullmatch(entry.name):
+                continue
+            try:
+                if not entry.is_file(follow_symlinks=False) or now - entry.stat(follow_symlinks=False).st_mtime < min_age:
+                    continue
+                os.unlink(entry.path)  # Removes a name in this folder; a swapped-in symlink's target is untouched.
+            except OSError as error:
+                print(f"Splice could not remove an old launch file {entry.name}: {error}", file=sys.stderr)
+                continue
+            removed.append(entry.name)
+    return removed
 
 
 def write_launcher(directory, url):

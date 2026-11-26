@@ -335,6 +335,168 @@ class RequestProof(ServerTestCase):
         self.assertEqual(self.server.request('GET', f'/api/exports/{fake}/file', token=False)[0], 404)
 
 
+class Relaunch(unittest.TestCase):
+    """Getting back in without a restart, and launch callbacks that fail."""
+
+    navigate = {'Sec-Fetch-Site': 'none', 'Sec-Fetch-Mode': 'navigate', 'Sec-Fetch-Dest': 'document'}
+
+    def test_a_failing_launch_callback_still_issues_the_session(self):
+        import contextlib
+        import io
+        calls = []
+
+        def locked_file():
+            calls.append(1)
+            raise PermissionError('The process cannot access the file because it is being used by another process')
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured), InProcessServer('held-open') as server:
+            server.server.on_launch = locked_file
+            status, cookie, _ = server.get('/?launch=held-open', {'Sec-Fetch-Site': 'cross-site', 'Sec-Fetch-Mode': 'navigate'})
+            self.assertEqual(status, 200)
+            self.assertIn('SameSite=Strict', cookie)
+            status, _, page = server.get('/', {**self.navigate, 'Sec-Fetch-Site': 'same-origin',
+                                               'Cookie': cookie.split(';')[0]})
+            self.assertEqual(status, 200)
+            self.assertIn(b'splice-token', page)
+            self.assertEqual(server.get('/?launch=held-open', self.navigate)[:2], (403, None))
+        self.assertEqual(calls, [1])
+        self.assertEqual(captured.getvalue().count('launch callback failed'), 1)
+        self.assertIn('PermissionError', captured.getvalue())
+
+    def test_stale_launch_files_are_removed_at_start(self):
+        from splice_app import remove_stale_launchers, write_launcher
+        with tempfile.TemporaryDirectory() as temp:
+            profile, outside = Path(temp) / 'browser', Path(temp) / 'outside'
+            profile.mkdir()
+            outside.mkdir()
+            old = time.time() - 3600
+            stale = write_launcher(profile, 'http://127.0.0.1:1/?launch=old')
+            fresh = write_launcher(profile, 'http://127.0.0.1:1/?launch=new')
+            keep = {name: profile / name for name in ('launch-notes.txt', 'launch-ABCDEFGH.html', 'mylaunch-abcdefgh.html',
+                                                      'launch-abcdefghi.html')}
+            target = outside / 'launch-precious.html'
+            target.write_text('not ours')
+            for path in (*keep.values(), target):
+                path.write_text('x')
+            os.utime(stale, (old, old))
+            for path in (*keep.values(), target):
+                os.utime(path, (old, old))
+            link = profile / 'launch-symlink1.html'
+            os.symlink(target, link)
+            nested = profile / 'launch-folder1.html'
+            nested.mkdir()
+            self.assertEqual(remove_stale_launchers(profile), [stale.name])
+            self.assertFalse(stale.exists())
+            self.assertTrue(fresh.exists(), 'a launch file younger than a minute may belong to a starting window')
+            self.assertTrue(all(path.exists() for path in keep.values()))
+            self.assertTrue(link.is_symlink() and target.read_text() == 'x' and nested.is_dir())
+            linked_profile = Path(temp) / 'linked-profile'
+            os.symlink(outside, linked_profile)
+            (outside / 'launch-abcdefgh.html').write_text('x')
+            os.utime(outside / 'launch-abcdefgh.html', (old, old))
+            self.assertEqual(remove_stale_launchers(linked_profile), [], 'never through a symlinked folder')
+            self.assertTrue((outside / 'launch-abcdefgh.html').exists())
+
+    def start(self, stdin):
+        import io
+        data = tempfile.TemporaryDirectory(prefix='splice-relaunch-')
+        self.addCleanup(data.cleanup)
+        process = subprocess.Popen([sys.executable, '-u', 'server.py', '--port', '0'], cwd=ROOT, stdin=stdin,
+                                   env={**os.environ, 'SPLICE_DATA_DIR': data.name}, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE)
+
+        def stop():
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+            process.stdout.close()
+            process.stderr.close()
+        self.addCleanup(stop)
+        return process
+
+    def line(self, process, timeout=10):
+        import select
+        ready, _, _ = select.select([process.stdout], [], [], timeout)
+        return process.stdout.readline().decode().strip() if ready else None
+
+    def launch(self, link, cookie=None):
+        match = re.fullmatch(r'http://127\.0\.0\.1:(\d+)/\?launch=([A-Za-z0-9_-]{20,})', link or '')
+        self.assertIsNotNone(match, link)
+        connection = http.client.HTTPConnection('127.0.0.1', int(match.group(1)), timeout=10)
+        try:
+            headers = {'Host': f'127.0.0.1:{match.group(1)}', **self.navigate}
+            if cookie:
+                headers['Cookie'] = cookie
+            connection.request('GET', '/?launch=' + match.group(2), headers=headers)
+            response = connection.getresponse()
+            response.read()
+            return response.status, response.getheader('Set-Cookie')
+        finally:
+            connection.close()
+
+    @unittest.skipUnless(os.name == 'posix', 'a pseudo-terminal and SIGUSR1 are POSIX')
+    def test_the_operator_gets_a_fresh_link_from_the_console_or_usr1(self):
+        import pty
+        import signal
+        controller, terminal = pty.openpty()
+        self.addCleanup(os.close, controller)
+        process = self.start(terminal)
+        os.close(terminal)
+        first = self.line(process)
+        status, cookie = self.launch(first)
+        self.assertEqual(status, 303)
+        # The browser restarted: its session cookie is gone and the printed link is spent.
+        self.assertEqual(self.launch(first)[0], 403)
+        os.write(controller, b'\n')  # Enter on the server's terminal.
+        second = self.line(process)
+        self.assertNotEqual(second, first)
+        self.assertEqual(self.launch(second)[0], 303)
+        self.assertEqual(self.launch(second)[0], 403, 'the new link works once too')
+        process.send_signal(signal.SIGUSR1)
+        third = self.line(process)
+        self.assertEqual(self.launch(first)[0], 403)
+        status, again = self.launch(third)
+        self.assertEqual(status, 303)
+        self.assertEqual(again.split(';')[0], cookie.split(';')[0], 'windows already open keep their session')
+        self.assertEqual(process.poll(), None)
+
+    def test_no_request_can_produce_a_fresh_link(self):
+        import inspect
+        import server as server_module
+        process = self.start(subprocess.DEVNULL)
+        first = self.line(process)
+        self.assertEqual(self.launch(first)[0], 303)
+        port = int(first.split(':')[2].split('/')[0])
+        probes = [('GET', '/?launch='), ('GET', '/?launch=new'), ('GET', '/?relaunch=1'), ('GET', '/api/launch'),
+                  ('POST', '/api/launch'), ('POST', '/api/relaunch'), ('POST', '/'), ('GET', '/index.html?launch=1')]
+        for method, path in probes:
+            for headers in ({}, {'Sec-Fetch-Site': 'cross-site'}, {'Origin': 'http://127.0.0.1:1'}, self.navigate):
+                connection = http.client.HTTPConnection('127.0.0.1', port, timeout=10)
+                try:
+                    connection.request(method, path, body=b'{}' if method == 'POST' else None,
+                                       headers={'Host': f'127.0.0.1:{port}', **headers})
+                    response = connection.getresponse()
+                    response.read()
+                    self.assertIsNone(response.getheader('Set-Cookie'), (method, path, headers))
+                finally:
+                    connection.close()
+        self.assertIsNone(self.line(process, timeout=1), 'no request printed a new link')
+        self.assertEqual(self.launch(first)[0], 403)
+        # Only the console reader and the signal handler call it; no route or request handler does.
+        self.assertNotIn('new_launch_url', inspect.getsource(server_module.Handler))
+        self.assertNotIn('print_new_launch', inspect.getsource(server_module.Handler))
+        for function in [*server_module.GET_ROUTES.values(), *(f for f, _, _ in server_module.POST_ROUTES.values())]:
+            self.assertNotIn('launch', inspect.getsource(function), function.__name__)
+        with InProcessServer() as server:
+            page = server.get('/', self.navigate)[2]
+            self.assertIn(b'press Enter in the terminal', page)
+            self.assertIn(b'USR1', page)
+
+
 class LinkInPlace(ServerTestCase):
     def test_linked_file_plays_saves_reopens_and_exports_without_a_copy(self):
         clip = self.outside / 'A001 take 1.mov'

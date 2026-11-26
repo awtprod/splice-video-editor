@@ -58,8 +58,12 @@ FORBIDDEN_PAGE = (b'<!doctype html><meta charset="utf-8"><title>Splice</title>'
                   b'<h1>Open Splice from its launch link</h1>'
                   b'<p>For your security this address only works in the browser that opened Splice\'s one-time '
                   b'launch link. Use the desktop launcher, or open the full link that <code>python3 server.py</code> '
-                  b'printed in its terminal (it ends in <code>?launch=</code> and a code). If you already used that '
-                  b'link in another browser, stop the server and start it again for a new one.</p>')
+                  b'printed in its terminal (it ends in <code>?launch=</code> and a code).</p>'
+                  b'<p>If that link was already used (for example before your browser restarted), press Enter in the '
+                  b'terminal where <code>python3 server.py</code> is running, or send that process the USR1 signal '
+                  b'(<code>kill -USR1</code> and its process id), and it prints a new one-time link. Only someone who '
+                  b'can reach that terminal or signal that process can get one. You can also stop the server and start '
+                  b'it again.</p>')
 # A launch from a page on another origin (the desktop launcher's local
 # redirect file) arrives cross-site, and a SameSite=Strict cookie is not sent
 # on the rest of that redirect chain. This page continues as a same-origin
@@ -549,6 +553,7 @@ class StudioServer(ThreadingHTTPServer):
         self.launch_token = launch_token
         self._launch_claimed = False
         self._launch_lock = threading.Lock()
+        # Called once the launch link is used (the desktop launcher deletes its launch file).
         self.on_launch = None
         super().__init__(*args)
         self.cookie_name = f'splice_session_{self.server_port}'
@@ -568,8 +573,25 @@ class StudioServer(ThreadingHTTPServer):
                 return False
             self._launch_claimed = True
         if self.on_launch:
-            self.on_launch()
+            try:
+                self.on_launch()
+            except Exception as error:  # noqa: BLE001 - the session must still be issued
+                # Windows may refuse to delete a launch file the browser still holds open. The
+                # link in it is spent now, so the file grants nothing; the launcher removes it
+                # again on exit. Never let this cost the user the session.
+                print(f'Splice: the launch callback failed after the link was used ({type(error).__name__}: '
+                      f'{error}); continuing.', file=sys.stderr, flush=True)
         return True
+
+    def new_launch_url(self):
+        """A fresh one-time launch link, for the operator of ``python3 server.py`` whose browser lost
+        the session (a browser restart drops the cookie). Only the console and the USR1 signal call
+        this: no request can, so the proof of authority is access to the server process itself.
+        The previous link stops working; the session itself is unchanged, so open windows stay in."""
+        with self._launch_lock:
+            self.launch_token = secrets.token_urlsafe(32)
+            self._launch_claimed = False
+        return self.launch_url()
 
     def server_close(self):
         self.jobs.shutdown()
@@ -584,6 +606,39 @@ def create_server(port=0, launch_token=None):
 def _exit_on_terminate(signum, frame):
     raise KeyboardInterrupt
 
+
+RELAUNCH_HINT = ('Lost the session (a browser restart, another browser)? Press Enter here for a new one-time link'
+                 + (', or run kill -USR1 {pid}.' if hasattr(signal, 'SIGUSR1') else '.'))
+
+
+def print_new_launch(server, stream=None):
+    """Print a fresh one-time link to the operator's console."""
+    stream = stream or sys.stdout
+    print(server.new_launch_url(), file=stream, flush=True)
+    print('That is a new one-time link; the earlier one no longer works.', file=sys.stderr, flush=True)
+
+
+def offer_relaunch(server, console=None):
+    """Let the operator ask for a new launch link: Enter on the server's own terminal (when its
+    input is a terminal) or SIGUSR1 where the platform has it. Both need local access to this
+    process as its user; nothing a web page or another local user can send reaches either."""
+    console = console if console is not None else sys.stdin
+    if hasattr(signal, 'SIGUSR1') and threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGUSR1, lambda signum, frame: print_new_launch(server))
+    try:
+        interactive = console is not None and console.isatty()
+    except (OSError, ValueError):
+        interactive = False
+    if interactive:
+        def read():
+            try:
+                while console.readline():
+                    print_new_launch(server)
+            except (OSError, ValueError):
+                return  # the terminal went away; the signal still works
+        threading.Thread(target=read, daemon=True, name='splice-relaunch-console').start()
+    return interactive
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8765)
@@ -593,8 +648,10 @@ if __name__ == '__main__':
         signal.signal(signal.SIGTERM,_exit_on_terminate)
         # The first stdout line is the one-time launch link (tests read it).
         print(server.launch_url(), flush=True)
-        print('Open the link above in your browser to start Splice. It works once; restart the server for a new '
-              f'one. http://127.0.0.1:{server.server_port}/ alone is refused.', file=sys.stderr, flush=True)
+        print('Open the link above in your browser to start Splice. It works once. '
+              f'http://127.0.0.1:{server.server_port}/ alone is refused.', file=sys.stderr, flush=True)
+        offer_relaunch(server)
+        print(RELAUNCH_HINT.format(pid=os.getpid()), file=sys.stderr, flush=True)
         try:
             server.serve_forever()
         except KeyboardInterrupt:
