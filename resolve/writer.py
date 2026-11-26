@@ -201,7 +201,14 @@ def _whole(row, column):
 
 
 def _volume_db(percent):
-    return 20 * math.log10(percent / 100)
+    """Decibels of a linear gain in percent, to a billionth of a dB (so +6 dB stays 6.0)."""
+    return round(20 * math.log10(percent / 100), 9)
+
+
+def _position_x(percent, width):
+    """Resolve's Position X (a fraction of the timeline width) of Splice's x (a percentage of it):
+    through whole micro-pixels, as Resolve's Inspector holds pixels (+200 px is 200 / 1920)."""
+    return round(percent / 100 * width, 6) / width
 
 
 def _imported(item, kind):
@@ -435,6 +442,8 @@ class Writer:
             start = wanted_tc
             report.add(EXACT, 'Timeline start timecode changed', name)
         self.delta = start - timeline.start
+        width = project.get('width')
+        self.width = width if isinstance(width, int) and not isinstance(width, bool) and 0 < width <= 32768 else 1920
         if name != timeline.name:
             self.renames.append((timeline, name))
             report.add(EXACT, 'Timeline renamed', f'{timeline.name} → {name}')
@@ -807,10 +816,11 @@ class Writer:
                                     'Inspector changes, and that stamp is not reproduced. Allow unproven changes to '
                                     'write the position anyway', where, need='unproven')
                     continue
+                value = _position_x(x, self.width)
                 try:
-                    blob = effects.single(effects.TRANSFORM, effects.POSITION_X, x / 100) if not row.get(
+                    blob = effects.single(effects.TRANSFORM, effects.POSITION_X, value) if not row.get(
                         'EffectFiltersBA') else effects.replace(row['EffectFiltersBA'], effects.TRANSFORM,
-                                                                effects.POSITION_X, x / 100)
+                                                                effects.POSITION_X, value)
                 except codec.CodecError:
                     self.report.add(NOT_WRITTEN, 'Position X changes on clips that carry other Resolve effects', where)
                     continue
