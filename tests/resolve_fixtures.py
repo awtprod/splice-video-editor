@@ -238,8 +238,15 @@ def _media_xml(m):
     return _el(m['tag'], _leaf('Name', m['name']) + _leaf('MpFolder', m['bin']) + streams, m['id'])
 
 
+def _sequence_fields(t):
+    fields = {'SeqRef': t['container']}
+    if 'drop' in t:
+        fields['timelineDropFrameTimecode'] = t['drop']
+    return fields
+
+
 def _sequence(t):
-    return _el('Sm2Sequence', _leaf('FieldsBlob', keyed({'SeqRef': t['container']}))
+    return _el('Sm2Sequence', _leaf('FieldsBlob', keyed(_sequence_fields(t)))
                + _leaf('FrameRate', rate(t['fps'])) + _leaf('Resolution', resolution(*t['size']))
                + _leaf('MediaExtents', extents(t['start'], 60.0)), t['seq'])
 
@@ -387,7 +394,7 @@ def write_db(spec, path):
             put('Sm2MpMedia', Sm2MpMedia_id=t['media'], DbType='Sm2MpTimelineClip', Name=t['name'],
                 MpFolder='bin-master', TimelineSharedHandle=t['id'], Sm2MpFolder_id='bin-master')
             put('Sm2Timeline', Sm2Timeline_id=t['id'], DbType='Sm2Timeline', Name=t['name'], Sequence=t['seq'])
-            put('Sm2Sequence', Sm2Sequence_id=t['seq'], DbType='Sm2Sequence', FieldsBlob=keyed({'SeqRef': t['container']}),
+            put('Sm2Sequence', Sm2Sequence_id=t['seq'], DbType='Sm2Sequence', FieldsBlob=keyed(_sequence_fields(t)),
                 FrameRate=rate(t['fps']), Resolution=resolution(*t['size']), MediaExtents=extents(t['start'], 60.0))
             put('Sm2SequenceContainer', Sm2SequenceContainer_id=t['container'], DbType='Sm2SequenceContainer')
             counts = {0: 0, 1: 0}

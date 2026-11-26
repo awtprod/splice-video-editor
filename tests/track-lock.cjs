@@ -75,11 +75,13 @@ async function main() {
     await lock.click();
     assert.equal(await page.getByRole('button', {name: 'Lock Video 2'}).getAttribute('aria-pressed'), 'false');
     await page.evaluate(() => SpliceSource.open('video'));
-    await page.waitForFunction(()=>document.querySelector('.source-range').textContent.startsWith('00:00:00:10'));
+    await page.waitForFunction(()=>document.querySelector('.source-range').textContent.startsWith('In 00:00:00:10'));
     await page.locator('.source-track').selectOption('2');
     await page.locator('[data-action=insert]').click();
     await page.waitForFunction(() => Editor.get().project.clips.length === 4);
-    assert.equal(await page.locator('.source-stage').count(), 0);
+    // The source monitor stays open for the next edit.
+    assert.equal(await page.locator('.source-stage').count(), 1);
+    await page.locator('.source-close').click();
     await page.getByRole('button', {name: 'Lock Video 2'}).click();
     await page.waitForFunction(() => document.querySelector('#session-status')?.textContent === 'Draft saved locally');
     await page.reload();

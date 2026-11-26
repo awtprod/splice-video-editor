@@ -138,7 +138,12 @@ def _clean_effects(clip: dict, warnings: list) -> dict:
 
 
 def build_project(name: str, rate: Fraction, width: int, height: int, media: list, clips: list,
-                  markers: list, warnings: list) -> dict:
+                  markers: list, warnings: list, start_frames=None, drop=None) -> dict:
+    """Splice's project for an imported timeline.
+
+    ``start_frames`` is the sequence start timecode as a whole frame count at ``rate`` and
+    ``drop`` whether it is drop-frame; both land in the project the way engine.js keeps them
+    (``startTimecode`` frames, ``dropFrame`` only for 29.97 and 59.94)."""
     if len(clips) > MAX_IMPORT_CLIPS:
         raise ValueError(f'The timeline has more than {MAX_IMPORT_CLIPS} clips')
     warnings = list(dict.fromkeys(warnings))
@@ -231,12 +236,18 @@ def build_project(name: str, rate: Fraction, width: int, height: int, media: lis
     total = max((c['start'] + c['duration'] for c in out), default=0)
     video_tracks = max([4] + [c['track'] for c in out if c['type'] != 'audio'])
     audio_tracks = max([3] + [-c['track'] for c in out if c['type'] == 'audio'])
-    return {'name': text(name or 'Imported timeline', 120) or 'Imported timeline', 'width': int(width), 'height': int(height),
+    result = {'name': text(name or 'Imported timeline', 120) or 'Imported timeline', 'width': int(width), 'height': int(height),
             'fps': float(rate), 'media': items, 'clips': out, 'captions': [],
             'markers': [{'id': f'marker-{i + 1}', 'name': text(m['name'], 500), 'time': _seconds(m['time'])}
                         for i, m in enumerate(markers) if 0 <= m['time'] <= total + 1e-6][:5000],
             'trackCounts': {'video': video_tracks, 'audio': audio_tracks}, 'trackState': {},
             'duration': total, 'compatibilityWarnings': [text(w, 1000) for w in dict.fromkeys(warnings)][:500]}
+    day = 24 * 3600 * math.ceil(float(rate))
+    if isinstance(start_frames, (int, Fraction)) and not isinstance(start_frames, bool) and 0 <= start_frames < day:
+        result['startTimecode'] = int(round(start_frames))
+    if rate in (Fraction(30000, 1001), Fraction(60000, 1001)):
+        result['dropFrame'] = bool(drop)
+    return result
 
 
 LINKED_LIST = 10

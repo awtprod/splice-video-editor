@@ -63,11 +63,23 @@ class DrpImportTests(Scratch):
     def test_timeline_settings(self):
         p = self.project
         self.assertEqual((p['name'], p['width'], p['height'], p['fps']), ('Harbor cut', 1280, 720, 24))
-        self.assertEqual((p['frameRate'], p['startFrame'], p['startTimecode']), ('24/1', 86400, '01:00:00:00'))
+        self.assertEqual((p['frameRate'], p['startFrame'], p['startTimecode']), ('24/1', 86400, 86400))
+        self.assertNotIn('dropFrame', p)
         self.assertEqual(p['resolveTimelines'], ['Harbor cut', 'Harbor alt'])
         other = resolve.open_drp(F.drp_bytes(self.spec), 1)
         self.assertEqual((other['name'], other['frameRate'], other['fps']), ('Harbor alt', '30000/1001', 30000 / 1001))
-        self.assertEqual((other['width'], other['height'], other['startTimecode']), (1920, 1080, '00:00:00:00'))
+        self.assertEqual((other['width'], other['height'], other['startTimecode']), (1920, 1080, 0))
+        # No drop-frame setting in the project: Resolve's default, non-drop, with a note.
+        self.assertIs(other['dropFrame'], False)
+        self.assertTrue(any('non-drop frame' in w for w in other['compatibilityWarnings']))
+
+    def test_drop_frame_flag_and_start_frames(self):
+        for drop in (True, False):
+            spec = F.sample()
+            spec['timelines'][1].update(drop=drop, start=107892 * 1001 / 30000)
+            for p in (resolve.open_drp(F.drp_bytes(spec), 1),):
+                self.assertEqual((p['startTimecode'], p['dropFrame']), (107892, drop))
+                self.assertFalse(any('non-drop frame' in w for w in p['compatibilityWarnings']))
 
     def test_tracks_and_clips(self):
         p = self.project
@@ -148,10 +160,18 @@ class LibraryTests(Scratch):
             from_drp = resolve.open_drp(F.drp_bytes(self.spec), index)
             self.assertEqual(from_db['resolveSource']['format'], 'library')
             self.assertEqual(from_db['resolveSource']['path'], str(db))
-            for key in ('name', 'width', 'height', 'fps', 'frameRate', 'startFrame', 'clips', 'markers',
+            for key in ('name', 'width', 'height', 'fps', 'frameRate', 'startFrame', 'startTimecode', 'clips', 'markers',
                         'trackCounts', 'trackNames', 'compatibilityWarnings', 'resolveTimelines'):
                 self.assertEqual(from_db[key], from_drp[key], key)
+            self.assertEqual(from_db.get('dropFrame'), from_drp.get('dropFrame'))
             self.assertEqual([{k: v for k, v in m.items()} for m in from_db['media']], from_drp['media'])
+
+    def test_library_drop_frame_flag(self):
+        self.spec['timelines'][1]['drop'] = True
+        self.library()
+        projects, _ = resolve.list_library(self.dir / 'library')
+        p = resolve.open_library_project(Path(projects[0]['path']), 1, None, self.dir)
+        self.assertIs(p['dropFrame'], True)
 
     def test_project_folder_or_users_folder_lists(self):
         self.library()

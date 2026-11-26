@@ -1124,3 +1124,348 @@ button svg {
   .transport{gap:4px}
   .viewer-scale{display:none}
 }
+/* Editing core: links, sync, In/Out, edit selection, density lanes, media list. */
+.timeline-clip.linked .clip-name {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.link-mark {
+  width: 11px;
+  height: 11px;
+  margin-right: 4px;
+  vertical-align: -1px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+}
+.timeline-clip.out-of-sync {
+  border-color: #ff8a6b;
+}
+.sync-badge {
+  position: absolute;
+  z-index: 3;
+  right: 11px;
+  bottom: 4px;
+  min-width: 20px;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: #c8432b;
+  color: #fff;
+  font: 700 10px "IBM Plex Mono", monospace;
+  text-align: center;
+  cursor: pointer;
+}
+.sync-menu {
+  position: fixed;
+  z-index: 60;
+  display: grid;
+  min-width: 170px;
+  padding: 4px;
+  background: #202620;
+  border: 1px solid #495443;
+  border-radius: 5px;
+  box-shadow: 0 8px 24px #0008;
+}
+.sync-menu button {
+  padding: 8px 10px;
+  text-align: left;
+  color: #edf5e8;
+  background: transparent;
+  border-radius: 3px;
+}
+.sync-menu button:hover,
+.sync-menu button:focus-visible {
+  background: #384238;
+}
+.clip-wave.camera-wave {
+  top: auto;
+  bottom: 0;
+  height: 34%;
+  opacity: 0.75;
+}
+.timeline-clip.edit-start .trim-left,
+.timeline-clip.edit-end .trim-right {
+  opacity: 1;
+  background: #ffcf64;
+}
+.lane-density {
+  position: absolute;
+  top: 12px;
+  height: 40px;
+  opacity: 0.85;
+  cursor: pointer;
+}
+.mark-range {
+  position: absolute;
+  z-index: 4;
+  top: 0;
+  pointer-events: none;
+  background: #9fd2ff1a;
+  border-left: 2px solid #8cc8ff;
+  border-right: 2px solid #8cc8ff;
+}
+.mark-range.open-in {
+  border-left: 0;
+}
+.mark-range.open-out {
+  border-right: 0;
+}
+.mark-status {
+  color: #a8d4ff;
+  font: 11px "IBM Plex Mono", monospace;
+}
+.viewer-timecode[role="button"] {
+  cursor: text;
+}
+.timecode-entry {
+  width: 13ch;
+  padding: 1px 4px;
+  color: inherit;
+  background: #101410;
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  font: inherit;
+}
+.edit-menu kbd {
+  float: right;
+  margin-left: 14px;
+  color: #93a28f;
+  font: 10px "IBM Plex Mono", monospace;
+}
+.edit-menu[open] > div {
+  min-width: 290px;
+}
+#linked-toggle.active {
+  color: #d1f6a3;
+}
+#zoom-label {
+  min-width: 64px;
+  text-align: center;
+}
+.media-extra {
+  color: #93a28f;
+  font-size: 10px;
+}
+#media-view {
+  flex: none;
+  padding: 0 8px;
+  color: #d6e2d2;
+  background: #202720;
+  border: 1px solid #475545;
+  border-radius: 4px;
+}
+.media-table {
+  display: grid;
+  margin: 0 0 10px;
+  overflow-x: auto;
+  font-size: 11px;
+}
+.media-table-head,
+.media-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 2fr) 84px 58px 92px 60px 64px minmax(80px, 1fr);
+  min-width: 600px;
+  text-align: left;
+}
+.media-table-head button {
+  padding: 6px 5px;
+  color: #aebbaa;
+  font-weight: 700;
+  text-align: left;
+  background: #202620;
+  border-bottom: 1px solid #3a4238;
+}
+.media-row {
+  padding: 0;
+  color: #e7efe4;
+  background: transparent;
+  border-bottom: 1px solid #2c332b;
+}
+.media-row:hover {
+  background: #2a322a;
+}
+.media-row span {
+  padding: 6px 5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.edit-menu {
+  position: relative;
+}
+.edit-menu > summary {
+  cursor: pointer;
+  list-style: none;
+  padding: 5px 10px;
+}
+.edit-menu[open] > div {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 20;
+  padding: 5px;
+  background: #202620;
+  border: 1px solid #495443;
+  box-shadow: 0 6px 18px #0006;
+}
+.edit-menu button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 8px 10px;
+}
+.edit-menu button:hover {
+  background: #384238;
+}
+/* Keep the ruler and its header cell visible while scrolling down through many tracks. */
+.time-ruler {
+  position: sticky;
+  top: 0;
+  z-index: 4;
+  background-color: #1a1f1a;
+}
+.ruler-head {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: inherit;
+}
+/* Pool tools share one row: the search field and filters shrink before anything overflows. */
+.pool-tools input {
+  flex: 1 1 70px;
+  width: auto;
+}
+.pool-tools select {
+  flex: 0 1 92px;
+  min-width: 0;
+}
+@media (max-width: 1320px) {
+  .pool-tools {
+    display: grid;
+    grid-template-columns: 1fr 1fr auto;
+    gap: 4px;
+    padding: 6px 8px;
+  }
+  .pool-tools input {
+    grid-column: 1 / -1;
+    grid-row: 1;
+    width: 100%;
+  }
+  .pool-tools select,
+  #bin-filter {
+    width: 100%;
+    max-width: none;
+  }
+  .pool-tools[hidden] {
+    display: none;
+  }
+}
+/* Round 1 layout fixes. */
+/* The sync badge sits at the top right and the clip name stops short of it. */
+.sync-badge {
+  top: 6px;
+  bottom: auto;
+  right: 10px;
+}
+.timeline-clip.out-of-sync .clip-name {
+  padding-right: 42px;
+}
+/* Pool tools: the search field has its own full-width row; bins, type and List share the next. */
+.pool-tools,
+.pool-tools:not([hidden]) {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  gap: 5px;
+  padding: 7px 10px;
+}
+.pool-tools input {
+  grid-column: 1 / -1;
+  grid-row: 1;
+  width: 100%;
+  min-width: 0;
+}
+.pool-tools select,
+#bin-filter {
+  width: 100%;
+  min-width: 0;
+  max-width: none;
+}
+.pool-tools[hidden] {
+  display: none;
+}
+/* The media list is a full table when the pool is wide enough; in a narrow pool each row
+   puts name and duration on one line and the other columns under them. */
+.library-body {
+  container-type: inline-size;
+}
+@container (max-width: 559px) {
+  .media-table-head,
+  .media-row {
+    display: flex;
+    flex-wrap: wrap;
+    min-width: 0;
+  }
+  .media-table-head {
+    gap: 2px;
+  }
+  .media-table-head button {
+    flex: 1 0 auto;
+    padding: 4px 6px;
+  }
+  .media-row span {
+    flex: 0 1 auto;
+    padding: 0 0 6px 6px;
+    color: #a9b8a5;
+    font-size: 10px;
+  }
+  .media-row span:empty {
+    display: none;
+  }
+  .media-row span:nth-child(1) {
+    flex: 1 0 calc(100% - 96px);
+    padding: 6px 5px 3px 6px;
+    color: #e7efe4;
+    font-size: 11px;
+    font-weight: 700;
+  }
+  .media-row span:nth-child(2) {
+    flex: 0 0 96px;
+    padding: 6px 6px 3px 0;
+    color: #e7efe4;
+    text-align: right;
+  }
+  .media-row span:nth-child(3):not(:empty)::after {
+    content: " fps";
+  }
+  .media-row span:nth-child(n + 3):not(:empty) ~ span:not(:empty)::before {
+    content: "· ";
+  }
+}
+/* Keyboard reference: the list scrolls, the heading and Close stay in view. */
+.studio-dialog.shortcut-reference[open] {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.shortcut-reference .shortcut-list {
+  min-height: 0;
+  overflow: auto;
+  margin: 0 0 14px;
+  padding-right: 6px;
+}
+.shortcut-reference > button {
+  align-self: flex-end;
+  flex: none;
+}
+/* Below 1320 px the four pool tabs tighten so Captions stays in view. */
+@media (max-width: 1320px) {
+  .library-tabs {
+    justify-content: space-between;
+    gap: 3px;
+    padding: 0 8px;
+  }
+  .library-tabs button {
+    font-size: 11px;
+  }
+}

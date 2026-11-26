@@ -366,5 +366,6 @@ def read(data: bytes, budget=None) -> dict:
         except (ValueError, AttributeError):
             warnings.append('A marker with an unreadable range was skipped.')
     width, height = int(splice.get('width') or 1920), int(splice.get('height') or 1080)
+    start_frames = round(_start) if isinstance(_start, (int, float, Fraction)) and _start >= 0 else None
     return build_project(str(document.get('name') or 'Imported OTIO'), rate, width, height, list(media.values()),
-                         clips, markers, warnings)
+                         clips, markers, warnings, start_frames=start_frames, drop=splice.get('dropFrame') is True)

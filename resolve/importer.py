@@ -8,6 +8,7 @@ Anything Splice does not represent is listed in ``compatibilityWarnings`` with t
 track and clip it belongs to; nothing is dropped without a line there.
 """
 import math
+import re
 from fractions import Fraction
 from pathlib import PureWindowsPath
 
@@ -106,6 +107,48 @@ def rational(fps):
         return int(round(fps)), 1
     value = Fraction(fps).limit_denominator(1001)
     return value.numerator, value.denominator
+
+
+def _is_drop_rate(numerator, denominator):
+    return denominator == 1001 and numerator in (30000, 60000)
+
+
+def fps_label(numerator, denominator):
+    return f'{numerator / denominator:.3f}'.rstrip('0').rstrip('.')
+
+
+_DROP_KEY = re.compile(r'drop[ _]?frame', re.I)
+
+
+def _drop_flag(fields):
+    """Resolve's "use drop frame timecode" setting from a decoded settings blob, or None.
+
+    The flag is looked up by name (a key containing "DropFrame", as in the scripting API's
+    ``timelineDropFrameTimecode``) at the timeline first, then in the project's settings."""
+    for key, value in (fields or {}).items():
+        if isinstance(key, str) and _DROP_KEY.search(key):
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, int):
+                return value != 0
+            if isinstance(value, (str, bytes)):
+                text = value.decode('latin-1') if isinstance(value, bytes) else value
+                if text.strip() in ('0', '1', 'true', 'false', 'True', 'False'):
+                    return text.strip() in ('1', 'true', 'True')
+    return None
+
+
+def _config_fields(project):
+    if project is None:
+        return {}
+    for config in project.iter('SM_Config'):
+        data = _raw(config, 'FieldsBlob')
+        try:
+            if data and blobs.is_keyed_dict(data):
+                return blobs.keyed_dict(data)
+        except BlobError:
+            return {}
+    return {}
 
 
 def timecode(frame, numerator, denominator):
@@ -529,6 +572,18 @@ def to_splice(model, index=0, link_media=None, source_ref=None):
             fields = {}
         if fields.get('FLStudioModelBA'):
             warnings.add(f'{tl_name}: Fairlight mixer settings, buses and track automation are not imported.')
+    else:
+        fields = {}
+    drop_frame = None
+    if _is_drop_rate(num, den):
+        drop_frame = _drop_flag(fields)
+        if drop_frame is None:
+            drop_frame = _drop_flag(_config_fields(model.source.project))
+        if drop_frame is None:
+            drop_frame = False
+            warnings.add(f'{tl_name}: the project does not say whether this {fps_label(num, den)} fps timeline '
+                         'uses drop-frame timecode; non-drop frame (Resolve’s default) is assumed. Change it '
+                         'in File → Sequence settings.')
 
     def seconds(frames, fraction=0.0):
         return (frames + fraction) * den / num
@@ -670,7 +725,10 @@ def to_splice(model, index=0, link_media=None, source_ref=None):
     project = {
         'name': tl_name, 'width': size[0], 'height': size[1], 'fps': fps,
         'frameRate': f'{num}/{den}', 'startFrame': start_frame,
-        'startTimecode': timecode(start_frame, num, den),
+        # Splice's project format: the start timecode is a whole frame count at the timeline rate
+        # (engine.js), with ``dropFrame`` only for the NTSC rates. Before the timeline starts at
+        # frame 0 (negative Resolve starts) there is no timecode, so 0 is used.
+        'startTimecode': max(0, start_frame) % (24 * 3600 * max(1, round(num / den))),
         'media': media_out, 'clips': clips, 'captions': [], 'markers': markers,
         'trackState': {}, 'trackCounts': {'video': max(1, min(MAX_TRACKS, counts['video'])),
                                           'audio': max(1, min(MAX_TRACKS, counts['audio']))},
@@ -682,6 +740,8 @@ def to_splice(model, index=0, link_media=None, source_ref=None):
         'resolveSource': dict(source_ref or {}, kind=model.source.kind, sha256=model.source.sha256,
                               project=model.name, timelineId=timeline['id']),
     }
+    if drop_frame is not None:
+        project['dropFrame'] = drop_frame
     project['resolveSource']['linkedMedia'] = linked
     return project
 
@@ -725,6 +785,10 @@ def _item(model, item, kind, track, label, tl_name, start_frame, num, den, secon
             'title': name, 'color': {}, 'volume': 100, 'transition': 'none',
             'resolveItemId': item.get('DbId'), 'resolveFrames': [relative, duration, source_in],
             '_where': where}
+    if kind == 'video':
+        # A Resolve video item never plays sound: the camera sound is its own audio item (linked
+        # to the picture when Resolve links them), so the picture carries no embedded sound.
+        clip['embeddedAudio'] = False
     flags = blobs.parse_int(_text(item, 'Flags'))
     if flags is not None:
         clip['resolveFlags'] = flags

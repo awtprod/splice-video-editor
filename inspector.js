@@ -147,7 +147,15 @@
       `<p class="splice-compat">${escape(nativeLimits.join(', '))} will not save to Premiere. Save a Splice working copy to keep this edit.</p>`);
     if(clip.transition==='native') html += section('Render compatibility',
       `<p class="splice-compat">This imported Premiere transition (${escape(clip.transitionMatchName||'unknown effect')}) stays in the native project. MP4 export cannot render it yet. Choose a supported transition to export video.</p>`);
+    // The scope canvas survives the re-render: it keeps its picture and the scopes' record of
+    // the frame it shows, so an edit does not repaint (or blank) the scope.
+    const previousScope = element.querySelector('.splice-scope');
     element.innerHTML = html;
+    const freshScope = element.querySelector('.splice-scope');
+    if (previousScope && freshScope) {
+      previousScope.style.height = freshScope.style.height;
+      freshScope.replaceWith(previousScope);
+    }
     for(const key of ['scale','x','y','rotation','opacity','volume'])
       if(clip.keyframes?.[key]?.length) element.querySelector(`[data-field="${key}"]:not([data-group="trackMix"])`)?.setAttribute('disabled','');
     if(clip.transition==='native') element.querySelector('[data-field="transitionDuration"]')?.setAttribute('disabled','');
@@ -236,7 +244,9 @@
       render(editor.get(),element,editor);
     });
     window.SpliceScopes.bind(element);
-    paintScope(element.querySelector('.splice-scope'),true);
+    // Never forced here: the scopes' own throttle and unchanged-frame check decide (the preview
+    // loop paints them too). A new canvas gets one paint on the next animation frame.
+    if (!previousScope) schedulePaint();
     paintMeters(state);
   }
   function paintMeters(state=window.Editor?.get()) {
@@ -254,6 +264,12 @@
       const label=document.querySelector('.splice-key-time');
       if(label)label.textContent=`Value at ${local.toFixed(2)} s`;
     }
+  }
+  let paintQueued = false;
+  function schedulePaint() {
+    if (paintQueued) return;
+    paintQueued = true;
+    requestAnimationFrame(() => { paintQueued = false; paintScope(); });
   }
   // Scopes read the graded program frame; SpliceScopes paces itself.
   function paintScope(canvas=document.querySelector('.splice-scope'),force=false) {
