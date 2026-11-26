@@ -249,7 +249,10 @@ async function threePointAndOverwrite(page, camera) {
   assert.equal(linkPairs(clips).length, 4);
   await page.keyboard.press('Backslash');
   await capture(page, 'three-point-in-out.png');
-  // Lift and extract the marked range.
+  // The edit used the timeline In/Out, so (as in Premiere) both marks are cleared and the playhead
+  // is parked after the placed clip. Mark the same range again, then extract it.
+  assert.deepEqual(await state(page, () => [Editor.get().project.marks ?? null, Math.round(Editor.get().time * 25)]), [null, 35]);
+  await state(page, () => { Editor.setMark('in', .4); Editor.setMark('out', 1.36); });
   await page.keyboard.press('Quote');
   clips = await state(page, () => Editor.get().project.clips);
   assert.deepEqual(layout(clips), [

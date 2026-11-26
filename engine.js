@@ -2093,9 +2093,10 @@
       else {
         if (!Number.isFinite(Number(at))) throw new Error("Choose a timeline position.");
         let frame = Math.max(0, Math.round(Number(at) * project.fps));
-        // The playhead parked at the sequence end sits after the last frame: Out marks that last frame.
-        const lastFrame = Math.ceil((project.duration || 0) * project.fps - 1e-6) - 1;
-        if (edge === "out" && lastFrame >= 0) frame = Math.min(frame, lastFrame);
+        // The playhead parked at the sequence end sits after the last frame: Out marks that last
+        // frame. (Marks set further out, past the end, are kept as set.)
+        const endFrame = Math.ceil((project.duration || 0) * project.fps - 1e-6);
+        if (edge === "out" && endFrame > 0 && frame === endFrame) frame = endFrame - 1;
         marks[edge] = (edge === "out" ? frame + 1 : frame) / project.fps;
         // A new mark that crosses the other one replaces it, as in Premiere.
         if (Number.isFinite(marks.in) && Number.isFinite(marks.out) && marks.out <= marks.in) delete marks[edge === "in" ? "out" : "in"];

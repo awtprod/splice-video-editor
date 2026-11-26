@@ -146,6 +146,12 @@ async function outInclusive(page) {
   await page.locator('.source-close').click();
   let placed = (await clipsOf(page)).find(c => c.start > 1.99 && c.start < 2.01);
   assert.deepEqual([frames(placed.start), frames(placed.duration), frames(placed.in), placed.speed ?? 1], [50, 31, 10, 1]);
+  // As in Premiere, an edit timed by the timeline In/Out clears both marks and parks the playhead
+  // after the placed clip; undo brings the marks back.
+  assert.deepEqual(await state(page, () => [Editor.get().project.marks ?? null, Math.round(Editor.get().time * 25)]), [null, 81]);
+  // Undo the monitor edit: the marks come back with it, for the arithmetic below.
+  await state(page, () => Editor.undo());
+  assert.deepEqual(await state(page, () => Editor.get().project.marks).then(m => [frames(m.in), frames(m.out)]), [50, 81]);
   // Three- and four-point arithmetic against the same 31-frame timeline range.
   const place = sourceMarks => state(page, marks => {
     const result = Editor.placeSource('long', {mode: 'overwrite', track: 2, marks});
@@ -174,7 +180,6 @@ async function outInclusive(page) {
   });
   assert.deepEqual(backTimed, [61, 81]);
   // Lift and extract remove frames 50 to 80, 31 frames.
-  await page.keyboard.press('Control+z');
   await page.keyboard.press('Semicolon');
   let clips = await clipsOf(page);
   assert.deepEqual(clips.filter(c => c.track === 1).map(c => [frames(c.start), frames(c.duration)]).sort((x, y) => x[0] - y[0]), [[0, 50], [81, 119], [200, 50]]);
