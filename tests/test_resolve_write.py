@@ -581,3 +581,85 @@ class PathMappingTests(unittest.TestCase):
         for rule in ({'from': 'media', 'to': 'E:\\'}, {'from': '/mnt', 'to': 'E:'}, {'from': '/mnt', 'to': ''}):
             with self.assertRaises(ValueError):
                 facts.check_mappings([rule])
+
+
+class LibraryEvidenceTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='splice-rw-lib-')
+        self.dir = Path(self.temp.name)
+        self.library = self.dir / 'library'
+        self.user = self.library / 'Resolve Projects' / 'Users' / 'guest'
+        (self.user / 'Projects').mkdir(parents=True)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def refused(self):
+        with self.assertRaises(place.PlaceError) as caught:
+            place.library_users(self.library)
+        return str(caught.exception)
+
+    def test_a_crafted_empty_library_is_refused(self):
+        self.assertIn('Create the library in Resolve first', self.refused())
+        (self.user / 'User.db').write_text('not a database')
+        (self.user / 'Projects' / 'Fake').mkdir()
+        (self.user / 'Projects' / 'Fake' / 'Project.db').write_bytes(b'SQLite format 3\x00' + bytes(1000))
+        self.assertIn('Create the library in Resolve first', self.refused())
+        conn = sqlite3.connect(self.user / 'Projects' / 'Fake' / 'Project.db.tmp')
+        conn.execute('CREATE TABLE Other (x)')
+        conn.close()
+        os.replace(self.user / 'Projects' / 'Fake' / 'Project.db.tmp', self.user / 'Projects' / 'Fake' / 'Project.db')
+        self.assertIn('Create the library in Resolve first', self.refused())
+
+    def test_resolve_user_database_or_a_resolve_project_is_evidence(self):
+        conn = sqlite3.connect(self.user / 'User.db')
+        conn.execute('CREATE TABLE SM_User (SM_User_id)')
+        conn.close()
+        self.assertEqual(sorted(place.library_users(self.library)[2]), ['guest'])
+        (self.user / 'User.db').unlink()
+        folder = self.user / 'Projects' / 'Real'
+        folder.mkdir()
+        conn = sqlite3.connect(folder / 'Project.db')
+        conn.execute('CREATE TABLE SM_Project (SM_Project_id)')
+        conn.close()
+        self.assertEqual(sorted(place.library_users(self.library)[2]), ['guest'])
+        # A linked User.db is not evidence.
+        (folder / 'Project.db').rename(self.dir / 'elsewhere.db')
+        (self.user / 'User.db').symlink_to(self.dir / 'elsewhere.db')
+        self.refused()
+
+    def test_project_db_inside_accepts_only_project_files_of_the_library(self):
+        projects = self.user / 'Projects'
+        (projects / 'A').mkdir()
+        (projects / 'A' / 'Project.db').write_bytes(b'x')
+        inside = place.project_db_inside(projects / 'A' / 'Project.db', projects)
+        self.assertEqual(inside, (projects / 'A' / 'Project.db').resolve())
+        (self.dir / 'B').mkdir()
+        (self.dir / 'B' / 'Project.db').write_bytes(b'x')
+        (projects / 'B').symlink_to(self.dir / 'B', target_is_directory=True)
+        (projects / 'A' / 'other.db').write_bytes(b'x')
+        for path in ('/etc/passwd', '/etc/Project.db', str(projects / 'B' / 'Project.db'), 'Project.db',
+                     str(projects / 'A' / 'other.db'), str(projects / 'A' / '..' / 'A' / 'Project.db'),
+                     str(projects / 'Missing' / 'Project.db'), str(projects / 'Project.db')):
+            self.assertIsNone(place.project_db_inside(path, projects), path)
+
+
+class SeedPathTests(SaveCase):
+    def test_the_live_seed_path_is_read_only_inside_the_library_and_refused_alike_otherwise(self):
+        project = self.opened()
+        no_kept = lambda kind, sha: None  # noqa: E731
+        answers = set()
+        secret = self.dir / 'secret.txt'
+        secret.write_text('x')
+        for path in ('/etc/passwd', str(secret), str(self.dir / 'missing' / 'Project.db'), str(self.dir),
+                     str(self.kept)):
+            payload = self.payload(project, confirm=False)
+            payload['seed']['path'] = path
+            with self.assertRaises(source.ResolveError) as caught:
+                save.run(payload, originals=no_kept, scratch=self.dir, resolve_media=lambda src: src[5:])
+            answers.add(str(caught.exception))
+        self.assertEqual(len(answers), 1, answers)
+        # The project's own Project.db in the library still works when the kept copy is gone.
+        result = save.run(self.payload(project, confirm=False), originals=no_kept, scratch=self.dir,
+                          resolve_media=lambda src: src[5:])
+        self.assertTrue(result['ok'])

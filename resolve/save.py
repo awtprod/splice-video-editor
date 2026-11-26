@@ -19,7 +19,7 @@ from pathlib import Path
 
 from . import importer, items, mediapool
 from .facts import check_mappings, mapped, measure
-from .place import PlaceError, Staging, check_name, check_new, library_users, pick_user
+from .place import PlaceError, Staging, check_name, check_new, library_users, pick_user, project_db_inside
 from .source import ResolveError, load_library, snapshot
 from .writer import EXACT, NOT_WRITTEN, OPT_IN, Report, Seed, WriteError, Writer, prepare_template
 
@@ -293,8 +293,8 @@ def run(payload, *, originals, scratch, resolve_media, drp_seed=None):
 def _stage_seed(request, projects, target, originals, scratch, drp_seed, report):
     kind = request.seed['kind']
     if kind == 'template':
-        path = Path(str(request.seed.get('path') or ''))
-        if path.name != 'Project.db' or path.parent.parent.resolve() != projects.resolve():
+        path = project_db_inside(request.seed.get('path') or '', projects)
+        if path is None:
             raise ResolveError('Choose the template among the projects of this library (and user).')
         with tempfile.TemporaryDirectory(prefix='splice-resolve-', dir=scratch) as folder:
             copy, _digest_ = snapshot(path, folder)
@@ -307,9 +307,12 @@ def _stage_seed(request, projects, target, originals, scratch, drp_seed, report)
         kept = originals('library', sha)
         if kept is None:
             live = request.seed.get('path')
-            if isinstance(live, str) and live:
+            # The project's own Project.db in the chosen library, and nothing else: any other path
+            # gets the one answer below, so a request cannot learn which files exist elsewhere.
+            live = project_db_inside(live, projects) if isinstance(live, str) and live else None
+            if live is not None:
                 with tempfile.TemporaryDirectory(prefix='splice-resolve-', dir=scratch) as folder:
-                    copy, digest = snapshot(Path(live), folder)
+                    copy, digest = snapshot(live, folder)
                     if digest != sha:
                         raise ResolveError('Resolve saved the original project again since Splice opened it, and '
                                            'Splice no longer holds the version it opened. Open the project again '

@@ -92,6 +92,49 @@ def _no_link(path, what):
     return info
 
 
+_SQLITE = b'SQLite format 3\x00'
+#: Project folders looked at for a Resolve ``Project.db`` when a user folder has no ``User.db``.
+EVIDENCE_SCAN = 64
+
+
+def _resolve_database(path, table):
+    """Whether ``path`` is a regular file (not a link) holding an SQLite database with ``table``:
+    read without changing it (read-only, immutable)."""
+    import sqlite3
+    try:
+        info = os.lstat(path)
+        if not stat.S_ISREG(info.st_mode) or info.st_size < 512:
+            return False
+        with open(path, 'rb') as handle:
+            if handle.read(16) != _SQLITE:
+                return False
+        conn = sqlite3.connect(f'file:{Path(path).as_posix()}?mode=ro&immutable=1', uri=True)
+        try:
+            return conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                                (table,)).fetchone() is not None
+        finally:
+            conn.close()
+    except (OSError, ValueError, Exception):  # sqlite3.Error and anything a crafted file raises
+        return False
+
+
+def made_by_resolve(user_folder, projects):
+    """Evidence that Resolve made this user's folder of a disk library: the ``User.db`` Resolve
+    keeps beside ``Projects`` (an SQLite database with its ``SM_User`` table), or at least one
+    project folder holding a ``Project.db`` with Resolve's ``SM_Project`` table."""
+    if _resolve_database(os.path.join(user_folder, 'User.db'), 'SM_User'):
+        return True
+    try:
+        entries = sorted(os.scandir(projects), key=lambda e: e.name)[:EVIDENCE_SCAN]
+    except OSError:
+        return False
+    for entry in entries:
+        if not entry.name.startswith('.') and entry.is_dir(follow_symlinks=False) and \
+                _resolve_database(os.path.join(entry.path, 'Project.db'), 'SM_Project'):
+            return True
+    return False
+
+
 def library_users(library):
     """``(library, Resolve Projects folder, {user: Projects folder})`` of a disk library."""
     library = Path(library).expanduser()
@@ -100,7 +143,7 @@ def library_users(library):
     root = library / 'Resolve Projects'
     _no_link(root, '“Resolve Projects”')
     _no_link(root / 'Users', '“Resolve Projects/Users”')
-    users = {}
+    users, unproven = {}, []
     try:
         entries = sorted(os.scandir(root / 'Users'), key=lambda e: e.name)
     except OSError as error:
@@ -113,14 +156,43 @@ def library_users(library):
             _no_link(projects, f'the Projects folder of user “{entry.name}”')
         except PlaceError:
             continue
+        if not made_by_resolve(entry.path, projects):
+            unproven.append(entry.name)
+            continue
         users[entry.name] = projects
     if not users:
+        if unproven:
+            raise PlaceError('This folder has the layout of a Resolve disk library, but nothing in it shows that '
+                             'Resolve made it (no user database, no Resolve project). Create the library in Resolve '
+                             'first (Project Manager → Project Libraries → Add Project Library), then save into it.')
         raise PlaceError('This folder is not a Resolve disk library: no user in it has a Projects folder.')
     real_library = library.resolve()
     for user, projects in users.items():
         if real_library not in projects.resolve().parents:
             raise PlaceError(f'The Projects folder of user “{user}” lies outside the library.')
     return library, root, users
+
+
+def project_db_inside(path, projects):
+    """``path`` resolved, when it names ``<project folder>/Project.db`` directly inside the
+    ``Projects`` folder ``projects`` (no link anywhere below it, nothing outside it); None
+    otherwise. Callers answer every None the same way, so the answer tells nothing about files
+    outside the library."""
+    try:
+        path = Path(str(path))
+        if not path.is_absolute() or path.name != 'Project.db' or '..' in path.parts:
+            return None
+        base = Path(projects).resolve(strict=True)
+        for part in (path.parent, path):
+            info = os.lstat(part)
+            if stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 0x400:
+                return None
+        real = path.resolve(strict=True)
+        if real.parent.parent != base or not stat.S_ISREG(os.lstat(real).st_mode):
+            return None
+        return real
+    except (OSError, ValueError, RuntimeError):
+        return None
 
 
 def pick_user(users, user=None):
