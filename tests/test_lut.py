@@ -198,11 +198,8 @@ class LargeLUTs(unittest.TestCase):
                 for intensity in (100, 50):
                     with self.subTest(domain=lut['domainMin'], intensity=intensity):
                         filters = _lut_filter({'lut':lut,'lutIntensity':intensity}, Path(folder)/'clip-0.cube')
-                        custom = lut['domainMin'] != [0,0,0]
-                        one_d = Path(folder)/'clip-0-1d.cube'
-                        one_d.write_text(cube1d_text(lut, 100 if custom else intensity, normalized_domain=custom))
-                        lut3d = filters[filters.index('lut3d='):].split(',')[0].split('[')[0]
-                        expected = ffmpeg_pixels(colors, filters.replace(lut3d, f'lut1d=file={one_d}:interp=linear'))
+                        self.assertIn('lut1d=', filters)
+                        expected = ffmpeg_pixels(colors, filters)
                         graded = js({'op':'apply','lut':lut,'intensity':intensity,'pixels':colors,'options':{'exact1D':True}})['pixels']
                         for color, want, got in zip(colors, expected, graded):
                             for channel in range(3):

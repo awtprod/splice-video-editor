@@ -749,14 +749,18 @@ def _lut_filter(color, destination, *, preserve_headroom=False):
     domain_min = lut.get('domainMin', [0,0,0]) if isinstance(lut, dict) else [0,0,0]
     domain_max = lut.get('domainMax', [1,1,1]) if isinstance(lut, dict) else [1,1,1]
     custom_domain = domain_min != [0,0,0] or domain_max != [1,1,1]
-    if not preserve_headroom and isinstance(lut, dict) and (lut.get('curve') or custom_domain):
+    if not preserve_headroom and isinstance(lut, dict) and lut.get('curve'):
         # A 1D file's full curve, and any domain, exactly as the monitor applies them (float RGB).
-        from color_grade import WORKING_FORMAT, look_filter
-        return (f',zscale,format={WORKING_FORMAT}'+look_filter(lut, intensity, destination.parent, destination.stem)+
-                ',zscale=m=709:r=limited')
+        from color_grade import look_filter
+        return (',zscale,format=gbrapf32le'+look_filter(lut, intensity, destination.parent, destination.stem))
     mix_after_lookup = custom_domain or preserve_headroom
-    destination.write_text(cube_text(lut,100 if mix_after_lookup else intensity,normalized_domain=custom_domain))
-    apply_lut = f'lut3d=file={_filter_path(destination)}:interp=trilinear'
+    if lut.get('curve'):
+        from lut import cube1d_text
+        destination.write_text(cube1d_text(lut, 100 if mix_after_lookup else intensity, normalized_domain=custom_domain))
+        apply_lut = f'lut1d=file={_filter_path(destination)}:interp=linear'
+    else:
+        destination.write_text(cube_text(lut,100 if mix_after_lookup else intensity,normalized_domain=custom_domain))
+        apply_lut = f'lut3d=file={_filter_path(destination)}:interp=trilinear'
     if not mix_after_lookup:
         return ','+apply_lut
     # Apply the input offset and scale explicitly. FFmpeg's .cube reader
