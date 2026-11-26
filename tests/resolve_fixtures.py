@@ -256,6 +256,7 @@ def _item_values(item):
               'PrettyType': item.get('pretty'), 'Name': item['name'], 'Start': item['start'],
               'Duration': item['duration']}
     if tag != 'Sm2TiTransition':
+        values['Flags'] = item.get('flags', 0)
         values.update({'In': item.get('in'), 'MediaRef': item.get('media'),
                        'MediaFilePath': None, 'MediaTimemapBA': item.get('timemap', compact_timemap()),
                        'MediaTrackIdx': 0 if tag == 'Sm2TiAudioClip' else None,
@@ -265,13 +266,27 @@ def _item_values(item):
     return values
 
 
+def lockable_blobs(spec):
+    """(blob id, tag, owner, FieldsBlob) for every timeline and clip marker list in ``spec``."""
+    out = [('lb-' + t['seq'], 'Sm2SequenceLockableBlob', t['seq'], markers(t['markers']))
+           for t in spec['timelines'] if t['markers']]
+    for t in spec['timelines']:
+        for track in t['tracks']:
+            for item in track['items']:
+                if item.get('markers'):
+                    out.append(('lb-' + item['id'], 'Sm2TiItemLockableBlob', item['id'], markers(item['markers'])))
+    return out
+
+
 def drp_bytes(spec):
+    blobs = ''.join(_el('Element', _el(tag, _leaf('BlobOwner', owner) + _leaf('FieldsBlob', data), bid))
+                    for bid, tag, owner, data in lockable_blobs(spec))
+    if spec.get('marker_layout') == 'nested':
+        # Older projects: LockableBlobMap/Sm2LockableBlobMap/LocableBlobSet/Element/<blob>.
+        blobs = _el('Sm2LockableBlobMap', _el('LocableBlobSet', blobs), 'lbm-1')
     project = (_leaf('ProjectName', spec['name']) + _leaf('LastModTimeInSecs', spec['saved'])
                + _el('TimelineHandleVec', ''.join(_el('Element', t['id']) for t in spec['timelines']))
-               + _el('LockableBlobMap', ''.join(
-                   _el('Element', _el('Sm2SequenceLockableBlob', _leaf('BlobOwner', t['seq'])
-                                      + _leaf('FieldsBlob', markers(t['markers'])), 'lb-' + t['seq']))
-                   for t in spec['timelines'] if t['markers'])))
+               + _el('LockableBlobMap', blobs))
     out = io.BytesIO()
     with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as archive:
         archive.writestr('project.xml', HEADER + _el('SM_Project', project, spec['id']))
@@ -293,7 +308,7 @@ def drp_bytes(spec):
                     + (_el('CompositionTable', _el('Sm2TiCompositionTable', '', 'ct-' + item['id']))
                        if item.get('fusion') else ''), item['id'])) for item in track['items'])
                 vecs[track['type']].append(_el('Element', _el('Sm2TiTrack', _leaf('Type', track['type'])
-                    + _leaf('Sequence', t['seq']) + _el('Items', items) + _leaf('UserDefinedName', track['name'] or None),
+                    + _leaf('Flags', track.get('flags', 0)) + _leaf('Sequence', t['seq']) + _el('Items', items) + _leaf('UserDefinedName', track['name'] or None),
                     track['id'])))
             body = _el('VideoTrackVec', ''.join(vecs[0])) + _el('AudioTrackVec', ''.join(vecs[1])) + '<SubtitleTrackVec/>'
             archive.writestr(f'SeqContainer/{t["container"]}.xml', HEADER + _el('Sm2SequenceContainer', body, t['container']))
@@ -316,10 +331,10 @@ TABLES = {
     'Sm2Timeline': ['Sm2Timeline_id', 'DbType', 'Name', 'Sequence'],
     'Sm2Sequence': ['Sm2Sequence_id', 'DbType', 'FieldsBlob', 'FrameRate', 'Resolution', 'MediaExtents'],
     'Sm2SequenceContainer': ['Sm2SequenceContainer_id', 'DbType'],
-    'Sm2TiTrack': ['Sm2TiTrack_id', 'DbType', 'Type', 'Sequence', 'UserDefinedName', 'Sm2SequenceContainer_id'],
+    'Sm2TiTrack': ['Sm2TiTrack_id', 'DbType', 'Type', 'Flags', 'Sequence', 'UserDefinedName', 'Sm2SequenceContainer_id'],
     'Sm2TiItem': ['Sm2TiItem_id', 'DbType', 'FieldsBlob', 'PrettyType', 'Name', 'Start', 'Duration', 'In',
                   'MediaRef', 'MediaFilePath', 'MediaTimemapBA', 'MediaTrackIdx', 'EffectFiltersBA',
-                  'AlignmentType', 'Position', 'pLmVerTable', 'CompositionTable', 'Sm2TiTrack_id'],
+                  'AlignmentType', 'Position', 'pLmVerTable', 'CompositionTable', 'Flags', 'Sm2TiTrack_id'],
 }
 JOINS = ['SM_Project_Sm2Timeline', 'Sm2MpFolder_Sm2MpMedia', 'BtAudioInfo_Sm2MpMedia',
          'Sm2SequenceContainer_Sm2TiTrack', 'Sm2TiItem_Sm2TiTrack']
@@ -345,9 +360,8 @@ def write_db(spec, path):
             LastModTimeInSecs=spec['saved'])
         for i, t in enumerate(spec['timelines']):
             link('SM_Project_Sm2Timeline', spec['id'], t['id'], 'TimelineHandleVec', i)
-            if t['markers']:
-                put('BtLockableBlob', BtLockableBlob_id='lb-' + t['seq'], DbType='Sm2SequenceLockableBlob',
-                    BlobOwner=t['seq'], FieldsBlob=markers(t['markers']))
+        for bid, tag, owner, data in lockable_blobs(spec):
+            put('BtLockableBlob', BtLockableBlob_id=bid, DbType=tag, BlobOwner=owner, FieldsBlob=data)
         for bid, name, parent in spec['bins']:
             put('Sm2MpFolder', Sm2MpFolder_id=bid, DbType='Sm2MpFolder', Name=name, MpFolder=parent)
         index = {}
@@ -381,7 +395,8 @@ def write_db(spec, path):
                 prop = 'VideoTrackVec' if track['type'] == 0 else 'AudioTrackVec'
                 link('Sm2SequenceContainer_Sm2TiTrack', t['container'], track['id'], prop, counts[track['type']])
                 counts[track['type']] += 1
-                put('Sm2TiTrack', Sm2TiTrack_id=track['id'], DbType='Sm2TiTrack', Type=track['type'], Sequence=t['seq'],
+                put('Sm2TiTrack', Sm2TiTrack_id=track['id'], DbType='Sm2TiTrack', Type=track['type'],
+                    Flags=track.get('flags', 0), Sequence=t['seq'],
                     UserDefinedName=track['name'] or None, Sm2SequenceContainer_id=t['container'])
                 for i, item in enumerate(track['items']):
                     link('Sm2TiItem_Sm2TiTrack', track['id'], item['id'], 'Items', i)
@@ -395,16 +410,25 @@ def write_db(spec, path):
 
 
 def write_library(spec, folder, user='guest'):
-    """A disk library folder holding ``spec`` as one project; returns the Project.db path."""
+    """A disk library folder holding ``spec`` as one project; returns the Project.db path.
+
+    An existing project of the same name is replaced the way a save replaces it (a new file
+    moved over the old one)."""
     project = Path(folder) / 'Resolve Projects' / 'Users' / user / 'Projects' / spec['name']
     project.mkdir(parents=True, exist_ok=True)
-    write_db(spec, project / 'Project.db')
+    fresh = project / 'Project.db.new'
+    fresh.unlink(missing_ok=True)
+    write_db(spec, fresh)
+    fresh.replace(project / 'Project.db')
     return project / 'Project.db'
 
 
 if __name__ == '__main__':
     mode, out, video, audio = sys.argv[1:5]
     spec = sample(video, audio, generator='--no-generator' not in sys.argv[5:])
+    if '--reverse' in sys.argv[5:]:  # Resolve reordered the timelines and saved again
+        spec['timelines'].reverse()
+        spec['saved'] += 60
     if mode == 'drp':
         Path(out).write_bytes(drp_bytes(spec))
     else:

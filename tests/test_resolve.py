@@ -346,7 +346,9 @@ class HostileInputTests(Scratch):
 
 
 class ZstdTests(unittest.TestCase):
-    def test_python_decoder_against_library_frames(self):
+    def test_python_decoder_against_committed_frames(self):
+        # Frames made by the reference zstd library at several levels (committed so 3.10-3.13
+        # run them too); the repeat-offset-* frames each reach one repeat-offset rule.
         for name, case in FRAMES.items():
             with self.subTest(name):
                 out = zstd.decompress_python(bytes.fromhex(case['frame']), case['size'])
@@ -360,18 +362,21 @@ class ZstdTests(unittest.TestCase):
             zstd.decompress(bytes.fromhex(case['frame']), 1000)
 
     def test_python_decoder_rejects_damage(self):
-        frame = bytearray.fromhex(FRAMES['fse-tables']['frame'])
+        frame = bytearray.fromhex(FRAMES['checksummed']['frame'])
         for cut in (5, 12, len(frame) // 2):
             with self.assertRaises(zstd.ZstdError):
                 zstd.decompress_python(bytes(frame[:cut]), 1 << 20)
         original = zstd.decompress_python(bytes(frame), 1 << 20)
-        damaged = bytearray(frame)
-        for i in range(20, len(damaged), 97):
+        # The frame carries a checksum, so damage is refused; never different bytes.
+        self.assertTrue(frame[4] & 0x04)
+        for i in range(20, len(frame), 7):
+            damaged = bytearray(frame)
             damaged[i] ^= 0x5A
-        try:  # damage is either refused or decodes to different bytes, never another exception
-            self.assertNotEqual(zstd.decompress_python(bytes(damaged), 1 << 20), original)
-        except zstd.ZstdError:
-            pass
+            with self.subTest(byte=i):
+                try:
+                    self.assertEqual(zstd.decompress_python(bytes(damaged), 1 << 20), original)
+                except zstd.ZstdError:
+                    pass
         with self.assertRaises(zstd.ZstdError):
             zstd.decompress_python(zstd.MAGIC + bytes([0x21, 0x01, 0x02, 0x03, 0x04, 0x05]), 100)
 
@@ -398,6 +403,430 @@ class ZstdTests(unittest.TestCase):
             spec = F.sample()
             project = resolve.open_drp(F.drp_bytes(spec))
             self.assertEqual(by_title(project, 'i-v1')['transform']['scale'], 125.0)
+
+
+# --------------------------------------------------------------------------- hand-built zstd frames
+
+def _bits(reads, padding=0):
+    """A zstd backward bitstream whose reads, in order, return ``reads`` [(value, width)]."""
+    value, total = 0, 0
+    for item, width in reads:
+        value = (value << width) | item
+        total += width
+    value <<= padding
+    total += padding
+    value |= 1 << total
+    return value.to_bytes((total + 8) // 8, 'little')
+
+
+def _sequences_block(literals, count, codes, reads, padding=0, last=True):
+    """A compressed block: raw literals, ``count`` sequences coded with RLE tables (ll, of, ml)."""
+    assert len(literals) < 32
+    body = bytes([len(literals) << 3]) + literals
+    body += bytes([count, 0x54]) + bytes(codes) + _bits(reads, padding)
+    return (len(body) << 3 | 2 << 1 | int(last)).to_bytes(3, 'little') + body
+
+
+def _frame(*blocks, size=None, flags=0, dict_id=b''):
+    if size is None:
+        header = bytes([flags | (len(dict_id) and {1: 1, 2: 2, 4: 3}[len(dict_id)]), 0x70]) + dict_id
+    else:
+        header = bytes([0x20 | flags | (len(dict_id) and {1: 1, 2: 2, 4: 3}[len(dict_id)])]) + dict_id + bytes([size])
+    return zstd.MAGIC + header + b''.join(blocks)
+
+
+def _raw_block(data, last=True):
+    return (len(data) << 3 | int(last)).to_bytes(3, 'little') + data
+
+
+class ZstdBoundaryTests(unittest.TestCase):
+    """Each rule the fallback decoder enforces, on frames built byte by byte."""
+
+    def test_hand_built_sequences_decode(self):
+        # One sequence: 1 literal, offset code 2 (explicit offset 1), match length 3.
+        frame = _frame(_sequences_block(b'A', 1, (1, 2, 0), [(0, 2)]))
+        self.assertEqual(zstd.decompress_python(frame, 100), b'AAAA')
+
+    def test_bitstream_must_be_fully_consumed(self):
+        frame = _frame(_sequences_block(b'A', 1, (1, 2, 0), [(0, 2)], padding=3))
+        with self.assertRaisesRegex(zstd.ZstdError, 'not fully consumed'):
+            zstd.decompress_python(frame, 100)
+
+    def test_block_output_is_bounded_while_matches_are_copied(self):
+        # The first sequence alone (1 + 131,074 bytes) overflows a block; the second would need a
+        # literal that does not exist. The bound must stop the copy at the first one.
+        reads = [(0, 2), (65535, 16), (0, 2), (65535, 16)]
+        frame = _frame(_sequences_block(b'A', 2, (1, 2, 52), reads))
+        with self.assertRaisesRegex(zstd.ZstdError, 'block output too large'):
+            zstd.decompress_python(frame, 1 << 30)
+
+    def test_rle_blocks_are_bounded(self):
+        frame = _frame((200_000 << 3 | 1 << 1 | 1).to_bytes(3, 'little') + b'A')
+        with self.assertRaises(zstd.ZstdError):
+            zstd.decompress_python(frame, 1 << 30)
+        with self.assertRaises(zstd.ZstdError):
+            zstd.decompress(frame, 1 << 30)
+
+    def test_declared_size_must_match(self):
+        for size in (2, 4):
+            frame = _frame(_raw_block(b'abc'), size=size)
+            with self.subTest(size=size):
+                with self.assertRaisesRegex(zstd.ZstdError, 'does not match'):
+                    zstd.decompress_python(frame, 100)
+                with self.assertRaises(zstd.ZstdError):
+                    zstd.decompress(frame, 100)
+        self.assertEqual(zstd.decompress_python(_frame(_raw_block(b'abc'), size=3), 100), b'abc')
+
+    def test_dictionary_frames_are_refused(self):
+        frame = _frame(_raw_block(b'abc'), size=3, dict_id=b'\x07')
+        with self.assertRaisesRegex(zstd.ZstdError, 'dictionary'):
+            zstd.decompress_python(frame, 100)
+        with self.assertRaisesRegex(zstd.ZstdError, 'dictionary'):
+            zstd.decompress(frame, 100)
+
+    def test_checksum_is_verified(self):
+        good = _frame(_raw_block(b'abc'), size=3, flags=0x04) + (zstd.xxh64(b'abc') & 0xFFFFFFFF).to_bytes(4, 'little')
+        self.assertEqual(zstd.decompress_python(good, 100), b'abc')
+        bad = good[:-1] + bytes([good[-1] ^ 1])
+        with self.assertRaisesRegex(zstd.ZstdError, 'checksum'):
+            zstd.decompress_python(bad, 100)
+        for cut in (1, 2, 3, 4):
+            with self.assertRaisesRegex(zstd.ZstdError, 'checksum'):
+                zstd.decompress_python(good[:-cut], 100)
+
+    def test_xxh64_reference_values(self):
+        self.assertEqual(zstd.xxh64(b''), 0xEF46DB3751D8E999)
+        self.assertEqual(zstd.xxh64(b'a'), 0xD24EC4F1A98C6E5B)
+        self.assertEqual(zstd.xxh64(b'abc'), 0x44BC2CF5AD770999)
+        self.assertEqual(zstd.xxh64(b'Nobody inspects the spammish repetition'), 0xFBCEA83C8A378BF1)
+
+    def test_malformed_blocks_raise_zstd_errors_only(self):
+        # Found by the validator: a block too short for its literals header (was IndexError).
+        frame = bytes.fromhex('28b52ffd206405000010676701003f012c')
+        with self.assertRaises(zstd.ZstdError):
+            zstd.decompress_python(frame, 1 << 20)
+        with self.assertRaisesRegex(zstd.ZstdError, 'truncated literals header'):
+            zstd.decompress_python(_frame((1 << 3 | 2 << 1 | 1).to_bytes(3, 'little') + b'\x04'), 100)
+        for body in (b'', b'\x04', b'\x0c\x01', b'\x02\x00\x00'):
+            block = (len(body) << 3 | 2 << 1 | 1).to_bytes(3, 'little') + body
+            with self.subTest(body=body.hex()), self.assertRaises(zstd.ZstdError):
+                zstd.decompress_python(_frame(block), 1 << 20)
+        with mock.patch.object(zstd, '_Frame', side_effect=IndexError('slip')):
+            with self.assertRaisesRegex(zstd.ZstdError, 'damaged'):
+                zstd.decompress_python(_frame(_raw_block(b'x')), 10)
+
+    def test_one_bad_blob_is_one_warning(self):
+        spec = F.sample()
+        bad = F.struct.pack('>II', 2, 18) + b'\x81' + bytes.fromhex('28b52ffd206405000010676701003f012c')
+        spec['timelines'][0]['tracks'][0]['items'][0]['effects'] = bad
+        with mock.patch.object(zstd, '_backend', lambda: ('python', None)):
+            project = resolve.open_drp(F.drp_bytes(spec))
+        self.assertEqual(len(project['clips']), 5)
+        self.assertTrue(any('i-v1' not in w and 'effects could not be decoded' in w
+                            for w in project['compatibilityWarnings']))
+
+    def test_truncated_frames_are_refused_on_every_backend(self):
+        frame = bytes.fromhex(FRAMES['fse-tables']['frame'])
+        for cut in range(4, len(frame)):
+            with self.subTest(cut=cut):
+                with self.assertRaises(zstd.ZstdError):
+                    zstd.decompress(frame[:cut], 1 << 20)
+                with self.assertRaises(zstd.ZstdError):
+                    zstd.decompress_python(frame[:cut], 1 << 20)
+
+        class Partial:
+            """A library decoder that hands back partial output for a cut frame, as some do."""
+            ZstdError = RuntimeError
+
+            class ZstdDecompressor:
+                eof = True
+
+                def stream_reader(self, data, read_across_frames=False):
+                    return io.BytesIO(b'partial')
+
+                def decompress(self, data, max_length=-1):
+                    return b'partial'
+        # No content size, cut inside its second block: only the frame's own structure shows it.
+        cut = _frame(_raw_block(b'abc', last=False), _raw_block(b'defgh'))[:-2]
+        for name in ('zstandard', 'pyzstd', 'compression.zstd'):
+            with self.subTest(backend=name), mock.patch.object(zstd, '_backend', lambda: (name, Partial)):
+                with self.assertRaisesRegex(zstd.ZstdError, 'truncated block'):
+                    zstd.decompress(cut, 1 << 20)
+                # A library that returns other bytes than the frame declares is refused too.
+                with self.assertRaisesRegex(zstd.ZstdError, 'does not match'):
+                    zstd.decompress(_frame(_raw_block(b'abc'), size=3), 1 << 20)
+        Partial.ZstdDecompressor.eof = False
+        whole = _frame(_raw_block(b'abc'))
+        for name in ('pyzstd', 'compression.zstd'):
+            with self.subTest(backend=name), mock.patch.object(zstd, '_backend', lambda: (name, Partial)):
+                with self.assertRaisesRegex(zstd.ZstdError, 'truncated'):
+                    zstd.decompress(whole, 1 << 20)
+
+    @unittest.skipUnless(importlib.util.find_spec('compression') and importlib.util.find_spec('compression.zstd'),
+                         'needs the standard-library zstd module')
+    def test_standard_library_output_is_bounded_while_decoding(self):
+        from compression import zstd as real
+        seen = []
+
+        original = real.ZstdDecompressor
+
+        class Recording:
+            def __init__(self):
+                self.inner = original()
+
+            @property
+            def eof(self):
+                return self.inner.eof
+
+            def decompress(self, data, max_length=-1):
+                seen.append(max_length)
+                return self.inner.decompress(data, max_length=max_length)
+        frame = real.compress(b'\0' * 1_000_000, options={real.CompressionParameter.content_size_flag: 0})
+        with mock.patch.object(real, 'ZstdDecompressor', Recording):
+            with self.assertRaisesRegex(zstd.ZstdError, 'exceeds'):
+                zstd.decompress(frame, 1000)
+        self.assertEqual(seen, [1001])
+
+    @unittest.skipUnless(importlib.util.find_spec('compression') and importlib.util.find_spec('compression.zstd'),
+                         'needs the standard-library zstd module to make frames')
+    def test_python_decoder_matches_the_reference_across_settings(self):
+        from compression import zstd as real
+        import random
+        P = real.CompressionParameter
+        rng = random.Random(11)
+        for trial in range(60):
+            period = rng.randbytes(rng.randint(1, 40))
+            data = b''.join(period if rng.random() < .7 else rng.randbytes(rng.randint(1, 9))
+                            for _ in range(rng.choice((1, 30, 400, 3000))))
+            options = {P.compression_level: rng.choice((-5, -1, 1, 3, 7, 12, 17, 19, 22)),
+                       P.checksum_flag: trial % 2, P.content_size_flag: (trial // 2) % 2}
+            if trial % 5 == 0:
+                options[P.window_log] = rng.choice((10, 17, 20))
+            frame = real.compress(data, options=options)
+            with self.subTest(trial=trial, options=str(options)):
+                self.assertEqual(zstd.decompress_python(frame, len(data)), data)
+                cut = rng.randrange(4, len(frame))
+                with self.assertRaises(zstd.ZstdError):
+                    zstd.decompress(frame[:cut], 1 << 22)
+
+
+class BoundsTests(Scratch):
+    def test_budget_refuses_past_its_limit(self):
+        budget = blobs.Budget(limit=10)
+        budget.charge(10)
+        with self.assertRaisesRegex(blobs.BlobError, 'more than 10 bytes'):
+            budget.charge(1)
+        self.assertEqual(budget.refused, 1)
+
+    def test_keyed_dict_nesting_is_bounded(self):
+        def nested(depth):
+            value = F.variant(1)
+            for _ in range(depth):
+                value = F.struct.pack('>IBI', 0x08, 0, 1) + F.qstring('k') + value
+            return F.struct.pack('>II', 1, 1) + F.qstring('root') + value
+        self.assertIn('root', blobs.keyed_dict(nested(30)))
+        with self.assertRaisesRegex(blobs.BlobError, 'nested too deeply'):
+            blobs.keyed_dict(nested(40))
+
+    def test_loaded_bytes_are_bounded(self):
+        db = self.library()
+        with mock.patch.object(source, 'MAX_LOAD_BYTES', 2000):
+            with self.assertRaisesRegex(resolve.ResolveError, 'more data'):
+                resolve.open_library_project(db, 0, None, self.dir)
+
+    def test_a_journal_stops_the_copy_before_it_starts(self):
+        db = self.library()
+        Path(str(db) + '-wal').write_bytes(b'')
+        with mock.patch('time.sleep'), mock.patch.object(source.tempfile, 'mkstemp', wraps=source.tempfile.mkstemp) as made:
+            with self.assertRaisesRegex(resolve.ResolveError, 'saving this project'):
+                source.snapshot(db, self.dir)
+        made.assert_not_called()
+
+    def test_a_save_that_keeps_the_size_is_still_noticed(self):
+        db = self.library()
+        real_open = open
+        opened = {'n': 0}
+
+        def opening(path, *args, **kwargs):
+            handle = real_open(path, *args, **kwargs)
+            if str(path) == str(db):
+                opened['n'] += 1
+                if opened['n'] == 1:  # saved during the first copy: same size, new time
+                    info = os.stat(db)
+                    os.utime(db, ns=(info.st_atime_ns, info.st_mtime_ns + 5_000_000_000))
+            return handle
+        with mock.patch('time.sleep'), mock.patch('builtins.open', opening):
+            copy, _digest = source.snapshot(db, self.dir)
+        self.assertEqual(opened['n'], 2)
+        self.assertEqual(len([p for p in self.dir.iterdir() if p.name.startswith('resolve-')]), 1)
+        copy.unlink()
+
+    def test_reads_take_no_lock(self):
+        # immutable=1: a library Resolve holds an exclusive lock on still reads, and nothing is created.
+        import sqlite3
+        db = self.library()
+        holder = sqlite3.connect(db, isolation_level=None)
+        try:
+            holder.execute('BEGIN EXCLUSIVE')
+            conn = source.connect(db, source.time.monotonic() + 5)
+            try:
+                self.assertEqual(conn.execute('SELECT ProjectName FROM SM_Project').fetchone()[0], 'Harbor Lights')
+            finally:
+                conn.close()
+            projects, _ = resolve.list_library(self.dir / 'library')
+            self.assertEqual((projects[0]['name'], projects[0]['error']), ('Harbor Lights', None))
+        finally:
+            holder.execute('ROLLBACK')
+            holder.close()
+
+    def test_listing_checks_size_and_header_first(self):
+        db = self.library()
+        other = db.parent.parent / 'Broken' / 'Project.db'
+        other.parent.mkdir()
+        other.write_bytes(b'not sqlite' * 10)
+        with mock.patch.object(source, 'connect', wraps=source.connect) as connected:
+            projects, _ = resolve.list_library(self.dir / 'library')
+        by_name = {p['folder']: p for p in projects}
+        self.assertEqual(by_name['Broken']['error'], 'Not a Resolve project database')
+        self.assertEqual(by_name['Harbor Lights']['error'], None)
+        self.assertEqual(connected.call_count, 1)
+        with mock.patch.object(source, 'MAX_DB_BYTES', 50):
+            projects, _ = resolve.list_library(self.dir / 'library')
+        self.assertTrue(all(p['error'].startswith('Larger than') for p in projects))
+        with mock.patch.object(source, 'MAX_LIST_SECONDS', -1):
+            projects, _ = resolve.list_library(self.dir / 'library')
+        self.assertTrue(all('too long' in p['error'] or 'Not a Resolve' in p['error'] for p in projects))
+
+    def test_xml_members_are_read_with_a_bound(self):
+        import tracemalloc
+        data = drp_with({'project.xml': '<SM_Project>' + ' ' * 40_000_000 + '</SM_Project>'})
+        tracemalloc.start()
+        try:
+            with mock.patch.object(source, 'MAX_MEMBER_BYTES', 1_000_000):
+                with self.assertRaisesRegex(resolve.ResolveError, 'more XML'):
+                    resolve.open_drp(data)
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 12_000_000)
+
+    def test_tracks_past_the_limit_are_listed(self):
+        spec = F.sample()
+        tracks = spec['timelines'][1]['tracks']
+        tracks[1:1] = [{'id': f'tr2-v{n}', 'type': 0, 'name': '', 'items': []} for n in range(2, 67)]
+        project = resolve.open_drp(F.drp_bytes(spec), 1)
+        self.assertEqual(project['trackCounts']['video'], importer.MAX_TRACKS)
+        self.assertNotIn('video:65', project['trackNames'])
+        self.assertEqual(sum('tracks of each kind' in w for w in project['compatibilityWarnings']), 2)
+
+    def test_stale_snapshots_are_reaped_only_in_the_private_folder(self):
+        folder = self.dir / 'snapshots'
+        folder.mkdir()
+        keep = self.dir / 'elsewhere'
+        keep.mkdir()
+        (keep / 'Project.db').write_bytes(b'precious')
+        old = folder / 'splice-resolve-old'
+        old.mkdir()
+        (old / 'resolve-1.db').write_bytes(b'x')
+        recent = folder / 'splice-resolve-recent'
+        recent.mkdir()
+        other = folder / 'unrelated-old'
+        other.mkdir()
+        link = folder / 'splice-resolve-link'
+        link.symlink_to(keep, target_is_directory=True)
+        hour_ago = source.time.time() - 3600
+        for path in (old, other):
+            os.utime(path, (hour_ago, hour_ago))
+        os.utime(link, (hour_ago, hour_ago), follow_symlinks=False)
+        self.assertEqual(source.reap_snapshots(folder), 1)
+        self.assertEqual(sorted(p.name for p in folder.iterdir()),
+                         ['splice-resolve-link', 'splice-resolve-recent', 'unrelated-old'])
+        self.assertEqual((keep / 'Project.db').read_bytes(), b'precious')
+
+    def test_scratch_folder_reaps_once_per_process(self):
+        os.environ['SPLICE_DATA_DIR'] = str(self.dir / 'data')
+        try:
+            stale = self.dir / 'data' / 'resolve-snapshots' / 'splice-resolve-crashed'
+            stale.mkdir(parents=True)
+            then = source.time.time() - 3600
+            os.utime(stale, (then, then))
+            with mock.patch.object(source, '_reaped', set()):
+                folder = source.scratch_folder()
+            self.assertEqual(list(folder.iterdir()), [])
+        finally:
+            os.environ.pop('SPLICE_DATA_DIR', None)
+
+    def test_non_utf8_xml_is_refused(self):
+        bomb = ('<?xml version="1.0" encoding="UTF-16"?><!DOCTYPE p [<!ENTITY a "aaaa">]>'
+                '<SM_Project><ProjectName>&a;</ProjectName></SM_Project>')
+        for data in (bomb.encode('utf-16'), bomb.encode('utf-16-le'), bomb.encode('utf-16-be'),
+                     '<?xml version="1.0" encoding="ISO-8859-1"?><SM_Project/>'.encode('latin-1')):
+            with self.subTest(data=data[:12]):
+                with self.assertRaisesRegex(resolve.ResolveError, 'not UTF-8 XML'):
+                    resolve.open_drp(drp_with({'project.xml': data}))
+        spec_xml = F.drp_bytes(F.sample())
+        with zipfile.ZipFile(io.BytesIO(spec_xml)) as archive:
+            members = {i.filename: archive.read(i) for i in archive.infolist()}
+        members['project.xml'] = b'\xef\xbb\xbf' + members['project.xml']
+        self.assertEqual(resolve.open_drp(drp_with(members))['name'], 'Harbor cut')
+
+
+class MarkerAndFlagTests(Scratch):
+    def nested_spec(self):
+        spec = F.sample()
+        spec['marker_layout'] = 'nested'
+        spec['timelines'][0]['markers'] = [(12, 'Wide shot', 'Check focus', 8), (30, 'Pickup', '', 32)]
+        spec['timelines'][0]['tracks'][0]['items'][0]['markers'] = [(2, 'Focus', '', 2), (5, 'Hold', '', 2)]
+        return spec
+
+    def test_markers_in_the_older_nested_layout(self):
+        project = resolve.open_drp(F.drp_bytes(self.nested_spec()))
+        self.assertEqual([(m['name'], m['time'], m['color']) for m in project['markers']],
+                         [('Wide shot', 0.5, 'Green'), ('Pickup', 1.25, 'Red')])
+        self.assertIn('Harbor cut · Picture · A001.mp4 at 01:00:00:00: 2 clip marker(s) are not imported.',
+                      project['compatibilityWarnings'])
+
+    def test_both_layouts_and_the_library_agree(self):
+        spec = self.nested_spec()
+        nested = resolve.open_drp(F.drp_bytes(spec))
+        spec['marker_layout'] = 'flat'
+        flat = resolve.open_drp(F.drp_bytes(spec))
+        library = resolve.open_library_project(self.library(spec), 0, None, self.dir)
+        for other in (flat, library):
+            self.assertEqual(other['markers'], nested['markers'])
+            self.assertEqual(other['compatibilityWarnings'], nested['compatibilityWarnings'])
+
+    def test_enabled_state_is_reported_not_guessed(self):
+        spec = F.sample()
+        spec['timelines'][0]['tracks'][2]['flags'] = 32
+        spec['timelines'][0]['tracks'][0]['items'][2]['flags'] = 4
+        for project in (resolve.open_drp(F.drp_bytes(spec)),
+                        resolve.open_library_project(self.library(spec), 0, None, self.dir)):
+            warnings = project['compatibilityWarnings']
+            self.assertIn('Harbor cut: clip and track enabled state, and track lock and mute, are not read from '
+                          'Resolve yet; every clip and track opens enabled, unlocked and unmuted.', warnings)
+            self.assertTrue(any(w.startswith('Harbor cut · Dialogue: the track carries Resolve flags 32') for w in warnings))
+            self.assertTrue(any(w.startswith('Harbor cut · Picture · A001.mp4 at 01:00:01:00: the clip carries '
+                                             'Resolve flags 4') for w in warnings))
+            self.assertEqual(sum('Resolve flags' in w for w in warnings), 2)
+            self.assertEqual(project['resolveTrackFlags'], {'video:1': 0, 'video:2': 0, 'audio:-1': 32})
+            self.assertEqual(by_title(project, 'i-v2')['resolveFlags'], 4)
+            self.assertEqual(by_title(project, 'i-v1')['resolveFlags'], 0)
+
+
+class TimelineIdTests(Scratch):
+    def test_timelines_open_by_id_whatever_their_order(self):
+        spec = F.sample()
+        first = resolve.open_drp(F.drp_bytes(spec))
+        self.assertEqual(first['resolveTimelineIds'], ['tl-1', 'tl-2'])
+        spec['timelines'].reverse()
+        moved = F.drp_bytes(spec)
+        self.assertEqual(resolve.open_drp(moved, 1)['name'], 'Harbor cut')
+        self.assertEqual(resolve.open_drp(moved, timeline_id='tl-2')['name'], 'Harbor alt')
+        db = self.library(spec)
+        self.assertEqual(resolve.open_library_project(db, 0, None, self.dir, timeline_id='tl-1')['name'], 'Harbor cut')
+        with self.assertRaisesRegex(resolve.ResolveError, 'no longer in this Resolve project'):
+            resolve.open_drp(moved, timeline_id='tl-9')
 
 
 class ServerTests(Scratch):
@@ -429,6 +858,11 @@ class ServerTests(Scratch):
     def test_routes(self):
         status, data = self.post('/api/resolve/open?timeline=1', F.drp_bytes(self.spec))
         self.assertEqual((status, data['project']['name']), (200, 'Harbor alt'))
+        status, data = self.post('/api/resolve/open?timelineId=tl-2', F.drp_bytes(self.spec))
+        self.assertEqual((status, data['project']['name']), (200, 'Harbor alt'))
+        status, data = self.post('/api/resolve/open?timelineId=gone', F.drp_bytes(self.spec))
+        self.assertEqual(status, 400)
+        self.assertIn('no longer in this Resolve project', data['error'])
         status, data = self.post('/api/resolve/open', b'junk')
         self.assertEqual(status, 400)
         self.assertIn('not a DaVinci Resolve project', data['error'])

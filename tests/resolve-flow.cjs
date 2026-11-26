@@ -61,7 +61,8 @@ async function main() {
     page.setDefaultTimeout(20000);
     const errors = [];
     page.on('pageerror', e => errors.push(e.message));
-    page.on('dialog', d => d.accept());
+    const dialogs = [];
+    page.on('dialog', d => { dialogs.push(d.message()); d.accept(); });
     page.on('response', async r => {
       if (r.status() >= 400 && r.url().includes('/api/') && !r.url().includes('/api/resolve/open'))
         console.error(r.status(), r.url(), (await r.text().catch(() => '')).slice(0, 300));
@@ -129,13 +130,24 @@ async function main() {
     await page.keyboard.press('Escape');
     console.log('Opened a .drp, relinked its Windows-path media, played and exported an MP4.');
 
-    // Switch timelines with the sequence selector; the relink is remembered.
+    // Switch timelines with the sequence selector: each timeline keeps its own edits (and the relink).
+    dialogs.length = 0;
+    const edited = await page.evaluate(() => { const c = Editor.get().project.clips.find(c => c.type === 'video'); Editor.updateClip(c.id, {volume:37}); return c.resolveItemId; });
     await page.locator('#sequence-select').selectOption('1');
     await waitState(() => Editor.get().project.name === 'Harbor alt');
     assert.deepEqual(await page.evaluate(() => { const c = Editor.get().project.clips[0]; return [Editor.get().project.fps, c.reverse]; }),
       [30000 / 1001, true]);
+    await page.evaluate(() => Editor.updateClip(Editor.get().project.clips[0].id, {volume:55}));
     await page.locator('#sequence-select').selectOption('0');
     await waitState(() => Editor.get().project.name === 'Harbor cut' && Editor.get().project.media.every(m => !m.offline));
+    assert.equal(await page.evaluate(id => Editor.get().project.clips.find(c => c.resolveItemId === id).volume, edited), 37);
+    await page.locator('#sequence-select').selectOption('1');
+    await waitState(() => Editor.get().project.name === 'Harbor alt');
+    assert.equal(await page.evaluate(() => Editor.get().project.clips[0].volume), 55);
+    await page.locator('#sequence-select').selectOption('0');
+    await waitState(() => Editor.get().project.name === 'Harbor cut');
+    assert.deepEqual(dialogs, []);
+    console.log('Switched timelines and back; each kept its edits without a prompt.');
 
     // Open from a disk library by typing its folder.
     await fileMenu('#open-resolve-library');
@@ -149,6 +161,37 @@ async function main() {
     assert.equal(await page.evaluate(() => Editor.get().project.clips.length), 4);
     assert.deepEqual(treeState(library), libraryBefore);
     console.log('Listed and opened a Resolve disk library project; the library is unchanged.');
+
+    // Resolve reorders the timelines and saves. The selector still lists "Harbor alt" second;
+    // it opens by its id (by position it would now be "Harbor cut"), with a note about the save.
+    execFileSync('python3', [fixtures, 'library', library, path.join(footage, 'A001.mp4'), windowsAudio, '--no-generator', '--reverse']);
+    await page.locator('#sequence-select').selectOption('1');
+    await waitState(() => Editor.get().project.name === 'Harbor alt' && Editor.get().project.resolveSource?.format === 'library');
+    await page.locator('.toast', {hasText:'saved this project again'}).waitFor();
+    console.log('A library timeline opened by its id after Resolve reordered the timelines.');
+    assert.deepEqual(errors, []);
+
+    // A browser that cannot store the original still opens the .drp, with a visible notice.
+    const limited = await browser.newContext({viewport:{width:1440, height:960}});
+    await limited.addInitScript(() => {
+      const open = indexedDB.open.bind(indexedDB);
+      indexedDB.open = (name, version) => {
+        if (name !== 'splice-resolve') return open(name, version);
+        const req = {};
+        setTimeout(() => { Object.defineProperty(req, 'error', {value:new DOMException('Quota exceeded', 'QuotaExceededError')}); req.onerror?.(); });
+        return req;
+      };
+    });
+    const second = await limited.newPage();
+    second.setDefaultTimeout(20000);
+    second.on('pageerror', e => errors.push(e.message));
+    await second.goto(url); await second.evaluate(() => SpliceSession.ready);
+    await second.locator('#resolve-input').setInputFiles(drp);
+    await second.waitForFunction(() => Editor.get().project.name === 'Harbor cut');
+    await second.locator('.toast', {hasText:'saving back to Resolve will be unavailable'}).waitFor();
+    assert.equal(await second.evaluate(() => Editor.get().project.resolveSource.originalKept), false);
+    await limited.close();
+    console.log('Opened a .drp where browser storage refused the original; the notice says write-back is unavailable.');
     assert.deepEqual(errors, []);
   } finally {
     await browser?.close();

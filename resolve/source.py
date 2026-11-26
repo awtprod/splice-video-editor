@@ -58,7 +58,18 @@ class Source:
 
 # --------------------------------------------------------------------------- .drp
 
+_XML_ENCODING = re.compile(rb'\A(?:\xef\xbb\xbf)?\s*<\?xml[^>]*?\bencoding\s*=\s*["\']([^"\']*)["\']')
+_UTF8_NAMES = {b'utf-8', b'utf8', b'us-ascii', b'ascii'}
+
+
 def _parse_xml(raw, name, budget):
+    # Resolve writes UTF-8. Anything else (UTF-16 with or without a byte order mark, or another
+    # declared encoding) is refused before parsing, so the byte-level DOCTYPE/ENTITY check below
+    # cannot be sidestepped by an encoding in which those words are not plain ASCII bytes.
+    declared = _XML_ENCODING.match(raw)
+    if (raw[:2] in (b'\xff\xfe', b'\xfe\xff') or b'\x00' in raw[:256]
+            or (declared and declared.group(1).strip().lower() not in _UTF8_NAMES)):
+        raise ResolveError(f'{name} is not UTF-8 XML, which Resolve always writes')
     if b'<!DOCTYPE' in raw or b'<!ENTITY' in raw:
         raise ResolveError(f'{name} declares a document type, which Resolve projects never do')
     for _ in range(8):
@@ -465,6 +476,52 @@ def _project_files(root):
     return found, False
 
 
+MAX_LIST_SECONDS = 60.0
+LIST_QUERY_SECONDS = 5.0
+
+
+def _list_entry(path, deadline):
+    """Name, save time and timeline count of one library project, read in place.
+
+    Listing reads each ``Project.db`` where it is, through :func:`connect` (``mode=ro`` and
+    ``immutable=1``: SQLite takes no locks and creates no journal, WAL or shared-memory file), and
+    only after checking its size and SQLite header. A file that is mid-save or damaged gives an
+    error entry, never a failed listing; opening a project reads a verified private snapshot.
+    """
+    entry = {'path': str(path), 'folder': path.parent.name, 'name': path.parent.name,
+             'saved': None, 'timelines': None, 'error': None}
+    try:
+        info = os.stat(path)
+        entry['saved'] = info.st_mtime
+        if not stat.S_ISREG(info.st_mode):
+            entry['error'] = 'Not a regular file'
+        elif info.st_size > MAX_DB_BYTES:
+            entry['error'] = f'Larger than Splice opens ({MAX_DB_BYTES // (1024 * 1024)} MB)'
+        elif _sidecar(path):
+            entry['error'] = 'Resolve is saving this project'
+        elif time.monotonic() > deadline:
+            entry['error'] = 'Not read: the library took too long to list'
+        else:
+            with open(path, 'rb') as head:
+                if head.read(len(SQLITE_MAGIC)) != SQLITE_MAGIC:
+                    entry['error'] = 'Not a Resolve project database'
+                    return entry
+            conn = connect(path, min(deadline, time.monotonic() + LIST_QUERY_SECONDS))
+            try:
+                row = conn.execute('SELECT ProjectName, LastModTimeInSecs FROM SM_Project LIMIT 2').fetchone()
+                if row:
+                    entry['name'] = (_key(row[0]) or entry['name'])[:256]
+                    if isinstance(row[1], int) and row[1] > 0:
+                        entry['saved'] = row[1]
+                (entry['timelines'],) = conn.execute(
+                    "SELECT count(*) FROM SM_Project_Sm2Timeline WHERE DbPropertyName='TimelineHandleVec'").fetchone()
+            finally:
+                conn.close()
+    except (sqlite3.Error, ResolveError, OSError) as error:
+        entry['error'] = 'Cannot read this project (%s)' % (error,)
+    return entry
+
+
 def list_library(root):
     """Projects in a disk library: [{path, name, folder, saved, timelines, error}], truncated flag."""
     root = Path(root).expanduser()
@@ -474,36 +531,51 @@ def list_library(root):
     if not files:
         raise ResolveError('No Resolve projects were found in this folder. Choose the library folder '
                            'that holds “Resolve Projects”.')
-    out = []
-    for path in sorted(files):
-        entry = {'path': str(path), 'folder': path.parent.name, 'name': path.parent.name,
-                 'saved': None, 'timelines': None, 'error': None}
+    deadline = time.monotonic() + MAX_LIST_SECONDS
+    return [_list_entry(path, deadline) for path in sorted(files)], truncated
+
+
+STALE_SNAPSHOT_SECONDS = 15 * 60
+_reaped = set()
+
+
+def reap_snapshots(folder, older_than=STALE_SNAPSHOT_SECONDS):
+    """Remove snapshot folders a crashed server left in ``folder`` (Splice's own private folder).
+
+    Only entries named the way :func:`load_library` names them are touched, never through a
+    symbolic link, and only once they are older than any read can last, so a read in progress in
+    another Splice window is left alone.
+    """
+    import shutil
+    removed = 0
+    cutoff = time.time() - older_than
+    try:
+        entries = list(os.scandir(folder))
+    except OSError:
+        return 0
+    for entry in entries:
+        if not entry.name.startswith('splice-resolve-'):
+            continue
         try:
-            entry['saved'] = os.stat(path).st_mtime
-            if _sidecar(path):
-                entry['error'] = 'Resolve is saving this project'
-            else:
-                conn = connect(path, time.monotonic() + 10)
-                try:
-                    row = conn.execute('SELECT ProjectName, LastModTimeInSecs FROM SM_Project').fetchone()
-                    if row:
-                        entry['name'] = _key(row[0]) or entry['name']
-                        if isinstance(row[1], int) and row[1] > 0:
-                            entry['saved'] = row[1]
-                    (entry['timelines'],) = conn.execute(
-                        "SELECT count(*) FROM SM_Project_Sm2Timeline WHERE DbPropertyName='TimelineHandleVec'").fetchone()
-                finally:
-                    conn.close()
-        except (sqlite3.Error, ResolveError, OSError) as error:
-            entry['error'] = 'Cannot read this project (%s)' % (error,)
-        out.append(entry)
-    return out, truncated
+            info = entry.stat(follow_symlinks=False)
+            if not stat.S_ISDIR(info.st_mode) or info.st_mtime > cutoff:
+                continue
+            shutil.rmtree(entry.path)
+            removed += 1
+        except OSError:
+            continue
+    return removed
 
 
 def scratch_folder():
-    """A private folder for library snapshots, beside Splice's media (never in the library)."""
+    """A private folder for library snapshots, beside Splice's media (never in the library).
+
+    The first use in a server process clears snapshots a crashed server left behind.
+    """
     from splice_platform import data_directory
     folder = data_directory() / 'resolve-snapshots'
     folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if str(folder) not in _reaped:
+        _reaped.add(str(folder))
+        reap_snapshots(folder)
     return folder
-

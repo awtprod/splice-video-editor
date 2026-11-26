@@ -8,6 +8,8 @@ the compact pure-Python decoder below (RFC 8878 frames without dictionaries).
 Every path refuses to produce more than ``max_output`` bytes.
 """
 
+import struct
+
 MAGIC = b'\x28\xb5\x2f\xfd'
 MAX_BLOCK = 128 * 1024
 
@@ -39,39 +41,134 @@ def backend_name():
 
 
 def decompress(frame, max_output):
-    """Decompress exactly one zstd frame, refusing output over ``max_output`` bytes."""
+    """Decompress exactly one zstd frame, refusing output over ``max_output`` bytes.
+
+    A frame that ends early (a truncated blob) is refused on every path: its block headers are
+    walked here first, and the standard-library and ``pyzstd`` decoders must also report the end of
+    the frame. A declared content size must match what was produced.
+    """
     frame = bytes(frame)
     if frame[:4] != MAGIC:
         raise ZstdError('not a zstd frame')
-    declared = _header(frame)[1]
+    offset, declared, checksum = _header(frame)
     if declared is not None and declared > max_output:
         raise ZstdError(f'zstd frame declares {declared} bytes, over the {max_output} byte limit')
+    _frame_end(frame, offset, checksum)
     name, module = _backend()
-    if name == 'compression.zstd':
-        try:
+    if name == 'python':
+        return decompress_python(frame, max_output)
+    finished = True
+    try:
+        if name == 'compression.zstd':
             decoder = module.ZstdDecompressor()
             out = decoder.decompress(frame, max_length=max_output + 1)
-        except module.ZstdError as error:
-            raise ZstdError(f'zstd: {error}') from None
-    elif name == 'zstandard':
-        try:
+            finished = decoder.eof
+        elif name == 'pyzstd':
+            decoder = module.ZstdDecompressor()
+            out = decoder.decompress(frame, max_length=max_output + 1)
+            finished = decoder.eof
+        else:
             reader = module.ZstdDecompressor().stream_reader(frame, read_across_frames=False)
             try:
                 out = reader.read(max_output + 1)
             finally:
                 reader.close()
-        except module.ZstdError as error:
-            raise ZstdError(f'zstd: {error}') from None
-    elif name == 'pyzstd':
-        try:
-            out = module.EndlessZstdDecompressor().decompress(frame, max_length=max_output + 1)
-        except module.ZstdError as error:
-            raise ZstdError(f'zstd: {error}') from None
-    else:
-        out = decompress_python(frame, max_output)
+    except (module.ZstdError, ValueError, EOFError) as error:
+        raise ZstdError(f'zstd: {error}') from None
     if len(out) > max_output:
         raise ZstdError(f'zstd output exceeds {max_output} bytes')
+    if not finished:
+        raise ZstdError('zstd: the frame is truncated')
+    if declared is not None and declared != len(out):
+        raise ZstdError('zstd: frame size does not match its header')
     return bytes(out)
+
+
+def _frame_end(frame, offset, checksum):
+    """Where the frame ends, from its block headers (raises if the frame is cut short)."""
+    while True:
+        if offset + 3 > len(frame):
+            raise ZstdError('zstd: truncated block header')
+        header = int.from_bytes(frame[offset:offset + 3], 'little')
+        offset += 3
+        last, kind, size = header & 1, (header >> 1) & 3, header >> 3
+        if kind == 3:
+            raise ZstdError('zstd: reserved block type')
+        if size > MAX_BLOCK:
+            raise ZstdError('zstd: block larger than 128 KiB')
+        offset += 1 if kind == 1 else size
+        if offset > len(frame):
+            raise ZstdError('zstd: truncated block')
+        if last:
+            break
+    if checksum:
+        offset += 4
+        if offset > len(frame):
+            raise ZstdError('zstd: truncated frame checksum')
+    return offset
+
+
+# --------------------------------------------------------------------------- XXH64 (frame checksum)
+
+_P1, _P2, _P3 = 11400714785074694791, 14029467366897019727, 1609587929392839161
+_P4, _P5 = 9650029242287828579, 2870177450012600261
+_M64 = (1 << 64) - 1
+
+
+def xxh64(data, seed=0):
+    """XXH64 of ``data`` (zstd's frame checksum is its low 32 bits)."""
+    data = memoryview(bytes(data))
+    n = len(data)
+    offset = 0
+    M, P1, P2 = _M64, _P1, _P2
+    if n >= 32:
+        v1, v2, v3, v4 = (seed + P1 + P2) & M, (seed + P2) & M, seed & M, (seed - P1) & M
+        limit = n - n % 32
+        for a, b, c, d in struct.iter_unpack('<4Q', data[:limit]):
+            v1 = (v1 + a * P2) & M
+            v1 = (((v1 << 31) | (v1 >> 33)) & M) * P1 & M
+            v2 = (v2 + b * P2) & M
+            v2 = (((v2 << 31) | (v2 >> 33)) & M) * P1 & M
+            v3 = (v3 + c * P2) & M
+            v3 = (((v3 << 31) | (v3 >> 33)) & M) * P1 & M
+            v4 = (v4 + d * P2) & M
+            v4 = (((v4 << 31) | (v4 >> 33)) & M) * P1 & M
+        h = (_rotl(v1, 1) + _rotl(v2, 7) + _rotl(v3, 12) + _rotl(v4, 18)) & M
+        for v in (v1, v2, v3, v4):
+            h = ((h ^ _xround(0, v)) * P1 + _P4) & M
+        offset = limit
+    else:
+        h = (seed + _P5) & M
+    h = (h + n) & M
+    while offset + 8 <= n:
+        (lane,) = struct.unpack_from('<Q', data, offset)
+        h ^= _xround(0, lane)
+        h = (_rotl(h, 27) * P1 + _P4) & M
+        offset += 8
+    if offset + 4 <= n:
+        (lane,) = struct.unpack_from('<I', data, offset)
+        h ^= (lane * P1) & M
+        h = (_rotl(h, 23) * P2 + _P3) & M
+        offset += 4
+    while offset < n:
+        h ^= (data[offset] * _P5) & M
+        h = (_rotl(h, 11) * P1) & M
+        offset += 1
+    h ^= h >> 33
+    h = (h * P2) & M
+    h ^= h >> 29
+    h = (h * _P3) & M
+    h ^= h >> 32
+    return h
+
+
+def _rotl(value, bits):
+    return ((value << bits) | (value >> (64 - bits))) & _M64
+
+
+def _xround(acc, lane):
+    acc = (acc + lane * _P2) & _M64
+    return (_rotl(acc, 31) * _P1) & _M64
 
 
 # --------------------------------------------------------------------------- pure Python
@@ -246,9 +343,13 @@ class _Frame:
 
     # -- literals ----------------------------------------------------------------------
     def literals(self, block):
+        if not block:
+            raise ZstdError('zstd: empty compressed block')
         kind = block[0] & 3
         form = (block[0] >> 2) & 3
         if kind in (0, 1):
+            if len(block) < (1, 2, 1, 3)[form]:
+                raise ZstdError('zstd: truncated literals header')
             if form in (0, 2):
                 size, used = block[0] >> 3, 1
             elif form == 1:
@@ -508,9 +609,24 @@ def _huffman_decode(huffman, data, regenerated, streams):
 
 
 def decompress_python(frame, max_output):
-    """The pure-Python decoder (used when no zstd library is available)."""
+    """The pure-Python decoder (used when no zstd library is available).
+
+    Any malformed input raises ZstdError: a slip inside the decoder (an index or unpack past the
+    data) is reported as a damaged frame rather than escaping as another exception.
+    """
+    try:
+        return _decompress_python(frame, max_output)
+    except ZstdError:
+        raise
+    except (IndexError, KeyError, TypeError, ValueError, OverflowError, struct.error) as error:
+        raise ZstdError(f'zstd: the frame is damaged ({type(error).__name__})') from None
+
+
+def _decompress_python(frame, max_output):
     frame = memoryview(bytes(frame))
     offset, declared, checksum = _header(frame)
+    if declared is not None and declared > max_output:
+        raise ZstdError(f'zstd frame declares {declared} bytes, over the {max_output} byte limit')
     state = _Frame(max_output)
     while True:
         if offset + 3 > len(frame):
@@ -541,10 +657,12 @@ def decompress_python(frame, max_output):
             raise ZstdError(f'zstd output exceeds {max_output} bytes')
         if last:
             break
-    if checksum:
-        offset += 4
-    if offset > len(frame):
-        raise ZstdError('zstd: truncated frame checksum')
     if declared is not None and declared != len(state.out):
         raise ZstdError('zstd: frame size does not match its header')
+    if checksum:
+        if offset + 4 > len(frame):
+            raise ZstdError('zstd: truncated frame checksum')
+        stored = int.from_bytes(frame[offset:offset + 4], 'little')
+        if stored != xxh64(state.out) & 0xFFFFFFFF:
+            raise ZstdError('zstd: frame checksum does not match (the data is damaged)')
     return bytes(state.out)

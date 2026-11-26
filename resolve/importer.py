@@ -30,6 +30,7 @@ _AUDIO_FADES = {'Cross Fade 0DB': 'Constant Gain', 'Cross Fade +3DB': 'Constant 
 _TRANSFORM, _COMPOSITE = 4, 2
 _POSITION_X, _POSITION_Y, _ZOOM_X, _ZOOM_Y = 40, 41, 42, 43
 _OPACITY = 1
+_LOCKABLE_KINDS = {'Sm2SequenceLockableBlob': 'timeline', 'Sm2TiItemLockableBlob': 'item'}
 
 
 # --------------------------------------------------------------------------- element helpers
@@ -170,30 +171,38 @@ class Model:
         self._timelines()
 
     def _markers(self):
-        holder = self.source.project.find('LockableBlobMap')
-        for wrapper in holder if holder is not None else []:
-            for el in wrapper:
-                kind = {'Sm2SequenceLockableBlob': 'timeline', 'Sm2TiItemLockableBlob': 'item'}.get(el.tag)
-                if kind is None:
-                    continue
-                owner = _text(el, 'BlobOwner')
-                try:
-                    fields = blobs.keyed_dict(_raw(el, 'FieldsBlob') or b'')
-                except BlobError:
-                    self.note('A marker list could not be decoded.')
-                    continue
-                data = fields.get('BlobData')
-                if not isinstance(data, bytes) or not owner:
-                    continue
-                payload = self.message(data, 'A marker list')
-                if payload is None:
-                    continue
-                try:
-                    found = blobs.markers(payload, MAX_MARKERS)
-                except BlobError as error:
-                    self.note(f'A marker list could not be decoded ({error}).')
-                    continue
-                self.markers.setdefault(owner, []).extend(found)
+        # Lockable blobs sit at different depths: LockableBlobMap/Element/<blob> in recent
+        # projects and LockableBlobMap/Sm2LockableBlobMap/LocableBlobSet/Element/<blob> in older
+        # ones, so every element named ...LockableBlob that has an owner is read.
+        other = 0
+        for el in self.source.project.iter():
+            if not isinstance(el.tag, str) or not el.tag.endswith('LockableBlob') or el.find('BlobOwner') is None:
+                continue
+            kind = _LOCKABLE_KINDS.get(el.tag)
+            owner = _text(el, 'BlobOwner')
+            if kind is None:
+                other += 1
+                continue
+            try:
+                fields = blobs.keyed_dict(_raw(el, 'FieldsBlob') or b'')
+            except BlobError:
+                self.note('A marker list could not be decoded.')
+                continue
+            data = fields.get('BlobData')
+            if not isinstance(data, bytes) or not owner:
+                continue
+            payload = self.message(data, 'A marker list')
+            if payload is None:
+                continue
+            try:
+                found = blobs.markers(payload, MAX_MARKERS)
+            except BlobError as error:
+                self.note(f'A marker list could not be decoded ({error}).')
+                continue
+            self.markers.setdefault(owner, []).extend(found)
+        if other:
+            self.note(f'{other} other Resolve annotation record(s) (media pool markers and clip metadata) '
+                      'are not imported.')
 
     def _media(self, el, bin_id):
         mid = el.get('DbId')
@@ -449,6 +458,15 @@ def _frames(item, tag, default=None):
     return frames, fraction or 0.0
 
 
+def timeline_index(model, timeline_id):
+    """The index of the timeline whose Resolve id is ``timeline_id`` (raises if it is gone)."""
+    for index, timeline in enumerate(model.timelines):
+        if timeline['id'] == timeline_id:
+            return index
+    raise ResolveError('That timeline is no longer in this Resolve project; it may have been deleted '
+                       'since the project was opened.')
+
+
 def to_splice(model, index=0, link_media=None, source_ref=None):
     """Splice's project for timeline ``index`` of ``model``."""
     if not model.timelines:
@@ -531,6 +549,10 @@ def to_splice(model, index=0, link_media=None, source_ref=None):
                 entry['duration'] = info['frames'] / info['rate']
             elif info['audio_seconds']:
                 entry['duration'] = info['audio_seconds']
+            if info['tracks']:
+                # Resolve's count of audio tracks. audioStreams (an integer count, with the list in
+                # audioStreamDetails) is left to Splice's media probe, which only runs while it is unset.
+                entry['resolveAudioTracks'] = info['tracks']
         if nested:
             entry['nativeUnsupported'] = 'Resolve ' + _NESTED[info['kind']]
             entry['name'] = info.get('name') or entry['name']
@@ -544,7 +566,11 @@ def to_splice(model, index=0, link_media=None, source_ref=None):
         media_out.append(entry)
         return identity
 
-    clips, by_item, links, track_names = [], {}, {}, {}
+    clips, by_item, links, track_names, track_flags = [], {}, {}, {}, {}
+    # Where Resolve keeps clip enabled/disabled and track enabled, lock and mute has not been
+    # located yet; the raw Flags values are kept (resolveFlags, resolveTrackFlags) for later.
+    warnings.add(f'{tl_name}: clip and track enabled state, and track lock and mute, are not read from '
+                 'Resolve yet; every clip and track opens enabled, unlocked and unmuted.')
     counts = {'video': 0, 'audio': 0}
     transitions = []
     for vec in timeline['container']:
@@ -570,6 +596,13 @@ def to_splice(model, index=0, link_media=None, source_ref=None):
                     continue
                 splice_track = number if kind == 'video' else -number
                 track_names[f'{kind}:{splice_track}'] = label
+                flags = blobs.parse_int(_text(track, 'Flags'))
+                if flags is not None:
+                    track_flags[f'{kind}:{splice_track}'] = flags
+                if flags:
+                    warnings.add(f'{tl_name} · {label}: the track carries Resolve flags {flags}, which Splice does '
+                                 'not interpret yet (the track may be disabled, locked or muted in Resolve; it '
+                                 'opens enabled and unlocked).')
                 items = track.find('Items')
                 for item_holder in items if items is not None else []:
                     for item in item_holder:
@@ -634,7 +667,8 @@ def to_splice(model, index=0, link_media=None, source_ref=None):
         'trackNames': track_names,
         'compatibilityWarnings': warnings.result(),
         'duration': max((c['start'] + c['duration'] for c in clips), default=0),
-        'resolveTimelines': model.labels(), 'resolveTimeline': index,
+        'resolveTimelines': model.labels(), 'resolveTimelineIds': [t['id'] for t in model.timelines],
+        'resolveTimeline': index, 'resolveTrackFlags': track_flags,
         'resolveSource': dict(source_ref or {}, kind=model.source.kind, sha256=model.source.sha256,
                               project=model.name, timelineId=timeline['id']),
     }
@@ -681,6 +715,12 @@ def _item(model, item, kind, track, label, tl_name, start_frame, num, den, secon
             'title': name, 'color': {}, 'volume': 100, 'transition': 'none',
             'resolveItemId': item.get('DbId'), 'resolveFrames': [relative, duration, source_in],
             '_where': where}
+    flags = blobs.parse_int(_text(item, 'Flags'))
+    if flags is not None:
+        clip['resolveFlags'] = flags
+    if flags:
+        warnings.add(f'{where}: the clip carries Resolve flags {flags}, which Splice does not interpret yet '
+                     '(the clip may be disabled in Resolve; it opens enabled).')
     pretty = _text(item, 'PrettyType')
     if tag == 'Sm2TiGenerator' or (tag == 'Sm2TiVideoClip' and pretty == 'Fusion Title'):
         what = 'Fusion title' if pretty == 'Fusion Title' else f'generator ({pretty or "unknown"})'

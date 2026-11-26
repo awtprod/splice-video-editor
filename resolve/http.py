@@ -38,6 +38,14 @@ def _index(value):
     return value
 
 
+def _timeline_id(value):
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value or len(value) > 256:
+        raise ResolveError('Invalid timeline')
+    return value
+
+
 def _path(payload):
     value = payload.get('path')
     if not isinstance(value, str) or not value.strip() or len(value) > 4096 or '\x00' in value:
@@ -51,13 +59,15 @@ def handle_post(handler, route, query):
         if route == '/api/resolve/open':
             data = _body(handler, MAX_DRP_BYTES)
             index = _index(query.get('timeline', [None])[0])
-            handler._json(200, {'project': open_drp(data, index, link_local)})
+            timeline_id = _timeline_id(query.get('timelineId', [None])[0])
+            handler._json(200, {'project': open_drp(data, index, link_local, timeline_id)})
         elif route == '/api/resolve/library/list':
             projects, truncated = list_library(_path(_json_body(handler)))
             handler._json(200, {'projects': projects, 'truncated': truncated})
         elif route == '/api/resolve/library/open':
             payload = _json_body(handler)
-            project = open_library_project(_path(payload), _index(payload.get('timeline')), link_local)
+            project = open_library_project(_path(payload), _index(payload.get('timeline')), link_local,
+                                           timeline_id=_timeline_id(payload.get('timelineId')))
             handler._json(200, {'project': project})
         else:
             handler.send_error(404)
