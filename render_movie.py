@@ -15,7 +15,7 @@ import tempfile
 from pathlib import Path
 
 from premiere import MEDIA_ROOT, STILL_IMAGES, _media_path
-from media_proxy import AVC_REC709, HDR_LINEAR_REC709, HDR_TONE_MAP, HDR_TRANSFERS, HDR_TO_REC709, REC709, tempo_filters
+from media_proxy import AVC_REC709, HDR_LINEAR_REC709, HDR_TONE_MAP, HDR_TRANSFERS, REC709, tempo_filters
 from splice_platform import data_directory, font_roots, installed_font
 import delivery
 
@@ -462,7 +462,7 @@ def _channel_mixer(matrix):
     return 'colorchannelmixer='+':'.join(f'{r}{c}={matrix[i][j]:.6f}' for i,r in enumerate('rgb') for j,c in enumerate('rgb'))
 
 
-def _css_color_filter(color, high_depth, still=False):
+def _css_color_filter(color, depth, still=False):
     brightness,contrast,saturation,gains=_grade_values(color)
     if (brightness,contrast,saturation,gains)==(1,1,1,(1,1,1)):
         return ''
@@ -471,7 +471,7 @@ def _css_color_filter(color, high_depth, still=False):
     contrast_filter=':'.join(f"{c}=(val-maxval/2)*{contrast:.6f}+maxval/2" for c in channels)
     mixer=_channel_mixer(_saturation_matrix(saturation))
     grade_filter=':'.join(f'{c}=val*{g:.7f}' for c,g in zip(channels,gains))
-    rgb = ('gbrap10le' if still else 'gbrp10le') if high_depth else ('rgba' if still else 'rgb24')
+    rgb = ('gbrap' if still else 'gbrp') + f'{depth}le' if depth > 8 else ('rgba' if still else 'rgb24')
     return f',format={rgb},lutrgb={brightness_filter},lutrgb={contrast_filter},{mixer},lutrgb={grade_filter}'
 
 
@@ -503,11 +503,13 @@ def _brightness_contrast(brightness, contrast, pivot=.5):
     return _linear_gain((slope,)*3)+f',exposure=exposure={-math.log2(1-offset):.12f}:black={-offset:.12f}'
 
 
-def _hdr_grade(color, lut, high_depth, profile, target=None):
+def _hdr_grade(color, lut, high_depth, profile, target=None, depth=10):
+    yuv = f'format=yuv444p{max(10,depth)}le'
+    tone_map = HDR_TONE_MAP + ',' + yuv
     brightness,contrast,saturation,gains=_grade_values(color)
     if (brightness,contrast,saturation,gains)==(1,1,1,(1,1,1)) and (not lut or not high_depth):
         if not high_depth:
-            return ','+HDR_TO_REC709+lut
+            return ','+HDR_LINEAR_REC709.format(peak=203)+','+tone_map+lut
         if not target or target==profile:
             return ''
     display_grade=(brightness,contrast,saturation)!=(1,1,1)
@@ -534,20 +536,21 @@ def _hdr_grade(color, lut, high_depth, profile, target=None):
         chain+=f',zscale=t=linear:{gamma},format=gbrpf32le'
     chain+=_linear_gain(gains)
     if not high_depth:
-        return chain+','+HDR_TONE_MAP+lut
+        return chain+','+tone_map+lut
     if lut:
         # The approximate transfer tables can clip extended-range RGB.
         chain+=',zscale=t=bt709:agamma=0,format=gbrpf32le'+lut+',zscale=t=linear:agamma=0,format=gbrpf32le'
     primaries,transfer,matrix=target or profile
-    return chain+f',zscale=p={primaries},zscale=t={transfer}:m={matrix}:r=limited:npl={peak:.9f},format=yuv444p10le'
+    return chain+f',zscale=p={primaries},zscale=t={transfer}:m={matrix}:r=limited:npl={peak:.9f},'+yuv
 
 
-def _hdr_still_filter(profile):
+def _hdr_still_filter(profile, depth):
     primaries, transfer, matrix = profile
     # zscale applies the requested legal range to every plane. Keep the
     # converted picture in legal range and restore full-range opacity.
-    limited = (f':m={matrix}:r=limited,format=yuva444p10le,'
-               "geq=lum='p(X,Y)':cb='p(X,Y)':cr='p(X,Y)':a='clip((p(X,Y)-64)*1023/876,0,1023)'")
+    scale, maximum = 1 << (depth-8), (1 << depth)-1
+    limited = (f':m={matrix}:r=limited,format=yuva444p{depth}le,'
+               f"geq=lum='p(X,Y)':cb='p(X,Y)':cr='p(X,Y)':a='clip((p(X,Y)-{16*scale})*{maximum}/{219*scale},0,{maximum})'")
     chain = (',format=gbrapf32le,setparams=color_primaries=bt709:color_trc=iec61966-2-1:colorspace=gbr:range=pc,'
              f'zscale=t=linear:p={primaries},format=gbrapf32le')
     if transfer != 'arib-std-b67' or primaries != 'bt2020':
@@ -564,22 +567,24 @@ def _hdr_still_filter(profile):
             'zscale=t='+transfer+limited)
 
 
-def _fit_picture(width, height, color, lut, alpha_format, high_depth, profile=None, rec709=False,
+def _fit_picture(width, height, color, lut, alpha_format, depth, profile=None, rec709=False,
                  *, still_frames=0, hdr_profile=None, conform_pq=False):
+    wide_yuv = f'format=yuv444p{max(10,depth)}le'
     if profile and profile[1] in HDR_TRANSFERS:
-        grade = _hdr_grade(color,lut,high_depth and not rec709,profile,PQ if conform_pq else None)
+        keep_hdr = depth > 8 and not rec709 and (depth <= 10 or hdr_profile is not None)
+        grade = _hdr_grade(color,lut,keep_hdr,profile,PQ if conform_pq else None,depth)
     else:
-        convert = (',zscale=p=bt709:t=bt709:m=bt709:r=limited,format=yuv444p10le'
+        convert = (',zscale=p=bt709:t=bt709:m=bt709:r=limited,'+wide_yuv
                    if rec709 and profile and profile!=REC709
                    and all(value not in (None,'unknown','unspecified') for value in profile) else '')
-        grade = convert+_css_color_filter(color,high_depth,bool(still_frames))+lut
+        grade = convert+_css_color_filter(color,depth,bool(still_frames))+lut
         if still_frames and hdr_profile:
-            grade += _hdr_still_filter(hdr_profile)
+            grade += _hdr_still_filter(hdr_profile,depth)
         elif conform_pq and profile:
             primaries,transfer,matrix=(value if value not in (None,'unknown','unspecified') else default
                                       for value,default in zip(profile,REC709))
             grade += (f',zscale=pin={primaries}:tin={transfer}:min={matrix}:p=bt2020:t=linear,format=gbrpf32le,'
-                      'zscale=t=smpte2084:m=bt2020nc:r=limited:npl=203,format=yuv444p10le')
+                      'zscale=t=smpte2084:m=bt2020nc:r=limited:npl=203,'+wide_yuv)
     repeat = f',loop=loop={still_frames-1}:size=1:start=0,setpts=N' if still_frames>1 else ''
     return (f'scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2'
             f'{grade},format={alpha_format},'
@@ -714,7 +719,7 @@ def _keyframe_clock(clip, fps, variable, zero):
     return f'((round({variable}*{rate!r})+({constant!r}))/{rate!r})'
 
 
-def _transform(clip, width, height, local_offset=0, fps=None):
+def _transform(clip, width, height, local_offset=0, fps=None, *, place_on_canvas=False):
     t = clip.get('transform') or {}
     scale = _number(t.get('scale',100),'scale',10,400)/100
     y = _number(t.get('y',0),'vertical position',-100,100)/100
@@ -722,7 +727,8 @@ def _transform(clip, width, height, local_offset=0, fps=None):
     local_clock=_keyframe_clock(clip,fps,'t',local_offset)
     scale_expr=_keyframe_expr(clip,'scale',scale*100,10,400,local_clock)
     timeline_clock=_keyframe_clock(clip,fps,'t',float(clip['start']))
-    horizontal=_horizontal_position(clip,width,'overlay_w',timeline_clock)
+    x = _number(t.get('x',0),'horizontal position',-100,100)
+    x_expr=_keyframe_expr(clip,'x',x,-100,100,timeline_clock)
     y_expr=_keyframe_expr(clip,'y',y*100,-100,100,timeline_clock)
     angle_expr=_keyframe_expr(clip,'rotation',angle,-180,180,local_clock)
     scale_keys = (clip.get('keyframes') or {}).get('scale')
@@ -763,7 +769,17 @@ def _transform(clip, width, height, local_offset=0, fps=None):
         canvas_width, canvas_height = 2*math.ceil(width*peak/2), 2*math.ceil(height*peak/2)
         filters += (f',pad=w={canvas_width}:h={canvas_height}:x=(ow-iw)/2:y=(oh-ih)/2'
                     f':color=black@0:eval=frame')
-    position = f"x='{horizontal}':y='(main_h-overlay_h)/2+{height/100:.3f}*({y_expr})'"
+    dx, dy = f'{width/100:.3f}*({x_expr})', f'{height/100:.3f}*({y_expr})'
+    if place_on_canvas:
+        # Center the transformed layer on transparent padding, then move the crop window
+        # in the opposite direction. Reserve only the travel used by this clip's keyframes.
+        keys = clip.get('keyframes') or {}
+        mx = math.ceil(width/100 * max([abs(x)] + [abs(p['value']) for p in keys.get('x') or []]))
+        my = math.ceil(height/100 * max([abs(y*100)] + [abs(p['value']) for p in keys.get('y') or []]))
+        position = (f"pad=w='max(iw,{width+2*mx})':h='max(ih,{height+2*my})':x=(ow-iw)/2:y=(oh-ih)/2:color=black@0,"
+                    f"crop={width}:{height}:x='(iw-ow)/2-trunc({dx})':y='(ih-oh)/2-trunc({dy})'")
+    else:
+        position = f"x='({width}-overlay_w)/2+{dx}':y='(main_h-overlay_h)/2+{dy}'"
     return filters, position
 
 
@@ -1060,8 +1076,36 @@ def _sample_origin(render_start, render_length, first, frames, fps, reverse):
     return first/fps-render_start
 
 
-def _alpha_bytes_per_pixel(high_depth):
-    return 6 if high_depth else 2.5
+def _alpha_bytes_per_pixel(spec):
+    if spec['chroma'] == '444':
+        return 8 if spec['high_depth'] else 4
+    return 6 if spec['high_depth'] else 3 if spec['chroma'] == '422' else 2.5
+
+
+def _composite_layer(filters, base, layer, output, position, overlay, first, frames, window_frames, base_format):
+    if overlay:
+        filters.append(f'[{base}][{layer}]overlay={position}:{overlay}[{output}]')
+        return
+    # FFmpeg's software overlay tops out at 10 bits. maskedmerge blends at 16 bits,
+    # with the positioned layer's alpha as the mask on every component.
+    alpha = base_format.startswith('yuva')
+    timing = f'setpts=PTS-STARTPTS,tpad=start={max(0,first)}:stop={max(0,window_frames-first-frames)}:color=black@0'
+    if first < 0:
+        timing = f'trim=start_frame={-first},' + timing
+    filters.append(f'[{layer}]format=yuva444p16le,{position},{timing},split[{output}_fg][{output}_a]')
+    if alpha:
+        # For straight alpha, weight foreground colour by As/Aout, where Aout = As + Ab*(1-As).
+        # Use As itself on the alpha plane to blend Ab towards opaque.
+        filters.append(f'[{base}]split[{output}_bg][{output}_ba];[{output}_ba]extractplanes=a[{output}_ab]')
+        filters.append(f'[{output}_a]extractplanes=a,split[{output}_as][{output}_opacity]')
+        filters.append(f"[{output}_ab][{output}_as]blend=all_expr='if(B,round(65535*B/(B+A*(1-B/65535))),0)'[{output}_weight]")
+        filters.append(f'[{output}_weight][{output}_opacity]mergeplanes=0x00000010:format={base_format}[{output}_mask]')
+        filters.append(f'[{output}_fg]lutyuv=y=val:u=val:v=val:a=maxval[{output}_color]')
+        base = f'{output}_bg'
+    else:
+        filters.append(f'[{output}_a]extractplanes=a,mergeplanes=0:format={base_format}[{output}_mask]')
+        filters.append(f'[{output}_fg]format={base_format}[{output}_color]')
+    filters.append(f'[{base}][{output}_color][{output}_mask]maskedmerge[{output}]')
 
 
 def _render_window_inner(project, output_path, directory, *, options=None, cancelled=None):
@@ -1094,13 +1138,16 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
     chroma = spec['chroma']
     if high_depth and chroma == '420':
         chroma = '422'
-    depth_suffix = 'p10le' if high_depth else 'p'
+    wide = spec['depth'] > 10
+    depth = 16 if wide else 10 if high_depth else 8
+    depth_suffix = f'p{depth}le' if high_depth else 'p'
     alpha_format = f'yuva{chroma}{depth_suffix}'
     base_format = alpha_format if spec['alpha'] else f'yuv{chroma}{depth_suffix}'
-    full_alpha = 'yuva444p10le' if high_depth else 'yuva444p'
-    dip_rgb = 'gbrap10le' if high_depth else 'gbrap'
+    full_alpha = 'yuva444' + depth_suffix
+    dip_rgb = 'gbra' + depth_suffix
     overlay_format = f'yuv{chroma}p10' if high_depth else f'yuv{chroma}'
-    overlay = 'eof_action=pass:shortest=0:format=' + overlay_format
+    overlay = None if wide else 'eof_action=pass:shortest=0:format=' + overlay_format
+    window_frames = math.ceil(duration*fps-1e-6)
     if not isinstance(render_options, dict) or not isinstance(render_options.get('mutedTracks', {}), dict):
         raise ValueError('Invalid render options')
     muted = render_options.get('mutedTracks', {})
@@ -1215,7 +1262,7 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
         reverse = bool(clip.get('reverse'))
         index, render_source = source_input(item['id'], ('main', number), plan['render_source'])
         color = clip.get('color') or {}
-        transform,position=_transform(clip,width,height,before,fps)
+        transform,position=_transform(clip,width,height,before,fps,place_on_canvas=wide)
         lut_filter=_lut_filter(color,Path(directory)/f'clip-{number}.cube',preserve_headroom=bool(
             hdr_profile and (item.get('_sourceProfile') or REC709)[1] in HDR_TRANSFERS))
         opacity=_number(clip.get('opacity',100),'opacity',0,100)/100
@@ -1229,11 +1276,11 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
             # mixes with the layers beneath.
             chain = (f'color=c=black@0:s={width}x{height}:r={fps}:d={frames/float(fps):.6f},format={alpha_format},'
                      f'setpts=PTS-STARTPTS,trim=end_frame={frames}')
-            transform, position = '', 'x=0:y=0'
+            transform, position = '', 'null' if wide else 'x=0:y=0'
         else:
             prefix = _picture_input(index,render_source,render_length,speed,width,height,fps,reverse,still_frames,
                                     frames=frames,origin=origin)
-            fit = _fit_picture(width,height,color,lut_filter,alpha_format,high_depth,item.get('_sourceProfile'),rec709,
+            fit = _fit_picture(width,height,color,lut_filter,alpha_format,depth,item.get('_sourceProfile'),rec709,
                                still_frames=still_frames,hdr_profile=hdr_profile,conform_pq=conform_pq)
             # Reverse after scaling so the buffered window holds sequence-size frames.
             flip = ',reverse' if reverse and not still_frames and index is not None else ''
@@ -1289,7 +1336,7 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
                     terminal=sorted(points,key=lambda point:point['time'])[-1]['value']
                     if key=='opacity': prior_tail['opacity']=terminal
                     else: prior_tail['transform'][key]=terminal
-            prior_transform,prior_position=_transform(prior_tail,width,height,fps=fps)
+            prior_transform,prior_position=_transform(prior_tail,width,height,fps=fps,place_on_canvas=wide)
             prior_color=previous.get('color') or {}
             prior_lut=_lut_filter(prior_color,Path(directory)/f'tail-{number}.cube',preserve_headroom=bool(
                 hdr_profile and (prior_item.get('_sourceProfile') or REC709)[1] in HDR_TRANSFERS))
@@ -1301,13 +1348,14 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
                 tail_origin = _sample_origin(start, tail, cut_frame, tail_frames, fps, prior_reverse)
                 prior_prefix = _picture_input(prior_index,prior_source,tail,prior_speed,width,height,fps,prior_reverse,
                                               still_tail,frames=tail_frames,origin=tail_origin)
-                prior_fit = _fit_picture(width,height,prior_color,prior_lut,alpha_format,high_depth,
+                prior_fit = _fit_picture(width,height,prior_color,prior_lut,alpha_format,depth,
                                          prior_item.get('_sourceProfile'),rec709,still_frames=still_tail,
                                          hdr_profile=hdr_profile,conform_pq=conform_pq)
                 prior_flip = ',reverse' if prior_reverse and not still_tail and prior_index is not None else ''
                 prior_alpha = _mask_alpha(f'{prior_opacity:.6f}',alpha_format,full_alpha) if prior_opacity!=1 else ''
                 filters.append(f'{prior_prefix},{prior_fit}{prior_flip}{prior_transform}{prior_alpha},setpts=PTS+{cut_frame}[tail{number}]')
-                filters.append(f'[{active}][tail{number}]overlay={prior_position}:{overlay}[under{number}]')
+                _composite_layer(filters, active, f'tail{number}', f'under{number}', prior_position, overlay,
+                                 cut_frame, tail_frames, window_frames, base_format)
                 active = f'under{number}'
         elif clip.get('transition') == 'dissolve' and not disabled:
             chain += f',fade=t=in:st=0:d={transition_duration:.6f}:alpha=1'
@@ -1326,7 +1374,8 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
         filters.append(chain)
         wipe_off = overlap_transition and disabled and clip.get('transition') == 'wipe'
         if overlap_transition and clip.get('transition') == 'dissolve' or wipe_off:
-            filters.append(f'[without{number}][clip{number}]overlay={position}:{overlay}[incoming{number}]')
+            _composite_layer(filters, f'without{number}', f'clip{number}', f'incoming{number}', position, overlay,
+                             first_frame, frames, window_frames, base_format)
             end = render_start+transition_duration
             progress = f'(T-{render_start:.9f})/{transition_duration:.9f}'
             # A wipe to a disabled clip uncovers the layers beneath from the left.
@@ -1336,7 +1385,8 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
             blend = f'if(lte(T,{render_start:.9f}),A,if(gte(T,{finish:.9f}),B,{mix}))'
             filters.append(f"[{active}][incoming{number}]blend=all_expr='{blend}'[base{number+1}]")
         else:
-            filters.append(f'[{active}][clip{number}]overlay={position}:{overlay}[base{number+1}]')
+            _composite_layer(filters, active, f'clip{number}', f'base{number+1}', position, overlay,
+                             first_frame, frames, window_frames, base_format)
         active = f'base{number+1}'
     window = options.get('_output_frames')
     if window is not None:
@@ -1690,7 +1740,7 @@ def _concat_list(directory, name, paths):
 
 
 def render_to_file(project, output_path, *, options=None, progress=None, cancelled=None, heartbeat=None,
-                   work_directory=None, report=None, _nested_depth=0):
+                   work_directory=None, report=None, _nested_depth=0, _lossless_intermediate=False):
     """Resolve imported nested Premiere sequences, then render the parent timeline.
 
     ``heartbeat`` is called whenever FFmpeg makes progress, so a supervisor
@@ -1705,6 +1755,11 @@ def render_to_file(project, output_path, *, options=None, progress=None, cancell
     if options is not None and not isinstance(options, dict): raise ValueError('Invalid export options')
     # Keys with a leading underscore are internal to the renderer.
     options = {key: value for key, value in (options or {}).items() if isinstance(key, str) and not key.startswith('_')}
+    if _lossless_intermediate:
+        # Use the child's MOV/PCM settings but encode losslessly. ProRes accepts only 10-bit picture.
+        spec = _delivery_spec(options)
+        options['_spec'] = dict(spec, codec='ffv1', encoder='ffv1', depth=16,
+                                pix_fmt='yuva444p16le' if spec['alpha'] else 'yuv444p16le')
     if _nested_depth>4: raise ValueError('Nested Premiere sequences exceed four levels')
     # Nested material used only by disabled clips is not rendered (it would contribute nothing).
     enabled_media = {clip.get('mediaId') for clip in project.get('clips') or [] if isinstance(clip, dict) and clip_enabled(clip)}
@@ -1719,7 +1774,7 @@ def render_to_file(project, output_path, *, options=None, progress=None, cancell
             if not child or item.get('id') not in enabled_media: continue
             if _nested_depth>=4: raise ValueError('Nested Premiere sequences exceed four levels')
             # Chroma detail lost in an intermediate cannot be recovered by the parent compositor.
-            parent_spec = _delivery_spec(options)
+            parent_spec = options.get('_spec') or _delivery_spec(options)
             child_codec = 'prores' if parent_spec['high_depth'] or parent_spec['chroma'] != '420' else 'h264'
             suffix='.mov' if child_codec=='prores' else '.mp4'
             target=Path(directory)/f'nested-{index}{suffix}'
@@ -1733,7 +1788,7 @@ def render_to_file(project, output_path, *, options=None, progress=None, cancell
             if child_codec=='h264' and options.get('codec','h264')=='h264' and 'crf' in options and not options.get('rateControl'):
                 child_options['crf']=options['crf']
             render_to_file(child,target,options=child_options,cancelled=cancelled,heartbeat=heartbeat,work_directory=work_directory,
-                           _nested_depth=_nested_depth+1)
+                           _nested_depth=_nested_depth+1, _lossless_intermediate=parent_spec['depth'] > 10)
             item['src']='/media/'+str(target.relative_to(MEDIA_ROOT))
             item['duration']=max((float(c['start'])+float(c['duration']) for c in child['clips']),default=0)
             item.pop('nestedSequence',None)
@@ -1757,10 +1812,10 @@ def _delivery_spec(options):
     return delivery.normalize({key: value for key, value in options.items() if not key.startswith('_')})
 
 
-def _export_settings(options):
+def _export_settings(options, *, spec=None):
     unknown = [key for key in options if not key.startswith('_') and key not in delivery.KNOWN_OPTIONS]
     if unknown: raise ValueError(f'Unknown export option {sorted(unknown)[0]!r}')
-    spec = _delivery_spec(options)
+    spec = spec or _delivery_spec(options)
     color_space = spec['color_space']
     enabled = options.get('limiter', True)
     if not isinstance(enabled, bool): raise ValueError('Invalid limiter setting: use true or false')
@@ -1820,6 +1875,8 @@ def _estimated_bytes(width, height, fps, seconds, spec):
         bits = 0
     elif spec['kind'] == 'images':
         bits = {'png': 24 if spec['profile'] == '8' else 40, 'tiff': 48, 'dpx': 32, 'exr': 30}[spec['codec']]
+    elif spec['codec'] == 'ffv1':
+        bits = 64 if spec['alpha'] else 48
     elif spec['codec'] in BITS_PER_PIXEL:
         bits = BITS_PER_PIXEL[spec['codec']][spec['profile']] * 1.5
     else:
@@ -1872,7 +1929,7 @@ class HardwareEncoderFailed(RuntimeError):
 
 def _render_delivery(project, output_path, *, options, progress, cancelled, heartbeat, work_directory, report):
     import copy
-    spec, color_space, limiter, language, peak_safe = _export_settings(options)
+    spec, color_space, limiter, language, peak_safe = _export_settings(options, spec=options.get('_spec'))
     codec = spec['codec']
     audio_only = spec['kind'] == 'audio'
     # One private copy: probe results are cached on its media items.
@@ -2221,7 +2278,7 @@ def _picture_windows(project, picture, first, stop, total_frames, fps, width, he
     protected.sort()
     reversed_spans.sort()
     import bisect
-    frame_bytes = width*height*_alpha_bytes_per_pixel(spec['high_depth'])
+    frame_bytes = width*height*_alpha_bytes_per_pixel(spec)
     reverse_frames = max(1, int(REVERSE_BUFFER_BYTES // frame_bytes))
     frames = [0]
     reversed_active, reversed_next = [], 0

@@ -317,6 +317,42 @@ class Intra(DeliveryCase):
 
 
 class ImageSequences(DeliveryCase):
+    def test_high_precision_sequence_keeps_fine_steps_through_a_composite(self):
+        # 4096 distinct legal-range luma codes. A 10-bit composite collapses several steps into one.
+        source = self.media / 'fine-ramp.mkv'
+        ffmpeg('-f', 'lavfi', '-i', f"nullsrc=s={W}x{H},format=yuv444p16le,"
+               f"geq=lum='4096+8*mod(X+Y*{W},4096)':cb=32768:cr=32768",
+               '-frames:v', '4', '-c:v', 'ffv1', str(source))
+        project = self.project(extra=dict(media=[dict(id='m', src=self.src(source))],
+                                          clips=[dict(type='video', track=1, mediaId='m', start=0, duration=.125, opacity=75)]))
+        nested = self.project(extra=dict(media=[dict(id='n', nestedProject=project)],
+                                         clips=[dict(type='video', track=1, mediaId='n', start=0, duration=.125)]))
+        for codec, timeline in [('png', project), ('tiff', project), ('exr', project), ('png', nested)]:
+            with self.subTest(codec=codec, nested=timeline is nested):
+                folder, _ = self.render(timeline, dict(codec=codec))
+                frame = next(p for p in sorted(folder.iterdir()) if p.suffix != '.wav')
+                # Half float has fewer representable values near white.
+                self.assertGreater(self.levels(frame, 'gray16le', frame=0), 3000 if codec == 'exr' else 3900)
+
+    def test_16bit_composite_positions_and_blends_straight_alpha(self):
+        media = []
+        for color in ('black', 'white'):
+            path = self.media / f'{color}.png'
+            ffmpeg('-f', 'lavfi', '-i', f'color={color}:s={W}x{H}', '-frames:v', '1', str(path))
+            media.append(dict(id=color, src=self.src(path)))
+        clips = [dict(type='video', mediaId='black', track=1, start=0, duration=5/FPS, opacity=50),
+                 dict(type='video', mediaId='white', track=2, start=1/FPS, duration=3/FPS, opacity=50,
+                      keyframes=dict(x=[dict(time=0, value=50), dict(time=2/FPS, value=-50)]))]
+        folder, _ = self.render(self.project(extra=dict(media=media, clips=clips)), dict(codec='png', profile='16', alpha=True))
+        for path, covered in zip(sorted(folder.glob('*.png')), [False, False, True, True, False], strict=True):
+            raw = subprocess.check_output(['ffmpeg', '-v', 'error', '-i', str(path), '-f', 'rawvideo',
+                                           '-pix_fmt', 'rgba64le', '-'], timeout=60)
+            offset = 4 * (H//2 * W + W//4)
+            r, g, b, a = array('H', raw)[offset:offset + 4]
+            self.assertAlmostEqual(a / 65535, .75 if covered else .5, delta=.005)
+            for value in (r, g, b):
+                self.assertAlmostEqual(value / 65535, 2/3 if covered else 0, delta=.01)
+
     def check_sequence(self, folder, extension, pix, *, start=0, padding=7, count=FPS * SECONDS):
         files = sorted(folder.glob(f'*.{extension}'))
         self.assertEqual(len(files), count)
