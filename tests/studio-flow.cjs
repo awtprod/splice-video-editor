@@ -1,6 +1,7 @@
 /* Regression through the shipped Linux HTTP, browser and FFmpeg entry points. */
 const assert = require('node:assert/strict');
-const {spawn, execFileSync} = require('node:child_process');
+const {execFileSync} = require('node:child_process');
+const {startSplice} = require('./splice-server.cjs');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -9,17 +10,10 @@ const {chromium} = require('playwright-core');
 async function main() {
   const root = path.resolve(__dirname, '..');
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'splice-flow-'));
-  const server = spawn('python3', ['-u','server.py','--port','0'], {
-    cwd:root, env:{...process.env, HOME:temp, XDG_DATA_HOME:temp}, stdio:['ignore','pipe','pipe']
-  });
-  let browser, logs='';
-  server.stderr.on('data',chunk=>{logs=(logs+chunk).slice(-4000);});
+  const splice=await startSplice({root,env:{HOME:temp,XDG_DATA_HOME:temp}});
+  const url=splice.url;
+  let browser;
   try {
-    const url=await new Promise((resolve,reject)=>{
-      server.stdout.once('data',d=>resolve(d.toString().trim()));
-      server.once('error',reject);
-      server.once('exit',code=>reject(Error('Server exited '+code+' '+logs)));
-    });
     const executablePath=[process.env.SPLICE_CHROME,'/opt/google/chrome/chrome','/usr/bin/chromium','/usr/bin/google-chrome',chromium.executablePath()].find(p=>p&&fs.existsSync(p));
     assert.ok(executablePath,'Install Chromium or set SPLICE_CHROME');
     browser=await chromium.launch({executablePath,args:['--no-sandbox','--autoplay-policy=no-user-gesture-required']});
@@ -44,7 +38,7 @@ async function main() {
     };
     const fileMenu=async(id)=>{if(!await page.locator(id).isVisible())await click('.file-menu summary');await click(id);};
     const waitState=async(fn,arg)=>page.waitForFunction(fn,arg,{timeout:12000});
-    await page.goto(url);await page.evaluate(()=>SpliceSession.ready);
+    await splice.open(page);
     await waitState(()=>Editor.get().video.readyState>=2);
     const screenshots=process.env.SPLICE_PROOF_DIR;
     if(screenshots){fs.mkdirSync(screenshots,{recursive:true});await page.screenshot({path:path.join(screenshots,'Splice-workspace.png')});}
@@ -325,7 +319,7 @@ async function main() {
     assert.deepEqual(errors,[]);
   } finally {
     await browser?.close();
-    if(server.exitCode===null){const end=new Promise(r=>server.once('exit',r));server.kill('SIGTERM');await end;}
+    await splice.stop();
     fs.rmSync(temp,{recursive:true,force:true});
   }
 }
