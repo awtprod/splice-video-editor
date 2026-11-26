@@ -11,7 +11,7 @@ import math
 from fractions import Fraction
 from pathlib import PurePath, PureWindowsPath
 
-from . import blobs
+from . import blobs, effects
 from .blobs import BlobError
 from .source import ResolveError
 
@@ -32,10 +32,10 @@ _AUDIO_FADES = {'Cross Fade 0DB': 'Constant Gain', 'Cross Fade +3DB': 'Constant 
 # 1920-wide timeline is 0.1041667), Volume parameter 95 holds decibels (+6 dB is 6.0). Position
 # Y (41), Zoom (42, 43) and Opacity (Composite 1) were not measured: their units are inferred and
 # every clip that uses them says so.
-_TRANSFORM, _COMPOSITE, _AUDIO_VOLUME = 4, 2, 124
-_POSITION_X, _POSITION_Y, _ZOOM_X, _ZOOM_Y = 40, 41, 42, 43
-_OPACITY = 1
-_VOLUME_DB = 95
+_TRANSFORM, _COMPOSITE, _AUDIO_VOLUME = effects.TRANSFORM, effects.COMPOSITE, effects.AUDIO_VOLUME
+_POSITION_X, _POSITION_Y, _ZOOM_X, _ZOOM_Y = effects.POSITION_X, effects.POSITION_Y, effects.ZOOM_X, effects.ZOOM_Y
+_OPACITY = effects.OPACITY
+_VOLUME_DB = effects.VOLUME_DB
 # Splice's clip volume is a linear gain in percent, 0 to 200 (+6.02 dB).
 MAX_VOLUME = 200.0
 # Sm2TiTrack/Flags and Sm2TiVideoClip/Flags, measured the same way: a track's Flags go 0 -> 1 when
@@ -391,26 +391,7 @@ def _effects(model, data, where, warn, clip, is_video):
         warn(where + ': its effects could not be decoded and are not imported.')
         return
     try:
-        top = blobs.protobuf(payload)
-        for value in blobs.pb_all(top, 1, 2):
-            effect = blobs.protobuf(value)
-            kind = blobs.pb_first(effect, 1, 0)
-            params = {}
-            plugin = None
-            keyed = False
-            for raw in blobs.pb_all(effect, 9, 2):
-                param = blobs.protobuf(raw)
-                pid = blobs.pb_first(param, 1, 0)
-                number = None
-                for holder in blobs.pb_all(param, 3, 2):
-                    for inner in blobs.pb_all(blobs.protobuf(holder), 1, 2):
-                        number = blobs.pb_double(blobs.pb_first(blobs.protobuf(inner), 2, 1)) if number is None else number
-                    for inner in blobs.pb_all(blobs.protobuf(holder), 2, 2):
-                        plugin = plugin or blobs.pb_text(blobs.pb_first(blobs.protobuf(inner), 2, 2))
-                if blobs.pb_all(param, 4):
-                    keyed = True
-                if pid is not None:
-                    params[pid] = number
+        for kind, params, plugin, keyed in effects.decode(payload):
             if not params and not plugin:
                 continue  # an effect at its defaults
             if keyed:
