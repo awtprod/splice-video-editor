@@ -561,3 +561,23 @@ class FramingTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class PathMappingTests(unittest.TestCase):
+    def test_the_longest_rule_wins_whatever_the_order(self):
+        from resolve import facts
+        rules = facts.check_mappings([{'from': '/mnt', 'to': 'E:\\'}, {'from': '/mnt/media', 'to': 'F:\\Footage'}])
+        self.assertEqual(facts.map_path('/mnt/media/x.mov', rules), 'F:\\Footage\\x.mov')
+        self.assertEqual(facts.map_path('/mnt/media/x.mov', list(reversed(rules))), 'F:\\Footage\\x.mov')
+        self.assertEqual(facts.map_path('/mnt/mediax/y.mov', rules), 'E:\\mediax\\y.mov')
+        self.assertEqual(facts.map_path('/mnt/other/z.wav', rules), 'E:\\other\\z.wav')
+        self.assertEqual(facts.map_path('/srv/z.wav', rules), '/srv/z.wav')
+        self.assertEqual(facts.mapped('/mnt/media/a/b.mov', rules), ('F:\\Footage\\a\\b.mov', 1))
+        self.assertEqual(facts.map_path('/mnt/media/x.mov', facts.check_mappings(
+            [{'from': '/mnt/media', 'to': '\\\\nas\\share'}])), '\\\\nas\\share\\x.mov')
+
+    def test_rules_must_be_absolute_paths(self):
+        from resolve import facts
+        for rule in ({'from': 'media', 'to': 'E:\\'}, {'from': '/mnt', 'to': 'E:'}, {'from': '/mnt', 'to': ''}):
+            with self.assertRaises(ValueError):
+                facts.check_mappings([rule])

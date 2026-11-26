@@ -311,7 +311,8 @@ window.SpliceResolve = (() => {
       '<fieldset data-seed><legend>Made from</legend></fieldset>' +
       '<fieldset data-timelines><legend>Timelines</legend></fieldset>' +
       '<details><summary>Path mapping (optional)</summary><p class="resolve-note">Where the Resolve computer sees your media, ' +
-      'one “from folder => to folder” per line.</p><textarea name="pathMap" rows="3" spellcheck="false" ' +
+      'one “from folder => to folder” per line. Where several rules match a path, the longest “from” folder wins, '
+      + 'whatever the order (<code>/mnt/media</code> before <code>/mnt</code>).</p><textarea name="pathMap" rows="3" spellcheck="false" ' +
       'placeholder="/mnt/shoot => E:\\Shoot"></textarea></details>' +
       '<label class="resolve-check"><input type="checkbox" name="unverified"> Allow media kinds Resolve has not been ' +
       'verified to take (they are listed in the report)</label>' +

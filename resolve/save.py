@@ -18,7 +18,7 @@ import tempfile
 from pathlib import Path
 
 from . import importer, items, mediapool
-from .facts import check_mappings, map_path, measure
+from .facts import check_mappings, mapped, measure
 from .place import PlaceError, Staging, check_name, check_new, library_users, pick_user
 from .source import ResolveError, load_library, snapshot
 from .writer import EXACT, NOT_WRITTEN, OPT_IN, Report, Seed, WriteError, Writer, prepare_template
@@ -199,6 +199,7 @@ class Measurer:
         self.resolve_media = resolve_media
         self.cache = {}
         self.local_of = {}
+        self.rules_used = {}  # index of the path-mapping rule -> names of the files it mapped
         for project in request.timelines:
             for media in project.get('media') or []:
                 if isinstance(media, dict) and media.get('resolveMediaId') and media.get('src'):
@@ -217,7 +218,9 @@ class Measurer:
             if isinstance(path, str) and (path[1:3] == ':\\' or path.startswith('\\\\')) and media.get('resolveMediaId'):
                 resolve_path = path
             else:
-                resolve_path = map_path(local, self.request.mappings) if local else None
+                resolve_path, rule = mapped(local, self.request.mappings) if local else (None, None)
+                if rule is not None:
+                    self.rules_used.setdefault(rule, {})[Path(str(local)).name] = None
         if local is None:
             return None, 'its file is not on this computer'
         key = (str(local), resolve_path)
@@ -350,7 +353,8 @@ def _write(request, target, scratch, resolve_media, report):
     seed = Seed(target)
     try:
         page_size, encoding = seed.page_size, seed.encoding
-        writer = Writer(seed, model, report, facts_for=Measurer(request, resolve_media),
+        measurer = Measurer(request, resolve_media)
+        writer = Writer(seed, model, report, facts_for=measurer,
                         allow_unverified=request.allow_unverified, allow_unproven=request.allow_unproven,
                         template_mode=request.seed['kind'] == 'template', keep_template_media=request.keep_media)
         if request.seed['kind'] == 'template':
@@ -390,6 +394,10 @@ def _write(request, target, scratch, resolve_media, report):
     if differences:
         raise WriteError('Self-check failed: the written project does not read back as meant: '
                          + '; '.join(differences[:5]) + '. Nothing was placed.')
+    for index, (source, target) in enumerate(request.mappings):
+        for name in measurer.rules_used.get(index, ()):
+            report.add(EXACT, 'Media paths mapped for the Resolve computer (where several rules match a path, the '
+                       'longest “from” folder wins, whatever the order)', f'{source} => {target}: {name}')
     report.add(EXACT, 'Everything else in the seed (bins, grades, Fusion, Fairlight, project settings) carried over '
                'unchanged, row for row')
     return {'ok': True, 'lines': report.lines(), 'needs': sorted(report.needs), 'notes': report.notes,

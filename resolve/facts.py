@@ -27,37 +27,28 @@ _MONTHS = ('Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct',
 
 
 def check_mappings(mappings):
-    """``[(from prefix, to prefix)]`` from the request: at most 16 pairs of non-empty text."""
+    """``[(from prefix, to prefix)]`` from the request: at most 16 rules, both sides absolute paths
+    (``/...``, ``X:\\...`` or ``\\\\server\\share\\...``), checked as the timeline exporter checks its own."""
+    from interchange.media import path_rules
     if mappings in (None, ''):
         return []
-    if not isinstance(mappings, list) or len(mappings) > MAX_MAPPINGS:
-        raise ValueError('Path mapping must be a list of at most 16 pairs.')
-    out = []
-    for pair in mappings:
-        if not isinstance(pair, dict):
-            raise ValueError('Each path mapping needs a “from” and a “to” folder.')
-        source, target = pair.get('from'), pair.get('to')
-        if not isinstance(source, str) or not isinstance(target, str) or not source.strip() or not target.strip() \
-                or len(source) > 1024 or len(target) > 1024 or '\x00' in source + target:
-            raise ValueError('Each path mapping needs a “from” and a “to” folder.')
-        out.append((source.strip(), target.strip()))
-    return out
+    if isinstance(mappings, list) and len(mappings) > MAX_MAPPINGS:
+        raise ValueError(f'Path mapping must be a list of at most {MAX_MAPPINGS} rules.')
+    return path_rules(mappings)
 
 
 def map_path(local, mappings):
-    """The path Resolve sees for ``local``: the first mapping whose folder holds it (compared
-    folder by folder), with the rest joined in the target's style; ``local`` itself otherwise."""
-    local = str(local)
-    for source, target in mappings:
-        base = source.rstrip('/\\')
-        if local == base or local.startswith(base + '/') or local.startswith(base + '\\'):
-            rest = [p for p in local[len(base):].replace('\\', '/').split('/') if p]
-            windows = '\\' in target or (len(target) >= 2 and target[1] == ':') or target.startswith('\\\\')
-            root = target.rstrip('/\\')
-            if windows:
-                return str(PureWindowsPath(root + '\\', *rest)) if len(root) == 2 else '\\'.join([root, *rest])
-            return str(PurePosixPath(root or '/', *rest))
-    return local
+    """The path Resolve sees for ``local``: the rule whose “from” folder is the LONGEST
+    whole-folder prefix of it wins, whatever the order (on a tie, the earlier rule), exactly as
+    the timeline exporter maps paths; the rest of the path is written in the “to” side's style.
+    ``local`` itself when no rule matches."""
+    return mapped(local, mappings)[0]
+
+
+def mapped(local, mappings):
+    """``(path Resolve sees, index of the rule that applied or None)`` (see :func:`map_path`)."""
+    from interchange.media import map_path as interchange_map
+    return interchange_map(str(local), list(mappings))
 
 
 def _birth_ns(path):
