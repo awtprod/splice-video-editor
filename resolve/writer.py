@@ -37,6 +37,64 @@ EXACT, OPT_IN, NOT_WRITTEN = 'written', 'opt-in', 'not written'
 TRACK_LOCKED, TRACK_OFF, CLIP_OFF = 0x1, 0x2, 0x2
 _EPSILON = 1e-4  # frames: Splice keeps times in seconds as doubles
 
+# Every field of Splice's project model, and what the writer does with it. A field the tables do
+# not name is compared with what the reader made of the seed and reported when it differs, so a
+# feature the editor gains later is never dropped without a report line (tests read the editor's
+# sources and fail on a field these tables do not name).
+#: Project fields: 'written' (or refused with a message), 'reported' (compared and reported),
+#: 'derived' (follows from other fields), 'meta' (Splice's bookkeeping).
+PROJECT_FIELDS = {
+    'name': 'written', 'clips': 'written', 'media': 'written', 'startTimecode': 'written', 'trackNames': 'written',
+    'trackCounts': 'written', 'trackState': 'written', 'trackMix': 'written', 'fps': 'written',
+    'frameRate': 'written', 'width': 'reported', 'height': 'reported', 'markers': 'reported',
+    'captions': 'reported', 'dropFrame': 'reported', 'marks': 'reported', 'duration': 'derived',
+    'startFrame': 'derived', 'resolveSource': 'meta', 'resolveTimeline': 'meta', 'resolveTimelineIds': 'meta',
+    'resolveTimelines': 'meta', 'resolveTrackFlags': 'meta', 'compatibilityWarnings': 'meta',
+    'compatibilityDetails': 'meta', 'premiereSequences': 'meta', 'id': 'meta', 'version': 'meta',
+    'savedAt': 'meta', 'revision': 'meta'}
+#: Clip fields (see :data:`PROJECT_FIELDS`).
+CLIP_FIELDS = {
+    'id': 'meta', 'type': 'written', 'track': 'written', 'start': 'written', 'duration': 'written', 'in': 'written',
+    'mediaId': 'written', 'linkGroup': 'written', 'enabled': 'written', 'volume': 'written',
+    'transform': 'written', 'transition': 'written', 'transitionDuration': 'written',
+    'transitionBefore': 'written', 'transitionMatchName': 'written', 'speed': 'reported', 'reverse': 'reported',
+    'keyframes': 'reported', 'color': 'reported', 'opacity': 'reported', 'fadeIn': 'reported',
+    'fadeOut': 'reported', 'pan': 'reported', 'title': 'reported', 'titleStyle': 'reported', 'text': 'reported',
+    'markers': 'reported', 'embeddedAudio': 'reported', 'audioStream': 'reported',
+    'nativeTimeRemap': 'reported', 'nativeUnsupported': 'written', 'resolveItemId': 'meta',
+    'resolveFrames': 'meta', 'resolveFlags': 'meta', 'resolveTransitionId': 'meta', 'premiereTrack': 'meta',
+    'premiereIndex': 'meta', 'premiereId': 'meta', 'nativeId': 'meta', 'locked': 'meta', 'selected': 'meta'}
+#: Sub-fields of a clip's ``color``, ``transform`` and ``keyframes`` with their neutral values.
+COLOR_FIELDS = {'brightness': 100, 'contrast': 100, 'saturation': 100, 'exposure': 0, 'temperature': 0, 'tint': 0,
+                'lut': None, 'lutName': None, 'lutIntensity': 100}
+TRANSFORM_FIELDS = {'x': 0, 'y': 0, 'scale': 100, 'rotation': 0}
+KEYFRAME_FIELDS = ('opacity', 'x', 'y', 'scale', 'rotation', 'volume')
+TRACK_STATE_FIELDS = {'locked': 'written', 'hidden': 'written', 'syncLocked': 'reported'}
+TRACK_MIX_FIELDS = {'mute': 'written', 'gain': 'reported', 'pan': 'reported', 'solo': 'reported'}
+#: Media fields: what the writer reads; ``name`` (a rename in Splice) is reported.
+MEDIA_FIELDS = {
+    'id': 'meta', 'name': 'reported', 'src': 'written', 'type': 'written', 'duration': 'meta', 'path': 'written',
+    'offline': 'meta', 'bin': 'meta', 'thumb': 'meta', 'resolveMediaId': 'written', 'resolveAudioTracks': 'meta',
+    'nativeUnsupported': 'written', 'nestedSequence': 'reported', 'nestedProject': 'reported', 'audioChannels': 'meta',
+    'still': 'meta', 'width': 'meta', 'height': 'meta', 'fps': 'meta', 'size': 'meta', 'codec': 'meta',
+    'audioStreams': 'meta', 'timecode': 'meta', 'proxy': 'meta', 'premiereId': 'meta', 'mediaKey': 'meta',
+    'linked': 'meta', 'missing': 'meta', 'local': 'meta', 'file': 'meta', 'audio': 'meta', 'video': 'meta'}
+_DEFAULTS = {'speed': 1, 'reverse': False, 'opacity': 100, 'fadeIn': 0, 'fadeOut': 0, 'pan': 0, 'title': '',
+             'markers': [], 'keyframes': {}, 'color': {}, 'audioStream': 0, 'nativeTimeRemap': None,
+             'titleStyle': None, 'text': None, 'embeddedAudio': None}
+
+
+def _same(a, b):
+    """Equal as Splice means it: numbers to a millionth, an absent value as its neutral one."""
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)) and not isinstance(a, bool) \
+            and not isinstance(b, bool):
+        return abs(a - b) <= 1e-6
+    if isinstance(a, dict) and isinstance(b, dict):
+        return set(a) == set(b) and all(_same(a[k], b[k]) for k in a)
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(_same(x, y) for x, y in zip(a, b))
+    return a == b
+
 
 class WriteError(ResolveError):
     """The project cannot be written as asked; nothing was placed."""
@@ -454,6 +512,11 @@ class Writer:
         if len(clips) > MAX_CLIPS:
             raise WriteError(f'“{name}” has more than {MAX_CLIPS:,} clips.')
         media = {m.get('id'): m for m in project.get('media') or [] if isinstance(m, dict)}
+        self.current_media = media
+        base = self.baseline(entry)
+        self.base_clips = {c.get('resolveItemId'): c for c in base.get('clips') or [] if c.get('resolveItemId')}
+        self.base_media = {m.get('id'): m for m in base.get('media') or []}
+        self._project_changes(project, base, name)
         self._tracks(project, timeline, name)
         expected, claimed = {}, set()
         placed = []  # (clip, item id, kind, track id, start, duration, in, new row or None)
@@ -478,6 +541,17 @@ class Writer:
         self.expected.append((timeline, expected, transitions, start, name))
         if start != timeline.start or self._timeline_changed(timeline):
             self.sequence_updates[timeline.sequence] = (start, timeline)
+
+    def baseline(self, entry):
+        """Splice's project of the seed's timeline as the reader makes it: what every change is
+        compared with."""
+        index = next((i for i, t in enumerate(self.model.timelines) if t['id'] == entry['id']), None)
+        if index is None:
+            return {}
+        try:
+            return importer.to_splice(self.model, index, None, {'format': 'library'})
+        except ResolveError:
+            return {}
 
     def _imported_item(self, row, timeline):
         """Whether the reader turned this seed item into a Splice clip (so its absence in Splice
@@ -672,41 +746,153 @@ class Writer:
         return (clip, item_id, kind, track_id, start + rel, duration, source_in, row, view, [])
 
     def _not_written(self, clip, kind, seed, where):
-        """Report every edit of ``clip`` the writer does not carry into Resolve."""
+        """Report every edit of ``clip`` the writer does not carry into Resolve: each field is
+        compared with what the reader made of the seed's item (or, for a new clip, with the
+        neutral value) and reported per kind of change."""
         report = self.report
-        before = _imported(seed[2], kind) if seed else None
-        speed = clip.get('speed', 1)
-        if (speed != 1 or clip.get('reverse')) and seed is None:
-            pass  # reported where new clips are refused
-        elif seed is not None and not (isinstance(seed[2].get('MediaTimemapBA'), bytes) and
-                                       len(seed[2]['MediaTimemapBA']) == 9) and seed[2].get('MediaTimemapBA'):
-            pass  # a retimed Resolve clip keeps its own speed
-        elif speed != 1 or clip.get('reverse'):
+        base = self.base_clips.get(clip.get('resolveItemId')) if seed is not None else None
+
+        def was(field, default=None):
+            if base is not None:
+                return base.get(field, _DEFAULTS.get(field, default))
+            return _DEFAULTS.get(field, default)
+
+        def changed(field, default=None):
+            return not _same(clip.get(field, _DEFAULTS.get(field, default)), was(field, default))
+        retimed_seed = seed is not None and seed[2].get('MediaTimemapBA') is not None and not (
+            isinstance(seed[2].get('MediaTimemapBA'), bytes) and len(seed[2]['MediaTimemapBA']) == 9)
+        if seed is not None and not retimed_seed and (changed('speed') or changed('reverse')):
             report.add(NOT_WRITTEN, 'Speed changes and reversed clips', where)
-        if clip.get('keyframes'):
-            report.add(NOT_WRITTEN, 'Keyframes', where)
-        if isinstance(clip.get('color'), dict) and any(v not in (0, None, '', False) for v in clip['color'].values()):
-            report.add(NOT_WRITTEN, 'Splice color adjustments and LUTs (Resolve grades are not written)', where)
-        if clip.get('lut'):
-            report.add(NOT_WRITTEN, 'Splice color adjustments and LUTs (Resolve grades are not written)', where)
-        if (clip.get('fadeIn') or 0) > 0 or (clip.get('fadeOut') or 0) > 0:
-            report.add(NOT_WRITTEN, 'Clip fades (Resolve fade handles are not written)', where)
+        elif seed is not None and retimed_seed and (changed('speed') or changed('reverse')):
+            report.add(NOT_WRITTEN, 'Speed changes of retimed Resolve clips (the clip keeps Resolve\'s speed)', where)
+        if changed('nativeTimeRemap'):
+            report.add(NOT_WRITTEN, 'Speed ramps (time remapping)', where)
+        keyframes = clip.get('keyframes') if isinstance(clip.get('keyframes'), dict) else {}
+        animated = sorted(k for k, v in keyframes.items() if v and not _same(v, (was('keyframes') or {}).get(k)))
+        if animated:
+            report.add(NOT_WRITTEN, 'Keyframes', f'{where} ({", ".join(animated)})')
+        color = clip.get('color') if isinstance(clip.get('color'), dict) else {}
+        before_color = was('color') if isinstance(was('color'), dict) else {}
+        tone = [k for k in color if k not in ('lut', 'lutName', 'lutIntensity') and
+                not _same(color.get(k), before_color.get(k, COLOR_FIELDS.get(k)))]
+        if tone:
+            report.add(NOT_WRITTEN, 'Splice color adjustments (Resolve grades are not written)',
+                       f'{where} ({", ".join(sorted(tone))})')
+        if color.get('lut') and not _same(color.get('lut'), before_color.get('lut')):
+            report.add(NOT_WRITTEN, 'Splice LUTs (Resolve grades are not written)', where)
+        for field, what in (('fadeIn', 'Clip fades (Resolve fade handles are not written)'),
+                            ('fadeOut', 'Clip fades (Resolve fade handles are not written)'),
+                            ('markers', 'Clip markers (not written: Resolve keeps the markers its clips have)'),
+                            ('title', 'Clip names changed in Splice (Resolve keeps its item names)'),
+                            ('audioStream', 'Changes of the audio stream an existing clip plays')):
+            if field == 'audioStream' and seed is None:
+                continue
+            if field == 'title' and seed is None:
+                continue
+            if changed(field):
+                report.add(NOT_WRITTEN, what, where)
         if kind == 'video':
             transform = clip.get('transform') if isinstance(clip.get('transform'), dict) else {}
-            old = before or {'x': 0.0, 'y': 0.0, 'scale': 100.0}
-            changed = [k for k, d in (('y', 0.0), ('scale', 100.0), ('rotation', 0.0))
-                       if abs(float(transform.get(k, d) or 0) - float((old or {}).get(k, d) if k != 'rotation' else 0))
-                       > _EPSILON and not (k == 'rotation' and not transform.get(k))]
-            if changed:
+            old = was('transform') if isinstance(was('transform'), dict) else {}
+            moved = sorted(k for k in transform if k != 'x' and
+                           not _same(transform.get(k), old.get(k, TRANSFORM_FIELDS.get(k))))
+            if moved:
                 report.add(NOT_WRITTEN, 'Zoom, vertical position and rotation (transforms beyond position X are not '
-                           'proven)', where)
+                           'proven)', f'{where} ({", ".join(moved)})')
             opacity = clip.get('opacity', 100)
-            imported = (before or {}).get('opacity', 100.0)
             stand_in = clip.get('enabled') is False and opacity == 0
-            if isinstance(opacity, (int, float)) and abs(opacity - imported) > _EPSILON and not stand_in:
+            if changed('opacity') and not stand_in:
                 report.add(NOT_WRITTEN, 'Opacity changes', where)
-        elif clip.get('pan'):
+            if clip.get('embeddedAudio') is not False and was('embeddedAudio') is False:
+                report.add(NOT_WRITTEN, 'Sound a picture clip plays in Splice (a Resolve picture item carries no sound; '
+                           'give the picture a linked sound clip)', where)
+            elif seed is None and clip.get('embeddedAudio') is not False and self._has_sound(clip):
+                report.add(NOT_WRITTEN, 'Sound a picture clip plays in Splice (a Resolve picture item carries no sound; '
+                           'give the picture a linked sound clip)', where)
+        if changed('pan'):
             report.add(NOT_WRITTEN, 'Clip pan', where)
+        for field in clip:
+            if field.startswith('_') or field in CLIP_FIELDS:
+                continue
+            if base is None and clip.get(field) in (None, False, 0, '', [], {}):
+                continue
+            if base is not None and _same(clip.get(field), base.get(field)):
+                continue
+            report.add(NOT_WRITTEN, 'Splice clip settings Splice cannot write to Resolve', f'{where} ({field})')
+
+    def _has_sound(self, clip):
+        media = self.current_media.get(clip.get('mediaId')) or {}
+        return media.get('type') == 'video' and not media.get('still') and (media.get('audioChannels') or 0) > 0
+
+    def _project_changes(self, project, base, name):
+        """Report each project-level change the writer does not write (compared with what the
+        reader made of the seed's timeline)."""
+        report = self.report
+        rate = self.current.rate
+
+        def marker_key(m):
+            return (round((m.get('time') or 0) * rate), round((m.get('duration') or 0) * rate), m.get('name') or '',
+                    m.get('color') or '', m.get('note') or '')
+        from collections import Counter
+        now = Counter(marker_key(m) for m in project.get('markers') or [] if isinstance(m, dict))
+        before = Counter(marker_key(m) for m in base.get('markers') or [] if isinstance(m, dict))
+        for key in sorted((now - before) + (before - now)):
+            report.add(NOT_WRITTEN, 'Timeline markers added, changed or removed in Splice (not written: the Resolve '
+                       'timeline keeps the markers it has)', f'{name} · {key[2] or "Marker"} at frame {key[0]}')
+        captions = [c for c in project.get('captions') or [] if isinstance(c, dict)]
+        if not _same(captions, base.get('captions') or []):
+            report.add(NOT_WRITTEN, 'Captions (Resolve subtitle tracks are not written)', f'{name}: {len(captions)} cue(s)')
+        if (project.get('width'), project.get('height')) != (base.get('width'), base.get('height')):
+            report.add(NOT_WRITTEN, 'Timeline resolution changes (the Resolve timeline keeps its own)',
+                       f'{name}: {base.get("width")}×{base.get("height")} → {project.get("width")}×'
+                       f'{project.get("height")}')
+        if bool(project.get('dropFrame')) != bool(base.get('dropFrame')):
+            report.add(NOT_WRITTEN, 'Drop-frame timecode setting changes', name)
+        if not _same(project.get('marks') or {}, base.get('marks') or {}):
+            report.add(NOT_WRITTEN, 'Timeline In and Out marks', name)
+        state = project.get('trackState') if isinstance(project.get('trackState'), dict) else {}
+        base_state = base.get('trackState') if isinstance(base.get('trackState'), dict) else {}
+        for key in sorted(set(state) | set(base_state)):
+            a, b = state.get(key) or {}, base_state.get(key) or {}
+            for field in sorted(set(a) | set(b)):
+                how = TRACK_STATE_FIELDS.get(field, 'unknown')
+                if how != 'written' and bool(a.get(field, field == 'syncLocked')) != bool(b.get(field, field ==
+                                                                                                'syncLocked')):
+                    report.add(NOT_WRITTEN, 'Track sync lock and other track switches Splice cannot write',
+                               f'{name} · {key} ({field})')
+        mix = project.get('trackMix') if isinstance(project.get('trackMix'), dict) else {}
+        base_mix = base.get('trackMix') if isinstance(base.get('trackMix'), dict) else {}
+        for key in sorted(set(mix) | set(base_mix)):
+            a, b = mix.get(key) or {}, base_mix.get(key) or {}
+            for field in sorted(set(a) | set(b)):
+                if TRACK_MIX_FIELDS.get(field) == 'written':
+                    continue
+                neutral = {'gain': 100, 'pan': 0, 'solo': False}.get(field)
+                if not _same(a.get(field, neutral), b.get(field, neutral)):
+                    report.add(NOT_WRITTEN, 'Track mixer gain, pan and solo (the Fairlight mixer is not written)',
+                               f'{name} · track {key} ({field})')
+        for media in project.get('media') or []:
+            if not isinstance(media, dict):
+                continue
+            old = self.base_media.get(media.get('id'))
+            if old is not None and media.get('name') != old.get('name'):
+                report.add(NOT_WRITTEN, 'Media renamed in Splice (Resolve keeps its media-pool names)',
+                           f'{old.get("name")} → {media.get("name")}')
+            for field in media:
+                if field in MEDIA_FIELDS or field.startswith('_'):
+                    continue
+                if old is not None and _same(media.get(field), old.get(field)):
+                    continue
+                if old is None and media.get(field) in (None, False, 0, '', [], {}):
+                    continue
+                report.add(NOT_WRITTEN, 'Splice media settings Splice cannot write to Resolve',
+                           f'{media.get("name") or "Media"} ({field})')
+        for field in project:
+            if field in PROJECT_FIELDS or field.startswith('_'):
+                continue
+            if _same(project.get(field), base.get(field)):
+                continue
+            report.add(NOT_WRITTEN, 'Splice timeline settings Splice cannot write to Resolve', f'{name} ({field})')
 
     def _links(self, placed, timeline, name):
         """Links follow Splice's link groups. A group whose members are linked in the seed exactly

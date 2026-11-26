@@ -221,7 +221,7 @@ class ReportTests(SaveCase):
         self.assertEqual(list((self.projects()).iterdir()), [self.db.parent])
         not_written = {line['what'].split(' (')[0]: line for line in result['lines']
                        if line['status'] == writer.NOT_WRITTEN}
-        for what in ('Keyframes', 'Splice color adjustments and LUTs', 'Zoom, vertical position and rotation',
+        for what in ('Keyframes', 'Splice color adjustments', 'Zoom, vertical position and rotation',
                      'Clip fades', 'Titles and other Splice-only clips',
                      'Clips on tracks the Resolve timeline does not have',
                      'New clips with a speed change or reversed'):
@@ -852,3 +852,217 @@ class RoundingReportTests(SaveCase):
         result = self.run_save(self.payload(project, confirm=False))
         line = next(line for line in result['lines'] if line['what'] == writer.ROUNDED)
         self.assertEqual(line['count'], 1)
+
+
+def _calls(source, name):
+    """The argument lists of every call ``name(...)`` in JavaScript ``source`` (top-level commas)."""
+    out = []
+    for match in __import__('re').finditer(r'\b' + name + r'\(', source):
+        depth, args, current, i, quote = 1, [], '', match.end(), None
+        while i < len(source) and depth:
+            ch = source[i]
+            if quote:
+                current += ch
+                if ch == '\\':
+                    current += source[i + 1]
+                    i += 1
+                elif ch == quote:
+                    quote = None
+            elif ch in '\'"`':
+                quote = ch
+                current += ch
+            elif ch in '([{':
+                depth += 1
+                current += ch
+            elif ch in ')]}':
+                depth -= 1
+                if depth:
+                    current += ch
+            elif ch == ',' and depth == 1:
+                args.append(current.strip())
+                current = ''
+            else:
+                current += ch
+            i += 1
+        args.append(current.strip())
+        out.append(args)
+    return out
+
+
+class EditorFieldCoverageTests(unittest.TestCase):
+    """Every field the editor can set has a line in the writer's field tables (written,
+    reported, derived or bookkeeping): a field the editor gains later fails here until the writer
+    says what it does with it."""
+
+    def test_every_field_the_editor_edits_is_known_to_the_writer(self):
+        import re
+        engine = (ROOT / 'engine.js').read_text()
+        inspector = (ROOT / 'inspector.js').read_text()
+        validate = engine[engine.index('function validateProject'):engine.index('function mergeTitleTrackStates')]
+        unknown = []
+
+        def need(table, names, what):
+            unknown.extend(f'{what}.{n}' for n in sorted(set(names)) if n not in table)
+        need(writer.PROJECT_FIELDS, re.findall(r'value\.(\w+)', validate), 'project')
+        need(writer.PROJECT_FIELDS, re.findall(r'\bproject\.(\w+)\s*=(?!=)', engine), 'project')
+        need(writer.CLIP_FIELDS, re.findall(r'\bclip\.(\w+)', validate), 'clip')
+        need(writer.MEDIA_FIELDS, re.findall(r'\bitem\.(\w+)', validate), 'media')
+        need(writer.TRACK_STATE_FIELDS, re.findall(r'\bstate\.(\w+)', validate), 'trackState')
+        mix = engine[engine.index('function validateTrackMix'):engine.index('function validateProject')]
+        need(writer.TRACK_MIX_FIELDS, re.findall(r'\bmix\.(\w+)', mix), 'trackMix')
+        need(writer.CLIP_FIELDS, re.findall(r'\b(?:clip|sound|picture|piece)\.(\w+)\s*=(?!=)', engine), 'clip')
+        for listed in re.findall(r'for \(const key of \[([^\]]*)\]\)', engine):
+            need(writer.CLIP_FIELDS, re.findall(r'"(\w+)"', listed), 'clip')
+        groups = {'': writer.CLIP_FIELDS, 'color': writer.COLOR_FIELDS, 'transform': writer.TRANSFORM_FIELDS,
+                  'trackMix': writer.TRACK_MIX_FIELDS, 'titleStyle': None}
+        for name, group_at in (('label', 7), ('field', 6)):
+            for args in _calls(inspector, name):
+                if len(args) < 2 or not re.fullmatch(r"'\w+'", args[1]):
+                    continue
+                key = args[1].strip("'")
+                group = args[group_at].strip("'") if len(args) > group_at else ''
+                if key == 'speedPercent':
+                    key = 'speed'
+                if group not in groups:
+                    unknown.append(f'inspector group {group}')
+                elif groups[group] is not None:
+                    need(groups[group], [key], group or 'clip')
+        for key, group in re.findall(r'data-field="(\w+)"(?: data-group="(\w+)")?', inspector):
+            if group not in groups:
+                unknown.append(f'inspector group {group}')
+            elif groups[group] is not None:
+                need(groups[group], [key], group or 'clip')
+        for listed in re.findall(r"\['opacity','x','y','scale','rotation'[^\]]*\]|\['volume'\]|\['opacity'\]", inspector):
+            need(writer.KEYFRAME_FIELDS, re.findall(r"'(\w+)'", listed), 'keyframes')
+        self.assertEqual(unknown, [])
+
+
+class EveryFeatureTests(SaveCase):
+    """One Splice timeline with one instance of every editable feature: each is written and read
+    back, or reported."""
+
+    def test_every_editable_feature_is_written_or_reported(self):
+        project = self.opened()
+        fps = project['fps']
+        fr = 1 / fps
+        v = [c for c in project['clips'] if c['type'] == 'video']
+        a = [c for c in project['clips'] if c['type'] == 'audio']
+        carrier = next(c for c in a if c.get('resolveTransitionId'))
+        others = [c for c in a if c is not carrier]
+        # Written exactly (or with the opt-in, allowed below).
+        project['name'] = 'Renamed cut'
+        project['trackNames'] = {'video:1': 'Pictures'}
+        project['startTimecode'] = project['startTimecode'] + 30
+        others[0]['volume'] = 50
+        v[2]['enabled'] = False
+        v[0]['transform'] = {'x': 10.0, 'y': 5.0, 'scale': 120, 'rotation': 15}
+        project['trackState'] = {'video:2': {'hidden': True, 'syncLocked': False}, 'audio:-2': {'locked': True}}
+        project['trackMix'] = {'-1': {'mute': True, 'gain': 150, 'pan': 20, 'solo': True}}
+        carrier.update(transitionDuration=8 * fr, transitionBefore=4 * fr)
+        # Reported.
+        v[0]['keyframes'] = {k: [{'time': 0, 'value': 1}, {'time': 0.1, 'value': 2}]
+                             for k in ('opacity', 'x', 'y', 'scale', 'rotation')}
+        others[1]['keyframes'] = {'volume': [{'time': 0, 'value': 50}]}
+        v[1]['color'] = {'brightness': 110, 'contrast': 90, 'saturation': 80, 'exposure': 0.5, 'temperature': 10,
+                         'tint': -5, 'lut': {'size': 2, 'name': 'x.cube'}, 'lutIntensity': 50}
+        v[1]['opacity'] = 50
+        v[1]['fadeIn'] = 0.2
+        others[1]['fadeOut'] = 0.2
+        others[1]['pan'] = -30
+        v[1]['speed'] = 2
+        v[0]['reverse'] = True
+        v[1]['nativeTimeRemap'] = {'points': [0, 1]}
+        v[1]['transition'], v[1]['transitionDuration'], v[1]['transitionBefore'] = 'dissolve', 4 * fr, 2 * fr
+        v[2]['transition'], v[2]['transitionDuration'] = 'fade', 4 * fr
+        v[0]['markers'] = [{'time': 0.1, 'name': 'clip marker'}]
+        v[0]['title'] = 'Renamed clip'
+        v[0]['embeddedAudio'] = True
+        others[1]['enabled'] = False
+        others[0]['audioStream'] = 1
+        project['markers'] = (project.get('markers') or []) + [{'id': 'm', 'time': 0.5, 'name': 'Marker'}]
+        project['captions'] = [{'id': 'cap', 'start': 0, 'duration': 1, 'text': 'hello'}]
+        project['width'], project['height'] = 3840, 2160
+        project['dropFrame'] = not project.get('dropFrame')
+        project['marks'] = {'in': 0.1, 'out': 0.5}
+        project['trackCounts'] = {'video': project['trackCounts']['video'] + 1,
+                                  'audio': project['trackCounts']['audio'] + 1}
+        project['media'][0]['name'] = 'Renamed media'
+        end = max(c['start'] + c['duration'] for c in project['clips'])
+        project['clips'] += [
+            {'id': 'title', 'type': 'title', 'track': 1, 'start': end, 'duration': 1.0, 'title': 'Hi',
+             'titleStyle': {'fontSize': 10}},
+            {'id': 'v3', 'type': 'video', 'track': project['trackCounts']['video'], 'start': 0, 'duration': 4 * fr,
+             'in': 0, 'mediaId': v[0]['mediaId']},
+            {'id': 'a3', 'type': 'audio', 'track': -project['trackCounts']['audio'], 'start': 0, 'duration': 4 * fr,
+             'in': 0, 'mediaId': a[0]['mediaId']}]
+        # Settings a later editor may add, unknown to the writer.
+        v[2]['futureClipFeature'] = 3
+        project['futureTimelineFeature'] = {'on': True}
+        project['media'][0]['futureMediaFeature'] = 'x'
+        result = self.run_save(self.payload(project, allow={'unproven': True}))
+        lines = {}
+        for line in result['lines']:
+            lines.setdefault(line['what'].split(' (')[0].split(':')[0], []).append(line)
+
+        def has(prefix, status=writer.NOT_WRITTEN, *places):
+            found = [line for what, group in lines.items() if what.startswith(prefix) for line in group]
+            self.assertTrue(found, f'{prefix}: no line among {sorted(lines)}')
+            self.assertEqual({line['status'] for line in found}, {status}, prefix)
+            for place in places:
+                self.assertTrue(any(place in p for line in found for p in line['all']), (prefix, place))
+        has('Keyframes', writer.NOT_WRITTEN, 'opacity', 'x', 'y', 'scale', 'rotation', 'volume')
+        has('Splice color adjustments', writer.NOT_WRITTEN, 'brightness', 'contrast', 'saturation', 'exposure',
+            'temperature', 'tint')
+        has('Splice LUTs')
+        has('Zoom, vertical position and rotation', writer.NOT_WRITTEN, 'y', 'scale', 'rotation')
+        has('Opacity changes')
+        has('Clip fades')
+        has('Clip pan')
+        has('Speed changes and reversed clips')
+        has('Speed ramps')
+        has('Picture transitions and fades')
+        has('Clip markers')
+        has('Clip names changed in Splice')
+        has('Sound a picture clip plays in Splice')
+        has('Disabled sound clips')
+        has('Changes of the audio stream')
+        has('Timeline markers added, changed or removed')
+        has('Captions')
+        has('Timeline resolution changes')
+        has('Drop-frame timecode setting changes')
+        has('Timeline In and Out marks')
+        has('Track sync lock', writer.NOT_WRITTEN, 'syncLocked')
+        has('Track mixer gain, pan and solo', writer.NOT_WRITTEN, 'gain', 'pan', 'solo')
+        has('New video tracks')
+        has('New audio tracks')
+        has('Media renamed in Splice')
+        has('Titles and other Splice-only clips')
+        has('Splice clip settings Splice cannot write to Resolve', writer.NOT_WRITTEN, 'futureClipFeature')
+        has('Splice timeline settings Splice cannot write to Resolve', writer.NOT_WRITTEN, 'futureTimelineFeature')
+        has('Splice media settings Splice cannot write to Resolve', writer.NOT_WRITTEN, 'futureMediaFeature')
+        has('Timeline renamed', writer.EXACT)
+        has('Track renamed', writer.EXACT)
+        has('Timeline start timecode changed', writer.EXACT)
+        has('Clip volume changes', writer.EXACT)
+        has('Clips disabled or enabled', writer.EXACT)
+        has('Resolve sound crossfades changed', writer.EXACT)
+        has('Position X written', writer.OPT_IN)
+        has('Track lock, hide or mute changed', writer.OPT_IN)
+        # What is written reads back.
+        again = self.opened(Path(result['project']['path']))
+        self.assertEqual(again['name'], 'Renamed cut')
+        self.assertEqual(again['trackNames'].get('video:1'), 'Pictures')
+        self.assertEqual(again['startTimecode'], project['startTimecode'])
+        by_item = {c['resolveItemId']: c for c in again['clips']}
+        self.assertAlmostEqual(by_item[others[0]['resolveItemId']]['volume'], 50, places=3)
+        self.assertIs(by_item[v[2]['resolveItemId']].get('enabled'), False)
+        self.assertAlmostEqual(by_item[v[0]['resolveItemId']]['transform']['x'], 10.0)
+        self.assertEqual(round(by_item[carrier['resolveItemId']]['transitionDuration'] * fps), 8)
+        self.assertEqual(again['trackState'], {'video:2': {'hidden': True}, 'audio:-2': {'locked': True}})
+        self.assertTrue((again.get('trackMix') or {}).get('-1', {}).get('mute'))
+
+    def test_a_frame_rate_change_is_refused(self):
+        project = self.opened()
+        project.update(fps=25, frameRate='25/1')
+        with self.assertRaises(writer.WriteError):
+            self.run_save(self.payload(project, confirm=False))
