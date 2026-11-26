@@ -448,6 +448,17 @@ async function exportAudioFields(page) {
   }
   assert.deepEqual(fields, ['true', '-1', 'und']);
   console.log('Export dialog offers limiter (on, −1 dBFS) and subtitle language (und).');
+  if (/aacPeakSafe/.test(renderer)) {
+    await state(page, () => SpliceDialogs.exportVideo());
+    const peakSafe = await state(page, () => {
+      const form = document.querySelector('dialog[open] form'), box = form.elements.aacPeakSafe;
+      const value = box ? [box.type, box.checked, !box.closest('label').hidden] : null;
+      form.closest('dialog').close();
+      return value;
+    });
+    assert.deepEqual(peakSafe, ['checkbox', false, true], 'MP4 offers aacPeakSafe, off by default');
+    console.log('Export dialog offers aacPeakSafe (off) for MP4.');
+  }
 }
 
 const only = process.env.SPLICE_ONLY?.split(',');

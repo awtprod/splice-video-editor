@@ -1,10 +1,9 @@
-"""Does the renderer on this tree leave hidden picture tracks out of an export?
+"""Regression check: the renderer leaves hidden picture tracks out of an export.
 
 A tiny probe: V1 is a black-graded ridge clip, V2 an ungraded valley clip on a hidden track. The
-renderer honours ``trackState["video:2"].hidden`` when the frame comes out dark (V1), and ignores
-it when V2's bright picture is on top. Prints ``honors`` or ``ignores`` (exit 0); anything else is
-an error. Used by tests/editing-round1.cjs to decide, by behaviour, whether its hidden-track export
-check can assert the picture or must report a skip.
+renderer honours ``trackState["video:2"].hidden`` when the frame comes out dark (V1). Prints
+``honors`` and exits 0; if V2's bright picture is on top it prints ``ignores`` and exits 1 (a hard
+failure: the renderer always honours hidden tracks). Run by tests/editing-round1.cjs.
 """
 import statistics
 import subprocess
@@ -31,7 +30,11 @@ def main():
         render_to_file(project, output)
         frame = subprocess.check_output(['ffmpeg', '-nostdin', '-v', 'error', '-ss', '0.2', '-i', str(output),
                                          '-frames:v', '1', '-pix_fmt', 'gray', '-f', 'rawvideo', 'pipe:1'], timeout=30)
-    print('honors' if statistics.mean(frame) < 24 else 'ignores')
+    honors = statistics.mean(frame) < 24
+    print('honors' if honors else 'ignores')
+    if not honors:
+        print('The export shows the hidden V2 track: the renderer must leave hidden picture tracks out.', file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == '__main__':

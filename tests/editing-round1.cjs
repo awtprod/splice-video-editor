@@ -6,15 +6,12 @@ const fs = require('node:fs');
 const path = require('node:path');
 const {root, startSplice, openPage, ffmpeg, makeCamera, nearestSegment, colorAt, readPcm, toneAt} = require('./browser-harness.cjs');
 
-// Whether the renderer on this tree leaves hidden picture tracks out of an export (the renderer
-// change is PR #6, impl/render-scale). Decided by behaviour, not by a flag: a tiny probe render
-// (tests/hidden_render_probe.py). When it honours trackState[...].hidden the hidden-track export
-// check asserts the picture; otherwise that half reports a clearly worded skip.
+// The renderer always leaves hidden picture tracks out of an export: a tiny probe render
+// (tests/hidden_render_probe.py) checks it directly and fails loudly (non-zero exit) if it does not.
 const {execFileSync} = require('node:child_process');
-function rendererHonorsHidden() {
+function assertRendererHonorsHidden() {
   const out = execFileSync('python3', [path.join(root, 'tests/hidden_render_probe.py')], {cwd: root, encoding: 'utf8', timeout: 60000}).trim();
-  if (!['honors', 'ignores'].includes(out)) throw Error('Hidden-track probe render gave ' + JSON.stringify(out));
-  return out === 'honors';
+  assert.equal(out, 'honors', 'Hidden-track probe render');
 }
 
 const evidence = process.env.SPLICE_EVIDENCE_DIR;
@@ -98,15 +95,9 @@ async function hiddenExport(splice, page) {
   // Hiding is a picture toggle: the hidden track's camera sound stays in the export
   // (source seconds 1.5 and 2.5: 300 Hz and 400 Hz).
   assert.ok(Math.abs(heard[0] - 300) < 30 && Math.abs(heard[1] - 400) < 30, 'hidden track sound in export: ' + heard);
-  const pictureOk = seen.every(segment => segment === 0);
-  if (rendererHonorsHidden()) {
-    assert.ok(pictureOk, 'Export shows the hidden V2 picture: ' + JSON.stringify({seen, heard}));
-    console.log('Hidden V2: export shows V1 and keeps V2\'s camera sound: ' + JSON.stringify({seen, heard}));
-  } else {
-    console.log('SKIPPED (picture half only): the renderer on this tree does not honour trackState hidden ' +
-      '(probe render; that change is PR #6, impl/render-scale), so the export shows V2 ' + JSON.stringify({seen, heard}) +
-      '. Checked and passing: preview shows V1, the export request carries the hidden state, and V2\'s camera sound is in the file.');
-  }
+  assert.ok(seen.every(segment => segment === 0), 'Export shows the hidden V2 picture: ' + JSON.stringify({seen, heard}));
+  assertRendererHonorsHidden();
+  console.log('Hidden V2: export shows V1 and keeps V2\'s camera sound: ' + JSON.stringify({seen, heard}));
 }
 
 // 2. A Premiere sequence opens at its own start timecode (Adobe fixture: 00:00:00;29, drop-frame).
