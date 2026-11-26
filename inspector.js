@@ -7,8 +7,12 @@
   const field = (title, key, value, min, max, step = .04, group = '') =>
     `<label class="splice-number"><span>${title}</span><input aria-label="${title}" type="number" data-field="${key}" data-group="${group}" min="${min}" max="${max}" step="${step}" value="${value}"></label>`;
   const section = (title, body) => `<section class="splice-section"><h3>${title}</h3>${body}</section>`;
+  // A 1D LUT longer than the 65-point lattice is applied as that lattice in preview and export alike.
+  const lutNote = lut => {
+    const error = lut?.curve ? window.SpliceLUT.curveError(lut) : 0;
+    return error >= .5 ? `<p class="splice-lut-note" role="note">This 1D LUT has ${lut.curve.size} entries. Preview and export apply it as a ${lut.size}-point table, up to ${error.toFixed(1)} code values (8-bit) away from the file.</p>` : '';
+  };
   const option = (key, title, selected) => `<option value="${escape(key)}" ${key === selected ? 'selected' : ''}>${escape(title)}</option>`;
-  let lastScopePaint = 0;
   let automationProperty = 'opacity';
   let showSafeArea = false;
   const automation = {opacity:['Opacity',0,100,1],x:['Horizontal',-100,100,1],y:['Vertical',-100,100,1],scale:['Scale',10,400,1],rotation:['Rotation',-180,180,1],volume:['Audio gain',0,200,1]};
@@ -67,10 +71,11 @@
         label('Exposure', 'exposure', number(color.exposure, 0), -4, 4, .1, ' EV', 'color') +
         label('Temperature', 'temperature', number(color.temperature, 0), -100, 100, 1, '', 'color') +
         label('Tint', 'tint', number(color.tint, 0), -100, 100, 1, '', 'color') +
-        `<div class="splice-lut-row"><button type="button" data-action="import-lut">Import .cube LUT</button><span>${escape(color.lut?.title || 'No LUT')}</span>${color.lut ? '<button type="button" data-action="remove-lut">Remove</button>' : ''}</div>` +
+        `<div class="splice-lut-row"><button type="button" data-action="import-lut">Import .cube LUT</button><span title="${escape(color.lut?.title || 'No LUT')}">${escape(color.lut?.title || 'No LUT')}</span>${color.lut ? '<button type="button" data-action="remove-lut">Remove</button>' : ''}</div>` +
+        lutNote(color.lut) +
         (color.lut ? label('LUT intensity', 'lutIntensity', number(color.lutIntensity, 100), 0, 100, 1, '%', 'color') : '') +
         '<input type="file" class="splice-lut-input" accept=".cube" hidden>' +
-        '<canvas class="splice-scope" width="240" height="210" aria-label="RGB parade, luma waveform, and vectorscope from graded frame"></canvas>');
+        window.SpliceScopes.markup());
       html += section('Incoming transition',
         `<label class="splice-number"><span>Style</span><select aria-label="Transition style" data-field="transition">${clip.transition==='native'?option('native','Imported: '+(clip.transitionMatchName||'Premiere effect'),'native'):''}${option('none','Cut',clip.transition || 'none')}${option('dissolve','Cross dissolve',clip.transition || 'none')}${option('fade','Fade through black',clip.transition || 'none')}${option('wipe','Wipe left to right',clip.transition || 'none')}</select></label>` +
         field('Length', 'transitionDuration', number(clip.transitionDuration, .5).toFixed(2), 1/fps, 7200, 1/fps) +
@@ -197,7 +202,7 @@
       const file=picker.files?.[0];
       if (!file) return;
       try {
-        if (file.size > 4_000_000) throw new Error('The LUT file is too large.');
+        if (file.size > window.SpliceLUT.limits.chars) throw new Error('The LUT file is too large.');
         const lut=window.SpliceLUT.parseCube(await file.text(),file.name);
         editor.updateClip(clip.id,{color:{...color,lut,lutIntensity:100}});
         render(editor.get(),element,editor);
@@ -230,7 +235,8 @@
       editor.seek(clip.start+Number(button.dataset.keyTime));
       render(editor.get(),element,editor);
     });
-    paintScope(element.querySelector('.splice-scope'));
+    window.SpliceScopes.bind(element);
+    paintScope(element.querySelector('.splice-scope'),true);
     paintMeters(state);
   }
   function paintMeters(state=window.Editor?.get()) {
@@ -249,37 +255,9 @@
       if(label)label.textContent=`Value at ${local.toFixed(2)} s`;
     }
   }
-  function paintScope(canvas=document.querySelector('.splice-scope')) {
-    if (!canvas) return;
-    const now=performance.now();
-    if (now-lastScopePaint < 100) return;
-    lastScopePaint=now;
-    const video=document.querySelector('#preview-canvas');
-    if (!video || !video.width || !video.height) return;
-    const small = document.createElement('canvas');
-    small.width = 96; small.height = 54;
-    const context = small.getContext('2d', {willReadFrequently:true});
-    try { context.drawImage(video, 0, 0, 96, 54); } catch { return; }
-    const bytes = context.getImageData(0,0,96,54).data;
-    const ctx = canvas.getContext('2d');
-    const w=canvas.width,h=canvas.height;
-    ctx.fillStyle='#101610'; ctx.fillRect(0,0,w,h);
-    ctx.strokeStyle='#344135'; ctx.lineWidth=1;
-    for(const y of [0,70,140,210]) {ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke();}
-    for(let p=0;p<bytes.length;p+=4){
-      const pixel=p/4,x=pixel%96;
-      for(let channel=0;channel<3;channel++){
-        ctx.fillStyle=['rgba(255,92,92,.12)','rgba(107,241,125,.12)','rgba(105,157,255,.12)'][channel];
-        ctx.fillRect(channel*80+bytes[p+channel]/255*79,70-bytes[p+channel]/255*68,1,1);
-      }
-      const lum=(.2126*bytes[p]+.7152*bytes[p+1]+.0722*bytes[p+2])/255;
-      ctx.fillStyle='rgba(244,244,220,.18)'; ctx.fillRect(x*2.5,140-lum*68,1,1);
-      const u=(-.14713*bytes[p]-.28886*bytes[p+1]+.436*bytes[p+2])/255;
-      const v=(.615*bytes[p]-.51499*bytes[p+1]-.10001*bytes[p+2])/255;
-      ctx.fillStyle='rgba(190,242,110,.23)';ctx.fillRect(120+u*112,175-v*50,1,1);
-    }
-    ctx.fillStyle='#b9c9b5';ctx.font='10px monospace';
-    ctx.fillText('RGB PARADE',5,10);ctx.fillText('LUMA WAVEFORM',5,80);ctx.fillText('VECTORSCOPE',5,150);
+  // Scopes read the graded program frame; SpliceScopes paces itself.
+  function paintScope(canvas=document.querySelector('.splice-scope'),force=false) {
+    window.SpliceScopes.paint(canvas,force);
   }
   window.SpliceInspector = {render,paintScope,paintMeters};
 })();
