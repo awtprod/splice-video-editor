@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import unittest
 import warnings
+from unittest import mock
 
 import delivery
 from interchange.timecode import timecode_frames
@@ -156,6 +157,24 @@ class HDR(Case):
         stream = next(s for s in probe(target)['streams'] if s['codec_type'] == 'video')
         self.assertEqual((stream['color_primaries'], stream['color_transfer']), ('bt709', 'bt709'))
 
+    def test_hardware_request_keeps_hdr10_side_data(self):
+        clip = self.neutral_source('hardware-pq', 500, 700, 'smpte2084')
+        for color_space in ('pq', 'source'):
+            with self.subTest(color_space=color_space):
+                options = dict(codec='hevc', encoder='nvenc', colorSpace=color_space,
+                               hdr=dict(display='bt2020', lightLevels='manual', maxCll=1800, maxFall=275))
+                target = self.out / (color_space + '.mp4')
+                report = {}
+                with self.assertWarnsRegex(UserWarning, 'HDR10 static metadata'), \
+                     mock.patch.object(render_movie, '_encoder_command', wraps=render_movie._encoder_command) as commands:
+                    render_to_file(self.project(clip), target, options=options, report=report)
+                self.assertEqual([call.args[0]['encoder'] for call in commands.call_args_list], ['libx265'])
+                self.assertTrue(report['hardwareFallback'])
+                side = self.side_data(target)
+                self.assertEqual(side['Mastering display metadata']['red_x'], '35400/50000')
+                levels = side['Content light level metadata']
+                self.assertEqual((levels['max_content'], levels['max_average']), (1800, 275))
+
     def test_hlg_passthrough_is_tagged_hlg(self):
         clip = self.neutral_source('hlg', 400, 800, 'arib-std-b67')
         target = self.out / 'hlg.mp4'
@@ -289,13 +308,14 @@ class BurnIns(Case):
         self.assertEqual(self.frame(plain, 10), self.frame(self.out / 'plain-prores.mov', 10), 'no burn-in unless asked')
 
     def test_upper_track_owns_name_and_source_timecode_only_during_overlap(self):
-        burn = dict(media={'a': dict(name='Base', _timecode=120), 'b': dict(name='Insert', _timecode=900)},
+        burn = dict(media={'a': dict(name='Base', _sourceTimecodeInfo=(120, 24, False)),
+                           'b': dict(name='Insert', _sourceTimecodeInfo=(900, 24, False))},
                     settings=dict(fields=['clipName', 'sourceTimecode']), timecode=0, drop=False, font='')
         clips = [dict(type='video', mediaId='a', track=1, start=0, duration=3),
                  dict(type='video', mediaId='b', track=2, start=1, duration=1)]
         spans = render_movie._window_burn(burn, clips, 0, 0, 24)['clips']
         self.assertEqual([tuple(span) for span in spans],
-                         [(0, 24, 'Base', 120), (24, 48, 'Insert', 900), (48, 72, 'Base', 168)])
+                         [(0, 24, 'Base', '00:00:05:00'), (24, 48, 'Insert', '00:00:36:12'), (48, 72, 'Base', '00:00:05:00')])
 
     def test_hidden_lower_clip_name_does_not_change_exported_pixels(self):
         source = self.media / 'plates.mkv'
@@ -323,6 +343,29 @@ class BurnIns(Case):
         self.assertNotEqual(regions[0], regions[1])
         self.assertNotEqual(regions[1], regions[2])
         self.assertEqual(regions[2], regions[3])
+
+    def test_source_burn_keeps_its_own_drop_frame_convention(self):
+        from fractions import Fraction
+        for rate, label, source_drop in ((Fraction(30000, 1001), '01:00:59:29', False),
+                                         (Fraction(60000, 1001), '01:00:59;59', True)):
+            with self.subTest(label=label):
+                clip = self.media / f'camera-{round(rate)}.mov'
+                ffmpeg('-f', 'lavfi', '-i', f'color=gray:s={W}x{H}:r={rate}:d=0.4',
+                       '-c:v', 'prores_ks', '-timecode', label, str(clip))
+                project = dict(self.project(clip, seconds=0.3), fps=float(rate),
+                               startTimecode=timecode_frames(label, rate))
+                frames = []
+                for source in (False, True):
+                    project['dropFrame'] = not source_drop if source else source_drop
+                    if source and source_drop:
+                        # Imported projects can record 59.94 while the camera uses 60000/1001.
+                        project['fps'] = round(float(rate), 2)
+                    target = self.out / f'{source}.mov'
+                    burn = dict(fields=['sourceTimecode' if source else 'timecode'], position='top-left')
+                    render_to_file(project, target, options=dict(codec='prores', burnIns=burn))
+                    frames.append([self.frame(target, n) for n in (0, 1)])
+                self.assertNotEqual(frames[0][0], frames[0][1])
+                self.assertTrue(frames[0] == frames[1], f'Source burn must follow {label} across the minute boundary')
 
 
 class Sources(Case):

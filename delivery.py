@@ -294,6 +294,8 @@ def normalize(options):
     spec['color_space'] = color_space
     spec['hdr_capable'] = hdr_capable
     spec['hdr'] = _hdr(options, color_space) if hdr_capable and codec in ('hevc', 'av1') else None
+    if color_space == 'pq':
+        select_hdr10_encoder(spec)
     if not (hdr_capable and codec in ('hevc', 'av1')):
         _check(options.get('hdr') is None, 'HDR10 static metadata is written in HEVC and AV1 deliveries only')
     # Audio.
@@ -386,6 +388,8 @@ def h264_level(width, height, rate):
 def conversions(spec, width, height, fps):
     """Every change to frame size, rate or level this delivery makes, in words. Nothing silent."""
     notes = []
+    if spec.get('encoder_note'):
+        notes.append(spec['encoder_note'])
     size = spec.get('output_size')
     if size and (size['width'], size['height']) != (width, height):
         how = {'fit': 'fitted inside the frame (letterbox or pillarbox bars)', 'fill': 'scaled to fill the frame (edges cropped)',
@@ -394,6 +398,13 @@ def conversions(spec, width, height, fps):
     if spec['codec'] == 'h264' and spec['chroma'] == '420' and spec['depth'] == 8 and spec['color_space'] in ('pq', 'hlg'):
         notes.append('HDR is tone-mapped to Rec. 709.')
     return notes
+
+
+def select_hdr10_encoder(spec):
+    """Only the x265 path can write HEVC mastering-display and content-light SEI."""
+    if spec['codec'] == 'hevc' and spec['hardware']:
+        spec.update(hardware=None, encoder=VIDEO_CODECS['hevc']['encoder'],
+                    encoder_note='Using software HEVC encoding to preserve HDR10 static metadata.')
 
 
 # ---------------------------------------------------------------------------------------------

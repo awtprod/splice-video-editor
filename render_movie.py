@@ -1942,6 +1942,13 @@ def _render_delivery(project, output_path, *, options, progress, cancelled, hear
                          'Splice does not convert other material to HLG: choose Rec. 2100 PQ or Rec. 709.')
     if spec['hdr'] and profile[1]!='smpte2084':
         spec['hdr'] = None  # HDR10 static metadata describes PQ programs only.
+    elif spec['hdr']:
+        delivery.select_hdr10_encoder(spec)  # A source-matched delivery can resolve to PQ here.
+    if spec.get('encoder_note'):
+        import warnings
+        warnings.warn(spec['encoder_note'], stacklevel=2)
+        if report is not None:
+            report['hardwareFallback'] = True
     options['_color_profile'] = profile
     captions=project.get('captions') or []
     if not isinstance(captions,list): raise ValueError('Invalid captions')
@@ -2820,9 +2827,12 @@ def _window_burn(burn, clips, a_frame, skip, fps):
         item = media.get(clip.get('mediaId')) or {}
         source = None
         if 'sourceTimecode' in burn['settings']['fields'] and not clip.get('reverse') and float(clip.get('speed', 1)) == 1:
-            start_tc = _media_timecode(item, fps)
-            if start_tc is not None:
-                source = start_tc + round((float(clip.get('in', 0)) + (begin + skip - float(clip['start'])*fps)/fps) * fps)
+            source_tc = _media_timecode(item, fps)
+            if source_tc is not None:
+                start_tc, source_rate, source_drop = source_tc
+                # drawtext counts from the window origin, including frames before this clip is visible.
+                window_offset = round((float(clip.get('in', 0)) - float(clip['start'])) * fps) + skip
+                source = delivery.timecode_label(start_tc + window_offset, source_rate, source_drop)
         rows.append((clip.get('track', 0), begin, end, str(item.get('name') or 'Clip')[:120], source))
     # Sweep only clip edges. Each interval has one label, from its uppermost active track.
     starts = collections.defaultdict(list)
@@ -2845,18 +2855,18 @@ def _window_burn(burn, clips, a_frame, skip, fps):
         if index == previous:
             spans[-1][1] = end
         else:
-            _, original, _, name, source = rows[index]
-            spans.append([begin, end, name, None if source is None else source + begin - original])
+            _, _, _, name, source = rows[index]
+            spans.append([begin, end, name, source])
         previous = index
     return dict(settings=burn['settings'], timecode=burn['timecode'] + first_out, drop=burn['drop'], font=burn['font'],
                 frame=first_out, clips=spans)
 
 
 def _media_timecode(item, fps):
-    """A source's start timecode as a frame count at the sequence rate, when the source carries one at that rate."""
-    if '_timecode' in item:
-        return item['_timecode']
-    item['_timecode'] = None
+    """The source start frame, rate and drop-frame convention when its rate matches the sequence."""
+    if '_sourceTimecodeInfo' in item:
+        return item['_sourceTimecodeInfo']
+    item['_sourceTimecodeInfo'] = None
     path = item.get('_path')
     if not path:
         return None
@@ -2868,11 +2878,12 @@ def _media_timecode(item, fps):
         rate = next((Fraction(s['r_frame_rate']) for s in data.get('streams', []) if s.get('codec_type') == 'video'), None)
         label = next((value for value in labels if value), None)
         if label and rate and abs(float(rate) - fps) < 1e-3:
-            from interchange.timecode import timecode_frames
-            item['_timecode'] = timecode_frames(label, Fraction(fps).limit_denominator(1001))
+            from interchange.timecode import is_drop_frame, snap_rate, timecode_frames
+            rate = snap_rate(rate) or rate
+            item['_sourceTimecodeInfo'] = (timecode_frames(label, rate), rate, is_drop_frame(label))
     except (subprocess.SubprocessError, OSError, ValueError, TypeError, ZeroDivisionError, KeyError):
-        item['_timecode'] = None
-    return item['_timecode']
+        item['_sourceTimecodeInfo'] = None
+    return item['_sourceTimecodeInfo']
 
 
 BURN_IN_XY = {'top-left': ('{m}', '{m}'), 'top-center': ('(w-text_w)/2', '{m}'), 'top-right': ('w-text_w-{m}', '{m}'),
@@ -2943,8 +2954,7 @@ def _burn_in_filters(burn, width, height, fps, directory, profile):
             text.write_text(name, encoding='utf-8')
             filters.append(f"drawtext={box}:textfile={_filter_path(text)}:expansion=none:{place(settings['clipNamePosition'], name_row)}:{enable}")
         if 'sourceTimecode' in fields and source is not None:
-            # drawtext counts from the window's first frame: start the label `begin` frames earlier.
-            label = delivery.timecode_label(source - begin, rate, burn['drop']).replace(':', '\\:').replace(';', '\\;')
+            label = source.replace(':', '\\:').replace(';', '\\;')
             filters.append(f"drawtext={box}:timecode='{label}':rate={rate.numerator}/{rate.denominator}:"
                            f"{place(settings['clipNamePosition'], name_row + ('clipName' in fields))}:{enable}")
     if 'watermark' in fields and settings['watermark']:
