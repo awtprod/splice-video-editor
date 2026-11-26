@@ -618,7 +618,8 @@ def _picture_grade(clip, item, directory, name, profile, *, fps, zero, frames, r
             return None
         if hdr_master:
             raise ValueError('Wheels, curves, input LUTs and grade keyframes are graded in Rec. 709 SDR. Export this timeline as Rec. 709.')
-        sdr = {key: value for key, value in color.items() if key not in ('brightness','contrast','saturation','exposure','temperature','tint','lut','lutIntensity')}
+        # The look LUT moves here too, so it follows the wheels and curves as in the monitor.
+        sdr = {key: value for key, value in color.items() if key not in ('brightness','contrast','saturation','exposure','temperature','tint')}
         sdr_clip = {**clip, 'color': sdr, 'keyframes': {key: value for key, value in (clip.get('keyframes') or {}).items()
                                                         if key not in ('brightness','contrast','saturation','exposure','temperature','tint')}}
         if grade and grade.get('bypass'):
@@ -1300,7 +1301,7 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
             hdr_master=bool(hdr_profile) or conform_pq)
         hdr_source = (item.get('_sourceProfile') or REC709)[1] in HDR_TRANSFERS
         lut_filter=_lut_filter(color,Path(directory)/f'clip-{number}.cube',preserve_headroom=bool(
-            hdr_profile and hdr_source)) if graded is None or hdr_source else ''
+            hdr_profile and hdr_source)) if graded is None else ''
         still_frames = frames if item.get('_renderStill') else 0
         origin = _sample_origin(render_start, render_length, first_frame, frames, fps, reverse)
         disabled = bool(item.get('_disabled'))
@@ -1382,7 +1383,7 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
                 hdr_master=bool(hdr_profile) or conform_pq)
             prior_hdr=(prior_item.get('_sourceProfile') or REC709)[1] in HDR_TRANSFERS
             prior_lut=_lut_filter(prior_color,Path(directory)/f'tail-{number}.cube',preserve_headroom=bool(
-                hdr_profile and prior_hdr)) if prior_graded is None or prior_hdr else ''
+                hdr_profile and prior_hdr)) if prior_graded is None else ''
             prior_opacity=_number(prior_tail.get('opacity',100),'opacity',0,100)/100
             # A disabled outgoing clip has no tail: the incoming clip dissolves or wipes in over what lies beneath.
             if tail + 1e-6 >= frame_duration and not prior_item.get('_disabled'):

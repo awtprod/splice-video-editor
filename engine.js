@@ -548,15 +548,8 @@
     if(next) fade*=audioTransitionGain(next,1-(time-next.start+transitionBefore(next))/transitionLength(next));
     return clamp(animated(clip,'volume',Number(clip.volume??100))/100,0,2) * clamp((mix.gain??100)/100,0,2) * clamp(fade,0,1);
   };
-  const filterFor = (clip) => {
-    const c = clip.color || {};
-    return `brightness(${Number(c.brightness ?? 100)}%) contrast(${Number(c.contrast ?? 100)}%) saturate(${Number(c.saturation ?? 100)}%)`;
-  };
-  const gradeGains = c => {
-    const exposure=clamp(Number(c.exposure)||0,-4,4), temperature=clamp(Number(c.temperature)||0,-100,100)/100;
-    const tint=clamp(Number(c.tint)||0,-100,100)/100, gain=2**exposure;
-    return [gain*(1+.35*temperature-.1*tint),gain*(1+.2*tint),gain*(1-.35*temperature-.1*tint)];
-  };
+  // Exposure and white balance gains (one formula, color-grade.js).
+  const gradeGains = c => window.SpliceGrade.gains(c);
   const decode709 = value => Math.sign(value)*Math.abs(value)**2.4;
   const encode709 = value => Math.sign(value)*Math.abs(value)**(1/2.4);
   const decodePixels709 = Array.from({length:256},(_,level)=>decode709(level/255));
@@ -972,59 +965,46 @@
     return right;
   }
   const layerCanvases = new Map();
-  const dissolveCanvas=document.createElement('canvas');
   const blackGenerator=document.createElement('canvas');blackGenerator.width=16;blackGenerator.height=9;
   blackGenerator.getContext('2d').fillRect(0,0,16,9);
-  function paintVideo(ctx,element,clip,canvas,alpha=1,brightness=1) {
-    if (!element || (element instanceof HTMLVideoElement && element.readyState < 2)) return;
-    const color=clip.color||{}, lut=color.lutIntensity===0?null:color.lut;
-    const gains=gradeGains(color);
-    const graded=gains.some(g=>Math.abs(g-1)>.0001);
-    const item=mediaOf(clip);
-    const gradingSource=item?.hdr && window.SpliceMedia?.hdrPreviewStatus(item,clipAudioStream(clip,item))?.src;
+  // An HDR clip graded with the brightness/contrast/exposure controls is graded in linear light on
+  // the CPU (as the export grades it before the tone map) at the monitor's size; the result is a
+  // layer the picture pipeline composites like any other.
+  function hdrLayer(element,clip,canvas) {
+    const color=clip.color||{}, gains=gradeGains(color), item=mediaOf(clip);
+    const gradingSource=window.SpliceMedia?.hdrPreviewStatus(item,clipAudioStream(clip,item))?.src;
     const gradingData=!!gradingSource && element.getAttribute('src')===gradingSource;
-    const hdrGrade=item?.hdr && (gradingData || hasHdrGrade(color));
-    const previewScale=(lut || hdrGrade) && playing ? .5 : 1;
-    const drawWidth=Math.max(1,Math.round(canvas.width*previewScale));
-    const drawHeight=Math.max(1,Math.round(canvas.height*previewScale));
-    const sourceWidth=element.videoWidth||element.width||canvas.width;
-    const sourceHeight=element.videoHeight||element.height||canvas.height;
-    const fit=Math.min(drawWidth/sourceWidth,drawHeight/sourceHeight);
-    const scale=clamp(animated(clip,"scale",Number(clip.transform?.scale??100))/100,.1,4);
-    const x=clamp(animated(clip,"x",Number(clip.transform?.x??0)),-100,100)*drawWidth/100;
-    const y=clamp(animated(clip,"y",Number(clip.transform?.y??0)),-100,100)*drawHeight/100;
-    const rotation=clamp(animated(clip,"rotation",Number(clip.transform?.rotation??0)),-180,180)*Math.PI/180;
-    let target=ctx;
-    if ((lut && window.SpliceLUT) || graded || hdrGrade) {
-      let layer=layerCanvases.get(clip.id);
-      if (!layer) { layer=document.createElement('canvas'); layerCanvases.set(clip.id,layer); }
-      if (layer.width!==drawWidth || layer.height!==drawHeight) {layer.width=drawWidth;layer.height=drawHeight;}
-      target=layer.getContext('2d',{willReadFrequently:true});
-      target.clearRect(0,0,layer.width,layer.height);
-    }
-    alpha *= clamp(animated(clip,"opacity",Number(clip.opacity??100))/100,0,1);
-    target.save(); target.globalAlpha=target===ctx?alpha:1; target.filter=hdrGrade?'none':filterFor(clip);
-    if (target===ctx && brightness<1) target.filter+=` brightness(${brightness})`;
-    target.translate(drawWidth/2+x,drawHeight/2+y); target.rotate(rotation);
-    target.drawImage(element,-sourceWidth*fit*scale/2,-sourceHeight*fit*scale/2,sourceWidth*fit*scale,sourceHeight*fit*scale);
-    target.restore();
-    if (target!==ctx) {
-      const image=target.getImageData(0,0,drawWidth,drawHeight);
-      if (hdrGrade) gradeHdrPreview(image.data,color,gains,gradingData);
-      else if (graded) {
-        const pixels=image.data;
-        for(let i=0;i<pixels.length;i+=4) {
-          pixels[i]=Math.min(255,pixels[i]*gains[0]);
-          pixels[i+1]=Math.min(255,pixels[i+1]*gains[1]);
-          pixels[i+2]=Math.min(255,pixels[i+2]*gains[2]);
-        }
-      }
-      if (lut && window.SpliceLUT) window.SpliceLUT.applyImageData(image,lut,clip.color.lutIntensity??100);
-      target.putImageData(image,0,0);
-      ctx.save();ctx.globalAlpha=alpha;
-      if (brightness<1) ctx.filter=`brightness(${brightness})`;
-      ctx.drawImage(target.canvas,0,0,canvas.width,canvas.height);ctx.restore();
-    }
+    const sourceWidth=element.videoWidth||canvas.width, sourceHeight=element.videoHeight||canvas.height;
+    const fit=Math.min(1,canvas.width/sourceWidth,canvas.height/sourceHeight);
+    const width=Math.max(1,Math.round(sourceWidth*fit)), height=Math.max(1,Math.round(sourceHeight*fit));
+    let layer=layerCanvases.get(clip.id);
+    if (!layer) { layer=document.createElement('canvas'); layerCanvases.set(clip.id,layer); }
+    if (layer.width!==width || layer.height!==height) {layer.width=width;layer.height=height;}
+    const target=layer.getContext('2d',{willReadFrequently:true});
+    target.drawImage(element,0,0,width,height);
+    const image=target.getImageData(0,0,width,height);
+    gradeHdrPreview(image.data,color,gains,gradingData);
+    target.putImageData(image,0,0);
+    return layer;
+  }
+  // Monitor-only switches (not saved, not exported): grade bypass, before/after split, views.
+  const monitor={bypass:false,split:null,view:'normal'};
+  const legacyColorKeys=['brightness','contrast','saturation','exposure','temperature','tint','lut','lutIntensity'];
+  // The grade of one clip at the playhead, for the picture pipeline: one prepared grade, or the two
+  // keyframe gradings and their mix (color-grade.js keySegment), plus the source's input LUT.
+  function gradeOf(clip,bypass) {
+    const item=mediaOf(clip), input=item?.inputLut||null, Grade=window.SpliceGrade;
+    if (!Grade) return null;
+    let color=clip.color||{};
+    // HDR clips with the linear-light controls get those on the CPU (hdrLayer); the rest here.
+    if (item?.hdr && hasHdrGrade(color)) color=Object.fromEntries(Object.entries(color).filter(([key])=>!legacyColorKeys.includes(key)||key==='lut'||key==='lutIntensity'));
+    if (bypass) return input?{a:Grade.prepare({}),input}:null;
+    const segment=Grade.keySegment(clip,time-clip.start);
+    const subject=segment?{...clip,color}:null;
+    const a=Grade.prepare(segment?Grade.colorAt(subject,segment.a):color);
+    const b=segment && segment.b!==segment.a ? Grade.prepare(Grade.colorAt(subject,segment.b)) : null;
+    if (a.identity && !b && !input) return null;
+    return {a,b,weight:segment?.weight||0,input};
   }
   function videoFor(clip) {
     if (mediaOf(clip)?.nativeGenerator===1112293707) return blackGenerator;
@@ -1075,14 +1055,9 @@
     const rotation=animated(clip,"rotation",Number(clip.transform?.rotation??0));
     return opacity>=100 && scale>=100 && !x && !y && !rotation;
   }
-  function drawFrame(canvas) {
-    const active = at('video', time);
-    if (!mutedTracks.video && active && mediaOf(active)?.src &&
-        video?.readyState < 2 && previewProjects.get(canvas) === project) return;
-    previewProjects.set(canvas, project);
-    const ctx = canvas.getContext("2d");
-    ctx.fillStyle = '#000';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
+  // The frame at the playhead as a display list for the picture pipeline (gl-preview.js).
+  function framePlan(canvas,bypass=monitor.bypass) {
+    const plan={width:canvas.width,height:canvas.height,ops:[],view:monitor.view};
     const visible=project.clips.filter(clip=>clip.type!=='audio' && !trackHidden(clip.type,clip.track) && (clip.type==='video' ? !mutedTracks.video &&
       clip.start-transitionBefore(clip)<=time && time<clip.start+clip.duration :
       !mutedTracks.title && clip.title && clip.start<=time && time<clip.start+clip.duration));
@@ -1099,26 +1074,40 @@
     for (let index=visible.length-1;index>=0;index--) {
       if (coversFrame(visible[index],canvas,dissolvePairs)) { firstShown=index; break; }
     }
+    const layerOp=(clip,alpha=1,brightness=1,wipe=null)=>{
+      const element=videoFor(clip), item=mediaOf(clip);
+      if (!element || (element instanceof HTMLVideoElement && element.readyState < 2)) return null;
+      const hdr=item?.hdr && hasHdrGrade(clip.color||{}) && element instanceof HTMLVideoElement;
+      const source=hdr?hdrLayer(element,clip,canvas):element;
+      return {type:'video',element:source,clip,exact:!hdr && !(element instanceof HTMLCanvasElement),
+        input:{matrix:item?.hdr?'bt709':window.SpliceGrade?.matrixName(item?.colorSpace,item?.colorMatrix)||'bt601',fullRange:false},
+        grade:gradeOf(clip,bypass), brightness, wipe,
+        alpha:alpha*clamp(animated(clip,"opacity",Number(clip.opacity??100))/100,0,1),
+        geometry:{sourceWidth:source.videoWidth||source.width||canvas.width,sourceHeight:source.videoHeight||source.height||canvas.height,
+          scale:clamp(animated(clip,"scale",Number(clip.transform?.scale??100))/100,.1,4),
+          x:clamp(animated(clip,"x",Number(clip.transform?.x??0)),-100,100),
+          y:clamp(animated(clip,"y",Number(clip.transform?.y??0)),-100,100),
+          rotation:clamp(animated(clip,"rotation",Number(clip.transform?.rotation??0)),-180,180)*Math.PI/180}};
+    };
     for (const clip of visible.slice(firstShown)) {
       if (clip.type==='title') {
-        paintTitle(ctx,canvas,clip);
+        plan.ops.push({type:'title',clip,paint:(ctx,target)=>paintTitle(ctx,target,clip)});
         continue;
       }
-      if (outgoingIds.has(clip.id) || mediaOf(clip)?.nativeGenerator===1414680150) continue;
+      if (outgoingIds.has(clip.id)) continue;
+      if (mediaOf(clip)?.adjustment) {
+        const grade=gradeOf(clip,bypass);
+        if (grade && clip.enabled!==false) plan.ops.push({type:'adjust',clip,grade,alpha:clamp(animated(clip,"opacity",Number(clip.opacity??100))/100,0,1)});
+        continue;
+      }
+      if (mediaOf(clip)?.nativeGenerator===1414680150) continue;
       if (clip.transition==='fade' && time<clip.start) continue;
-      const element=videoFor(clip);
       const progress=clamp((time-(clip.start-transitionBefore(clip)))/transitionLength(clip),0,1);
       const previous=dissolvePairs.get(clip.id);
       if (previous) {
-        if (dissolveCanvas.width!==canvas.width || dissolveCanvas.height!==canvas.height) {
-          dissolveCanvas.width=canvas.width;dissolveCanvas.height=canvas.height;
-        }
-        const mix=dissolveCanvas.getContext('2d');
-        mix.clearRect(0,0,canvas.width,canvas.height);
-        paintVideo(mix,videoFor(previous),previous,canvas,1-progress);
-        mix.save();mix.globalCompositeOperation='lighter';
-        paintVideo(mix,element,clip,canvas,progress);mix.restore();
-        ctx.drawImage(dissolveCanvas,0,0);
+        // As the export blends: (beneath + outgoing) * (1-p) + (beneath + incoming) * p.
+        const incoming=layerOp(clip);
+        if (incoming) plan.ops.push({type:'dissolve',outgoing:layerOp(previous),incoming,progress});
         continue;
       }
       let brightness=1;
@@ -1127,13 +1116,25 @@
       const nextDip=videoDipFollowers.get(clip.id);
       if (nextDip && transitionBefore(nextDip)>0) brightness*=clamp((nextDip.start-time)/transitionBefore(nextDip),0,1);
       if (clip.transition==='wipe') {
-        const tail=transitionTail(clip,time);
-        if (tail) paintVideo(ctx,videoFor(tail),tail,canvas);
-        ctx.save();ctx.beginPath();ctx.rect(0,0,canvas.width*progress,canvas.height);ctx.clip();
+        const tail=transitionTail(clip,time), under=tail&&layerOp(tail);
+        if (under) plan.ops.push(under);
       }
-      paintVideo(ctx,element,clip,canvas,clip.transition==='dissolve'?progress:1,brightness);
-      if (clip.transition==='wipe') ctx.restore();
+      const op=layerOp(clip,clip.transition==='dissolve'?progress:1,brightness,clip.transition==='wipe'?progress:null);
+      if (op) plan.ops.push(op);
     }
+    return plan;
+  }
+  function drawFrame(canvas) {
+    const active = at('video', time);
+    if (!mutedTracks.video && active && mediaOf(active)?.src &&
+        video?.readyState < 2 && previewProjects.get(canvas) === project) return;
+    previewProjects.set(canvas, project);
+    const plan=framePlan(canvas);
+    if (monitor.split!=null) { plan.split=monitor.split; plan.beforeOps=framePlan(canvas,true).ops; }
+    window.SplicePicture.render(canvas,plan);
+    const shown=new Set();
+    for (const op of [...plan.ops,...(plan.beforeOps||[])]) for (const part of [op,op.outgoing,op.incoming]) if (part?.element) shown.add(part.element);
+    window.SplicePicture.forget(shown);
   }
   function tick(timestamp) {
     if (playing) {
@@ -1725,6 +1726,8 @@
       linkedSelection,
     }),
     drawFrame,
+    framePlan,
+    monitor,
     refreshMedia() { syncMedia(true);notify(); },
     editProject(fn) {
       const next = cloneState(project);

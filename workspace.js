@@ -598,6 +598,8 @@
   let lastPaint = "", lastScope = -Infinity, monitorState;
   for (const event of ['loadeddata','seeked','canplay','emptied'])
     document.addEventListener(event,()=>{lastPaint="";},true);
+  // A decoded frame's exact planes arrive after the paint that asked for them: paint again.
+  window.SplicePicture?.onReady(()=>{lastPaint="";});
   function paintPreview(now) {
     const canvas = $("preview-canvas"), state = monitorState;
     if (!state) { requestAnimationFrame(paintPreview); return; }
