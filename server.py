@@ -324,7 +324,14 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(data)
 
     def _json(self, status, payload):
-        self._reply(status, json.dumps(payload).encode(), 'application/json')
+        """Every JSON reply goes through here, and is strict JSON: NaN or Infinity (Python's
+        json writes them, a browser's JSON.parse rejects them) becomes a 500 with a message."""
+        try:
+            data = json.dumps(payload, allow_nan=False)
+        except ValueError:
+            status, data = 500, json.dumps({'error': 'Splice computed a number that is not finite (infinite or '
+                                                     'undefined) for this reply, so it sent none.'})
+        self._reply(status, data.encode(), 'application/json')
 
     def _local_request(self):
         host = self.headers.get('Host', '')

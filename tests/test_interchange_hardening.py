@@ -2,6 +2,7 @@
 all four importers), clamps on import are reported, repeated warnings carry a count, Windows
 device names are caught by path mapping, an EDL import says where its timeline starts, and the
 media-link step runs under its own time budget."""
+from fractions import Fraction
 import sys
 import tempfile
 import time
@@ -86,9 +87,75 @@ class MalformedFiles(unittest.TestCase):
         failures, slow, counts = interchange_fuzz.run(interchange_fuzz.seeds_from_export(), 120, seed=20261126, slow=10)
         self.assertEqual([(kind, repr(error)) for kind, error, _ in failures], [])
         self.assertEqual(slow, [])
-        self.assertEqual(sum(counts.values()), 480)
+        self.assertEqual(sum(counts.values()), 480 + 7, '120 mutants per format plus the fixed regressions')
         for kind in interchange_fuzz.FILENAMES:  # the mutants reach the readers, not only the parsers
             self.assertGreater(sum(n for (k, outcome), n in counts.items() if k == kind and outcome == 'ok'), 0, kind)
+
+
+class FiniteNumbers(unittest.TestCase):
+    """Every number an import returns is finite: the server answers in strict JSON."""
+
+    def test_an_otio_speed_too_large_for_a_float_imports_at_normal_speed(self):
+        import json
+        for scalar in (1e308, -1e308, 1.7976931348623157e308, 1e-308, 2e6):
+            with self.subTest(scalar=scalar):
+                document = otio_document(extra_clip={'effects': [{'OTIO_SCHEMA': 'LinearTimeWarp.1', 'time_scalar': scalar}]})
+                result = api.import_timeline('a.otio', document)
+                json.dumps(result, allow_nan=False)  # raises on Infinity or NaN
+                self.assertNotIn('speed', result['clips'][0])
+                self.assertIn('out of range; played at normal speed', '\n'.join(result['compatibilityWarnings']))
+        result = api.import_timeline('a.otio', otio_document(extra_clip={'effects': [
+            {'OTIO_SCHEMA': 'LinearTimeWarp.1', 'time_scalar': 1000}]}))
+        self.assertEqual(result['clips'][0]['speed'], 16.0)
+        self.assertAlmostEqual(result['media'][0]['duration'], 2 * 16, 6, 'the source span Splice plays at 16x')
+
+    def test_a_speed_past_any_float_never_makes_an_infinite_source_length(self):
+        import json
+        clip = {'kind': 'video', 'media': 'a', 'name': 'a', 'start': 0, 'duration': 2, 'in': 0, 'speed': 1e308}
+        result = project_module.build_project('T', Fraction(25), 1920, 1080, [{'key': 'a', 'name': 'a.mov', 'path': '', 'kind': 'video',
+                                                             'duration': None, 'rate': '25'}], [clip], [], [])
+        json.dumps(result, allow_nan=False)
+        self.assertEqual(result['clips'][0]['speed'], 16.0)
+
+    def test_the_server_never_sends_infinity_or_nan(self):
+        import json
+        import server
+        sent = []
+        handler = server.Handler.__new__(server.Handler)
+        handler._reply = lambda status, data, kind, headers=(): sent.append((status, data, kind))
+        for bad in (float('inf'), float('-inf'), float('nan')):
+            sent.clear()
+            handler._json(200, {'project': {'media': [{'duration': bad}]}})
+            status, data, kind = sent[0]
+            self.assertEqual((status, kind), (500, 'application/json'))
+            body = json.loads(data, parse_constant=lambda name: self.fail(f'{name} in a reply'))
+            self.assertIn('not finite', body['error'])
+        sent.clear()
+        handler._json(200, {'duration': 1.5})
+        self.assertEqual(sent[0][:2], (200, b'{"duration": 1.5}'))
+
+    def test_an_otio_rate_below_a_frame_a_minute_is_refused(self):
+        for rate in (0.01, 1 / 61):
+            with self.subTest(rate=rate), self.assertRaisesRegex(ValueError, 'out of range'):
+                otio._rt({'OTIO_SCHEMA': 'RationalTime.1', 'rate': rate, 'value': 1}, 'start')
+        self.assertEqual(otio._rt({'OTIO_SCHEMA': 'RationalTime.1', 'rate': 1 / 60, 'value': 1}, 'start')[1], Fraction(1, 60))
+
+    def test_an_fcpxml_title_style_too_large_for_a_float_is_a_warning(self):
+        seed = interchange_fuzz.seeds_from_export()['fcpxml']
+        for old, new in (('fontColor="1 1 1 1"', 'fontColor="1e400 0 0 1"'), ('fontColor="1 1 1 1"', 'fontColor="-1e400 0 0 1"')):
+            with self.subTest(new=new):
+                self.assertIn(old, seed)
+                result = api.import_timeline('a.fcpxml', seed.replace(old, new))
+                self.assertIn('its text style could not be read', '\n'.join(result['compatibilityWarnings']))
+
+    def test_an_fcpxml_volume_louder_than_a_float_can_hold_is_capped(self):
+        from interchange import fcpxml
+        for text in ('12dB', '9999dB', '1e300dB', '+400 dB'):
+            with self.subTest(text=text):
+                self.assertEqual(fcpxml.percent(text), 200.0)
+        self.assertEqual(fcpxml.percent('0dB'), 100.0)
+        with self.assertRaises(ValueError):
+            fcpxml.percent('1e400dB')
 
 
 class ImportWarnings(unittest.TestCase):

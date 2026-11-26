@@ -211,6 +211,8 @@ def write(cut: Cut) -> str:
 
 #: rates a RationalTime may carry: below a frame a minute or above a 1 MHz audio clock is no real media
 MIN_RATE, MAX_RATE = 1 / 60, 1_000_000
+#: a LinearTimeWarp beyond this many times real speed (either way) is no real retime
+MAX_SPEED = 1_000_000
 
 
 def _dict(value) -> dict:
@@ -372,6 +374,9 @@ def read(data: bytes, budget=None) -> dict:
                             scalar = _number(effect.get('time_scalar', 1), 'speed')
                         except ValueError as error:
                             warnings.append(f'{clip["name"]}: {error}; played at normal speed.')
+                            continue
+                        if abs(scalar) > MAX_SPEED or 0 < abs(scalar) < 1 / MAX_SPEED:
+                            warnings.append(f'{clip["name"]}: speed {scalar:g}x is out of range; played at normal speed.')
                             continue
                         speed, reverse = abs(scalar) or 1.0, scalar < 0
                     elif isinstance(effect, dict):

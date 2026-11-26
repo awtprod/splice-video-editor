@@ -136,6 +136,20 @@ def _lines(text, rng):
     return '\n'.join(lines)
 
 
+def _regressions(seed, kind):
+    """Fixed inputs that once got through: always imported first, before the random mutants."""
+    if kind == 'otio':
+        # A speed of 1e308 made a media duration of Infinity, which is not JSON (the browser failed).
+        for value in ('1e308', '-1e308', '1e-308', '1.7976931348623157e308'):
+            yield re.sub(r'"time_scalar": [-0-9.e+]+', f'"time_scalar": {value}', seed)
+    if kind in ('fcpxml', 'xmeml', 'edl'):
+        yield _numbers_everywhere(seed, '1e308')
+
+
+def _numbers_everywhere(text, value):
+    return NUMBER.sub(value, text)
+
+
 def mutants(seed, kind, count, rng):
     strategies = [_numbers, _numbers, _spans, _bytes, lambda t, r: t[:r.randrange(len(t) + 1)],
                   lambda t, r: _nest(t, r, kind)]
@@ -169,14 +183,18 @@ def _run(api, seeds, count, seed, slow):
     rng = random.Random(seed)
     failures, slow_ones, counts = [], [], {}
     for kind, text in seeds.items():
-        for mutant in mutants(text, kind, count, rng):
+        for mutant in [*_regressions(text, kind), *mutants(text, kind, count, rng)]:
             options = {'fps': rng.choice(['23.976', '25', '29.97', '1e-300', 'nan', '0', '60']),
                        'width': rng.choice([None, 1920, '1e308', 'nan', 16])} if kind == 'edl' else {}
-            started = time.monotonic()
+            started, outcome = time.monotonic(), None
             try:
-                api.import_timeline(FILENAMES[kind], mutant, options)
+                project = api.import_timeline(FILENAMES[kind], mutant, options)
                 outcome = 'ok'
+                # The server answers with strict JSON; NaN or Infinity in a project is a failure.
+                json.dumps(project, allow_nan=False)
             except CLIENT_ERRORS as error:
+                if outcome == 'ok':  # json.dumps refused a non-finite number
+                    failures.append((kind, error, mutant))
                 outcome = type(error).__name__
             except RecursionError as error:  # a RuntimeError: the server would answer 500
                 failures.append((kind, error, mutant))

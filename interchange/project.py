@@ -235,11 +235,12 @@ def build_project(name: str, rate: Fraction, width: int, height: int, media: lis
             data['in'] = max(0.0, _seconds(clip.get('in', 0)))
             data['color'] = {'brightness': 100, 'contrast': 100, 'saturation': 100}
             item = by_id[media_id]
-            speed = float(clip.get('speed', 1) or 1)
-            used = data['in'] + duration * speed
+            speed = _finite(clip.get('speed', 1)) or 1.0
+            limited = min(16.0, max(0.1, speed))  # what Splice plays, so what it reads of the source
+            used = data['in'] + duration * limited
             item['duration'] = max(item['duration'], round(used, 9))
             if abs(speed - 1) > 1e-9:
-                data['speed'] = round(min(16.0, max(0.1, speed)), 6)
+                data['speed'] = round(limited, 6)
                 if speed < .1 or speed > 16:
                     warnings.append(f'{clip.get("name")}: speed {speed:g}x is outside Splice\'s 0.1x-16x and was limited.')
             if clip.get('reverse'):
