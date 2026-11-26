@@ -146,10 +146,21 @@ def build_cut(project: dict, options: dict | None = None) -> Cut:
     except ValueError as error:
         raise InterchangeError(str(error)) from None
     width, height = int(_number(project.get('width'), 1920, 16, 16384)), int(_number(project.get('height'), 1080, 16, 16384))
-    drop = bool(options.get('dropFrame')) and rate in (Fraction(30000, 1001), Fraction(60000, 1001))
-    tc_text = str(options.get('startTimecode') or '01:00:00:00')
+    # The sequence start timecode and drop-frame come from the options when given (the export
+    # dialog fills them in from the sequence), else from the project as engine.js keeps them:
+    # ``startTimecode`` a whole frame count, ``dropFrame`` false for non-drop (absent = drop at
+    # 29.97/59.94). Text starts written by earlier builds are read as labels.
+    drop_rate = rate in (Fraction(30000, 1001), Fraction(60000, 1001))
+    wanted = options.get('dropFrame')
+    drop = drop_rate and (bool(wanted) if wanted is not None else project.get('dropFrame') is not False)
+    start = options.get('startTimecode') or project.get('startTimecode')
     try:
-        tc_start = timecode_frames(tc_text, rate, drop)
+        if isinstance(start, int) and not isinstance(start, bool):
+            if start < 0:
+                raise ValueError('it is before 00:00:00:00')
+            tc_start = start
+        else:
+            tc_start = timecode_frames(str(start or '01:00:00:00'), rate, drop)
     except ValueError as error:
         raise InterchangeError(f'Sequence start timecode: {error}') from None
     report = Report()

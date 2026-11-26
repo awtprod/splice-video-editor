@@ -42,27 +42,40 @@ window.SpliceSession = (() => {
   const signature=file=>[file.lastModified,file.size].join(':');
   let chain = Promise.resolve();
   // Large immutable payloads (LUT tables) are stored once in the 'originals' store under a
-  // content key ("lut:<hash>"), the way the Premiere original is, and drafts refer to them as
+  // content key ("lut:v2:<hash>"; drafts from earlier builds keep their older "lut:<size>:" keys), the way the Premiere original is, and drafts refer to them as
   // {payload: key}. Undo states share LUT objects and never change them in place, so a key is
   // computed once per table. Rows list their keys in `payloadKeys` so pruning can keep them.
   const payloadKeys = new WeakMap();
   const storedPayloads = new Set();
+  // The key covers everything that defines the LUT: every field, nested ones included (the 3D
+  // table, its size and domain, a 1D LUT's full `curve` with its size and samples, the title),
+  // each hashed with its name and type, so two LUTs differing in any of them get different keys.
   function contentKey(lut) {
     let key = payloadKeys.get(lut);
     if (key) return key;
     const view = new DataView(new ArrayBuffer(8));
-    let low = 0x811c9dc5, high = 0x01000193 ^ lut.data.length;
+    let low = 0x811c9dc5, high = 0x01000193 ^ (lut.data?.length || 0), count = 0;
     const mix = value => {
       view.setFloat64(0, value);
       low = Math.imul(low ^ view.getUint32(0), 0x01000193);
       high = Math.imul(high ^ view.getUint32(4), 0x5bd1e995) ^ (low >>> 13);
+      count++;
     };
-    mix(lut.size);
-    for (const value of [...(lut.domainMin || []), ...(lut.domainMax || [])]) mix(value);
-    for (const value of lut.data) mix(value);
-    const text = String(lut.title ?? '');
-    for (let index = 0; index < text.length; index++) mix(text.charCodeAt(index));
-    key = 'lut:' + lut.size + ':' + lut.data.length + ':' + (low >>> 0).toString(16) + (high >>> 0).toString(16);
+    const text = value => { mix(value.length); for (let index = 0; index < value.length; index++) mix(value.charCodeAt(index)); };
+    const walk = value => {
+      if (typeof value === 'number') { mix(1); mix(value); }
+      else if (typeof value === 'string') { mix(2); text(value); }
+      else if (typeof value === 'boolean') { mix(3); mix(value ? 1 : 0); }
+      else if (Array.isArray(value)) { mix(4); mix(value.length); for (const entry of value) walk(entry); }
+      else if (value && typeof value === 'object') {
+        const keys = Object.keys(value).filter(name => value[name] !== undefined).sort();
+        mix(5); mix(keys.length);
+        for (const name of keys) { text(name); walk(value[name]); }
+      } else mix(6);
+    };
+    walk(lut);
+    key = 'lut:v2:' + lut.size + ':' + (lut.data?.length || 0) + ':' + (lut.curve ? lut.curve.size + ':' : '') +
+      count.toString(36) + ':' + (low >>> 0).toString(16) + (high >>> 0).toString(16);
     payloadKeys.set(lut, key);
     return key;
   }
@@ -137,6 +150,10 @@ window.SpliceSession = (() => {
         pending = undefined;
         const tx = db.transaction(['sessions','versions','originals','handles','metadata'],'readwrite',{durability:'strict'});
         const done = complete(tx);
+        // When a request in the transaction fails first (quota exceeded), the error is thrown
+        // from that request and reported once below; the transaction's own abort is the same
+        // failure and must not surface again as an unhandled rejection.
+        done.catch(() => {});
         const sessions = tx.objectStore('sessions');
         const current = await request(sessions.get(payload.id));
         if (current && current.writer !== tab && (current.token || current.stamp) !== (lastRecord?.token || lastRecord?.stamp)) {
@@ -424,6 +441,6 @@ window.SpliceSession = (() => {
     });
   }
   window.addEventListener('beforeunload',e=>{if(persisting){e.preventDefault();e.returnValue='';}});
-  return {ready,open,openFile,save,saveAs:format=>save(format,true),history,sequence,prune,mediaReferences,
+  return {ready,open,openFile,save,saveAs:format=>save(format,true),history,sequence,prune,mediaReferences,lutKey:contentKey,
           newProject:settings=>start(()=>editor.newProject(settings),null,null)};
 })();

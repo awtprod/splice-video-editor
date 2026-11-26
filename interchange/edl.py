@@ -497,7 +497,8 @@ def read(data: bytes, options: dict | None = None, budget=None) -> dict:
             record.pop(extra, None)
         media_list.append(record)
     return build_project(title or 'Imported EDL', rate, width, height,
-                         media_list, out, [m for m in marker_list if m['time'] >= 0], warnings)
+                         media_list, out, [m for m in marker_list if m['time'] >= 0], warnings,
+                         start_frames=tc_start, drop=record_drop and rate in DROP_FRAME_RATES)
 
 
 def _media_for(key, name, path, reel, kind, rate, probes):

@@ -264,6 +264,16 @@ def _sequence_timecode(sequence):
 def _write_sequence_timecode(sequence, data):
     """Store Splice's start timecode and drop-frame choice in the sequence (zero point, display format)."""
     start = data.get('startTimecode') or 0
+    if isinstance(start, str):
+        # A start written as text by an earlier build ("01:00:00:00"): read it as a label.
+        from fractions import Fraction
+        from interchange.timecode import DROP_FRAME_RATES, timecode_frames
+        rate = Fraction(data.get('fps') or 25).limit_denominator(1001)
+        drop = rate in DROP_FRAME_RATES and (';' in start if data.get('dropFrame') is None else data.get('dropFrame') is True)
+        try:
+            start = timecode_frames(start.replace(';', ':'), rate, drop)
+        except ValueError:
+            raise ValueError('Invalid sequence start timecode') from None
     if not isinstance(start, int) or isinstance(start, bool) or start < 0:
         raise ValueError('Invalid sequence start timecode')
     if sequence.zero_point.ticks != start * sequence.timebase:

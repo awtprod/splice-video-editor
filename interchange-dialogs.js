@@ -80,6 +80,17 @@ window.SpliceInterchange = (() => {
     fields.rangeMode.onchange = () => {
       for (const field of range) { field.closest('label').hidden = fields.rangeMode.value !== 'custom'; field.required = !field.closest('label').hidden; }
     };
+    // The sequence's own start timecode and drop-frame setting (File → Sequence settings), and its
+    // timeline In/Out marks as the default range. A stored Out is the end of its (included) frame.
+    fields.startTimecode.value = Editor.sequenceTimecode ? Editor.sequenceTimecode(0) : '01:00:00:00';
+    fields.dropFrame.value = drop && project.dropFrame !== false ? '1' : '0';
+    const marks = project.marks || {};
+    if (Number.isFinite(marks.in) || Number.isFinite(marks.out)) {
+      range[0].value = String(Number((Number.isFinite(marks.in) ? marks.in : 0).toFixed(6)));
+      range[1].value = String(Number(Math.min(Number.isFinite(marks.out) ? marks.out : state.duration, state.duration).toFixed(6)));
+      fields.rangeMode.value = 'custom';
+      fields.rangeMode.onchange();
+    }
     const syncSound = () => {
       fields.audioEdl.closest('label').hidden = !fields.edl.checked;
       form.querySelector('[data-edl-note]').hidden = !fields.edl.checked;

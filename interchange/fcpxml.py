@@ -597,6 +597,8 @@ class _Reader:
         if not (16 <= self.width <= 16384 and 16 <= self.height <= 16384):
             raise ValueError('The sequence frame size is invalid')
         tc_start = self.time(sequence, 'tcStart', Fraction(0))
+        self.start_frames = round(tc_start * self.rate) if tc_start >= 0 else None
+        self.drop = sequence.get('tcFormat') == 'DF'
         spine = sequence.find('spine')
         if spine is None:
             raise ValueError('The sequence has no spine')
@@ -974,4 +976,5 @@ def read(data: bytes, budget: Budget | None = None) -> dict:
         record.pop('start', None)
         media.append(record)
     return build_project(reader.name, reader.rate, reader.width, reader.height, media, clips,
-                         [{'time': float(m['time']), 'name': m['name']} for m in reader.markers], reader.warnings)
+                         [{'time': float(m['time']), 'name': m['name']} for m in reader.markers], reader.warnings,
+                         start_frames=reader.start_frames, drop=reader.drop)
