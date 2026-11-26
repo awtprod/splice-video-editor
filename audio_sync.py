@@ -61,6 +61,11 @@ def envelope(samples):
         block = samples[start:start+BLOCK]
         energy = sum(value*value for value in block)/BLOCK
         levels.append(10*math.log10(energy+1e-10))
+    if levels:
+        # Silence is as quiet as the recording's own noise floor allows: floor every level 40 dB
+        # under the loud passages, so a recorder's digital silence and a camera's hiss read alike.
+        floor = sorted(levels)[int(.95*(len(levels)-1))]-40
+        levels = [max(level, floor) for level in levels]
     window = ENVELOPE_RATE
     out, total, history = [], 0.0, []
     for value in levels:
@@ -230,3 +235,42 @@ def timecode_offset(picture_info, sound_info, fps=24.0):
     offset = picture-reference/sample_rate
     return dict(ok=True, method='timecode', confidence=1.0, offsetSeconds=round(offset, 6), offsetSamples=round(offset*48000),
                 offsetFrames=round(offset*fps, 2))
+
+
+def sync_pairs(payload):
+    """The /api/audio/sync request: {pairs: [{picture, sound, pictureStream?, soundStream?, pictureSeconds?}],
+    method: auto|waveform|timecode, fps, searchSeconds}. ``picture`` and ``sound`` are media srcs."""
+    from media_proxy import describe
+    from premiere import _media_path
+    pairs = payload.get('pairs')
+    if not isinstance(pairs, list) or not 1 <= len(pairs) <= MAX_PAIRS:
+        raise ValueError(f'Sync takes 1 to {MAX_PAIRS} picture and sound pairs')
+    method = payload.get('method', 'auto')
+    if method not in ('auto', 'waveform', 'timecode'):
+        raise ValueError('Invalid sync method: use auto, waveform or timecode')
+    fps = payload.get('fps', 24)
+    if isinstance(fps, bool) or not isinstance(fps, (int, float)) or not 1 <= fps <= 240:
+        raise ValueError('Invalid sync frame rate')
+    search = payload.get('searchSeconds', DEFAULT_SEARCH_SECONDS)
+    if isinstance(search, bool) or not isinstance(search, (int, float)) or not 1 <= search <= MAX_SEARCH_SECONDS:
+        raise ValueError(f'Invalid sync search range: use 1 to {MAX_SEARCH_SECONDS} seconds')
+    results = []
+    for pair in pairs:
+        if not isinstance(pair, dict) or not isinstance(pair.get('picture'), str) or not isinstance(pair.get('sound'), str):
+            raise ValueError('Each sync pair names a picture and a sound source')
+        streams = [pair.get('pictureStream', 0), pair.get('soundStream', 0)]
+        if any(isinstance(value, bool) or not isinstance(value, int) or not 0 <= value < 64 for value in streams):
+            raise ValueError('Invalid sync audio stream')
+        seconds = pair.get('pictureSeconds')
+        if seconds is not None and (isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not 1 <= seconds <= 86400):
+            raise ValueError('Invalid picture duration for sync')
+        result = None
+        if method in ('auto', 'timecode'):
+            result = timecode_offset(describe(pair['picture']), describe(pair['sound']), fps)
+            if method == 'timecode' or result['ok']:
+                results.append(result)
+                continue
+        result = waveform_offset(_media_path(pair['picture']), _media_path(pair['sound']), picture_stream=streams[0],
+                                 sound_stream=streams[1], picture_seconds=seconds, search_seconds=search, fps=fps)
+        results.append(result)
+    return results

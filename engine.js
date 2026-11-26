@@ -1848,6 +1848,41 @@
       project.trackMix[key] = next;
       syncMedia(); notify();
     },
+    // Dual-system sound: link each picture clip to its separately recorded sound.
+    // `offset` is seconds: a picture source time t plays the sound file at t + offset.
+    // scratch: 'mute' turns the camera's own sound off (embeddedAudio false), 'keep' leaves it.
+    syncSound(items, {scratch = 'mute'} = {}) {
+      if (!Array.isArray(items) || !items.length) throw Error('Nothing to sync.');
+      if (!['mute','keep'].includes(scratch)) throw Error('Choose mute or keep for the camera sound.');
+      const made = [];
+      Editor.editProject(next => {
+        for (const {pictureId, mediaId, offset} of items) {
+          const picture = next.clips.find(clip => clip.id === pictureId && clip.type === 'video');
+          const sound = next.media.find(item => item.id === mediaId);
+          if (!picture || !sound) throw Error('A clip or sound file to sync is missing.');
+          if (picture.reverse) throw Error('Reversed clips cannot be synced to sound.');
+          if (!Number.isFinite(offset)) throw Error('Invalid sync offset.');
+          ensureEditable(picture);
+          const speed = Number(picture.speed) || 1;
+          let start = picture.start, length = picture.duration, inPoint = Number(picture.in || 0) + offset;
+          if (inPoint < 0) { start += -inPoint/speed; length -= -inPoint/speed; inPoint = 0; }
+          if (sound.duration && inPoint + length*speed > sound.duration) length = (sound.duration - inPoint)/speed;
+          start = Math.round(start*1e9)/1e9;
+          if (!(length > 1/next.fps)) throw Error(`${sound.name || 'The sound file'} does not overlap ${picture.title || 'the picture clip'} at that offset.`);
+          const track = freeAudioTrack(next, start, start + length);
+          if (track === null) throw Error("There is no free, unlocked audio track for the synced sound.");
+          const group = picture.linkGroup || uid();
+          const clip = {id: uid(), mediaId, type: 'audio', track, start, duration: length, in: inPoint, title: '', volume: 100,
+            transition: 'none', linkGroup: group, ...(speed !== 1 ? {speed} : {})};
+          picture.linkGroup = group;
+          if (scratch === 'mute') picture.embeddedAudio = false;
+          next.clips.push(clip);
+          made.push(clip.id);
+        }
+      });
+      notify();
+      return made;
+    },
     // Master bus EQ and compressor (null removes them).
     setMasterFx(fx) {
       window.SpliceAudioDSP.validateFx(fx, ['eq','comp']);

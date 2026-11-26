@@ -52,6 +52,7 @@ window.SpliceDialogs = (() => {
         'Enter a three-letter ISO 639-2 code, such as nld or swe.');
     };
     limiter.onchange=language.onchange=ceiling.oninput=languageCode.oninput=syncAudio;
+    window.SpliceExportAudio?.extend(audioGroup);
     form.elements.codec.closest('label').insertAdjacentHTML('afterend',
       '<label hidden>Color space<select name="colorSpace"><option value="source">Preserve source color space</option><option value="rec709">Rec. 709 SDR</option><option value="pq">Rec. 2100 PQ HDR</option></select></label>');
     rangeFields[0].value=String(Math.min(state.time,Math.max(0,state.duration-1/state.project.fps)).toFixed(6));
@@ -134,13 +135,14 @@ window.SpliceDialogs = (() => {
       if(audio&&typeof audio==='object'){
         const parts=[];
         // A silent file has no peak (null); its loudness is only the meter's floor.
+        for(const text of window.SpliceExportAudio?.describe(audio)||[]){const line=document.createElement('p');line.className='export-measured';line.textContent=text;report.append(line);}
         const silent=!Number.isFinite(audio.decodedTruePeakDb);
         parts.push(silent?'silent':'peak '+dB(audio.decodedTruePeakDb)+' dBTP');
         if(!silent&&Number.isFinite(audio.loudnessLufs))parts.push(dB(audio.loudnessLufs)+' LUFS');
         if(audio.aacPeakSafe)parts.push(audio.gainDb?'lowered '+Math.abs(audio.gainDb).toFixed(1)+' dB to fit the ceiling':'no gain needed');
-        const line=document.createElement('p');line.className='export-measured';
-        line.textContent='Decoded audio: '+parts.join(' · ');
-        report.append(line);
+        if(!audio.output){const line=document.createElement('p');line.className='export-measured';
+          line.textContent='Decoded audio: '+parts.join(' · ');
+          report.append(line);}
       }
       if(warnings.length){
         const list=document.createElement('ul');list.className='export-warnings';list.setAttribute('aria-label','Export warnings');
@@ -168,10 +170,11 @@ window.SpliceDialogs = (() => {
         if(opts.codec==='h264')opts.aacPeakSafe=peakSafe.checked;
         if(!language.closest('label').hidden)opts.subtitleLanguage=language.value==='other'?languageCode.value.trim().toLowerCase():language.value;
         if(form.elements.rangeMode.value==='custom')opts.range={start:rangeFields[0].valueAsNumber,end:rangeFields[1].valueAsNumber};
+        window.SpliceExportAudio?.apply(form,opts);
         const result=await Editor.exportVideo(opts,job=>{
           renderWarnings=Array.isArray(job.warnings)?job.warnings:[]; renderReport=job.report||{}; progress.value=job.progress;status.textContent='Rendering · '+Math.round(100*job.progress)+'%';
         },controller.signal);
-        progress.value=1;status.textContent=({h264:'MP4',prores:'MOV',wav:'WAV'}[form.elements.codec.value])+' exported.'+(result?.url?' Review the render below.':'');
+        progress.value=1;status.textContent=(opts.codec==='stems'?'Stems':{h264:'MP4',prores:'MOV',wav:'WAV'}[form.elements.codec.value])+' exported.'+(result?.url?' Review the render below.':'');
         showReport(renderReport.audio,renderWarnings);
         // The result is what the editor looks for next: bring it above the footer.
         (report.hidden?status:report).scrollIntoView({block:'nearest'});

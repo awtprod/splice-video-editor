@@ -227,6 +227,19 @@ def _rotation(stream):
         return 0
 
 
+def _time_reference(fmt):
+    value = _tag(fmt.get('tags'), 'time_reference')
+    return int(value) if value and value.isdigit() and int(value) < 2**63 else None
+
+
+def _sample_rate(audio):
+    try:
+        rate = int(audio.get('sample_rate') or 0)
+    except (TypeError, ValueError):
+        return None
+    return rate if 0 < rate <= 768000 else None
+
+
 def _color(value):
     return value if isinstance(value, str) and value not in ('unknown', 'unspecified', 'reserved') else None
 
@@ -290,6 +303,8 @@ def _describe_file(path, size, modified):
                 fps=fps, rate=_rational(rate) if rate else None, vfr=vfr,
                 timecode=(':'.join(timecode.group(1, 2, 3)) + (';' if drop else ':') + timecode.group(5)) if timecode else None,
                 dropFrame=drop, reel=reel,
+                # Dual-system sync: a BWF recorder file's start (samples since midnight) and its rate.
+                timeReference=_time_reference(fmt), audioSampleRate=_sample_rate(audio),
                 videoCodec=vcodec, audioCodec=acodec, audioChannels=2 if len(audio_streams)>1 else audio.get('channels',0),
                 audioStreams=len(audio_streams),
                 audioStreamDetails=[dict(index=i, streamIndex=s.get('index'), channels=s.get('channels', 1),
