@@ -113,6 +113,9 @@ async function main() {
     for (const source of ['hlg', 'pq']) {
       one(`${source} source`, {}, source, {kind:'hdr'});
       one(`${source} source with wheels`, {grade:{gain:[1.1, 1, .9, 1]}}, source, {kind:'hdr'});
+      one(`${source} source bypassed`, {exposure:1, contrast:140, grade:{bypass:true, gain:[1.2, 1, .8, 1]}}, source, {kind:'hdr'});
+      cases.push({name:`${source} source animated exposure`, source, length:1, clips:[{track:1, color:{exposure:.5},
+        keyframes:{exposure:[{time:0, value:-1}, {time:.48, value:0}, {time:.96, value:1}]}}], times:[0, .48, .96]});
     }
     cases.push({name:'input LUT on the source', source:'flat', inputLut:true, clips:[{track:1, color:{saturation:120}}], times:[.48]});
     // Keyframed exposure ramp over two seconds: -1 EV to +1 EV, sampled at five points.
@@ -286,7 +289,19 @@ async function main() {
       ...rows.map(row => `| ${row.case} | ${row.prores.toFixed(2)} | ${row.h264.toFixed(2)} | ${row.canvas.toFixed(2)} | ${row.restored.toFixed(2)} | ${row.limit} |`)].join('\n');
     if (proof) fs.writeFileSync(path.join(proof, 'parity-table.md'), table+'\n');
     console.log(table);
-    if (!process.env.SPLICE_PARITY_ONLY) assert.ok(changed >= rows.length*.7, `the cases change the picture (${changed} of ${rows.length})`);
+    if (!process.env.SPLICE_PARITY_ONLY) {
+      assert.ok(changed >= rows.length*.7, `the cases change the picture (${changed} of ${rows.length})`);
+      for (const source of ['hlg', 'pq']) {
+        const idxOf = name => sampleTimes.findIndex(s => s.item.name === name);
+        const u = idxOf(`${source} source`), b = idxOf(`${source} source bypassed`);
+        assert.ok(worst(exports.prores[b], exports.prores[u]) <= 1, `${source} bypassed ProRes matches tone-mapped ungraded`);
+        assert.ok(worst(gl[b], gl[u]) <= 2, `${source} bypassed WebGL2 matches tone-mapped ungraded`);
+        const a0 = sampleTimes.findIndex(s => s.item.name === `${source} source animated exposure` && Math.abs(s.time-s.item.start) < .01);
+        const a2 = sampleTimes.findIndex(s => s.item.name === `${source} source animated exposure` && Math.abs(s.time-s.item.start-.96) < .01);
+        assert.ok(worst(exports.prores[a0], exports.prores[a2]) > 40, `${source} animated exposure moves across keyframes in ProRes`);
+        assert.ok(worst(gl[a0], gl[a2]) > 40, `${source} animated exposure moves across keyframes in WebGL2`);
+      }
+    }
     assert.deepEqual(failures, [], failures.join('\n'));
     assert.deepEqual(errors, []);
     console.log(`Monitor matches the export: ${rows.length} samples, WebGL2, Canvas and after context loss, ProRes and H.264.`);

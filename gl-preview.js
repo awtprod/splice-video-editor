@@ -197,6 +197,7 @@ void main() {
 #endif
   x *= u_gain;
   if (u_wipe.x >= 0.0 && gl_FragCoord.x >= u_wipe.x) discard;
+  if (u_wipe.z >= 0.0 && gl_FragCoord.x < u_wipe.z) discard;
   outColor = vec4(x, source.a*u_alpha);
 }`;
   // Full-frame passes: copy, mix of two composites, monitoring views.
@@ -485,7 +486,7 @@ void main() {
       gl.uniform2f(u.u_size, g.sourceWidth*fit*g.scale, g.sourceHeight*fit*g.scale);
       gl.uniform1f(u.u_angle, g.rotation);
       gl.uniform1f(u.u_alpha, op.alpha); gl.uniform1f(u.u_gain, op.brightness ?? 1);
-      gl.uniform4f(u.u_wipe, op.wipe == null ? -1 : op.wipe*width, height, 0, 0);
+      gl.uniform4f(u.u_wipe, op.wipe == null ? -1 : op.wipe*width, height, op.wipeOut == null ? -1 : op.wipeOut*width, 0);
       gl.enable(gl.BLEND);
       gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
@@ -513,7 +514,7 @@ void main() {
       gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, scratch.texture); gl.uniform1i(u.u_y, 0);
       this.bindGrade(u, op.grade);
       gl.uniform2f(u.u_canvas, width, height); gl.uniform2f(u.u_center, width/2, height/2); gl.uniform2f(u.u_size, width, -height);
-      gl.uniform1f(u.u_angle, 0); gl.uniform1f(u.u_alpha, op.alpha); gl.uniform1f(u.u_gain, 1); gl.uniform4f(u.u_wipe, -1, height, 0, 0);
+      gl.uniform1f(u.u_angle, 0); gl.uniform1f(u.u_alpha, op.alpha); gl.uniform1f(u.u_gain, 1); gl.uniform4f(u.u_wipe, -1, height, -1, 0);
       gl.enable(gl.BLEND); gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4); gl.disable(gl.BLEND);
     }
@@ -542,7 +543,7 @@ void main() {
           this.passTo(a.framebuffer, acc.texture, null, 0); this.passTo(b.framebuffer, acc.texture, null, 0);
           gl.viewport(0, 0, width, height);
           if (op.outgoing) this.compose([op.outgoing], a, depth+3, width, height);
-          this.compose([op.incoming], b, depth+3, width, height);
+          if (op.incoming) this.compose([op.incoming], b, depth+3, width, height);
           gl.viewport(0, 0, width, height);
           this.passTo(acc.framebuffer, a.texture, b.texture, op.progress);
         }
@@ -675,6 +676,7 @@ void main() {
       }
       ctx.save(); ctx.globalAlpha = op.alpha ?? 1;
       if (op.wipe != null) { ctx.beginPath(); ctx.rect(0, 0, width*op.wipe, height); ctx.clip(); }
+      if (op.wipeOut != null) { ctx.beginPath(); ctx.rect(width*op.wipeOut, 0, width*(1-op.wipeOut), height); ctx.clip(); }
       ctx.drawImage(layer, 0, 0); ctx.restore();
     }
     compose(ctx, ops, depth, width, height) {
@@ -692,7 +694,7 @@ void main() {
           actx.globalAlpha = 1; bctx.globalAlpha = 1;
           actx.drawImage(ctx.canvas, 0, 0); bctx.drawImage(ctx.canvas, 0, 0);
           if (op.outgoing) this.compose(actx, [op.outgoing], depth+1, width, height);
-          this.compose(bctx, [op.incoming], depth+1, width, height);
+          if (op.incoming) this.compose(bctx, [op.incoming], depth+1, width, height);
           // A*(1-p)+B*p: draw A, then B at opacity p.
           ctx.save(); ctx.globalAlpha = 1; ctx.drawImage(A, 0, 0); ctx.globalAlpha = op.progress; ctx.drawImage(B, 0, 0); ctx.restore();
         }

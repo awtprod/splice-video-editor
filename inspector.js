@@ -172,7 +172,7 @@
     for(const key of ['scale','x','y','rotation','opacity','volume',...gradeKeys])
       if(clip.keyframes?.[key]?.length) element.querySelector(`[data-field="${key}"]:not([data-group="trackMix"])`)?.setAttribute('disabled','');
     if(clip.transition==='native') element.querySelector('[data-field="transitionDuration"]')?.setAttribute('disabled','');
-    if(locked) for(const input of element.querySelectorAll('[data-field]:not([data-group="trackMix"]),[data-key-add],[data-key-delete],[data-key-property],.splice-key-value,[data-action="import-lut"],[data-action="remove-lut"]')) input.disabled=true;
+    if(locked) for(const input of element.querySelectorAll('[data-field]:not([data-group="trackMix"]),[data-key-add],[data-key-delete],[data-key-property],.splice-key-value,[data-action="import-lut"],[data-action="remove-lut"],[data-grade-tools] input,[data-grade-tools] select,[data-grade-tools] button:not([data-grade-action="copy"]):not([data-grade-action="cube"]):not([data-curve-tab])')) input.disabled=true;
     document.querySelector('#monitor-frame')?.classList.toggle('show-safe-area', showSafeArea);
     element.querySelector('[data-safe-area]')?.addEventListener('change',event=>{
       showSafeArea=event.target.checked;

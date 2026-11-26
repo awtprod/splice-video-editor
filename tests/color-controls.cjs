@@ -74,8 +74,25 @@ async function main() {
         await page.screenshot({path:path.join(process.env.SPLICE_PROOF_DIR, 'controls-'+width+'.png')});
       await action('reset');
     }
+    // Locking a track disables editable Color controls while keeping read-only Copy and Export .cube usable.
+    await page.evaluate(() => { Editor.setTrackState(1, 'video', {locked: true}); });
+    await page.waitForFunction(() => document.querySelector('[data-grade-bypass]')?.disabled === true);
+    assert.equal(await page.locator('[data-wheel-number="gain"][data-channel="0"]').isDisabled(), true);
+    assert.equal(await page.locator('[data-grade-action="reset"]').isDisabled(), true);
+    assert.equal(await page.locator('[data-grade-action="copy"]').isDisabled(), false);
+    assert.equal(await page.locator('[data-grade-action="cube"]').isDisabled(), false);
+    await page.locator('[data-wheel="gain"] .grade-wheel-pad').focus();
+    await page.keyboard.press('ArrowRight');
+    assert.equal((await color(0)).grade, undefined, 'locked wheel pad ignores keyboard edits');
+    await page.evaluate(() => { Editor.setTrackState(1, 'video', {locked: false}); });
+    // Adjustment clips hide source-file controls (untagged matrix and input LUT).
+    await page.locator('.edit-menu > summary').click();
+    await page.locator('#new-adjustment-clip').click();
+    await page.waitForFunction(() => Editor.get().selected && Editor.get().project.media.find(m => m.id === Editor.get().selected.mediaId)?.adjustment);
+    await page.evaluate(() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))));
+    assert.equal(await page.locator('.grade-source').count(), 0, 'adjustment clip hides Source matrix/input LUT UI');
     assert.deepEqual(errors, []);
-    console.log('Grade actions, cube download and monitor controls passed at both viewport sizes.');
+    console.log('Grade actions, cube download, monitor controls, locked-track and adjustment UI passed.');
   } finally {
     await splice.stop();
   }

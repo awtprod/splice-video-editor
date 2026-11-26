@@ -1,5 +1,7 @@
 """Guard edits that cross the native Premiere object graph boundary."""
+import gzip
 import subprocess
+import xml.etree.ElementTree as ET
 import tempfile
 import unittest
 from pathlib import Path
@@ -107,6 +109,48 @@ class PremiereRoundTrip(unittest.TestCase):
                                          'title:2': {'locked': True, 'syncLocked': True}})
         merged = open_project(save_project(mixed))['trackState']['video:2']
         self.assertEqual((merged['locked'], merged.get('hidden')), (True, True))
+
+    def test_disabled_clips_save_as_disabled_track_items_and_reopen(self):
+        """Premiere keeps Clip > Enable off as ClipTrackItem/IsMuted on the track item (py-premiere's
+        is_disabled); the corpus has no disabled clip, so this writes one and reads it back."""
+        media = [dict(id=n, src=f'assets/{n}.mp4') for n in ('ridge', 'valley')]
+        clips = [dict(id='low', type='video', mediaId='ridge', start=0, duration=2, track=1, **{'in': 1}),
+                 dict(id='alt', type='video', mediaId='valley', start=0, duration=2, track=2, enabled=False, **{'in': 1}),
+                 dict(id='after', type='video', mediaId='valley', start=2, duration=1, track=1, enabled=True, **{'in': 1})]
+        saved = save_project(dict(name='Alternates', fps=25, clips=clips, media=media))
+        root = ET.fromstring(gzip.decompress(saved))
+        flags = [item.findtext('ClipTrackItem/IsMuted') for item in root.iter('VideoClipTrackItem')]
+        self.assertEqual(sorted(flag or '' for flag in flags), ['', '', 'true'])
+        reopened = open_project(saved)
+        by_place = {(clip['track'], round(clip['start'], 3)): clip for clip in reopened['clips']}
+        self.assertIs(by_place[(2, 0)]['enabled'], False)
+        self.assertNotIn('enabled', by_place[(1, 0)])
+        self.assertNotIn('enabled', by_place[(1, 2)])
+        # Re-enabled in Splice: the native flag goes away on the next save; disabling another works too.
+        by_place[(2, 0)].pop('enabled')
+        by_place[(1, 2)]['enabled'] = False
+        again = open_project(save_project(reopened))
+        states = {(clip['track'], round(clip['start'], 3)): clip.get('enabled', True) for clip in again['clips']}
+        self.assertEqual(states, {(1, 0): True, (2, 0): True, (1, 2): False})
+
+    def test_track_mute_is_not_a_disabled_clip(self):
+        project = open_project(TRACK_MUTE.read_bytes())
+        self.assertFalse([clip for clip in project['clips'] if clip.get('enabled') is False])
+
+    def test_disabled_camera_clip_disables_its_placed_sound(self):
+        MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=MEDIA_ROOT) as directory:
+            camera = Path(directory) / 'camera.mp4'
+            subprocess.run(['ffmpeg', '-nostdin', '-v', 'error', '-f', 'lavfi', '-i', 'color=c=blue:s=64x36:r=25:d=3',
+                            '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=3',
+                            '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest', str(camera)], check=True)
+            media = [dict(id='camera', type='video', src='/media/' + str(camera.relative_to(MEDIA_ROOT)), duration=3)]
+            clips = [dict(id='v1', type='video', mediaId='camera', start=0, duration=2, track=1, enabled=False, **{'in': 0})]
+            saved = save_project(dict(name='Camera', fps=25, clips=clips, media=media))
+        root = ET.fromstring(gzip.decompress(saved))
+        flags = [item.findtext('ClipTrackItem/IsMuted') for tag in ('VideoClipTrackItem', 'AudioClipTrackItem') for item in root.iter(tag)]
+        self.assertEqual(flags, ['true', 'true'])
+        self.assertTrue(all(clip.get('enabled') is False for clip in open_project(saved)['clips']))
 
     def test_split_camera_sound_saves_linked_and_out_of_sync(self):
         MEDIA_ROOT.mkdir(parents=True, exist_ok=True)

@@ -323,6 +323,8 @@ def _event(cut: Cut, clip: dict) -> Event | None:
         report.note(f'{label}: its grade is bypassed in Splice; receiving apps get the ungraded clip and none of its grade.')
     if source is not None and source.input_lut:
         report.note(f'{label}: the input LUT of its source ({source.input_lut}) is not carried.')
+    if source is not None and source.color_matrix:
+        report.note(f'{label}: the untagged color matrix override of its source ({source.color_matrix}) is not carried.')
     if clip.get('pan') not in (None, 0):
         report.note(f'{label}: clip pan is not carried by timeline interchange.')
     if clip.get('nativeVolumeOutsideTrim'):

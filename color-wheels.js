@@ -65,7 +65,7 @@
           `<button type="button" data-curve-reset title="Reset this curve">Reset curve</button>` +
         `</div>` +
       `</div>` +
-      (source && source.type === 'video' ? `<div class="grade-source"><p class="grade-source-title"><small>Source</small> ${esc(source.name)}</p>` +
+      (source && source.type === 'video' && !source.adjustment && source.nativeGenerator == null ? `<div class="grade-source"><p class="grade-source-title"><small>Source</small> ${esc(source.name)}</p>` +
         (untagged ? `<label class="splice-number"><span>Untagged matrix</span><select data-source-matrix aria-label="Read this untagged source as">` +
           `<option value="" ${!source.colorMatrix ? 'selected' : ''}>Rec. 601 (default)</option><option value="bt709" ${source.colorMatrix === 'bt709' ? 'selected' : ''}>Rec. 709</option><option value="bt601" ${source.colorMatrix === 'bt601' ? 'selected' : ''}>Rec. 601</option></select></label>` : '') +
         `<p class="splice-lut-name" title="${esc(source.inputLut?.title || 'No input LUT')}"><small>Input LUT</small> ${esc(source.inputLut?.title || 'None')}</p>` +
@@ -124,6 +124,7 @@
     const root = element.querySelector('[data-grade-tools]');
     if (!root) return;
     const current = () => editor.get().project.clips.find(item => item.id === clip.id) || clip;
+    const isLocked = () => !!editor.isTrackLocked?.(current().track, current().type);
     const gradeOf = () => ({...(current().color?.grade || {})});
     const write = (grade, keep = false) => {
       const active = current(), clean = {...grade};
@@ -156,6 +157,7 @@
         return {cb, cr};
       };
       pad.addEventListener('pointerdown', guarded(event => {
+        if (isLocked()) return;
         pad.setPointerCapture(event.pointerId); pad.focus();
         editor.beginGesture();
         const start = fromPointer(event), origin = puckOf(name, values()), fine = event.shiftKey;
@@ -166,8 +168,9 @@
         const up = () => { pad.removeEventListener('pointermove', move); pad.removeEventListener('pointerup', up); pad.removeEventListener('pointercancel', up); editor.endGesture(); rerender(); };
         pad.addEventListener('pointermove', move); pad.addEventListener('pointerup', up); pad.addEventListener('pointercancel', up);
       }));
-      pad.addEventListener('dblclick', guarded(() => { const grade = gradeOf(); delete grade[name]; write(grade); }));
+      pad.addEventListener('dblclick', guarded(() => { if (isLocked()) return; const grade = gradeOf(); delete grade[name]; write(grade); }));
       pad.addEventListener('keydown', guarded(event => {
+        if (isLocked()) return;
         const step = (event.shiftKey ? .02 : .002), p = puckOf(name, values());
         const moves = {ArrowLeft:[-step, 0], ArrowRight:[step, 0], ArrowUp:[0, step], ArrowDown:[0, -step]}[event.key];
         if (!moves) return;
@@ -175,24 +178,26 @@
         setPuck(p.cb+moves[0], p.cr+moves[1], false);
       }));
       box.querySelector('[data-wheel-master]').addEventListener('input', guarded(event => {
+        if (isLocked()) return;
         const grade = gradeOf(), v = [...values()]; v[3] = Number(event.target.value); grade[name] = v; write(grade, true);
         box.querySelector(`[data-wheel-number][data-channel="3"]`).value = String(v[3]);
       }));
-      box.querySelector('[data-wheel-master]').addEventListener('pointerdown', () => editor.beginGesture());
-      box.querySelector('[data-wheel-master]').addEventListener('change', () => { editor.endGesture(); rerender(); });
+      box.querySelector('[data-wheel-master]').addEventListener('pointerdown', () => { if (!isLocked()) editor.beginGesture(); });
+      box.querySelector('[data-wheel-master]').addEventListener('change', () => { if (!isLocked()) { editor.endGesture(); rerender(); } });
       for (const input of box.querySelectorAll('[data-wheel-number]')) input.addEventListener('change', guarded(() => {
+        if (isLocked()) return;
         const value = Number(input.value), [low, high] = G.wheels[name];
         if (!Number.isFinite(value) || value < low || value > high) { input.setCustomValidity(`Enter ${low} to ${high}.`); input.reportValidity(); return; }
         input.setCustomValidity('');
         const grade = gradeOf(), v = [...values()]; v[Number(input.dataset.channel)] = value; grade[name] = v; write(grade);
       }));
-      box.querySelector('[data-wheel-reset]').addEventListener('click', guarded(() => { const grade = gradeOf(); delete grade[name]; write(grade); }));
+      box.querySelector('[data-wheel-reset]').addEventListener('click', guarded(() => { if (isLocked()) return; const grade = gradeOf(); delete grade[name]; write(grade); }));
     }
     // Pivot
     const pivot = root.querySelector('[data-grade-pivot]');
-    pivot.addEventListener('pointerdown', () => editor.beginGesture());
-    pivot.addEventListener('input', guarded(() => { const grade = gradeOf(); grade.pivot = Number(pivot.value); write(grade, true); root.querySelector('[data-grade-out="pivot"]').textContent = Number(pivot.value).toFixed(2); }));
-    pivot.addEventListener('change', () => { editor.endGesture(); rerender(); });
+    pivot.addEventListener('pointerdown', () => { if (!isLocked()) editor.beginGesture(); });
+    pivot.addEventListener('input', guarded(() => { if (isLocked()) return; const grade = gradeOf(); grade.pivot = Number(pivot.value); write(grade, true); root.querySelector('[data-grade-out="pivot"]').textContent = Number(pivot.value).toFixed(2); }));
+    pivot.addEventListener('change', () => { if (!isLocked()) { editor.endGesture(); rerender(); } });
     // Curves
     const canvas = root.querySelector('.grade-curve');
     const pointsOf = grade => curveTab === 'hueSat' ? [...(grade.hueSat || [])].map(p => [...p]) : [...(grade.curves?.[curveTab] || [[0, 0], [1, 1]])].map(p => [...p]);
@@ -222,6 +227,7 @@
       points[index] = [round(Math.max(low, Math.min(high, x))), round(y)];
     };
     canvas.addEventListener('pointerdown', guarded(event => {
+      if (isLocked()) return;
       const grade = gradeOf(), points = pointsOf(grade), at = toValue(event);
       let index = nearest(points, at);
       if (index < 0) {
@@ -242,6 +248,7 @@
       canvas.addEventListener('pointermove', move); canvas.addEventListener('pointerup', up); canvas.addEventListener('pointercancel', up);
     }));
     const removeSelected = guarded(() => {
+      if (isLocked()) return;
       const grade = gradeOf(), points = pointsOf(grade);
       if (curveTab !== 'hueSat' && points.length <= 2) return;
       points.splice(selectedPoint, 1); selectedPoint = Math.max(0, selectedPoint-1);
@@ -250,8 +257,9 @@
     canvas.addEventListener('dblclick', removeSelected);
     canvas.addEventListener('keydown', guarded(event => {
       const grade = gradeOf(), points = pointsOf(grade);
-      if (event.key === 'Delete' || event.key === 'Backspace') { event.preventDefault(); removeSelected(); return; }
       if (event.key === 'Home' || event.key === 'End') { event.preventDefault(); selectedPoint = event.key === 'Home' ? 0 : points.length-1; rerender(); return; }
+      if (isLocked()) return;
+      if (event.key === 'Delete' || event.key === 'Backspace') { event.preventDefault(); removeSelected(); return; }
       const step = event.shiftKey ? .05 : .005, moves = {ArrowLeft:[-step, 0], ArrowRight:[step, 0], ArrowUp:[0, step], ArrowDown:[0, -step]}[event.key];
       if (!moves || !points[selectedPoint]) return;
       event.preventDefault();

@@ -242,6 +242,7 @@ class Source:
     generator: bool = False
     adjustment: bool = False    # a Splice adjustment clip (a generator that grades the tracks beneath)
     input_lut: str | None = None  # title of the source's technical input LUT, for the loss report
+    color_matrix: str | None = None  # untagged source matrix override ('bt709' or 'bt601'), for the loss report
     location: str = 'none'      # see Reference.kind
     original_path: str | None = None   # path on this machine, when export path mapping rewrote it
     path_rule: int | None = None        # index of the mapping rule that applied
@@ -383,6 +384,8 @@ def resolve_source(item: dict, sequence_rate: Fraction, budget: ProbeBudget) -> 
         return source
     if isinstance(item.get('inputLut'), dict):
         source.input_lut = clean(str(item['inputLut'].get('title') or 'LUT'))[:120]
+    if item.get('colorMatrix') in ('bt709', 'bt601'):
+        source.color_matrix = item['colorMatrix']
     reference = media_reference(item)
     local = reference.local
     source.local, source.path, source.location = local, reference.path, reference.kind

@@ -409,6 +409,36 @@
   const groupMembers = (clip, source = project) => clip.linkGroup
     ? source.clips.filter((other) => other.id !== clip.id && other.linkGroup === clip.linkGroup) : [];
   const linkedClips = (clip) => linkingActive() ? groupMembers(clip) : [];
+  // A link group with two or more members on one lane holds the pieces of one shot that
+  // picture-only edits cut apart, kept in sync with the sound that spans them. Linked operations
+  // then act on the members they concern rather than on the whole group:
+  // - an edit at one edge (trim, roll) also moves only members whose same edge is at that time;
+  // - an operation on a whole clip (delete, enable/disable, slide) also takes only the members
+  //   that lie within it (the sound spanning every piece takes every piece with it);
+  // - a ripple delete cuts a linked clip that spans the removed stretch, so the members after it
+  //   move left together (see deleteClips).
+  // Groups with at most one member per lane (a linked pair, J- and L-cuts included) act whole.
+  const piecesGroup = (members) => {
+    const lanes = new Set();
+    for (const member of members) {
+      const lane = (member.type === "audio" ? "audio:" : "video:") + member.track;
+      if (lanes.has(lane)) return true;
+      lanes.add(lane);
+    }
+    return false;
+  };
+  const partnersAtEdge = (clip, edge) => {
+    const members = linkedClips(clip);
+    if (!members.length || !piecesGroup([clip, ...members])) return members;
+    const edgeOf = (member) => edge === "start" ? member.start : member.start + member.duration;
+    return members.filter((member) => Math.abs(edgeOf(member) - edgeOf(clip)) < .5 / project.fps);
+  };
+  const partnersWithin = (clip) => {
+    const members = linkedClips(clip);
+    if (!members.length || !piecesGroup([clip, ...members])) return members;
+    const end = clip.start + clip.duration;
+    return members.filter((member) => member.start >= clip.start - 1e-6 && member.start + member.duration <= end + 1e-6);
+  };
   // A link group reduced to one clip (linked selection off) is no longer a link.
   function dropLoneLinks(source) {
     const counts = new Map();
@@ -449,6 +479,19 @@
     }
     for (const [key, members] of groups) {
       const afterMembers = after.clips.filter((clip) => clip.linkGroup === key);
+      if (afterMembers.length && piecesGroup(members)) {
+        // Pieces of a shot: a member may be deleted or edited alone, but every member still in the
+        // group keeps its picture and sound in sync with the others (equal sync-anchor shifts).
+        if (members.some((clip) => current.has(clip.id) && current.get(clip.id).linkGroup !== key))
+          throw new Error("Linked audio and video must be edited together.");
+        const shifts = afterMembers.flatMap((clip) => {
+          const prior = members.find((member) => member.id === clip.id);
+          return prior ? [syncAnchor(clip) - syncAnchor(prior)] : [];
+        });
+        if (shifts.some((shift) => Math.abs(shift - shifts[0]) > .001))
+          throw new Error("Linked audio and video must stay aligned.");
+        continue;
+      }
       if (afterMembers.length && afterMembers.length !== members.length)
         throw new Error("Linked audio and video must be edited together.");
       if (!afterMembers.length) continue;
@@ -503,12 +546,24 @@
       if (trackLocked(clip.type, clip.track, after) && !sameValue(clip, oldClips.get(clip.id)))
         throw new Error(`Unlock ${clip.type} track ${Math.abs(clip.track)} before editing.`);
   };
-  // The topmost clip of a kind at a time. Hidden picture tracks never reach the program monitor;
-  // their clips still get media elements (see syncMedia's layers), so embedded camera sound plays.
+  // A disabled clip (`enabled === false`) keeps every property but contributes no picture and
+  // no sound, its own embedded camera sound included; absent or true means enabled.
+  // Transitions next to a disabled clip follow the renderer (render_movie._disabled_stand_ins):
+  // the transition still plays for the enabled clip and the disabled side is transparent and
+  // silent. A transition carried by a disabled clip dissolves / wipes / dips the clip before it
+  // out to whatever is underneath (black if nothing); a transition on the clip after a disabled
+  // clip brings that clip in from what is underneath; an audio crossfade fades the enabled side
+  // against silence.
+  const isEnabled = (clip) => clip?.enabled !== false;
+  // A disabled picture clip that carries a transition: drawn as nothing, but its transition
+  // still takes the clip before it out.
+  const standIn = (clip) => clip.type === "video" && !isEnabled(clip) && ["dissolve", "wipe", "fade"].includes(clip.transition);
+  // The topmost enabled clip of a kind at a time. Hidden picture tracks never reach the program
+  // monitor; their clips still get media elements (see syncMedia's layers), so embedded camera sound plays.
   const at = (kind, t) =>
     project.clips
       .filter(
-        (c) => c.type === kind && c.start <= t && t < c.start + c.duration &&
+        (c) => c.type === kind && isEnabled(c) && c.start <= t && t < c.start + c.duration &&
           (kind === "audio" || !trackHidden(kind, c.track)),
       )
       .sort((a, b) => b.track - a.track)[0];
@@ -541,6 +596,10 @@
     const value=clamp(progress,0,1);
     return clip.transitionMatchName==='Constant Power' ? Math.sin(value*Math.PI/2) : value;
   };
+  // Enabled sound clips heard now, including a clip fading out through the crossfade of the clip
+  // after it (which may be disabled: the fade then runs against silence).
+  const soundingAudioClips = () => project.clips.filter(c=>c.type==='audio' && isEnabled(c) && c.start-transitionBefore(c)<=time &&
+    time<c.start+c.duration+(followingTransition(c)?transitionLength(followingTransition(c))-transitionBefore(followingTransition(c)):0));
   const audibility = clip => {
     const mix = trackSettings(clip.track);
     if (mutedTracks.audio || mix.mute || (soloActive() && !mix.solo)) return 0;
@@ -562,7 +621,21 @@
     const value=(level/255)**(32/2523);
     return (10000/203)*(Math.max(0,value-3424/4096)/(2413/128-(2392/128)*value))**(16384/2610);
   });
-  function hasHdrGrade(color={}) {
+  const primaryColorKeys = ['brightness','contrast','saturation','exposure','temperature','tint'];
+  function hdrStaticColor(clip) {
+    const color = clip?.color || {};
+    if (color.grade?.bypass) return {};
+    const keys = clip?.keyframes || {};
+    const out = {};
+    for (const key of primaryColorKeys) {
+      if (keys[key]?.length) continue;
+      if (key in color) out[key] = color[key];
+    }
+    return out;
+  }
+  function hasHdrGrade(clipOrColor={}) {
+    const color = 'color' in clipOrColor || 'keyframes' in clipOrColor ? hdrStaticColor(clipOrColor) : clipOrColor;
+    if (color.grade?.bypass) return false;
     return ['brightness','contrast','saturation'].some(key=>(color[key]??100)!==100) ||
       ['exposure','temperature','tint'].some(key=>Number(color[key])||0);
   }
@@ -571,7 +644,7 @@
     const item=clip && mediaOf(clip);
     if (!item?.src) return;
     const stream=clipAudioStream(clip,item);
-    if (item.hdr && hasHdrGrade(clip.color||{})) {
+    if (item.hdr && hasHdrGrade(clip)) {
       const graded=window.SpliceMedia?.preparePreview(item,stream,true)?.src;
       if (graded) return graded;
     }
@@ -641,6 +714,7 @@
         .filter(
           (c) =>
             c.type === "video" &&
+            isEnabled(c) &&
             c.id !== clip.id &&
             source.media.find(m=>m.id===c.mediaId)?.nativeGenerator !== 1414680150 &&
             c.track === clip.track &&
@@ -719,13 +793,19 @@
     for(const state of auditions.values()) state.active=false;
     indexTransitions();
     if (window.SpliceMedia?.prepareNested) for (const clip of project.clips) {
-      if (clip.type==='title' || clip.start-transitionBefore(clip)>time+1.5 || clip.start+clip.duration<time) continue;
+      if (clip.type==='title' || !isEnabled(clip) || clip.start-transitionBefore(clip)>time+1.5 || clip.start+clip.duration<time) continue;
       const item=mediaOf(clip);
       if (item?.nestedProject && !item.src) window.SpliceMedia.prepareNested(item);
     }
     const clip = at("video", time);
-    const audioClips = project.clips.filter(c=>c.type==='audio' && c.start-transitionBefore(c)<=time &&
-      time<c.start+c.duration+(followingTransition(c)?transitionLength(followingTransition(c))-transitionBefore(followingTransition(c)):0));
+    // The clip before a disabled clip's transition keeps playing out through that transition.
+    const standInTails = new Map();
+    for (const c of project.clips) {
+      if (!standIn(c) || trackHidden("video", c.track)) continue;
+      const tail = transitionTail(c, time);
+      if (tail) standInTails.set(tail.id, tail);
+    }
+    const audioClips = soundingAudioClips();
     const mediaItem = clip && mediaOf(clip);
     const source = programSource(clip);
     if (clip && clip.id !== activeVideoId) {
@@ -733,7 +813,8 @@
       const prepared=clip.id===preloadClipId?transitionVideo:preparedLayer;
       if(prepared){
         const outgoing=video, outgoingId=activeVideoId;
-        const staysVisible=project.clips.some(c=>c.id===outgoingId && c.start<=time && time<c.start+c.duration);
+        const staysVisible=standInTails.has(outgoingId) ||
+          project.clips.some(c=>c.id===outgoingId && isEnabled(c) && c.start<=time && time<c.start+c.duration);
         video=prepared;
         activeVideoId=clip.id;
         if(preparedLayer)layerVideos.delete(clip.id);
@@ -793,7 +874,7 @@
     } else transitionVideo.pause();
     if (playing && playbackRate > 0 && clip && !previous) {
       const upcoming = project.clips
-        .filter(c=>c.type==='video' && c.start>=time && c.start<=time+1.5 &&
+        .filter(c=>c.type==='video' && isEnabled(c) && c.start>=time && c.start<=time+1.5 &&
           (c.track>clip.track || c.start>=clip.start+clip.duration-1e-6))
         .sort((a,b)=>a.start-b.start || b.track-a.track)
         .find(c=>at('video',c.start)?.id===c.id);
@@ -819,17 +900,18 @@
         syncClipPlayback(transitionVideo,upcoming,target,forceSeek,transitionBefore(upcoming)>0);
       }
     }
-    const visible = project.clips.filter(c=>c.type==='video' && c.start-transitionBefore(c)<=time && time<c.start+c.duration);
+    const visible = project.clips.filter(c=>c.type==='video' && isEnabled(c) && c.start-transitionBefore(c)<=time && time<c.start+c.duration);
     const layers = new Map(visible.map(layer=>[layer.id,layer]));
     for (const layer of visible) {
       const tail = transitionTail(layer,time);
       if (tail && tail.id!==previous?.id) layers.set(tail.id,tail);
     }
+    for (const tail of standInTails.values()) if (tail.id!==previous?.id) layers.set(tail.id,tail);
     const preloading = new Set();
     if (playing && playbackRate>0) {
       const waiting = new Map();
       for (const next of project.clips) {
-        if (next.type!=='video' || next.id===preloadClipId || layers.has(next.id)) continue;
+        if (next.type!=='video' || !isEnabled(next) || next.id===preloadClipId || layers.has(next.id)) continue;
         const first = next.start-transitionBefore(next);
         if (first<=time || first>time+.75 || !preceding(next)) continue;
         const prior = waiting.get(next.track);
@@ -973,18 +1055,20 @@
   const layerCanvases = new Map();
   const blackGenerator=document.createElement('canvas');blackGenerator.width=16;blackGenerator.height=9;
   blackGenerator.getContext('2d').fillRect(0,0,16,9);
-  // An HDR clip graded with the brightness/contrast/exposure controls is graded in linear light on
-  // the CPU (as the export grades it before the tone map) at the monitor's size; the result is a
-  // layer the picture pipeline composites like any other.
-  function hdrLayer(element,clip,canvas) {
-    const color=clip.color||{}, gains=gradeGains(color), item=mediaOf(clip);
+  // An HDR clip graded with static brightness/contrast/exposure controls is graded in linear light
+  // on the CPU (as the export grades it before the tone map) at the monitor's size; the result is a
+  // layer the picture pipeline composites like any other. When bypassed while showing PQ grading
+  // data, it still runs the neutral BT.2020->BT.709 Mobius tone map so bypass preserves tone mapping.
+  function hdrLayer(element,clip,canvas,bypass=false) {
+    const color=bypass ? {} : hdrStaticColor(clip), gains=bypass ? [1,1,1] : gradeGains(color), item=mediaOf(clip);
     const gradingSource=window.SpliceMedia?.hdrPreviewStatus(item,clipAudioStream(clip,item))?.src;
     const gradingData=!!gradingSource && element.getAttribute('src')===gradingSource;
     const sourceWidth=element.videoWidth||canvas.width, sourceHeight=element.videoHeight||canvas.height;
     const fit=Math.min(1,canvas.width/sourceWidth,canvas.height/sourceHeight);
     const width=Math.max(1,Math.round(sourceWidth*fit)), height=Math.max(1,Math.round(sourceHeight*fit));
-    let layer=layerCanvases.get(clip.id);
-    if (!layer) { layer=document.createElement('canvas'); layerCanvases.set(clip.id,layer); }
+    const key=bypass ? `${clip.id}:bypass` : clip.id;
+    let layer=layerCanvases.get(key);
+    if (!layer) { layer=document.createElement('canvas'); layerCanvases.set(key,layer); }
     if (layer.width!==width || layer.height!==height) {layer.width=width;layer.height=height;}
     const target=layer.getContext('2d',{willReadFrequently:true});
     target.drawImage(element,0,0,width,height);
@@ -995,16 +1079,16 @@
   }
   // Monitor-only switches (not saved, not exported): grade bypass, before/after split, views.
   const monitor={bypass:false,split:null,view:'normal'};
-  const legacyColorKeys=['brightness','contrast','saturation','exposure','temperature','tint','lut','lutIntensity'];
   // The grade of one clip at the playhead, for the picture pipeline: one prepared grade, or the two
   // keyframe gradings and their mix (color-grade.js keySegment), plus the source's input LUT.
   function gradeOf(clip,bypass) {
     const item=mediaOf(clip), input=item?.inputLut||null, Grade=window.SpliceGrade;
     if (!Grade) return null;
+    const clipBypass=bypass || !!clip.color?.grade?.bypass;
+    if (clipBypass) return input?{a:Grade.prepare({}),input}:null;
     let color=clip.color||{};
-    // HDR clips with the linear-light controls get those on the CPU (hdrLayer); the rest here.
-    if (item?.hdr && hasHdrGrade(color)) color=Object.fromEntries(Object.entries(color).filter(([key])=>!legacyColorKeys.includes(key)||key==='lut'||key==='lutIntensity'));
-    if (bypass) return input?{a:Grade.prepare({}),input}:null;
+    // HDR static primaries run in linear light (hdrLayer); animated primaries and wheels/curves/LUTs run here.
+    if (item?.hdr) color=Object.fromEntries(Object.entries(color).filter(([key])=>!primaryColorKeys.includes(key)));
     const segment=Grade.keySegment(clip,time-clip.start);
     const subject=segment?{...clip,color}:null;
     const a=Grade.prepare(segment?Grade.colorAt(subject,segment.a):color);
@@ -1047,8 +1131,11 @@
     ctx.restore();
   }
   // Whether a video layer paints every pixel of the frame with full opacity right now.
-  function coversFrame(clip, canvas, dissolvePairs) {
-    if (clip.type!=='video' || clip.transition==='wipe' || clip.transition==='fade' || dissolvePairs.has(clip.id)) return false;
+  // A clip inside its own dissolve does not, with or without a clip before it; nor does a clip
+  // that a transition is taking out (it may be leaving against a disabled, transparent clip).
+  function coversFrame(clip, canvas, outgoingIds) {
+    if (clip.type!=='video' || !isEnabled(clip) || clip.transition==='wipe' || clip.transition==='fade' || outgoingIds.has(clip.id)) return false;
+    if (clip.transition==='dissolve' && time<clip.start+transitionLength(clip)-transitionBefore(clip)) return false;
     if (time<clip.start || videoDipFollowers.get(clip.id)) return false;
     const item=mediaOf(clip);
     if (!item || item.nativeGenerator===1414680150) return false;
@@ -1064,30 +1151,36 @@
   // The frame at the playhead as a display list for the picture pipeline (gl-preview.js).
   function framePlan(canvas,bypass=monitor.bypass) {
     const plan={width:canvas.width,height:canvas.height,ops:[],view:monitor.view};
-    const visible=project.clips.filter(clip=>clip.type!=='audio' && !trackHidden(clip.type,clip.track) && (clip.type==='video' ? !mutedTracks.video &&
+    const visible=project.clips.filter(clip=>clip.type!=='audio' && (isEnabled(clip) || standIn(clip)) && !trackHidden(clip.type,clip.track) && (clip.type==='video' ? !mutedTracks.video &&
       clip.start-transitionBefore(clip)<=time && time<clip.start+clip.duration :
       !mutedTracks.title && clip.title && clip.start<=time && time<clip.start+clip.duration));
     visible.sort((a,b)=>(a.track??4)-(b.track??4) || Number(a.type==='title')-Number(b.type==='title') || a.start-b.start);
-    const dissolvePairs=new Map(), outgoingIds=new Set();
+    const dissolvePairs=new Map(), wipeOuts=new Map(), outgoingIds=new Set();
     for (const clip of visible) {
-      if (clip.type!=='video' || clip.transition!=='dissolve' || time>=clip.start+transitionLength(clip)-transitionBefore(clip)) continue;
+      if (clip.type!=='video' || time>=clip.start+transitionLength(clip)-transitionBefore(clip)) continue;
       const previous=preceding(clip);
-      if (previous) {dissolvePairs.set(clip.id,previous);outgoingIds.add(previous.id);}
+      if (!previous) continue;
+      if (clip.transition==='dissolve') {dissolvePairs.set(clip.id,previous);outgoingIds.add(previous.id);}
+      // A disabled clip wiping in over the clip before it: that clip is wiped off to what is underneath.
+      else if (clip.transition==='wipe' && !isEnabled(clip)) {wipeOuts.set(clip.id,previous);outgoingIds.add(previous.id);}
     }
     // Layers under an opaque, untransformed full-frame picture cannot show: skip drawing them.
     // (Their camera sound still plays; this only saves compositing work on stacked tracks.)
     let firstShown=0;
     for (let index=visible.length-1;index>=0;index--) {
-      if (coversFrame(visible[index],canvas,dissolvePairs)) { firstShown=index; break; }
+      if (coversFrame(visible[index],canvas,outgoingIds)) { firstShown=index; break; }
     }
-    const layerOp=(clip,alpha=1,brightness=1,wipe=null)=>{
+    const layerOp=(clip,alpha=1,brightness=1,wipe=null,wipeOut=null)=>{
       const element=videoFor(clip), item=mediaOf(clip);
       if (!element || (element instanceof HTMLVideoElement && element.readyState < 2)) return null;
-      const hdr=item?.hdr && hasHdrGrade(clip.color||{}) && element instanceof HTMLVideoElement;
-      const source=hdr?hdrLayer(element,clip,canvas):element;
+      const clipBypass=bypass || !!clip.color?.grade?.bypass;
+      const gradingSource=item?.hdr ? window.SpliceMedia?.hdrPreviewStatus(item,clipAudioStream(clip,item))?.src : null;
+      const gradingData=!!gradingSource && element instanceof HTMLVideoElement && element.getAttribute('src')===gradingSource;
+      const hdr=item?.hdr && element instanceof HTMLVideoElement && (clipBypass ? gradingData : hasHdrGrade(clip));
+      const source=hdr?hdrLayer(element,clip,canvas,clipBypass):element;
       return {type:'video',element:source,clip,exact:!hdr && !(element instanceof HTMLCanvasElement),
         input:{matrix:item?.hdr?'bt709':window.SpliceGrade?.matrixName(item?.colorSpace,item?.colorMatrix)||'bt601',fullRange:false},
-        grade:gradeOf(clip,bypass), brightness, wipe,
+        grade:gradeOf(clip,bypass), brightness, wipe, wipeOut,
         alpha:alpha*clamp(animated(clip,"opacity",Number(clip.opacity??100))/100,0,1),
         geometry:{sourceWidth:source.videoWidth||source.width||canvas.width,sourceHeight:source.videoHeight||source.height||canvas.height,
           scale:clamp(animated(clip,"scale",Number(clip.transform?.scale??100))/100,.1,4),
@@ -1103,7 +1196,7 @@
       if (outgoingIds.has(clip.id)) continue;
       if (mediaOf(clip)?.adjustment) {
         const grade=gradeOf(clip,bypass);
-        if (grade && clip.enabled!==false) plan.ops.push({type:'adjust',clip,grade,alpha:clamp(animated(clip,"opacity",Number(clip.opacity??100))/100,0,1)});
+        if (grade && isEnabled(clip)) plan.ops.push({type:'adjust',clip,grade,alpha:clamp(animated(clip,"opacity",Number(clip.opacity??100))/100,0,1)});
         continue;
       }
       if (mediaOf(clip)?.nativeGenerator===1414680150) continue;
@@ -1112,10 +1205,19 @@
       const previous=dissolvePairs.get(clip.id);
       if (previous) {
         // As the export blends: (beneath + outgoing) * (1-p) + (beneath + incoming) * p.
-        const incoming=layerOp(clip);
-        if (incoming) plan.ops.push({type:'dissolve',outgoing:layerOp(previous),incoming,progress});
+        // A disabled incoming clip is transparent: outgoing dissolves out to what is underneath.
+        const incoming=isEnabled(clip)?layerOp(clip):null, outgoing=layerOp(previous);
+        if (outgoing || incoming) plan.ops.push({type:'dissolve',outgoing,incoming,progress});
         continue;
       }
+      const wipedOff=wipeOuts.get(clip.id);
+      if (wipedOff) {
+        const op=layerOp(wipedOff,1,1,null,progress);
+        if (op) plan.ops.push(op);
+        continue;
+      }
+      // Any other disabled stand-in paints nothing (a dip it carries still darkens the clip before).
+      if (!isEnabled(clip)) continue;
       let brightness=1;
       const head=transitionLength(clip)-transitionBefore(clip);
       if (clip.transition==='fade' && head>0) brightness=clamp((time-clip.start)/head,0,1);
@@ -1418,9 +1520,10 @@
         return piece;
       },
       settle() {
+        const owned = new Set(sides.values());
         const buckets = new Map();
         for (const clip of source.clips) {
-          if (!anchors.has(clip) || !clip.linkGroup) continue;
+          if (!anchors.has(clip) || !clip.linkGroup || !owned.has(clip.linkGroup)) continue;
           const moved = Math.round((syncAnchor(clip) - anchors.get(clip)) * source.fps * 100);
           if (!buckets.has(clip.linkGroup)) buckets.set(clip.linkGroup, new Map());
           const byShift = buckets.get(clip.linkGroup);
@@ -1452,26 +1555,34 @@
       }
     }
     const touched = new Set(source.clips.filter((clip) => clip.linkGroup && crossing(clip)).map((clip) => clip.linkGroup));
+    // A member on a lane the edit leaves alone that spans the cleared range (the whole sound
+    // under a picture-only overwrite) stays in sync with the pieces on both sides, so those
+    // pieces and it remain one group; settle() still unlinks whatever the edit moved out of sync.
+    const spanning = new Set(source.clips.filter((clip) => touched.has(clip.linkGroup) && !crossing(clip) &&
+      clip.start < from - 1e-6 && clip.start + clip.duration > to + 1e-6).map((clip) => clip.linkGroup));
     const links = linkSides(source, touched);
     const kept = [];
     for (const clip of source.clips) {
+      // Decided from the clip's group before assign() gives it its side's new group.
+      const spans = spanning.has(clip.linkGroup);
+      const sideOf = (side) => spans ? "spanning" : side;
       if (!crossing(clip)) {
-        kept.push(links.assign(clip, clip, clip.start >= to - 1e-6 ? "after" : "before"));
+        kept.push(links.assign(clip, clip, sideOf(clip.start >= to - 1e-6 ? "after" : "before")));
         continue;
       }
       const head = clip.start < from - 1e-6, tail = clip.start + clip.duration > to + 1e-6;
       if (head && tail) {
         const middle = splitClipAt(clip, from, source);
         const right = splitClipAt(middle, to, source);
-        kept.push(links.assign(clip, clip, "before"), links.assign(right, clip, "after"));
+        kept.push(links.assign(clip, clip, sideOf("before")), links.assign(right, clip, sideOf("after")));
       } else if (head) {
         splitClipAt(clip, from, source);
-        kept.push(links.assign(clip, clip, "before"));
+        kept.push(links.assign(clip, clip, sideOf("before")));
       } else if (tail) {
         const right = splitClipAt(clip, to, source);
         const native = {};
         for (const key of ["premiereIndex", "premiereTrack"]) if (key in clip) native[key] = clip[key];
-        kept.push(links.assign({...right, ...native, id: clip.id}, clip, "after"));
+        kept.push(links.assign({...right, ...native, id: clip.id}, clip, sideOf("after")));
       }
     }
     source.clips = kept;
@@ -1680,10 +1791,14 @@
       };
       const first = Math.max(0, Math.floor(from * fps)), last = Math.ceil(to * fps);
       if (step < 1) {
-        // Frame steps: frames whose label's frame field is a multiple of the step.
+        // Frame steps: frames whose label's frame field is a multiple of the step, and in
+        // drop-frame minutes the first real frame (;02 or ;04), whose labels before it are skipped.
         const every = Math.max(1, Math.round(step * nominal));
-        for (let frame = first; frame <= last; frame++)
-          if ((labelCount(frame + start, fps, drop) % nominal) % every === 0) add(frame);
+        for (let frame = first; frame <= last; frame++) {
+          const count = labelCount(frame + start, fps, drop);
+          const afterSkip = drop && frame + start > 0 && count - labelCount(frame + start - 1, fps, drop) > 1;
+          if ((count % nominal) % every === 0 || afterSkip) add(frame);
+        }
         return ticks;
       }
       const perTick = Math.round(step) * nominal;
@@ -1978,7 +2093,10 @@
       ensureEditable(clip, "track" in patch ? Number(patch.track) : clip.track);
       if (Object.entries(patch).every(([key,value]) => sameValue(clip[key],value))) return;
       const linkedFields=["start","duration","in","speed","reverse"];
-      const partners=linkedFields.some(key=>key in patch) ? linkedClips(clip) : [];
+      // A trim through updateClip (a new duration) takes the partners at the edge it moves.
+      const trimmed="duration" in patch && !sameValue(clip.duration,patch.duration);
+      const edge=trimmed && "start" in patch && !sameValue(clip.start,patch.start) ? "start" : "end";
+      const partners=!linkedFields.some(key=>key in patch) ? [] : trimmed ? partnersAtEdge(clip,edge) : linkedClips(clip);
       const changes=[{id,patch}];
       for (const partner of partners) {
         ensureEditable(partner);
@@ -2038,7 +2156,8 @@
     trimEdge(id, edge, atTime, { ripple = false } = {}) {
       const clip = project.clips.find(c => c.id === id);
       if (!clip) return;
-      ensureLinkedEditable(clip);
+      const partners = partnersAtEdge(clip, edge);
+      for (const member of [clip, ...partners]) ensureEditable(member);
       const oldStart = clip.start, oldEnd = oldStart + clip.duration;
       const boundary = snap(atTime);
       const speed=Number(clip.speed)||1;
@@ -2050,7 +2169,7 @@
       const newEnd = edge === "end" ? clamp(boundary, oldStart + 1/project.fps, latest) : oldEnd;
       const shift = (edge === "start" ? newStart - oldStart : newEnd - oldEnd);
       if (!shift) return;
-      const memberIds=new Set([clip.id,...linkedClips(clip).map(c=>c.id)]);
+      const memberIds=new Set([clip.id,...partners.map(c=>c.id)]);
       const rippleShift=edge==="start"?-shift:shift;
       for(const member of project.clips.filter(c=>memberIds.has(c.id))){
         const nextIn=member.in+(edge==="start"&&!member.reverse?shift*(Number(member.speed)||1):edge==="end"&&member.reverse?-shift*(Number(member.speed)||1):0);
@@ -2076,7 +2195,7 @@
     rollEdit(leftId, rightId, boundary) {
       const left = project.clips.find(c => c.id === leftId), right = project.clips.find(c => c.id === rightId);
       if (!left || !right || left.type !== right.type || left.track !== right.track || Math.abs(left.start + left.duration - right.start) > .05) return;
-      const outgoing = [left, ...linkedClips(left)], incoming = [right, ...linkedClips(right)];
+      const outgoing = [left, ...partnersAtEdge(left, "end")], incoming = [right, ...partnersAtEdge(right, "start")];
       const leftIds = new Set(outgoing.map(clip => clip.id)), rightIds = new Set(incoming.map(clip => clip.id));
       if (incoming.some(clip => leftIds.has(clip.id))) return;
       for (const clip of [...outgoing,...incoming]) ensureEditable(clip);
@@ -2137,7 +2256,7 @@
       const clip = project.clips.find((c) => c.id === id);
       if (!clip) return;
       const frame = frameSeconds(), near = .5 / project.fps;
-      const parts = [clip, ...linkedClips(clip)].map((member) => {
+      const parts = [clip, ...partnersWithin(clip)].map((member) => {
         const lane = project.clips.filter((other) => other.id !== member.id && laneOf(other) === laneOf(member));
         const end = member.start + member.duration;
         return {member, lane,
@@ -2385,6 +2504,40 @@
       });
       return "linked";
     },
+    // Enable or disable clips (Premiere's Clip > Enable, Shift+E). The command acts on the whole
+    // selection as one, as Premiere does: when the lead clip (the one right-clicked, otherwise the
+    // primary selection; by default the first id) is enabled, every chosen clip becomes disabled,
+    // otherwise every chosen clip becomes enabled. With linked selection on, linked partners are
+    // chosen too. One undo step; nothing changes when a clip that would change is on a locked
+    // track. A disabled clip stores `enabled: false`; enabling removes the key, so older projects
+    // and re-enabled clips look the same.
+    toggleEnabled(ids, lead = ids?.[0]) {
+      const wanted = new Set(ids);
+      const chosen = project.clips.filter((clip) => wanted.has(clip.id));
+      for (const clip of [...chosen]) for (const partner of partnersWithin(clip)) if (!wanted.has(partner.id)) {
+        wanted.add(partner.id);
+        chosen.push(partner);
+      }
+      if (!chosen.length) return null;
+      const disable = isEnabled(chosen.find((clip) => clip.id === lead) || chosen[0]);
+      const changing = chosen.filter((clip) => isEnabled(clip) === disable || (!disable && "enabled" in clip));
+      for (const clip of changing) ensureEditable(clip);
+      if (changing.length) Editor.editProject((next) => {
+        for (const clip of next.clips) {
+          if (!wanted.has(clip.id)) continue;
+          if (disable) clip.enabled = false;
+          else delete clip.enabled;
+        }
+      });
+      const count = chosen.filter((clip) => isEnabled(clip) === disable).length;
+      return disable ? {disabled: count, enabled: 0} : {disabled: 0, enabled: count};
+    },
+    isClipEnabled: (clip) => isEnabled(clip),
+    // The gain each sound clip heard at the playhead gets (what playback sets on its gain node).
+    audioGains() {
+      indexTransitions();
+      return Object.fromEntries(soundingAudioClips().map((clip) => [clip.id, audibility(clip)]));
+    },
     // Give an embedded camera clip a linked audio clip (used before trimming one side).
     detachAudio(id) {
       const clip = project.clips.find((c) => c.id === id);
@@ -2434,7 +2587,7 @@
     deleteClips(ids, {ripple=false} = {}) {
       const selected=new Set(ids);
       const members=project.clips.filter(clip=>selected.has(clip.id));
-      for(const clip of [...members])for(const linked of linkedClips(clip))selected.add(linked.id);
+      for(const clip of [...members])for(const linked of partnersWithin(clip))selected.add(linked.id);
       const removing=project.clips.filter(clip=>selected.has(clip.id));
       if(!removing.length)return;
       for(const clip of removing)ensureEditable(clip);
@@ -2446,14 +2599,28 @@
         if(last && clip.start<=last[1]+.001) last[1]=Math.max(last[1],end);
         else spans.push([clip.start,end]);
       }
+      const moves=clip=>!trackLocked(clip.type,clip.track)&&syncLocked(clip.type,clip.track);
       Editor.editProject(next=>{
         next.clips=next.clips.filter(clip=>!selected.has(clip.id));
-        if(!ripple)return;
-        for(const clip of next.clips){
-          if(trackLocked(clip.type,clip.track)||!syncLocked(clip.type,clip.track))continue;
-          const shift=spans.filter(([,end])=>end<=clip.start+.001).reduce((sum,[begin,end])=>sum+end-begin,0);
-          if(shift)clip.start=Math.max(0,snap(clip.start-shift));
+        if(ripple){
+          // A linked clip spanning a removed stretch (the sound under a picture piece or under a
+          // clip cut into a linked shot) whose group has members after it that move left loses
+          // the part under the stretch, so the whole group stays in sync.
+          const settles=[];
+          if(linkingActive())for(const [begin,end] of spans){
+            const spanning=next.clips.filter(clip=>clip.linkGroup&&moves(clip)&&clip.start<begin-1e-6&&clip.start+clip.duration>end+1e-6&&
+              next.clips.some(other=>other.linkGroup===clip.linkGroup&&other.id!==clip.id&&moves(other)&&other.start>=end-.001));
+            if(spanning.length)settles.push(clearRange(next,new Set(spanning.map(laneOf)),begin,end));
+          }
+          for(const clip of next.clips){
+            if(!moves(clip))continue;
+            const shift=spans.filter(([,end])=>end<=clip.start+.001).reduce((sum,[begin,end])=>sum+end-begin,0);
+            if(shift)clip.start=Math.max(0,snap(clip.start-shift));
+          }
+          for(const links of settles)links.settle();
         }
+        // Deleting pieces of a shot can leave a group with one member: that is no longer a link.
+        dropLoneLinks(next);
       });
       selectedId = project.clips[0]?.id || null;
       notify();

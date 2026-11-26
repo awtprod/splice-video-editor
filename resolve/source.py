@@ -418,8 +418,10 @@ class _Layout:
         return out
 
 
-def load_library(path, scratch=None, *, deadline_seconds=MAX_READ_SECONDS):
-    """Read a library ``Project.db`` through a private snapshot (deleted before returning)."""
+def load_library(path, scratch=None, *, deadline_seconds=MAX_READ_SECONDS, keep=None):
+    """Read a library ``Project.db`` through a private snapshot (deleted before returning).
+    ``keep(snapshot path, sha256)``, when given, is called once the snapshot has been read, so the
+    exact bytes read can be kept as a save's seed."""
     path = Path(path)
     if path.is_dir():
         path = path / 'Project.db'
@@ -441,6 +443,8 @@ def load_library(path, scratch=None, *, deadline_seconds=MAX_READ_SECONDS):
             raise ResolveError(f'The project database cannot be read ({error}).') from None
         finally:
             conn.close()
+        if keep is not None:
+            keep(copy, digest)
     return Source('library', project, bins, containers, digest)
 
 

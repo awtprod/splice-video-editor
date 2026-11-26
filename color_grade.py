@@ -410,7 +410,7 @@ def _static_chain(color, directory, name, input_lut=None):
         chain += look_filter(input_lut, 100, directory, name+'-input')
     bypass = bool((color.get('grade') or {}).get('bypass'))
     if bypass:
-        return chain
+        return chain + (',lut1d=file=' + _filter_path(_clamp_table(directory)) + ':interp=linear' if chain else '')
     t = tables(color)
     if t['pre']:
         _write_1d(directory/f'{name}-pre.cube', [t['pre']]*3)
@@ -447,7 +447,8 @@ def grade_filter(clip, directory, name, *, input_lut=None, clock='T', offset=0.0
     """
     directory = Path(directory)
     times = key_times(clip)
-    if not times:
+    bypass = bool(((clip.get('color') or {}).get('grade') or {}).get('bypass'))
+    if not times or bypass:
         return _static_chain(clip.get('color') or {}, directory, name, input_lut)
     if len(times) == 1:
         return _static_chain(color_at(clip, times[0]), directory, name, input_lut)

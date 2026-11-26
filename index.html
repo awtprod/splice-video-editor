@@ -59,7 +59,7 @@
       <div class="utility-bar">
         <div class="utility-left">
           <details class="file-menu"><summary>File</summary><div>
-            <button id="new-project">New project…</button><button id="open-resolve">Open Resolve project (.drp)…</button><button id="open-resolve-library">Open from Resolve library…</button><button id="save-as">Save Premiere as…</button>
+            <button id="new-project">New project…</button><button id="open-resolve">Open Resolve project (.drp)…</button><button id="open-resolve-library">Open from Resolve library…</button><button id="save-resolve-library">Save to Resolve library…</button><button id="resolve-compatibility">Resolve compatibility details…</button><button id="save-as">Save Premiere as…</button>
             <button id="save-working">Save working project…</button>
             <button id="link-media">Link media in place…</button><button id="media-cache">Media cache…</button>
             <button id="export-timeline">Export timeline…</button><button id="import-timeline">Import timeline…</button>
@@ -76,12 +76,13 @@
             <button data-command="rippleStart">Ripple trim start to playhead <kbd>Q</kbd></button>
             <button data-command="rippleEnd">Ripple trim end to playhead <kbd>W</kbd></button>
             <button data-command="link">Link / unlink <kbd>Ctrl+L</kbd></button>
+            <button data-command="enable">Enable / disable clip <kbd>Shift+E</kbd></button>
             <button id="new-adjustment-clip" title="An adjustment clip grades every track beneath it for its duration">New adjustment clip</button>
           </div></details><button id="import-media" class="menu-button">
             Import media <span>+</span></button
           ><span class="utility-sep"></span
           ><span class="sequence-label">SEQUENCE 01</span
-          ><span class="sequence-name">Alpine Passage — Main Edit</span><select id="sequence-select" aria-label="Sequence" hidden></select>
+          ><span class="sequence-name">Alpine Passage — Main Edit</span><select id="sequence-select" aria-label="Sequence" hidden></select><button id="compat-badge" class="compat-badge" type="button" hidden></button>
         </div>
         <div class="utility-right">
           <span class="format-pill" id="size-label">1920 × 1080</span
