@@ -669,14 +669,18 @@ async function unguarded(page) {
     const clips = Editor.get().project.clips, picture = clips.find(c => c.id === 'pic');
     return [picture.embeddedAudio, Editor.hasEmbeddedAudio(picture), clips.filter(c => c.type === 'audio').length];
   }), [false, false, 1]);
-  // Overwrite on both lanes through a linked pair whose members differ in length unlinks the whole group.
+  // Overwrite on both lanes through a linked pair whose members differ in length (an L-cut): the
+  // pieces before and after the new material are each still an in-sync pair, so each stays linked.
   await load(page, {media: [{id: 'long', name: 'Camera take', src: 'assets/ridge.mp4', type: 'video', duration: 30, audioChannels: 2}],
     clips: [clip('v', 0, 2, {in: 0, linkGroup: 'g', embeddedAudio: false}), clip('s', 0, 2.4, {type: 'audio', track: -1, in: 0, linkGroup: 'g'})]});
   await state(page, () => { Editor.setMark('in', .8); Editor.setMark('out', 1.16);
     Editor.placeSource('long', {mode: 'overwrite', track: 1, audioTrack: -1, marks: {in: 10, out: 11}}); });
   clips = await clipsOf(page);
   assert.equal(clips.filter(c => Math.abs(c.in - 10) < .01 && c.linkGroup).length, 2, 'the new picture and sound are linked');
-  assert.deepEqual(clips.filter(c => Math.abs(c.in - 10) > .01 && c.linkGroup).map(c => c.id), [], 'the cut pair is unlinked');
+  const pieces = clips.filter(c => Math.abs(c.in - 10) > .01);
+  const pairs = Object.values(Object.groupBy(pieces, c => c.linkGroup || '-'));
+  assert.deepEqual(pairs.map(members => members.map(c => c.type).sort().join('+')).sort(), ['audio+video', 'audio+video'], 'each side of the cut pair stays linked');
+  assert.ok(pieces.every(c => c.linkGroup), 'no piece is left unlinked');
   // Split: a linked member wholly after the cut joins the right-hand piece; a lone left piece is unlinked.
   await load(page, {clips: [clip('v', 0, 4, {in: 0, linkGroup: 'g', embeddedAudio: false}),
     clip('s', 2.6, 1.4, {type: 'audio', track: -1, in: 2.6, linkGroup: 'g'})]});
@@ -695,7 +699,7 @@ async function unguarded(page) {
   await state(page, () => Editor.slideClip('b', 5));
   clips = await clipsOf(page);
   assert.deepEqual([frames(byId(clips, 'b').start), frames(byId(clips, 'c').duration), frames(byId(clips, 'c').start)], [99, 1, 149]);
-  console.log('Separated sound, overwrite unlinking, split regrouping, insert sync lock and slide limits hold.');
+  console.log('Separated sound, overwrite keeping in-sync pieces linked, split regrouping, insert sync lock and slide limits hold.');
 }
 
 const only = process.env.SPLICE_ONLY?.split(',');
