@@ -242,7 +242,7 @@ async function sourcePanel(page) {
       const rect = node => node.getBoundingClientRect();
       const overlaps = (a, b) => a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
       const panel = rect(document.querySelector('.source-dialog'));
-      const hidden = [...document.querySelectorAll('.source-actions button')].filter(button => {
+      const hidden = [...document.querySelectorAll('.source-footer button')].filter(button => {
         const box = rect(button), x = (box.left + box.right) / 2, y = (box.top + box.bottom) / 2;
         return box.top < 0 || box.bottom > innerHeight || box.left < 0 || box.right > innerWidth || document.elementFromPoint(x, y) !== button;
       }).map(button => button.textContent);
@@ -253,7 +253,7 @@ async function sourcePanel(page) {
         stage: rect(document.querySelector('.source-stage')).height};
     });
     assert.deepEqual([layout.hidden, layout.coversHeads, layout.coversTimeline, layout.programVisible], [[], false, false, true], JSON.stringify({size, layout}));
-    assert.ok(layout.stage >= 70, JSON.stringify({size, layout}));
+    assert.ok(layout.stage >= 56, JSON.stringify({size, layout}));
     await capture(page, `source-monitor-${size.width}.png`);
   }
   await page.setViewportSize(original);

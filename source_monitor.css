@@ -2,6 +2,14 @@
    While it is open the inspector column makes room for it (see .workspace.source-open). */
 .workspace.source-open{grid-template-columns:minmax(180px,18%) minmax(0,1fr) minmax(0,1fr)}
 .workspace.source-open>.inspector{display:none}
+/* The narrower pool keeps all four tabs in view. */
+.workspace.source-open .library-tabs{justify-content:space-between;gap:3px;padding:0 8px}
+.workspace.source-open .library-tabs button{font-size:11px}
+/* Wide windows keep the inspector beside the two monitors. */
+@media (min-width:1400px){
+  .workspace.source-open{grid-template-columns:minmax(250px,17%) minmax(0,1fr) minmax(0,1fr) minmax(230px,17%)}
+  .workspace.source-open>.inspector{display:flex}
+}
 .source-dialog{position:relative;inset:auto;margin:0;padding:0;width:auto;height:auto;max-width:none;max-height:none;min-width:0;min-height:0;
   color:#edf5e8;background:#181d19;border:1px solid #56634d;border-radius:8px;overflow:hidden;z-index:auto}
 .source-dialog[open]{display:flex;flex-direction:column}
@@ -13,25 +21,26 @@
 .source-head strong{font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .source-close{font-size:22px;line-height:1;background:transparent;border:0;color:#ddebd4;cursor:pointer;padding:0 4px}
 /* The picture takes what the settings and footer leave. */
-.source-stage{flex:1 1 0;min-height:72px;background:#080c09;display:grid;place-items:center;overflow:hidden}
+.source-stage{flex:1 1 0;min-height:56px;background:#080c09;display:grid;place-items:center;overflow:hidden}
 .source-stage video{width:100%;height:100%;min-width:0;min-height:0;object-fit:contain}
 .source-stage audio{width:min(540px,90%)}
-.source-controls{flex:0 1 auto;min-height:44px;max-height:52%;overflow-y:auto;display:grid;gap:6px;padding:8px 10px}
+.source-controls{flex:0 1 auto;min-height:0;max-height:52%;overflow-y:auto;display:grid;gap:6px;padding:8px 10px}
 .source-scrub{width:100%;margin:0;accent-color:#c6f178}
 .source-readout{display:flex;flex-wrap:wrap;justify-content:space-between;gap:2px 12px}
 .source-time,.source-range{font:11px 'IBM Plex Mono',monospace;color:#d7efb8}
 .source-buttons,.source-actions{display:flex;gap:6px;flex-wrap:wrap}
-.source-dialog button:not(.source-close){border:1px solid #4b5948;background:#252e25;color:#ebf4e6;padding:5px 9px;border-radius:5px;cursor:pointer;font-size:12px}
+.source-dialog button:not(.source-close){border:1px solid #4b5948;background:#252e25;color:#ebf4e6;padding:4px 8px;border-radius:5px;cursor:pointer;font-size:12px}
 .source-dialog button:hover{border-color:#c6f178}
 .source-dialog button:disabled{opacity:.55;cursor:default}
 .source-shortcuts{color:#9aaa98;font:10px 'IBM Plex Mono',monospace}
 .source-bin,.source-track-label{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:12px;color:#b3c2ac}
 .source-bin input,.source-track-label select{width:min(260px,62%);min-width:0;padding:5px;color:#eef8e9;background:#252e25;border:1px solid #4b5948;border-radius:5px}
 .source-proxy{justify-self:start}
-.source-footer{flex:none;display:grid;gap:4px;padding:7px 10px 9px;border-top:1px solid #374335;background:#1b211c}
+.source-footer{flex:none;display:grid;gap:4px;padding:6px 10px 7px;border-top:1px solid #374335;background:#1b211c}
 .source-plan{color:#c6dba8;font:11px 'IBM Plex Mono',monospace}
 .source-status{margin:0;min-height:0;color:#b9d79a;font-size:12px}
 .source-status:empty{display:none}
 .source-status.error{color:#e4b5a2}
-.source-actions{justify-content:flex-end}
+.source-bar{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:6px}
+.source-actions{justify-content:flex-end;margin-left:auto}
 .source-dialog .source-primary{background:#c6f178!important;color:#162214!important;border-color:#c6f178!important;font-weight:700}

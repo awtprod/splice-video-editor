@@ -141,16 +141,18 @@
     const tag=media.type==='audio'?'audio':'video';
     const trackOptions=Array.from({length:trackCount},(_,i)=>media.type==='video'?i+1:-i-1)
       .map(n=>`<option value="${n}">${media.type==='video'?'Video':'Audio'} ${Math.abs(n)}${Math.abs(n)>nativeTrackLimit?' · working project only':''}</option>`).join('');
-    // Head, picture, settings (scroll when short) and a footer whose edit buttons are always in view.
+    // Head, picture, settings (they scroll when the window is short) and a footer whose transport,
+    // mark and edit buttons are always in view.
     dialog.innerHTML=`<div class="source-head"><div><small>SOURCE</small><strong>${esc(media.name)}</strong></div><button class="source-close" aria-label="Close source monitor">×</button></div>`+
       `<div class="source-stage"><${tag} controls playsinline preload="auto"></${tag}></div>`+
       `<div class="source-controls"><input class="source-scrub" type="range" min="0" max="${media.duration}" step="${1/fps}" value="0" aria-label="Source playhead">`+
-      `<div class="source-readout"><span class="source-time"></span><span class="source-range"></span></div>`+
-      `<div class="source-buttons"><button data-action="back" title="Back one frame (←)">−1</button><button data-action="play" title="Play / pause (Space)">Play</button><button data-action="forward" title="Forward one frame (→)">+1</button><button data-action="in" title="Mark In on this frame (I)">Mark In</button><button data-action="out" title="Mark Out on this frame, included (O)">Mark Out</button></div>`+
+      `<div class="source-readout"><span class="source-time"></span><span class="source-range"></span></div><small class="source-plan"></small>`+
       `<small class="source-shortcuts">I · O mark (both frames included) · J K L shuttle · , insert · . overwrite</small>`+
       `<label class="source-track-label">Timeline track <select class="source-track">${trackOptions}</select></label>${soundTarget}`+
       `<label class="source-bin">Bin path <input type="text" value="${esc(media.bin || '')}" placeholder="e.g. Interview / Camera A" aria-label="Media bin path"></label></div>`+
-      `<div class="source-footer"><small class="source-plan"></small><p class="source-status" role="status"></p><div class="source-actions"><button data-action="append">Append</button><button data-action="overwrite" title="Overwrite (.)">Overwrite</button><button class="source-primary" data-action="insert" title="Insert (,)">Insert</button></div></div>`;
+      `<div class="source-footer"><p class="source-status" role="status"></p><div class="source-bar">`+
+      `<div class="source-buttons"><button data-action="back" title="Back one frame (←)">−1</button><button data-action="play" title="Play / pause (Space)">Play</button><button data-action="forward" title="Forward one frame (→)">+1</button><button data-action="in" title="Mark In on this frame (I)">Mark In</button><button data-action="out" title="Mark Out on this frame, included (O)">Mark Out</button></div>`+
+      `<div class="source-actions"><button data-action="append">Append</button><button data-action="overwrite" title="Overwrite (.)">Overwrite</button><button class="source-primary" data-action="insert" title="Insert (,)">Insert</button></div></div></div>`;
     // A panel of the workspace, left of the program monitor (the inspector makes room).
     const workspace=document.querySelector('.workspace'), viewer=workspace?.querySelector('.viewer');
     if (viewer) { viewer.before(dialog); workspace.classList.add('source-open'); }

@@ -127,6 +127,7 @@ window.SpliceDialogs = (() => {
     node.classList.add('shortcut-reference');
     list.className='shortcut-list';
     node.append(list,close);node.showModal();
+    close.focus({preventScroll:true});
     list.scrollTop=0;node.scrollTop=0;
   }
   function compatibility(project=Editor.get().project) {
