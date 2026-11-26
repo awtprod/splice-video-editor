@@ -358,11 +358,13 @@
     } finally {
       transactionBase = null;
       if (!inGesture) { gesture = false; gestureBefore = null; }
-      if (failed) project = before;
-      else if (project !== before && sameValue(before, project)) project = before;
-      else if (project !== before && !inGesture) remember(before);
-      project.duration = duration();
-      time = clamp(time, 0, project.duration);
+      if (failed || sameValue(before, project)) project = before;
+      else {
+        if (!inGesture) remember(before);
+        // Only the new state is written to; `before` may be an undo state.
+        project.duration = duration();
+        time = clamp(time, 0, project.duration);
+      }
       syncMedia(true);
       notify();
     }

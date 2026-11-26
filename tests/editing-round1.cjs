@@ -369,6 +369,11 @@ async function atomicActions(page) {
   assert.deepEqual(await state(page, () => { const a = Editor.get().project.clips[0]; return [a.speed, a.volume, a.duration]; }), [1, 100, 4]);
   await state(page, () => Editor.undo());
   assert.equal(await state(page, () => JSON.stringify(Editor.get().project.clips)), kept);
+  // A Reset that changes nothing leaves the project untouched (no step, nothing written to it).
+  await load(page, {clips: [clip('plain', 0, 2, {color: {brightness: 100, contrast: 100, saturation: 100}})]});
+  const plain = await state(page, () => ({project: JSON.stringify(Editor.get().project), revision: Editor.get().revision}));
+  await state(page, () => Editor.resetClip('plain'));
+  assert.deepEqual(await state(page, () => ({project: JSON.stringify(Editor.get().project), revision: Editor.get().revision})), plain);
   // Slip into sync that runs out of source changes nothing.
   // The sound starts six frames early against its picture but has one frame of source before it.
   await load(page, {clips: [clip('pic', .24, 2, {in: 0, linkGroup: 'g', embeddedAudio: false}),
