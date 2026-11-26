@@ -288,6 +288,7 @@ class Writer:
         self.renames = []
         self.removed_media = []
         self.operations = set()
+        self.delta = 0
 
     # -- ids -----------------------------------------------------------------------------
     def fresh(self):
@@ -416,6 +417,7 @@ class Writer:
                 and wanted_tc != timeline.start % day and 0 <= wanted_tc < day:
             start = wanted_tc
             report.add(EXACT, 'Timeline start timecode changed', name)
+        self.delta = start - timeline.start
         if name != timeline.name:
             self.renames.append((timeline, name))
             report.add(EXACT, 'Timeline renamed', f'{timeline.name} → {name}')
@@ -777,18 +779,31 @@ class Writer:
         for entry in placed:
             by_track.setdefault(entry[3], []).append(entry)
         kept = set()
+        carriers = {entry[0].get('resolveTransitionId'): entry for entry in placed
+                    if entry[0].get('resolveTransitionId')}
         for item_id, (kind, track_id, row) in timeline.items.items():
             if row['DbType'] != items.TRANSITION:
                 continue
             s, d = _seed_frames(row, 'Start'), _seed_frames(row, 'Duration')
+            if s is not None:
+                s += self.delta
             neighbours = by_track.get(track_id, [])
-            if s is not None and d is not None and any(e[4] <= s + d and s <= e[4] and any(
-                    o[4] + o[5] == e[4] for o in neighbours if o is not e) for e in neighbours):
+            meets = s is not None and d is not None and any(
+                e[4] <= s + d and s <= e[4] and any(o[4] + o[5] == e[4] for o in neighbours if o is not e)
+                for e in neighbours)
+            carrier = carriers.get(item_id)
+            removed = carrier is not None and carrier[0].get('transition') in (None, 'none')
+            if meets and not removed:
                 kept.add(item_id)
                 out.append({'id': item_id, 'track': track_id, 'start': round(s), 'duration': round(d), 'seed': True,
                             'kind': kind})
+                if self.delta:
+                    self._shift(item_id, row)
+                if carrier is None and row.get('PrettyType') not in items.SOUND_KINDS.values():
+                    self.report.add(EXACT, 'Resolve transitions Splice does not show, kept on their cut',
+                                    f'{name} · {row.get("PrettyType") or "Transition"}')
             else:
-                self._delete(item_id, row, timeline, name, transition=True)
+                self._delete(item_id, row, timeline, name, transition=True, removed=removed)
         for entry in placed:
             clip, item_id, kind, track_id, s = entry[0], entry[1], entry[2], entry[3], entry[4]
             style = clip.get('transition')
@@ -838,7 +853,7 @@ class Writer:
             self.report.add(EXACT, 'Sound crossfades (Cross Fade 0 dB or +3 dB, centred on the cut)', where)
         return out
 
-    def _delete(self, item_id, row, timeline, name, transition=False):
+    def _delete(self, item_id, row, timeline, name, transition=False, removed=False):
         owned = [table for table, columns in self.seed.columns.items()
                  if 'Sm2TiItem_id' in columns and table != 'Sm2TiItem' and
                  self.seed.conn.execute(f'SELECT 1 FROM {_q(table)} WHERE Sm2TiItem_id = ? LIMIT 1', (item_id,)).fetchone()]
@@ -854,7 +869,9 @@ class Writer:
             return
         self.deletes.append(item_id)
         self.operations.add('remove_items')
-        self.report.add(EXACT, 'Transitions removed because their cut changed' if transition else 'Clips deleted', where)
+        what = ('Transitions removed in Splice' if removed else 'Transitions removed because their cut changed') \
+            if transition else 'Clips deleted'
+        self.report.add(EXACT, what, where)
 
     def _orders(self, placed, transitions, timeline, start):
         """Every track's ``Items`` vector in record order (a transition before a clip starting on
@@ -872,6 +889,9 @@ class Writer:
             if item_id in kept or item_id not in handled:
                 s = _seed_frames(row, 'Start')
                 d = _seed_frames(row, 'Duration')
+                if s is not None and self.delta:
+                    s += self.delta
+                    self._shift(item_id, row)
                 is_clip = row['DbType'] != items.TRANSITION
                 tracks[track_id].append((s if s is not None else -1, 1 if is_clip else 0, item_id,
                                          (s or 0) + (d or 0), is_clip and item_id in kept))
@@ -885,6 +905,17 @@ class Writer:
             order = [e[2] for e in entries]
             if order != timeline.order.get(track_id):
                 self.track_orders[track_id] = order
+
+    def _shift(self, item_id, row):
+        """Move an item the edit did not touch by the change of the timeline's start."""
+        text = str(row.get('Start'))
+        whole, sep, fraction = text.partition('|')
+        try:
+            moved = str(int(whole) + self.delta) + (sep + fraction if sep else '')
+        except ValueError:
+            raise WriteError('An item of the timeline has an unreadable start, so the start timecode cannot be '
+                             'changed.') from None
+        self._update('Sm2TiItem', item_id, {'Start': moved})
 
     def _timeline_changed(self, timeline):
         ids = set(timeline.items)
@@ -992,6 +1023,9 @@ def prepare_template(seed, model, writer, report):
     entry = timelines[0]
     timeline = Timeline(seed, entry)
     for item_id, (_kind, _track, row) in timeline.items.items():
+        if row['DbType'] not in (items.PICTURE, items.SOUND, items.TRANSITION):
+            raise WriteError('The template\'s timeline holds titles, generators or other items Splice does not '
+                             'remove; choose a template with an empty timeline.')
         if any(row.get(c) is not None for c in items.LATER_COLUMNS) or seed.rows('BtLockableBlob', 'BlobOwner = ?',
                                                                                   (item_id,)):
             raise WriteError('The template\'s timeline holds clips with Resolve work (grades, Fusion, effects or '
