@@ -94,6 +94,7 @@ def _kill_group(group):
 class ExportJobs:
     def __init__(self):
         self.jobs = {}
+        self.closed = False
         self.lock = threading.RLock()
         self.context = multiprocessing.get_context('spawn')
         from render_movie import reap_stale_work
@@ -117,6 +118,8 @@ class ExportJobs:
         previewable = (spec['codec'], spec['container']) in PREVIEWABLE
         images = spec['kind'] == 'images'
         with self.lock:
+            if self.closed:
+                raise ValueError('The server is shutting down')
             self.reap()
             if any(job['state'] == 'rendering' for job in self.jobs.values()):
                 raise ValueError('An export is already running')
@@ -277,6 +280,7 @@ class ExportJobs:
 
     def shutdown(self):
         with self.lock:
+            self.closed = True
             jobs = list(self.jobs.values())
             for job in jobs:
                 if job['state'] == 'rendering':

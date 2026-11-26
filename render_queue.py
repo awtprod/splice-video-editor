@@ -498,7 +498,7 @@ class RenderQueue:
         project = json.loads(self._project_file(job['id']).read_text(encoding='utf-8'))
         spec = delivery.normalize(job['options'])
         with self.lock:
-            if job['state'] != 'queued':
+            if self.closing.is_set() or job['state'] != 'queued':
                 return
             job.update(state='rendering', started=time.time(), progress=0, eta=None, attempts=job.get('attempts', 0) + 1,
                        cancelRequested=False)
@@ -507,6 +507,8 @@ class RenderQueue:
             identifier = self.exports.start(project, job['options'], folder_name=_frame_name(job['name']) if spec['kind'] == 'images' else 'frames')
         except ValueError as error:
             with self.lock:
+                if self.closing.is_set():
+                    return  # On restart the in-flight job is marked interrupted.
                 job.update(state='failed', error=str(error), finished=time.time())
                 self._save()
             return

@@ -246,6 +246,26 @@ class Confinement(QueueCase):
 
 
 class Restart(QueueCase):
+    def test_server_close_preserves_waiting_exports(self):
+        from server import _render_queue, create_server
+        server = create_server()
+        self.addCleanup(server.server_close)
+        queue = server.render_queue = self.queue(server.jobs)
+        ids = queue.add(self.project, [dict(options=dict(codec='h264'), name=name)
+                                       for name in ('active', 'waiting')], folder=str(self.folder))
+        self.wait(queue, ids[:1], states=('rendering',))
+        server.server_close()
+        self.assertFalse(queue.thread.is_alive())
+        self.assertFalse(server.jobs.running())
+        with self.assertRaisesRegex(ValueError, 'shutting down'):
+            server.jobs.start(self.project, dict(codec='h264'))
+        with self.assertRaisesRegex(ValueError, 'shutting down'):
+            _render_queue(mock.Mock(server=server))
+        self.assertEqual(queue.list()['jobs'][1]['state'], 'queued')
+        resumed = self.queue()
+        jobs = self.wait(resumed, ids[1:])
+        self.assertEqual([jobs[i]['state'] for i in ids], ['interrupted', 'complete'])
+
     def test_waiting_jobs_survive_and_a_rendering_job_becomes_interrupted(self):
         queue = self.queue()
         queue.set_paused(True)

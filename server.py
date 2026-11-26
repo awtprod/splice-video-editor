@@ -245,6 +245,8 @@ _queue_lock = threading.Lock()
 
 def _render_queue(handler):
     with _queue_lock:
+        if handler.server.closing:
+            raise ValueError('The server is shutting down')
         if getattr(handler.server, 'render_queue', None) is None:
             from render_queue import RenderQueue
             handler.server.render_queue = RenderQueue(handler.server.jobs)
@@ -668,6 +670,7 @@ class Handler(BaseHTTPRequestHandler):
 class StudioServer(ThreadingHTTPServer):
     def __init__(self, *args, launch_token):
         self.jobs = ExportJobs()
+        self.closing = False
         # Per-launch secrets. The cookie proves a request comes from a page
         # this server served; the page token proves a fetch was made by it.
         self.session = secrets.token_urlsafe(32)
@@ -716,6 +719,11 @@ class StudioServer(ThreadingHTTPServer):
         return self.launch_url()
 
     def server_close(self):
+        with _queue_lock:
+            self.closing = True
+            queue = getattr(self, 'render_queue', None)
+        if queue is not None:
+            queue.shutdown()
         self.jobs.shutdown()
         super().server_close()
 
