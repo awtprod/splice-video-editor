@@ -617,26 +617,65 @@ def print_new_launch(server):
     print('That is a new one-time link; the earlier one no longer works.', file=sys.stderr, flush=True)
 
 
-def offer_relaunch(server, console=None):
+def _in_foreground(fd):
+    """False only when this process is a background job of ``fd``'s terminal, the one case where
+    reading it would stop the process. True otherwise: the foreground job, a terminal that is not
+    this process's controlling terminal (tcgetpgrp fails; job control does not apply to it), a
+    terminal gone away (the read then ends the reader), or a platform without job control."""
+    if not hasattr(os, 'tcgetpgrp'):
+        return True
+    try:
+        return os.tcgetpgrp(fd) == os.getpgrp()
+    except OSError:
+        return True
+
+
+BACKGROUND_POLL_SECONDS = 1.0
+
+
+def offer_relaunch(server, console=None, poll=BACKGROUND_POLL_SECONDS):
     """Let the operator ask for a new launch link: Enter on the server's own terminal (when its
     input is a terminal) or SIGUSR1 where the platform has it. Both need local access to this
-    process as its user; nothing a web page or another local user can send reaches either."""
+    process as its user; nothing a web page or another local user can send reaches either.
+
+    The console is read only while this process is the terminal's foreground job. ``python3
+    server.py &`` must keep serving: a background job that reads its terminal is stopped by the
+    kernel (SIGTTIN), so that signal is ignored here (the read then fails with EIO instead) and a
+    background job checks once every ``poll`` seconds whether ``fg`` has brought it forward."""
     console = console if console is not None else sys.stdin
-    if hasattr(signal, 'SIGUSR1') and threading.current_thread() is threading.main_thread():
+    main = threading.current_thread() is threading.main_thread()
+    if hasattr(signal, 'SIGUSR1') and main:
         signal.signal(signal.SIGUSR1, lambda signum, frame: print_new_launch(server))
     try:
-        interactive = console is not None and console.isatty()
-    except (OSError, ValueError):
-        interactive = False
-    if interactive:
-        def read():
+        fd = console.fileno()
+        interactive = console.isatty()
+    except (AttributeError, OSError, ValueError):  # no stdin at all (pythonw), or a closed one
+        fd, interactive = None, False
+    if not interactive:
+        return False
+    if hasattr(signal, 'SIGTTIN'):
+        if not main:
+            return False  # Only the main thread can ignore SIGTTIN; without that a read could stop the server.
+        signal.signal(signal.SIGTTIN, signal.SIG_IGN)
+    stop = threading.Event()
+
+    def read():
+        while not stop.is_set():
+            if not _in_foreground(fd):
+                stop.wait(poll)  # a background job: wait for fg, never read
+                continue
             try:
-                while console.readline():
-                    print_new_launch(server)
+                line = console.readline()
             except (OSError, ValueError):
+                # EIO: moved to the background mid-read (Ctrl-Z, bg) or the terminal hung up.
+                if not _in_foreground(fd):
+                    continue
                 return  # the terminal went away; the signal still works
-        threading.Thread(target=read, daemon=True, name='splice-relaunch-console').start()
-    return interactive
+            if not line:
+                return  # end of input (Ctrl-D)
+            print_new_launch(server)
+    threading.Thread(target=read, daemon=True, name='splice-relaunch-console').start()
+    return True
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()

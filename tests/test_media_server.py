@@ -464,6 +464,126 @@ class Relaunch(unittest.TestCase):
         self.assertEqual(again.split(';')[0], cookie.split(';')[0], 'windows already open keep their session')
         self.assertEqual(process.poll(), None)
 
+    def test_input_that_is_not_a_terminal_never_mints_a_link(self):
+        # Another program feeding the server's stdin (a pipe) must not be able to ask for a link.
+        process = self.start(subprocess.PIPE)
+        first = self.line(process)
+        process.stdin.write(b'\n' * 50)
+        process.stdin.flush()
+        self.assertIsNone(self.line(process, timeout=1.5), 'a pipe on stdin printed a new link')
+        self.assertEqual(self.launch(first)[0], 303)
+        process.stdin.close()
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'job control on a pseudo-terminal; process state from /proc')
+    def test_a_background_job_on_the_terminal_keeps_serving(self):
+        """``python3 server.py &`` from a shell: the server is a background job of the terminal on
+        its stdin. Reading that terminal would get it stopped (SIGTTIN); it must keep answering,
+        read Enter only once ``fg`` makes it the foreground job, and survive Ctrl-Z then ``bg``."""
+        import pty
+        import select
+        import signal
+        controller, terminal = pty.openpty()
+        self.addCleanup(os.close, controller)
+        commands_read, commands = os.pipe()
+        self.addCleanup(os.close, commands)
+        data = tempfile.TemporaryDirectory(prefix='splice-job-')
+        self.addCleanup(data.cleanup)
+        # A minimal job-control shell: a new session on the pseudo-terminal, the server in its own
+        # process group (a background job), and "fg"/"bg" commands that hand the terminal over.
+        shell = f'''
+import os, signal, sys, fcntl, termios
+os.setsid()
+fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+child = os.fork()
+if child == 0:
+    signal.signal(signal.SIGTTOU, signal.SIG_DFL)
+    os.setpgid(0, 0)
+    os.execv(sys.executable, [sys.executable, '-u', 'server.py', '--port', '0'])
+os.setpgid(child, child)
+print(child, file=sys.stderr, flush=True)
+commands = os.fdopen({commands_read}, 'r')
+for command in commands:
+    command = command.strip()
+    if command == 'fg':
+        os.tcsetpgrp(0, child)
+    elif command == 'stop':
+        os.killpg(child, signal.SIGTSTP)
+        os.waitpid(child, os.WUNTRACED)
+        os.tcsetpgrp(0, os.getpgrp())
+    elif command == 'bg':
+        os.killpg(child, signal.SIGCONT)
+    print('done', file=sys.stderr, flush=True)
+'''
+        wrapper = subprocess.Popen([sys.executable, '-c', shell], cwd=ROOT, stdin=terminal, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, pass_fds=(commands_read,),
+                                   env={**os.environ, 'SPLICE_DATA_DIR': data.name})
+        os.close(terminal)
+        os.close(commands_read)
+        server_pid = int(wrapper.stderr.readline())
+
+        def cleanup():
+            # A server stopped by the kernel would ignore SIGTERM until continued: kill exactly it.
+            for pid in (server_pid, wrapper.pid):
+                for sig in (signal.SIGCONT, signal.SIGKILL):
+                    try:
+                        os.kill(pid, sig)
+                    except ProcessLookupError:
+                        pass
+            wrapper.wait(10)
+            try:
+                os.waitpid(server_pid, os.WNOHANG)
+            except ChildProcessError:
+                pass
+            wrapper.stdout.close()
+            wrapper.stderr.close()
+        self.addCleanup(cleanup)
+
+        def command(name):
+            os.write(commands, name.encode() + b'\n')
+            for _ in range(20):  # the server's own messages share this stream
+                if wrapper.stderr.readline().strip() == b'done':
+                    return
+            self.fail(f'the job-control shell did not finish {name}')
+
+        def state():
+            fields = Path(f'/proc/{server_pid}/stat').read_text().rsplit(')', 1)[1].split()
+            return fields[0], int(fields[11]) + int(fields[12])  # state, CPU ticks (user + system)
+
+        def line(timeout):
+            ready, _, _ = select.select([wrapper.stdout], [], [], timeout)
+            return wrapper.stdout.readline().decode().strip() if ready else None
+
+        first = line(10)
+        self.assertIsNotNone(first)
+        time.sleep(1.5)
+        os.write(controller, b'\n')  # Enter typed while the server runs in the background
+        self.assertIsNone(line(2), 'a background job does not read the terminal')
+        self.assertNotEqual(state()[0], 'T', 'the kernel stopped the background server')
+        self.assertEqual(self.launch(first)[0], 303, 'the background server answers')
+        command('fg')
+        second = line(5)  # the Enter queued while in the background is read once in front
+        self.assertIsNotNone(second, 'fg brought the console back')
+        self.assertNotEqual(second, first)
+        os.write(controller, b'\n')
+        third = line(5)
+        self.assertEqual(self.launch(third)[0], 303, 'Enter in the foreground mints a link')
+        self.assertEqual(self.launch(second)[0], 403)
+        command('stop')  # Ctrl-Z
+        self.assertEqual(state()[0], 'T')
+        command('bg')
+        time.sleep(1.5)
+        ticks = state()[1]
+        os.write(controller, b'\n')
+        self.assertIsNone(line(2), 'back in the background, the terminal is not read')
+        current, later = state()
+        self.assertNotEqual(current, 'T', 'the server was stopped after bg')
+        self.assertLess(later - ticks, 50, 'the background reader must not spin')
+        os.kill(server_pid, signal.SIGUSR1)
+        fourth = line(5)
+        self.assertEqual(self.launch(fourth)[0], 303, 'USR1 still works in the background')
+        self.assertIsNone(wrapper.poll())
+
     def test_no_request_can_produce_a_fresh_link(self):
         import inspect
         import server as server_module
