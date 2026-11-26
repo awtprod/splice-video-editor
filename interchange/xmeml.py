@@ -698,6 +698,8 @@ class _Reader:
         self.rate = _rate_of(sequence, Fraction(25))
         if sequence.find('rate') is None:
             self.warnings.append('The sequence frame rate is missing; 25 fps was used.')
+        self.start_frames = _int(sequence.find('timecode'), 'frame', None) if sequence.find('timecode') is not None else None
+        self.drop = (sequence.findtext('timecode/displayformat') or '').strip().upper() == 'DF'
         chars = sequence.find('media/video/format/samplecharacteristics')
         self.width = _int(chars, 'width', 1920) if chars is not None else 1920
         self.height = _int(chars, 'height', 1080) if chars is not None else 1080
@@ -1146,4 +1148,5 @@ def read(data: bytes, budget: Budget | None = None) -> dict:
                 clip[key] = float(clip[key])
         clips.append(clip)
     return build_project(reader.name, reader.rate, reader.width, reader.height, list(reader.media.values()), clips,
-                         [{'time': float(m['time']), 'name': m['name']} for m in reader.markers], reader.warnings)
+                         [{'time': float(m['time']), 'name': m['name']} for m in reader.markers], reader.warnings,
+                         start_frames=reader.start_frames, drop=reader.drop)

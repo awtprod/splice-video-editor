@@ -1,25 +1,65 @@
-.source-dialog{width:min(920px,calc(100vw - 32px));max-height:min(880px,calc(100vh - 32px));padding:0;color:#edf5e8;background:#181d19;border:1px solid #56634d;border-radius:10px;box-shadow:0 24px 80px #0009;overflow:auto}
-.source-dialog::backdrop{background:#080d08bf}
-.source-head{display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid #374335}
-.source-head>div{display:grid;gap:4px}.source-head small{font:10px 'IBM Plex Mono',monospace;color:#aaca83;letter-spacing:.12em}.source-head strong{font-size:17px}
-.source-close{font-size:27px;line-height:1;background:transparent;border:0;color:#ddebd4;cursor:pointer}
-.source-stage{height:min(45vh,450px);background:#080c09;display:grid;place-items:center}
-.source-stage video{height:100%;max-width:100%;object-fit:contain}
+/* Source monitor: a non-modal panel of the workspace, left of the program monitor.
+   While it is open the inspector column makes room for it (see .workspace.source-open). */
+.workspace.source-open{grid-template-columns:minmax(180px,18%) minmax(0,1fr) minmax(0,1fr)}
+.workspace.source-open>.inspector{display:none}
+/* While the source monitor is open the timeline gives the monitors some height back. */
+body:has(.workspace.source-open) .timeline{height:clamp(245px,36vh,510px)}
+/* The narrower pool keeps all four tabs in view. */
+.workspace.source-open .library-tabs{justify-content:space-between;gap:3px;padding:0 8px}
+.workspace.source-open .library-tabs button{font-size:11px}
+/* Wide windows keep the inspector beside the two monitors. */
+@media (min-width:1400px){
+  .workspace.source-open{grid-template-columns:minmax(250px,17%) minmax(0,1fr) minmax(0,1fr) minmax(230px,17%)}
+  .workspace.source-open>.inspector{display:flex}
+}
+.source-dialog{position:relative;inset:auto;margin:0;padding:0;width:auto;height:auto;max-width:none;max-height:none;min-width:0;min-height:0;
+  color:#edf5e8;background:#181d19;border:1px solid #56634d;border-radius:8px;overflow:clip;z-index:auto}
+.source-dialog[open]{display:flex;flex-direction:column}
+.source-dialog:focus{outline:none}
+.source-dialog:focus-within{border-color:#8fb05e}
+.source-head{flex:none;display:flex;justify-content:space-between;align-items:center;gap:8px;padding:6px 10px;border-bottom:1px solid #374335;min-width:0}
+.source-head>div{display:flex;align-items:baseline;gap:8px;min-width:0}
+.source-head small{font:10px 'IBM Plex Mono',monospace;color:#aaca83;letter-spacing:.12em}
+.source-head strong{font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.source-close{font-size:22px;line-height:1;background:transparent;border:0;color:#ddebd4;cursor:pointer;padding:0 4px}
+/* The picture comes first: it keeps at least 40% of the panel (never under 120 px, 160 px from
+   780 px tall windows) and grows into what the footer and settings leave; the settings shrink
+   and scroll instead. */
+.source-stage{flex:1 1 0;min-height:max(120px,40%);background:#080c09;display:grid;place-items:center;overflow:hidden;cursor:grab}
+@media (min-height:780px){.source-stage{min-height:max(160px,40%)}}
+.source-stage video{width:100%;height:100%;min-width:0;min-height:0;object-fit:contain}
 .source-stage audio{width:min(540px,90%)}
-.source-controls{display:grid;gap:12px;padding:17px 20px 20px}
-.source-scrub{width:100%;accent-color:#c6f178}.source-time,.source-range{font:12px 'IBM Plex Mono',monospace;color:#d7efb8}
-.source-buttons,.source-actions{display:flex;gap:8px;flex-wrap:wrap}
-.source-dialog button:not(.source-close){border:1px solid #4b5948;background:#252e25;color:#ebf4e6;padding:8px 11px;border-radius:5px;cursor:pointer}
+.source-controls{flex:0 1 auto;min-height:0;max-height:30%;overflow-y:auto;display:grid;gap:6px;padding:8px 10px;align-content:start}
+.source-scrub{width:100%;margin:0;accent-color:#c6f178}
+.source-readout{display:flex;flex-wrap:wrap;justify-content:space-between;gap:2px 12px}
+.source-time,.source-range{font:11px 'IBM Plex Mono',monospace;color:#d7efb8}
+.source-buttons,.source-actions{display:flex;gap:6px;flex-wrap:wrap}
+.source-dialog button:not(.source-close){border:1px solid #4b5948;background:#252e25;color:#ebf4e6;padding:4px 8px;border-radius:5px;cursor:pointer;font-size:12px}
 .source-dialog button:hover{border-color:#c6f178}
-.source-bin,.source-track-label{display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:12px;color:#b3c2ac}
-.source-bin input,.source-track-label select{width:min(350px,70%);padding:8px;color:#eef8e9;background:#252e25;border:1px solid #4b5948;border-radius:5px}
-.source-actions{justify-content:flex-end;margin-top:4px}
+.source-dialog button:disabled{opacity:.55;cursor:default}
+.source-shortcuts{color:#9aaa98;font:10px 'IBM Plex Mono',monospace}
+.source-bin,.source-track-label{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:12px;color:#b3c2ac}
+.source-bin input,.source-track-label select{width:min(260px,62%);min-width:0;padding:5px;color:#eef8e9;background:#252e25;border:1px solid #4b5948;border-radius:5px}
+.source-proxy{justify-self:start}
+.source-footer{flex:none;display:grid;gap:4px;padding:6px 10px 7px;border-top:1px solid #374335;background:#1b211c}
+/* The plan says where the next edit lands and how it is timed: one line, full text in its tooltip. */
+.source-plan{margin:0;color:#c6dba8;font:11px 'IBM Plex Mono',monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* Track targets (source patching) share the bar with the buttons, so they are always in view. */
+.source-targets{display:flex;flex-wrap:wrap;gap:4px 10px;align-items:center}
+.source-target{display:flex;align-items:center;gap:5px;font-size:12px;color:#b3c2ac;white-space:nowrap}
+.source-target select{max-width:150px;padding:3px 4px;color:#eef8e9;background:#252e25;border:1px solid #4b5948;border-radius:5px;font-size:12px}
+.source-target select:focus-visible{outline:2px solid #c6f178;outline-offset:1px}
+/* The status line keeps its height when empty, so a message after an edit never moves the picture. */
+.source-status{margin:0;min-height:1.35em;line-height:1.35em;color:#b9d79a;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.source-status.error{color:#e4b5a2}
+.source-bar{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:6px}
+.source-actions{justify-content:flex-end;margin-left:auto}
 .source-dialog .source-primary{background:#c6f178!important;color:#162214!important;border-color:#c6f178!important;font-weight:700}
-.source-status{margin:0;min-height:15px;color:#e4b5a2;font-size:12px}
-.source-stage{overflow:hidden;min-height:0}
-.source-stage video{width:100%;height:100%;min-width:0;min-height:0;max-height:100%;object-fit:contain}
-.source-controls{position:relative;z-index:1}
-.source-stage{height:min(36vh,350px)}
-.source-controls{gap:9px;padding:14px 20px}
-@media(max-height:720px){.source-stage{height:min(30vh,240px)}}
-.source-shortcuts{color:#9aaa98;font:11px 'IBM Plex Mono',monospace}
+/* Narrow panels: one compact row of transport, mark and edit buttons. */
+@container source (max-width:520px){
+  .source-dialog button:not(.source-close){padding:3px 6px;font-size:11px}
+  .source-bar,.source-buttons,.source-actions{gap:4px}
+  .source-target{font-size:11px}
+  .source-target select{font-size:11px;max-width:118px}
+}
+.source-dialog{container:source/inline-size}

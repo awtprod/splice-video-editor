@@ -209,13 +209,42 @@ def write(cut: Cut) -> str:
 
 # -- import -------------------------------------------------------------------------------------
 
+#: rates a RationalTime may carry: below a frame a minute or above a 1 MHz audio clock is no real media
+MIN_RATE, MAX_RATE = 1 / 60, 1_000_000
+#: a LinearTimeWarp beyond this many times real speed (either way) is no real retime
+MAX_SPEED = 1_000_000
+
+
+def _dict(value) -> dict:
+    """``value`` when it is a JSON object, else an empty one: a malformed file is read as missing."""
+    return value if isinstance(value, dict) else {}
+
+
+def _list(value) -> list:
+    return value if isinstance(value, list) else []
+
+
+def _number(value, what) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError(f'{what} is not a number')
+    try:
+        number = float(value)
+    except (ValueError, OverflowError):
+        raise ValueError(f'{what} is not a number') from None
+    if not math.isfinite(number):
+        raise ValueError(f'{what} is out of range')
+    return number
+
+
 def _rt(value, what) -> tuple:
     if not isinstance(value, dict) or not str(value.get('OTIO_SCHEMA', '')).startswith('RationalTime'):
         raise ValueError(f'{what} is not a RationalTime')
-    rate, amount = float(value.get('rate', 0)), float(value.get('value', 0))
-    if not (math.isfinite(rate) and math.isfinite(amount)) or rate <= 0 or abs(amount) > 1e12:
+    rate, amount = _number(value.get('rate', 0), what), _number(value.get('value', 0), what)
+    if not MIN_RATE <= rate <= MAX_RATE or abs(amount) > 1e12:
         raise ValueError(f'{what} is out of range')
     exact = snap_rate(Fraction(repr(rate))) or Fraction(repr(rate)).limit_denominator(1001)
+    if exact <= 0:
+        raise ValueError(f'{what} is out of range')
     return Fraction(repr(amount)), exact
 
 
@@ -228,6 +257,11 @@ def _range(value, what):
     if not isinstance(value, dict):
         raise ValueError(f'{what} is missing')
     return _seconds(value.get('start_time'), what), _seconds(value.get('duration'), what)
+
+
+def _size(value, default) -> int:
+    """A frame dimension from Splice's own metadata; anything implausible is the default."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and 16 <= value <= 16384 else default
 
 
 def read(data: bytes, budget=None) -> dict:
@@ -243,21 +277,24 @@ def read(data: bytes, budget=None) -> dict:
     stack = document.get('tracks')
     if not isinstance(stack, dict) or not isinstance(stack.get('children'), list):
         raise ValueError('The OTIO timeline has no tracks')
-    splice = (document.get('metadata') or {}).get('splice') or {}
+    splice = _dict(_dict(document.get('metadata')).get('splice'))
     _start, rate = _rt(document.get('global_start_time') or {'OTIO_SCHEMA': 'RationalTime.1', 'rate': 25, 'value': 0}, 'global start')
     rate = snap_rate(rate) or rate
     warnings, clips, media, markers = [], [], {}, []
     counts = {'Video': 0, 'Audio': 0}
     for track in stack['children'][:128]:
+        if budget is not None:
+            budget.tick()
         if not isinstance(track, dict) or not str(track.get('OTIO_SCHEMA', '')).startswith('Track.'):
             warnings.append('A nested stack or unknown track type was not imported.')
             continue
         kind = 'audio' if track.get('kind') == 'Audio' else 'video'
-        counts[track.get('kind', 'Video')] = counts.get(track.get('kind', 'Video'), 0) + 1
+        track_kind = 'Audio' if kind == 'audio' else 'Video'
+        counts[track_kind] += 1
         named = re.fullmatch(r'[VA](\d{1,2})', str(track.get('name') or ''))
-        number = int(named.group(1)) if named else counts.get(track.get('kind', 'Video'), 1)
+        number = int(named.group(1)) if named else counts[track_kind]
         cursor, pending = Fraction(0), None
-        for item in (track.get('children') or [])[:20000]:
+        for item in _list(track.get('children'))[:20000]:
             if budget is not None:
                 budget.tick()
             if not isinstance(item, dict):
@@ -282,8 +319,10 @@ def read(data: bytes, budget=None) -> dict:
                 cursor += duration
                 pending = None
                 continue
-            meta = ((item.get('metadata') or {}).get('splice') or {}) if isinstance(item.get('metadata'), dict) else {}
-            reference = item.get('media_reference') or (item.get('media_references') or {}).get(item.get('active_media_reference_key', 'DEFAULT_MEDIA')) or {}
+            meta = _dict(_dict(item.get('metadata')).get('splice'))
+            active = item.get('active_media_reference_key', 'DEFAULT_MEDIA')
+            reference = _dict(item.get('media_reference') or (_dict(item.get('media_references')).get(active)
+                                                               if isinstance(active, str) else None))
             clip = {'name': str(item.get('name') or 'Clip')[:240], 'start': cursor, 'duration': duration,
                     'enabled': item.get('enabled', True) is not False}
             if meta.get('embeddedFrom'):  # a copy of picture-clip sound; the picture clip carries it
@@ -291,17 +330,19 @@ def read(data: bytes, budget=None) -> dict:
                 pending = None
                 continue
             if str(reference.get('OTIO_SCHEMA', '')).startswith('GeneratorReference') and reference.get('generator_kind') == 'SpliceTitle':
-                clip.update(kind='title', text=str(meta.get('title') or (reference.get('parameters') or {}).get('text') or ''),
-                            track=int(meta.get('trackNumber') or number))
+                placed = meta.get('trackNumber')
+                clip.update(kind='title', text=str(meta.get('title') or _dict(reference.get('parameters')).get('text') or ''),
+                            track=placed if isinstance(placed, int) and not isinstance(placed, bool) and 0 < placed <= 99
+                            else number)
                 if isinstance(meta.get('titleStyle'), dict):
                     clip['titleStyle'] = meta['titleStyle']
             elif str(reference.get('OTIO_SCHEMA', '')).startswith('ExternalReference'):
                 try:
-                    path = path_from_url(reference.get('target_url', ''))
+                    path = path_from_url(str(reference.get('target_url') or ''))
                 except ValueError as error:
                     warnings.append(f'{clip["name"]}: {error}')
                     path = ''
-                key = path or reference.get('name') or clip['name']
+                key = path or str(reference.get('name') or '') or clip['name']
                 available = reference.get('available_range')
                 origin = Fraction(0)
                 if isinstance(available, dict):
@@ -312,8 +353,11 @@ def read(data: bytes, budget=None) -> dict:
                 else:
                     length = None
                 if key not in media:
-                    media_rate = _rt((available or {}).get('start_time'), 'rate')[1] if isinstance(available, dict) else rate
-                    record = {'key': key, 'name': reference.get('name') or base_name(path) or clip['name'], 'path': path,
+                    try:
+                        media_rate = _rt(available.get('start_time'), 'rate')[1] if isinstance(available, dict) else rate
+                    except ValueError:
+                        media_rate = rate
+                    record = {'key': key, 'name': str(reference.get('name') or '') or base_name(path) or clip['name'], 'path': path,
                               'kind': kind, 'duration': float(length) if length else None, 'rate': rate_text(media_rate)}
                     if isinstance(available, dict) and kind == 'video':
                         try:
@@ -324,9 +368,16 @@ def read(data: bytes, budget=None) -> dict:
                 elif kind == 'video':
                     media[key]['kind'] = 'video'
                 speed, reverse = 1.0, False
-                for effect in item.get('effects') or []:
+                for effect in _list(item.get('effects')):
                     if isinstance(effect, dict) and str(effect.get('OTIO_SCHEMA', '')).startswith('LinearTimeWarp'):
-                        scalar = float(effect.get('time_scalar', 1))
+                        try:
+                            scalar = _number(effect.get('time_scalar', 1), 'speed')
+                        except ValueError as error:
+                            warnings.append(f'{clip["name"]}: {error}; played at normal speed.')
+                            continue
+                        if abs(scalar) > MAX_SPEED or 0 < abs(scalar) < 1 / MAX_SPEED:
+                            warnings.append(f'{clip["name"]}: speed {scalar:g}x is out of range; played at normal speed.')
+                            continue
                         speed, reverse = abs(scalar) or 1.0, scalar < 0
                     elif isinstance(effect, dict):
                         warnings.append(f'{clip["name"]}: effect {effect.get("effect_name") or effect.get("OTIO_SCHEMA")} was not imported.')
@@ -350,7 +401,7 @@ def read(data: bytes, budget=None) -> dict:
                 try:
                     before = _seconds(pending.get('in_offset'), 'transition in offset')
                     after = _seconds(pending.get('out_offset'), 'transition out offset')
-                    kind_name = ((pending.get('metadata') or {}).get('splice') or {}).get('kind', 'dissolve')
+                    kind_name = _dict(_dict(pending.get('metadata')).get('splice')).get('kind', 'dissolve')
                     clip['transition'] = {'transition': kind_name if kind_name in ('dissolve', 'wipe', 'fade') else 'dissolve',
                                           'transitionDuration': float(before + after), 'transitionBefore': float(before)}
                 except ValueError as error:
@@ -359,12 +410,13 @@ def read(data: bytes, budget=None) -> dict:
             clip['start'], clip['duration'] = float(clip['start']), float(clip['duration'])
             clips.append(clip)
             cursor += duration
-    for marker in stack.get('markers') or []:
+    for marker in _list(stack.get('markers')):
         try:
-            at, _length = _range(marker.get('marked_range'), 'marker')
+            at, _length = _range(_dict(marker).get('marked_range'), 'marker')
             markers.append({'time': float(at), 'name': str(marker.get('name') or 'Marker')})
         except (ValueError, AttributeError):
             warnings.append('A marker with an unreadable range was skipped.')
-    width, height = int(splice.get('width') or 1920), int(splice.get('height') or 1080)
+    width, height = _size(splice.get('width'), 1920), _size(splice.get('height'), 1080)
+    start_frames = round(_start) if isinstance(_start, (int, float, Fraction)) and _start >= 0 else None
     return build_project(str(document.get('name') or 'Imported OTIO'), rate, width, height, list(media.values()),
-                         clips, markers, warnings)
+                         clips, markers, warnings, start_frames=start_frames, drop=splice.get('dropFrame') is True)

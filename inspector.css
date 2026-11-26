@@ -26,11 +26,13 @@
 .splice-scope-luma input{accent-color:#c4ee78}
 .splice-scope-size{display:grid;grid-template-columns:auto 1fr;align-items:center;gap:8px;font-size:11px;color:#aebaae}
 .splice-scope-size input{width:100%;min-width:0;accent-color:#c4ee78}
-.splice-lut-row{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:8px;align-items:center;font-size:11px;color:#b6c9af}
+.splice-lut{display:grid;gap:6px}
+.splice-lut-name{margin:0;font-size:12px;line-height:1.35;color:#e4f2d9;overflow-wrap:anywhere;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.splice-lut-name small{font:10px 'IBM Plex Mono',monospace;letter-spacing:.08em;color:#9baa9b;margin-right:4px}
+.splice-lut-row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-size:11px;color:#b6c9af}
 .splice-lut-note{margin:0;font-size:11px;line-height:1.35;color:#e0a44a}
 .splice-lut-row button{border:1px solid #56684f;background:#253025;color:#e4f2d9;border-radius:4px;padding:6px 8px;cursor:pointer}
 .splice-lut-row button{white-space:nowrap}
-.splice-lut-row span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
 .splice-handle{margin:0;color:#a9bca5;font:11px 'IBM Plex Mono',monospace;line-height:1.4}
 .splice-handle-warn{color:#f6c46e}
 .splice-meter{height:10px;background:#1d251d;border:1px solid #4b5b49;border-radius:3px;overflow:hidden}
@@ -47,3 +49,4 @@
 #monitor-frame.show-safe-area::before,#monitor-frame.show-safe-area::after{content:"";position:absolute;z-index:5;pointer-events:none;border:1px dashed #e9e8bb9c}
 #monitor-frame.show-safe-area::before{inset:5%}
 #monitor-frame.show-safe-area::after{inset:10%;border-color:#c4ee78b8}
+.splice-scope-enlarge{justify-self:start;border:1px solid #56684f;background:#253025;color:#e4f2d9;border-radius:4px;padding:5px 8px;font:11px 'DM Sans',sans-serif;cursor:pointer}

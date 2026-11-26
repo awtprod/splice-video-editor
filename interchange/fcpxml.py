@@ -63,7 +63,8 @@ def percent(db_text: str) -> float:
     value = float(str(db_text).strip().removesuffix('dB').strip())
     if not math.isfinite(value):
         raise ValueError('volume is not finite')
-    return 0.0 if value <= SILENT_DB else min(200.0, round(100 * 10 ** (value / 20), 3))
+    # 200 % is +6 dB: any louder value is capped before the power can overflow a float
+    return 0.0 if value <= SILENT_DB else min(200.0, round(100 * 10 ** (min(value, 12.0) / 20), 3))
 
 
 # -- export -------------------------------------------------------------------------------------
@@ -597,6 +598,8 @@ class _Reader:
         if not (16 <= self.width <= 16384 and 16 <= self.height <= 16384):
             raise ValueError('The sequence frame size is invalid')
         tc_start = self.time(sequence, 'tcStart', Fraction(0))
+        self.start_frames = round(tc_start * self.rate) if tc_start >= 0 else None
+        self.drop = sequence.get('tcFormat') == 'DF'
         spine = sequence.find('spine')
         if spine is None:
             raise ValueError('The sequence has no spine')
@@ -929,7 +932,7 @@ class _Reader:
                 if style.get('fontColor'):
                     red, green, blue = (min(255, max(0, round(float(v) * 255))) for v in style.get('fontColor').split()[:3])
                     title_style['color'] = f'#{red:02x}{green:02x}{blue:02x}'
-            except ValueError:
+            except (ValueError, OverflowError):  # OverflowError: round() of an infinite size or colour
                 self.warnings.append(f'Title "{clip["name"]}": its text style could not be read.')
             if style.get('alignment') in ('left', 'center', 'right'):
                 title_style['align'] = style.get('alignment')
@@ -974,4 +977,5 @@ def read(data: bytes, budget: Budget | None = None) -> dict:
         record.pop('start', None)
         media.append(record)
     return build_project(reader.name, reader.rate, reader.width, reader.height, media, clips,
-                         [{'time': float(m['time']), 'name': m['name']} for m in reader.markers], reader.warnings)
+                         [{'time': float(m['time']), 'name': m['name']} for m in reader.markers], reader.warnings,
+                         start_frames=reader.start_frames, drop=reader.drop)

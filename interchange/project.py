@@ -72,7 +72,12 @@ def _bounded(work, budget):
 
 KEYFRAME_KEYS = ('opacity', 'x', 'y', 'scale', 'rotation', 'volume')
 LIMITS = {'volume': (0, 200), 'opacity': (0, 100), 'fadeIn': (0, 7200), 'fadeOut': (0, 7200), 'pan': (-100, 100)}
+# The ranges engine.js draws (scale 0.1-4 of the fitted size, x/y within one frame width or
+# height, rotation one turn) and inspector.js offers.
 TRANSFORM = {'x': (-100, 100), 'y': (-100, 100), 'scale': (10, 400), 'rotation': (-180, 180)}
+TRANSFORM_LABELS = {'x': 'horizontal position %', 'y': 'vertical position %', 'scale': 'scale %',
+                    'rotation': 'rotation (degrees)', 'opacity': 'opacity %', 'volume': 'volume %'}
+KEYFRAME_LIMITS = {**TRANSFORM, 'opacity': LIMITS['opacity'], 'volume': LIMITS['volume']}
 
 
 def _finite(value):
@@ -101,6 +106,10 @@ def _clean_effects(clip: dict, warnings: list) -> dict:
     if transform is not None:
         values = {k: _finite(transform.get(k)) if isinstance(transform, dict) else None for k in TRANSFORM}
         if all(v is not None for v in values.values()):
+            for key, (low, high) in TRANSFORM.items():
+                if not low <= values[key] <= high:
+                    warnings.append(f'{name}: {TRANSFORM_LABELS[key]} {values[key]:g} is outside Splice\'s '
+                                    f'{low:g} to {high:g} and was set to {min(high, max(low, values[key])):g}.')
             out['transform'] = {k: min(h, max(lo, values[k])) for k, (lo, h) in TRANSFORM.items()}
         else:
             warnings.append(f'{name}: its transform is incomplete and was not imported.')
@@ -113,6 +122,15 @@ def _clean_effects(clip: dict, warnings: list) -> dict:
                 continue
             good = [{'time': max(0.0, _finite(p.get('time'))), 'value': _finite(p.get('value'))} for p in points[:2000]
                     if isinstance(p, dict) and _finite(p.get('time')) is not None and _finite(p.get('value')) is not None]
+            low, high = KEYFRAME_LIMITS[key]
+            outside = [point['value'] for point in good if not low <= point['value'] <= high]
+            if outside:
+                warnings.append(f'{name}: {len(outside)} {TRANSFORM_LABELS.get(key, key)} keyframe'
+                                f'{"s" if len(outside) != 1 else ""} outside Splice\'s {low:g} to {high:g} '
+                                f'(from {min(outside):g} to {max(outside):g}) {"were" if len(outside) != 1 else "was"} '
+                                'limited.')
+                for point in good:
+                    point['value'] = min(high, max(low, point['value']))
             if good:
                 cleaned[key] = good
         if cleaned:
@@ -137,11 +155,25 @@ def _clean_effects(clip: dict, warnings: list) -> dict:
     return out
 
 
+def counted(warnings: list, limit: int = 500) -> list:
+    """Each distinct warning once, in first-seen order, with how many times it occurred: three
+    clips of one source skipped for the same reason are one line ending "(3 times)"."""
+    counts = {}
+    for warning in warnings:
+        counts[warning] = counts.get(warning, 0) + 1
+    return [text(w, 1000) if n == 1 else text(w, 980) + f' ({n} times)' for w, n in counts.items()][:limit]
+
+
 def build_project(name: str, rate: Fraction, width: int, height: int, media: list, clips: list,
-                  markers: list, warnings: list) -> dict:
+                  markers: list, warnings: list, start_frames=None, drop=None) -> dict:
+    """Splice's project for an imported timeline.
+
+    ``start_frames`` is the sequence start timecode as a whole frame count at ``rate`` and
+    ``drop`` whether it is drop-frame; both land in the project the way engine.js keeps them
+    (``startTimecode`` frames, ``dropFrame`` only for 29.97 and 59.94)."""
     if len(clips) > MAX_IMPORT_CLIPS:
         raise ValueError(f'The timeline has more than {MAX_IMPORT_CLIPS} clips')
-    warnings = list(dict.fromkeys(warnings))
+    warnings = list(warnings)
     ids, items = {}, []
     for record in media:
         identity = f'm{len(items) + 1}'
@@ -166,13 +198,21 @@ def build_project(name: str, rate: Fraction, width: int, height: int, media: lis
     ordered = sorted(clips, key=lambda c: (c['start'], 0 if c['kind'] != 'audio' else 1))
     for index, clip in enumerate(ordered):
         start, duration = _seconds(clip['start']), _seconds(clip['duration'])
-        if duration <= 0 or start < 0:
-            warnings.append(f'{clip.get("name") or "A clip"} has no length or starts before the timeline and was skipped.')
+        label = clip.get("name") or "A clip"
+        if duration <= 0:
+            warnings.append(f'{label} has no length and was skipped.')
+            continue
+        if start < 0:
+            warnings.append(f'{label} starts before the timeline start and was skipped.')
             continue
         source_in = _seconds(clip.get('in', 0) or 0) if clip['kind'] != 'title' else 0.0
-        if start + duration > MAX_TIMELINE_SECONDS or source_in > MAX_SOURCE_SECONDS:
-            warnings.append(f'{clip.get("name") or "A clip"} ends more than 24 hours into the timeline or starts more than a '
-                            'week into its source, which no real timeline does, and was skipped.')
+        if start + duration > MAX_TIMELINE_SECONDS:
+            warnings.append(f'{label} ends more than 24 hours into the timeline (Splice\'s limit; no real timeline is '
+                            'that long) and was skipped.')
+            continue
+        if source_in > MAX_SOURCE_SECONDS:
+            warnings.append(f'{label} starts more than a week into its source (Splice\'s limit; no real recording is '
+                            'that long) and was skipped.')
             continue
         side = -1 if clip['kind'] == 'audio' else 1
         track = clip.get('track')
@@ -195,11 +235,12 @@ def build_project(name: str, rate: Fraction, width: int, height: int, media: lis
             data['in'] = max(0.0, _seconds(clip.get('in', 0)))
             data['color'] = {'brightness': 100, 'contrast': 100, 'saturation': 100}
             item = by_id[media_id]
-            speed = float(clip.get('speed', 1) or 1)
-            used = data['in'] + duration * speed
+            speed = _finite(clip.get('speed', 1)) or 1.0
+            limited = min(16.0, max(0.1, speed))  # what Splice plays, so what it reads of the source
+            used = data['in'] + duration * limited
             item['duration'] = max(item['duration'], round(used, 9))
             if abs(speed - 1) > 1e-9:
-                data['speed'] = round(min(16.0, max(0.1, speed)), 6)
+                data['speed'] = round(limited, 6)
                 if speed < .1 or speed > 16:
                     warnings.append(f'{clip.get("name")}: speed {speed:g}x is outside Splice\'s 0.1x-16x and was limited.')
             if clip.get('reverse'):
@@ -231,12 +272,18 @@ def build_project(name: str, rate: Fraction, width: int, height: int, media: lis
     total = max((c['start'] + c['duration'] for c in out), default=0)
     video_tracks = max([4] + [c['track'] for c in out if c['type'] != 'audio'])
     audio_tracks = max([3] + [-c['track'] for c in out if c['type'] == 'audio'])
-    return {'name': text(name or 'Imported timeline', 120) or 'Imported timeline', 'width': int(width), 'height': int(height),
+    result = {'name': text(name or 'Imported timeline', 120) or 'Imported timeline', 'width': int(width), 'height': int(height),
             'fps': float(rate), 'media': items, 'clips': out, 'captions': [],
             'markers': [{'id': f'marker-{i + 1}', 'name': text(m['name'], 500), 'time': _seconds(m['time'])}
                         for i, m in enumerate(markers) if 0 <= m['time'] <= total + 1e-6][:5000],
             'trackCounts': {'video': video_tracks, 'audio': audio_tracks}, 'trackState': {},
-            'duration': total, 'compatibilityWarnings': [text(w, 1000) for w in dict.fromkeys(warnings)][:500]}
+            'duration': total, 'compatibilityWarnings': counted(warnings)}
+    day = 24 * 3600 * math.ceil(float(rate))
+    if isinstance(start_frames, (int, Fraction)) and not isinstance(start_frames, bool) and 0 <= start_frames < day:
+        result['startTimecode'] = int(round(start_frames))
+    if rate in (Fraction(30000, 1001), Fraction(60000, 1001)):
+        result['dropFrame'] = bool(drop)
+    return result
 
 
 LINKED_LIST = 10

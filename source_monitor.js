@@ -1,5 +1,12 @@
 (() => {
-  let dialog, media, player, markIn = 0, markOut = 0, fps = 25, shuttleTimer, shuttleRate = 0;
+  // Source marks: either may be unset, which three-point editing treats differently. Both
+  // include the frame they are set on; `out` is stored as the end of that frame (see Editor.setMark).
+  let dialog, media, player, marks = {}, fps = 25, shuttleTimer, shuttleRate = 0;
+  let unsubscribe = null, committedMarks = '{}', frameRequest = 0;
+  const markIn = () => Number.isFinite(marks.in) ? marks.in : 0;
+  const markOut = () => Number.isFinite(marks.out) ? marks.out : media.duration;
+  // The last frame the range includes, for display.
+  const lastFrame = () => Math.max(markIn(), Math.round(markOut() * fps - 1) / fps);
   const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const snap = value => Math.round(value * fps) / fps;
   const format = seconds => Editor.formatTimecode(seconds,fps);
@@ -8,16 +15,82 @@
   function update() {
     if (!dialog?.open) return;
     dialog.querySelector('.source-time').textContent = format(current())+' / '+format(media.duration);
-    dialog.querySelector('.source-range').textContent = format(markIn)+' → '+format(markOut)+'  ·  '+format(markOut-markIn);
+    dialog.querySelector('.source-range').textContent = 'In '+format(markIn())+' · Out '+format(lastFrame())+' · '+format(markOut()-markIn());
+    const planText = targetsText() + ' · ' + plan();
+    const planNode = dialog.querySelector('.source-plan');
+    if (planNode.textContent !== planText) {
+      planNode.textContent = planText;
+      planNode.title = planText;
+    }
     dialog.querySelector('.source-scrub').value = current();
     dialog.querySelector('.source-scrub').max = media.duration;
-    requestAnimationFrame(update);
+    frameRequest = requestAnimationFrame(update);
+  }
+  // Track targeting, as in other editors' source patching. The picture goes to the chosen video
+  // track (or the track it is dropped on); its sound follows to the audio track with the same
+  // number (V2 → A2) unless another audio track, or "in the picture clip", is chosen. A drop
+  // on an audio track places the sound only. Returns {picture, sound}: track numbers or null.
+  function targets(drop = null) {
+    const soundPicker = dialog.querySelector('.source-audio-track');
+    if (media.type === 'audio') {
+      const track = drop ? Number(drop.track) : Number(dialog.querySelector('.source-track').value);
+      return {picture: null, sound: track};
+    }
+    if (drop && drop.kind === 'audio') return {picture: null, sound: hasSound() ? Number(drop.track) : null, soundOnly: true};
+    const chosen = dialog.querySelector('.source-track').value;
+    const picture = drop ? Number(drop.track) : chosen === 'none' ? null : Number(chosen);
+    if (!soundPicker) return {picture, sound: null};
+    const choice = soundPicker.value;
+    if (choice === '') return {picture, sound: null, embedded: true};
+    if (choice === 'follow') return {picture, sound: -Math.max(1, picture ?? 1)};
+    return {picture, sound: Number(choice)};
+  }
+  const hasSound = () => media.type === 'video' && !media.still && media.audioChannels > 0;
+  const lockedTrack = (kind, track) => track !== null && Editor.isTrackLocked(track, kind);
+  function targetsText(drop = null) {
+    const {picture, sound, embedded, soundOnly} = targets(drop);
+    const locked = (kind, track) => lockedTrack(kind, track) ? ' (locked)' : '';
+    if (soundOnly && sound === null) return 'No sound in this clip to place on an audio track';
+    const parts = [];
+    if (picture !== null) parts.push('Picture → V' + picture + locked('video', picture));
+    if (sound !== null) parts.push((picture === null ? 'Sound only → A' : 'sound → A') + Math.abs(sound) + locked('audio', sound));
+    else if (embedded) parts.push('sound in the picture clip');
+    else if (picture !== null && media.type === 'video' && !media.still) parts.push('no sound');
+    return parts.join(', ') || 'Choose a track';
+  }
+  // Describe how the next edit will be timed: the three-point rule that applies.
+  function plan() {
+    const timeline=Editor.get().project.marks||{};
+    const hasIn=Number.isFinite(timeline.in), hasOut=Number.isFinite(timeline.out);
+    const timecode=Editor.sequenceTimecode;
+    if(hasIn&&hasOut){
+      const fourPoint=Number.isFinite(marks.in)&&Number.isFinite(marks.out);
+      return 'Fills timeline In '+timecode(timeline.in)+' to Out '+timecode(Editor.markOutFrame(timeline.out))+
+        (fourPoint?' (four-point: speed changes if lengths differ)':!Number.isFinite(marks.in)&&Number.isFinite(marks.out)?' back-timed from the source Out':'');
+    }
+    if(hasIn)return 'Starts at timeline In '+timecode(timeline.in);
+    if(hasOut)return 'Ends at timeline Out '+timecode(Editor.markOutFrame(timeline.out))+' (back-timed)';
+    return 'Starts at the playhead '+timecode(Editor.get().time);
   }
   function close() {
     if (!dialog) return;
     stopShuttle();
+    cancelAnimationFrame(frameRequest);
+    unsubscribe?.();unsubscribe=null;
     player.pause();player.removeAttribute('src');player.load();
+    document.removeEventListener('keydown',onKey,true);
     dialog.close();dialog.remove();dialog=null;player=null;media=null;
+    document.querySelector('.workspace')?.classList.remove('source-open');
+  }
+  // Follow the project: undo can change the saved marks, and a new project can drop the source.
+  function follow(state) {
+    if (!dialog || !media) return;
+    const item=state.project.media.find(entry=>entry.id===media.id);
+    if (!item) { close(); return; }
+    const saved=JSON.stringify(item.sourceMarks||{});
+    if (saved===committedMarks) return;
+    committedMarks=saved;
+    marks={...(item.sourceMarks||{})};
   }
   function stopShuttle() {
     if(shuttleTimer)clearInterval(shuttleTimer);
@@ -34,82 +107,50 @@
       player.currentTime=Math.max(0,current()-rate/fps);
     },1000/fps);
   }
-  function newClip(start,track,selection) {
-    return {id:crypto.randomUUID(),mediaId:media.id,start,track,type:media.type,title:'',
-      color:{brightness:100,contrast:100,saturation:100},volume:100,transition:'none',...selection};
-  }
   function mark(edge) {
-    const point=Math.min(media.duration,snap(current()));
+    // The frame under the source playhead; an Out mark includes it, so it ends one frame later.
+    const frame=Math.round(current()*fps);
+    const lastStart=Math.max(0,Math.ceil(media.duration*fps-1e-6)-1);
     if (edge==='in') {
-      markIn=Math.min(point,Math.max(0,media.duration-1/fps));
-      markOut=Math.max(markOut,Math.min(media.duration,markIn+1/fps));
+      marks.in=Math.min(frame,lastStart)/fps;
+      if(Number.isFinite(marks.out) && marks.out<marks.in+1/fps-1e-9) delete marks.out;
     } else {
-      markOut=Math.max(point,Math.min(media.duration,1/fps));
-      markIn=Math.min(markIn,Math.max(0,markOut-1/fps));
+      marks.out=Math.min(Math.min(frame,lastStart)+1,Math.max(1,media.duration*fps))/fps;
+      if(Number.isFinite(marks.in) && marks.in>marks.out-1/fps+1e-9) delete marks.in;
     }
-    Editor.setSourceSettings(media.id,{sourceMarks:{in:markIn,out:markOut}});
+    committedMarks=JSON.stringify(marks);
+    Editor.setSourceSettings(media.id,{sourceMarks:{...marks}});
   }
-  function place(mode) {
-    if (dialog.dataset.preparing) return;
+  // `drop` places the marked range where it was dragged on the timeline: {kind, track, at}.
+  function place(mode, drop=null) {
+    if (!dialog || dialog.dataset.preparing) return;
     show('');
-    const track=Number(dialog.querySelector('.source-track').value);
-    if (Editor.isTrackLocked(track, media.type)) return show(`Unlock ${media.type} track ${Math.abs(track)} before editing.`);
-    const state=Editor.get(), time=mode==='append' ? Math.max(0,...state.project.clips.filter(c=>c.type===media.type && c.track===track).map(c=>c.start+c.duration)) : state.time;
-    const sequenceFps=state.project.fps;
-    let selection;
-    try { selection=Editor.sourceSelection(media,{in:markIn,out:markOut},media.audioStream??null); }
-    catch(error) { return show(error.message); }
-    const start=Math.round(time*sequenceFps)/sequenceFps, length=selection.duration, end=start+length;
-    const clip=newClip(start,track,selection);
-    try { Editor.editProject(project => {
-      const additions=[];
-      const rightGroups=new Map();
-      if (mode==='insert') {
-        for (const existing of project.clips) {
-          if (Editor.isTrackLocked(existing.track, existing.type)) continue;
-          if ((existing.track !== track || existing.type !== media.type) && !Editor.isTrackSyncLocked(existing.track, existing.type)) continue;
-          if (existing.start >= start-1e-5) existing.start+=length;
-          else if (existing.start+existing.duration > start+1e-5) {
-            const right=Editor.splitClipAt(existing,start);
-            if(right){if(right.linkGroup){if(!rightGroups.has(right.linkGroup))rightGroups.set(right.linkGroup,crypto.randomUUID());right.linkGroup=rightGroups.get(right.linkGroup);}
-              right.start+=length;additions.push(right);}
-          }
-        }
-      } else {
-        for(let i=project.clips.length-1;i>=0;i--) {
-          const existing=project.clips[i];
-          if(existing.track!==track || existing.type!==media.type) continue;
-          const a=existing.start,b=a+existing.duration;
-          if(b<=start+1e-5 || a>=end-1e-5) continue;
-          const head=a<start-1e-5, tail=b>end+1e-5;
-          if(!head && !tail){project.clips.splice(i,1);continue;}
-          if(head && tail){
-            const middle=Editor.splitClipAt(existing,start);
-            const right=Editor.splitClipAt(middle,end);
-            delete existing.linkGroup;delete right.linkGroup;
-            additions.push(right);continue;
-          }
-          if(head){
-            Editor.splitClipAt(existing,start);
-            delete existing.linkGroup;continue;
-          }
-          const right=Editor.splitClipAt(existing,end);
-          const {id,premiereIndex,premiereTrack}=existing;
-          for (const key of Object.keys(existing)) delete existing[key];
-          Object.assign(existing,right,{id});
-          if(premiereIndex!==undefined)existing.premiereIndex=premiereIndex;
-          if(premiereTrack!==undefined)existing.premiereTrack=premiereTrack;
-          delete existing.linkGroup;
-        }
-      }
-      project.clips.push(...additions,clip);
-      project.duration=Math.max(0,...project.clips.map(item=>item.start+item.duration));
-    }); } catch (error) { return show(error.message); }
-    Editor.select(clip.id);
-    close();
+    const {picture, sound, soundOnly} = targets(drop);
+    if (soundOnly && sound === null) return show(media.name + ' has no sound to place on an audio track.');
+    // Never edit a locked track: refuse, naming it, rather than leave part of the edit behind.
+    if (lockedTrack('video', picture)) return show(`Unlock video track ${picture} before editing.`);
+    if (lockedTrack('audio', sound))
+      return show(`Unlock audio track ${Math.abs(sound)} before editing, or send the sound to another audio track.`);
+    const options = {mode, marks: {...marks}};
+    if (media.type === 'audio') options.track = sound;
+    else {
+      options.track = picture;
+      options.audioTrack = sound;
+    }
+    if (drop) options.at = drop.at;
+    let result;
+    try { result=Editor.placeSource(media.id,options); }
+    catch (error) { return show(error.message); }
+    if (result.speed!==1) Editor.select(result.clips[0]);
+    // The monitor stays open: three-point editing is mark, place, mark, place.
+    const verb={insert:'Inserted',overwrite:'Overwrote',append:'Appended'}[mode];
+    show(verb+' '+format(result.duration)+' at '+Editor.sequenceTimecode(result.start)+' · '+result.method+
+      (result.speed!==1?' at '+Math.round(result.speed*100)+'% speed':''),false);
   }
+  // The monitor is non-modal: its keys apply only while focus is inside it.
   function onKey(event) {
-    if (!dialog?.open || /INPUT|SELECT|TEXTAREA/.test(document.activeElement?.tagName) && document.activeElement?.type!=='range') return;
+    if (!dialog?.open || !dialog.contains(document.activeElement)) return;
+    if (window.SpliceKeys?.keyBelongsToControl(document.activeElement,event)) return;
     const key=event.key.toLowerCase();
     if(key==='escape'){event.preventDefault();close();}
     if(key==='i'||key==='o'){event.preventDefault();mark(key==='i'?'in':'out');}
@@ -119,7 +160,8 @@
     if(key==='l'){event.preventDefault();shuttle(1);}
     if(key==='arrowleft'){event.preventDefault();stopShuttle();player.currentTime=Math.max(0,current()-1/fps);}
     if(key==='arrowright'){event.preventDefault();stopShuttle();player.currentTime=Math.min(media.duration,current()+1/fps);}
-    if(key==='enter'){event.preventDefault();place('insert');}
+    if(key==='enter'||key===','){event.preventDefault();place('insert');}
+    if(key==='.'){event.preventDefault();place('overwrite');}
   }
   function open(id) {
     close();
@@ -132,19 +174,56 @@
     const trackCount=Math.min(64,Math.max(state.trackCounts?.[media.type] || 3,
       ...state.clips.filter(clip=>clip.type===media.type).map(clip=>Math.abs(clip.track)),2)+1);
     const nativeTrackLimit=media.type==='video' && !state.premiereOriginal ? 64 : (state.trackCounts?.[media.type] || 3);
-    const saved=item.sourceMarks;
-    markOut=Number.isFinite(saved?.out)?Math.max(0,Math.min(media.duration,saved.out)):media.duration;
-    markIn=Number.isFinite(saved?.in)?Math.max(0,Math.min(markOut,saved.in)):0;
-    if(markOut<=markIn) {markIn=0;markOut=media.duration;}
+    const saved=item.sourceMarks||{};
+    marks={};
+    if(Number.isFinite(saved.out)) marks.out=Math.max(0,Math.min(media.duration,saved.out));
+    if(Number.isFinite(saved.in)) marks.in=Math.max(0,Math.min(markOut(),saved.in));
+    if(markOut()<=markIn()) marks={};
+    // Sound can go to any audio track up to one past the last used, and to the audio track
+    // matching any picture track offered (it is created when the edit uses it).
+    const soundTracks=Math.min(64,Math.max(state.trackCounts?.audio || 3,trackCount,
+      ...state.clips.filter(clip=>clip.type==='audio').map(clip=>Math.abs(clip.track)),2)+1);
+    const soundOptions=Array.from({length:soundTracks},(_,i)=>`<option value="${-i-1}">Audio ${i+1}</option>`).join('');
+    const soundTarget=hasSound() ?
+      `<label class="source-target">Sound <select class="source-audio-track" aria-label="Sound goes to"><option value="follow" selected>With picture</option>${soundOptions}<option value="">In picture clip</option></select></label>` : '';
     dialog=document.createElement('dialog');dialog.className='source-dialog';
-    dialog.innerHTML=`<div class="source-head"><div><small>SOURCE MONITOR</small><strong>${esc(media.name)}</strong></div><button class="source-close" aria-label="Close source monitor">×</button></div><div class="source-stage"><${media.type==='audio'?'audio':'video'} controls playsinline preload="auto"></${media.type==='audio'?'audio':'video'}></div><div class="source-controls"><input class="source-scrub" type="range" min="0" max="${media.duration}" step="${1/fps}" value="0" aria-label="Source playhead"><span class="source-time"></span><div class="source-buttons"><button data-action="back">−1 frame</button><button data-action="play">Play / Pause</button><button data-action="forward">+1 frame</button><button data-action="in">Mark In (I)</button><button data-action="out">Mark Out (O)</button></div><span class="source-range"></span><small class="source-shortcuts">J reverse · K stop · L forward</small><label class="source-bin">Bin path <input type="text" value="${esc(media.bin || '')}" placeholder="e.g. Interview / Camera A" aria-label="Media bin path"></label><label class="source-track-label">Timeline track <select class="source-track">${Array.from({length:trackCount},(_,i)=>media.type==='video'?i+1:-i-1).map(n=>`<option value="${n}">${media.type==='video'?'Video':'Audio'} ${Math.abs(n)}${Math.abs(n)>nativeTrackLimit?' · working project only':''}</option>`).join('')}</select></label><div class="source-actions"><button data-action="append">Append</button><button data-action="overwrite">Overwrite</button><button class="source-primary" data-action="insert">Insert at playhead</button></div><p class="source-status" role="status"></p></div>`;
-    document.body.append(dialog);player=dialog.querySelector('video,audio');player.src=media.src;player.onerror=()=>show('The source file could not be decoded.');player.onended=stopShuttle;
+    dialog.setAttribute('aria-label','Source monitor: '+media.name);
+    const tag=media.type==='audio'?'audio':'video';
+    const trackOptions=Array.from({length:trackCount},(_,i)=>media.type==='video'?i+1:-i-1)
+      .map(n=>`<option value="${n}">${media.type==='video'?'Video':'Audio'} ${Math.abs(n)}${Math.abs(n)>nativeTrackLimit?' · working project only':''}</option>`).join('')+
+      (hasSound()?'<option value="none">None (sound only)</option>':'');
+    const pictureTarget=`<label class="source-target">${media.type==='video'?'Picture':'Sound'} <select class="source-track" aria-label="${media.type==='video'?'Picture goes to':'Sound goes to'}">${trackOptions}</select></label>`;
+    // Head, picture, settings (they scroll when the window is short) and a footer whose transport,
+    // mark and edit buttons are always in view.
+    dialog.innerHTML=`<div class="source-head"><div><small>SOURCE</small><strong>${esc(media.name)}</strong></div><button class="source-close" aria-label="Close source monitor">×</button></div>`+
+      `<div class="source-stage"><${tag} controls playsinline preload="auto"></${tag}></div>`+
+      `<div class="source-controls"><input class="source-scrub" type="range" min="0" max="${media.duration}" step="${1/fps}" value="0" aria-label="Source playhead">`+
+      `<div class="source-readout"><span class="source-time"></span><span class="source-range"></span></div>`+
+      `<small class="source-shortcuts">I · O mark (both frames included) · J K L shuttle · , insert · . overwrite</small>`+
+      `<label class="source-bin">Bin path <input type="text" value="${esc(media.bin || '')}" placeholder="e.g. Interview / Camera A" aria-label="Media bin path"></label></div>`+
+      `<div class="source-footer"><p class="source-plan"></p><p class="source-status" role="status"></p><div class="source-bar">`+
+      `<div class="source-targets" role="group" aria-label="Edit targets">${pictureTarget}${soundTarget}</div>`+
+      `<div class="source-buttons"><button data-action="back" title="Back one frame (←)">−1</button><button data-action="play" title="Play / pause (Space)">Play</button><button data-action="forward" title="Forward one frame (→)">+1</button><button data-action="in" title="Mark In on this frame (I)">Mark In</button><button data-action="out" title="Mark Out on this frame, included (O)">Mark Out</button></div>`+
+      `<div class="source-actions"><button data-action="append">Append</button><button data-action="overwrite" title="Overwrite (.)">Overwrite</button><button class="source-primary" data-action="insert" title="Insert (,)">Insert</button></div></div></div>`;
+    // A panel of the workspace, left of the program monitor (the inspector makes room).
+    const workspace=document.querySelector('.workspace'), viewer=workspace?.querySelector('.viewer');
+    if (viewer) { viewer.before(dialog); workspace.classList.add('source-open'); }
+    else document.body.append(dialog);
+    // Drag the picture (or the sound's stage) onto a timeline track: overwrite there, Ctrl or ⌘ inserts.
+    const stage=dialog.querySelector('.source-stage');
+    stage.draggable=true;stage.title='Drag onto a timeline track to overwrite there (hold Ctrl or ⌘ to insert)';
+    stage.addEventListener('dragstart',event=>{
+      if(!media){event.preventDefault();return;}
+      event.dataTransfer.setData('application/x-splice-source',media.id);
+      event.dataTransfer.effectAllowed='copy';
+    });
+    player=dialog.querySelector('video,audio');player.src=media.src;player.onerror=()=>show('The source file could not be decoded.');player.onended=stopShuttle;
     player.onloadedmetadata=()=>{
       if(!dialog?.open)return;
       if(Number.isFinite(player.duration)&&player.duration>0){
         const old=media.duration;
         media.duration=player.duration;
-        if(!Number.isFinite(old)||old<=0||markOut>media.duration) markOut=media.duration;
+        if(Number.isFinite(marks.out) && marks.out>media.duration) delete marks.out;
       }
     };
     dialog.querySelector('.source-close').onclick=close;
@@ -181,10 +260,10 @@
     const proxyButton=document.createElement('button');
     const trackPicker=document.createElement('select');
     if(media.type==='video' && !media.still && !Number.isInteger(media.nestedSequence)) {
-      const button=proxyButton;button.type='button';
+      const button=proxyButton;button.type='button';button.className='source-proxy';
       button.textContent=media.seekOptimized?'Seek proxy active':'Build seek proxy';
       button.disabled=!!media.seekOptimized;
-      dialog.querySelector('.source-actions').prepend(button);
+      dialog.querySelector('.source-bin').before(button);
       button.onclick=async()=>{
         const active=dialog;
         button.disabled=trackPicker.disabled=true;
@@ -204,7 +283,7 @@
       trackPicker.append(new Option('Default stereo routing',''));
       for(let i=0;i<media.audioStreams;i++)trackPicker.append(new Option(`Stream ${i+1}`,String(i)));
       trackPicker.value=media.audioStream??'';
-      dialog.querySelector('.source-actions').before(label);
+      dialog.querySelector('.source-bin').before(label);
       trackPicker.onchange=async()=>{
         const active=dialog;
         const choice=trackPicker.value===''?null:Number(trackPicker.value);
@@ -237,9 +316,14 @@
         default:place(button.dataset.action);
       }
     };
-    dialog.addEventListener('cancel',event=>{event.preventDefault();close();});
-    dialog.addEventListener('click',event=>{if(event.target===dialog)close();});
-    dialog.showModal();update();
+    // Non-modal, so the timeline (playhead, In/Out, scrolling) stays usable while it is open.
+    dialog.tabIndex=-1;
+    dialog.show();
+    document.addEventListener('keydown',onKey,true);
+    committedMarks=JSON.stringify(item.sourceMarks||{});
+    unsubscribe=Editor.subscribe(follow);
+    dialog.focus();
+    update();
     const choice=item.sourceAudioStream;
     if(media.audioStreams>1 && (choice===null || Number.isInteger(choice) && choice>=0 && choice<media.audioStreams) &&
         choice!==(media.audioStream??null)){
@@ -247,6 +331,10 @@
       trackPicker.onchange();
     }
   }
-  document.addEventListener('keydown',onKey,true);
-  window.SpliceSource={open};
+  // Where a drop on a timeline lane would put picture and sound: shown while dragging.
+  function describeDrop(drop) {
+    if (!dialog || !media) return '';
+    return targetsText(drop);
+  }
+  window.SpliceSource={open,place,describeDrop,isOpen:()=>!!dialog?.open,mediaId:()=>media?.id??null,mediaType:()=>media?.type??null};
 })();

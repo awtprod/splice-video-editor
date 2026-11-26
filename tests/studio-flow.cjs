@@ -76,7 +76,7 @@ async function main() {
       const dlg=page.getByRole('dialog');
       await dlg.locator('[name=name]').fill(name);
       await dlg.locator('[name=size]').selectOption('1280x720');
-      await dlg.getByRole('button',{name:'Create sequence'}).click();
+      await dlg.getByRole('button',{name:'Create project'}).click();
       await waitState(n=>Editor.get().project.name===n,name);
       await click('[data-library=media]');
       await page.locator('#media-input').setInputFiles(pass===1?path.join(root,'assets/ridge.mp4'):cameraOriginal);
@@ -87,12 +87,16 @@ async function main() {
       }
       await click('[data-media]');await waitState(()=>document.querySelector('.source-stage video')?.readyState>=2);
       if(screenshots&&pass===1)await page.screenshot({path:path.join(screenshots,'Splice-source.png')});
+      // Out includes the frame it is marked on: mark it on the last frame before 3 s for a 1-3 s range.
+      const sourceFps=await page.evaluate(()=>Editor.get().project.media[0].fps||Editor.get().project.fps);
       await change('.source-scrub',1);await click('[data-action=in]');
-      await change('.source-scrub',3);await click('[data-action=out]');
+      await change('.source-scrub',3-1/sourceFps);await click('[data-action=out]');
       await change('.source-bin input','Documentary / A camera');
       await page.locator('.source-track').selectOption('2');
       await click('[data-action=insert]');
       await waitState(()=>Editor.get().project.clips.some(c=>c.track===2&&c.in===1&&c.duration===2));
+      // The source monitor stays open for further edits; close it to work in the inspector.
+      await click('.source-close');
       await click('.timeline-clip.video');
       await change('[data-field=saturation]',75);
       const edge=await page.locator('.timeline-clip.video .trim-right').boundingBox();
