@@ -307,6 +307,16 @@ def resolve_library_open(handler, body):
     resolve_http.library_open_route(handler, body)
 
 
+@post('/api/resolve/seed', limit=resolve_http.MAX_DRP_BYTES, stream=True)
+def resolve_seed(handler, length, query):
+    resolve_http.seed_route(handler, length, query)
+
+
+@post('/api/resolve/library/save', limit=resolve_http.MAX_SAVE_JSON)
+def resolve_library_save(handler, body):
+    resolve_http.save_route(handler, body)
+
+
 class Handler(BaseHTTPRequestHandler):
     def _reply(self, status, data, content_type, headers=()):
         self.send_response(status)

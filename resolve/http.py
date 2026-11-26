@@ -3,13 +3,16 @@ they pass the same request checks (session cookie, page token, same-origin fetch
 /api/ route before any of this runs."""
 import json
 
-from . import ResolveError, list_library, open_drp, open_library_project
+from . import ResolveError, list_library, open_drp, open_library_project, originals
 from .media import link_local
-from .source import MAX_DRP_BYTES
+from .source import MAX_DRP_BYTES, load_drp
 
 MAX_JSON = 64 * 1024
+#: A save request carries every chosen timeline as Splice's project JSON.
+MAX_SAVE_JSON = 48 * 1024 * 1024
 
-__all__ = ['MAX_DRP_BYTES', 'MAX_JSON', 'open_route', 'library_list_route', 'library_open_route']
+__all__ = ['MAX_DRP_BYTES', 'MAX_JSON', 'MAX_SAVE_JSON', 'open_route', 'library_list_route', 'library_open_route',
+           'seed_route', 'save_route']
 
 
 def _json_body(body):
@@ -56,7 +59,7 @@ def _answer(handler, work):
     except (BrokenPipeError, ConnectionResetError):
         return
     except Exception as error:
-        handler._json(500, {'error': f'The Resolve project could not be opened ({type(error).__name__}: {error}).'})
+        handler._json(500, {'error': f'The Resolve request failed ({type(error).__name__}: {error}).'})
 
 
 def open_route(handler, length, query):
@@ -73,14 +76,49 @@ def open_route(handler, length, query):
 
 def library_list_route(handler, body):
     def work():
-        projects, truncated = list_library(_path(_json_body(body)))
-        return {'projects': projects, 'truncated': truncated}
+        from .place import PlaceError, library_users
+        path = _path(_json_body(body))
+        projects, truncated = list_library(path)
+        try:
+            users = sorted(library_users(path)[2])
+        except PlaceError:
+            users = []
+        return {'projects': projects, 'truncated': truncated, 'users': users}
     _answer(handler, work)
+
+
+def _keep_library(copy, digest):
+    originals.keep('library', digest, copy)
 
 
 def library_open_route(handler, body):
     def work():
         payload = _json_body(body)
         return {'project': open_library_project(_path(payload), _index(payload.get('timeline')), link_local,
-                                                timeline_id=_timeline_id(payload.get('timelineId')))}
+                                                timeline_id=_timeline_id(payload.get('timelineId')),
+                                                keep=_keep_library)}
+    _answer(handler, work)
+
+
+def seed_route(handler, length, query):
+    """POST /api/resolve/seed with a .drp as the body: kept as a save's seed; returns its SHA-256."""
+    def work():
+        data = handler.rfile.read(length)
+        if len(data) != length:
+            raise ResolveError('Incomplete request')
+        load_drp(data)  # only a readable Resolve project is kept
+        return {'sha256': originals.keep_bytes('drp', data)}
+    _answer(handler, work)
+
+
+def save_route(handler, body):
+    """POST /api/resolve/library/save: check (``confirm`` false) or save Splice timelines as a new
+    project in a Resolve disk library (see resolve.save)."""
+    def work():
+        import media_links
+        from . import drp_seed, save
+        from .source import scratch_folder
+        return save.run(_json_body(body), originals=lambda kind, sha: originals.find(kind, sha),
+                        scratch=scratch_folder(), resolve_media=media_links.resolve_media,
+                        drp_seed=drp_seed.make_seed)
     _answer(handler, work)
