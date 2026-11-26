@@ -49,12 +49,13 @@
   const lockedTrack = (kind, track) => track !== null && Editor.isTrackLocked(track, kind);
   function targetsText(drop = null) {
     const {picture, sound, embedded, soundOnly} = targets(drop);
-    const locked = (kind, track) => lockedTrack(kind, track) ? ' (locked)' : '';
+    const locked = (kind, track) => lockedTrack(kind, track) ? ' (locked)' :
+      kind === 'video' && track !== null && Editor.isTrackHidden(track, 'video') ? ' (hidden: the picture will not show)' : '';
     if (soundOnly && sound === null) return 'No sound in this clip to place on an audio track';
     const parts = [];
     if (picture !== null) parts.push('Picture → V' + picture + locked('video', picture));
     if (sound !== null) parts.push((picture === null ? 'Sound only → A' : 'sound → A') + Math.abs(sound) + locked('audio', sound));
-    else if (embedded) parts.push('sound in the picture clip');
+    else if (embedded && picture !== null) parts.push('sound in the picture clip');
     else if (picture !== null && media.type === 'video' && !media.still) parts.push('no sound');
     return parts.join(', ') || 'Choose a track';
   }
@@ -191,7 +192,7 @@
     const tag=media.type==='audio'?'audio':'video';
     const trackOptions=Array.from({length:trackCount},(_,i)=>media.type==='video'?i+1:-i-1)
       .map(n=>`<option value="${n}">${media.type==='video'?'Video':'Audio'} ${Math.abs(n)}${Math.abs(n)>nativeTrackLimit?' · working project only':''}</option>`).join('')+
-      (hasSound()?'<option value="none">None (sound only)</option>':'');
+      (hasSound()?'<option value="none" title="No picture: the sound only">None</option>':'');
     const pictureTarget=`<label class="source-target">${media.type==='video'?'Picture':'Sound'} <select class="source-track" aria-label="${media.type==='video'?'Picture goes to':'Sound goes to'}">${trackOptions}</select></label>`;
     // Head, picture, settings (they scroll when the window is short) and a footer whose transport,
     // mark and edit buttons are always in view.
@@ -301,6 +302,17 @@
         finally {trackPicker.disabled=false;proxyButton.disabled=!!media?.seekOptimized;}
       };
     }
+    // Changing a target clears the last edit's message (it was about the old target). Sound "in
+    // the picture clip" needs a picture track, so it is unavailable while Picture is None.
+    const picturePicker=dialog.querySelector('.source-track'), soundPicker=dialog.querySelector('.source-audio-track');
+    const syncTargets=()=>{
+      const embeddedOption=soundPicker?.querySelector('option[value=""]');
+      if(!embeddedOption)return;
+      embeddedOption.disabled=picturePicker.value==='none';
+      if(embeddedOption.disabled&&soundPicker.value==='')soundPicker.value='follow';
+    };
+    picturePicker.onchange=()=>{syncTargets();show('');};
+    if(soundPicker)soundPicker.onchange=()=>show('');
     dialog.querySelector('.source-scrub').oninput=event=>{player.pause();player.currentTime=Number(event.target.value);};
     dialog.querySelector('.source-bin input').onchange=event=>{
       const value=event.target.value.trim().replace(/\s*\/\s*/g,'/').replace(/^\/+|\/+$/g,'');

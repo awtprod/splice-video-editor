@@ -416,6 +416,16 @@ def resolve_library_open(handler, body):
     resolve_http.library_open_route(handler, body)
 
 
+@post('/api/resolve/seed', limit=resolve_http.MAX_DRP_BYTES, stream=True)
+def resolve_seed(handler, length, query):
+    resolve_http.seed_route(handler, length, query)
+
+
+@post('/api/resolve/library/save', limit=resolve_http.MAX_SAVE_JSON)
+def resolve_library_save(handler, body):
+    resolve_http.save_route(handler, body)
+
+
 class Handler(BaseHTTPRequestHandler):
     def _reply(self, status, data, content_type, headers=()):
         self.send_response(status)
@@ -794,6 +804,7 @@ if __name__ == '__main__':
     parser.add_argument('--port', type=int, default=8765)
     args = parser.parse_args()
     server = create_server(args.port)
+    resolve_http.clean_staging_at_start()
     with server:
         signal.signal(signal.SIGTERM,_exit_on_terminate)
         # The first stdout line is the one-time launch link (tests read it).
