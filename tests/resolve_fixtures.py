@@ -119,15 +119,23 @@ def links(*partners):
     return envelope(pb((1, pb((1, pb((1, listed))), (4, 1))), (15, 4)))
 
 
-def effects(*entries):
-    """entries: (effect type, {param id: value}) -> an EffectFiltersBA envelope."""
+def effects(*entries, compress=True, slot=None):
+    """entries: (effect type, {param id: value}) -> an EffectFiltersBA envelope.
+
+    Resolve 21.1 writes a short list uncompressed (``compress=False``) and keeps the parameters in
+    fixed slots, an empty slot for each one at its default: ``slot={param id: index}`` puts each
+    parameter at that index, after empty slots."""
     out = []
     for kind, params in entries:
         fields = [(1, kind), (7, 0)]
+        slots = []
         for pid, value in params.items():
-            fields.append((9, pb((1, pid), (3, pb((1, pb((2, float(value)))))))))
+            index = (slot or {}).get(pid, len(slots))
+            slots += [b''] * (index + 1 - len(slots))
+            slots[index] = pb((1, pid), (3, pb((1, pb((2, float(value)))))))
+        fields += [(9, entry) for entry in slots]
         out.append((1, pb(*fields)))
-    return envelope(pb(*out), compress=True)
+    return envelope(pb(*out), compress=compress)
 
 
 def markers(entries):
@@ -239,10 +247,7 @@ def _media_xml(m):
 
 
 def _sequence_fields(t):
-    fields = {'SeqRef': t['container']}
-    if 'drop' in t:
-        fields['timelineDropFrameTimecode'] = t['drop']
-    return fields
+    return {'SeqRef': t['container']}
 
 
 def _sequence(t):
