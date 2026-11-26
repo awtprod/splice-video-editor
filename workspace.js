@@ -692,6 +692,8 @@
     badge.title='Open the project compatibility report';
     if(state.opened!==lastOpenedReport){
       lastOpenedReport=state.opened;
+      // A multi-selection belongs to the project it was made in.
+      group.clear();
       const disabled=state.project.clips.filter(clip=>clip.enabled===false).length;
       const parts=[];
       if(issueCount)parts.push(issueCount+' compatibility note'+(issueCount===1?'':'s')+' (see ⚠ beside the sequence name)');
