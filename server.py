@@ -305,6 +305,21 @@ def queue_add(handler, body):
     handler._json(202, {'ids': ids})
 
 
+@post('/api/queue/turnover')
+def queue_turnover(handler, body):
+    from render_queue import ConflictError
+    payload = _json_body(body)
+    try:
+        ids = _render_queue(handler).add_turnover(payload['project'], formats=payload.get('formats'), movie=payload.get('movie', 'h264'),
+                                                  name=payload.get('name'), folder=payload.get('folder'),
+                                                  overwrite=payload.get('overwrite', False), span=payload.get('range'),
+                                                  audio_edl=payload.get('audioEdl', False))
+    except ConflictError as error:
+        handler._json(409, {'error': str(error), 'conflict': True})
+        return
+    handler._json(202, {'ids': ids})
+
+
 @post('/api/queue/action', limit=MAX_SMALL_BODY)
 def queue_action(handler, body):
     payload = _json_body(body)

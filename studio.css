@@ -1577,3 +1577,5 @@ body{min-width:1024px}
 .preset-list{list-style:none;padding:0;display:grid;gap:6px}
 .preset-list li{display:flex;gap:6px;align-items:center}
 .preset-list li span{flex:1}
+.studio-dialog[data-dialog=export] fieldset{min-width:0}
+.studio-dialog[data-dialog=export] label>select,.studio-dialog[data-dialog=export] label>input:not([type=checkbox]){width:100%;min-width:0;box-sizing:border-box}

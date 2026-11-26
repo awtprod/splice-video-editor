@@ -150,6 +150,36 @@ class Running(QueueCase):
         self.assertTrue((self.folder / 'film - frames' / 'film - frames.wav').exists())
 
 
+class Turnover(QueueCase):
+    def test_reference_movie_rendered_into_the_turnover_package(self):
+        import zipfile
+        queue = self.queue()
+        project = dict(self.project, startTimecode=24 * 3600 * 10, marks={})
+        ids = queue.add_turnover(project, formats=['fcpxml', 'edl'], movie='prores', folder=str(self.folder), span=dict(start=0.5, end=1.5))
+        jobs = self.wait(queue, ids)
+        self.assertEqual(jobs[ids[0]]['state'], 'complete', jobs[ids[0]]['error'])
+        package = self.folder / 'Queue-test-turnover.zip'
+        self.assertEqual(jobs[ids[0]]['outputs'], [str(package)])
+        with zipfile.ZipFile(package) as archive:
+            names = sorted(archive.namelist())
+            request = json.loads(archive.read('Queue-test/REFERENCE-MOVIE-REQUEST.json'))
+            movie = self.folder / 'movie.mov'
+            movie.write_bytes(archive.read('Queue-test/Queue-test-reference.mov'))
+            edl = archive.read(next(name for name in names if name.endswith('.edl'))).decode()
+        self.assertIn('Queue-test/Queue-test.fcpxml', names)
+        self.assertEqual(request['status'], 'rendered by the Splice render queue')
+        self.assertEqual(request['file'], 'Queue-test-reference.mov')
+        info = json.loads(subprocess.check_output(['ffprobe', '-v', 'error', '-show_streams', '-count_frames', '-of', 'json', str(movie)]))
+        video = next(s for s in info['streams'] if s['codec_type'] == 'video')
+        timecode = next(s for s in info['streams'] if s['codec_type'] == 'data')['tags']['timecode']
+        # The movie matches the exported timeline: its range, frame count and start timecode.
+        self.assertEqual((video['profile'], int(video['nb_read_frames'])), ('Proxy', request['range']['frames']))
+        self.assertEqual(request['range']['frames'], 24)
+        self.assertEqual(timecode, request['startTimecode'])
+        self.assertIn(request['startTimecode'], edl, 'the EDL record starts where the movie starts')
+        self.assertFalse((self.folder / 'Queue-test-reference.mov').exists(), 'the movie lives in the package')
+
+
 class Confinement(QueueCase):
     def test_names_and_folders_are_confined(self):
         queue = self.queue()

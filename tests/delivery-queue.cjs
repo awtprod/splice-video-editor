@@ -106,7 +106,7 @@ async function main() {
     const clip = path.join(temp, 'clip.mp4');
     ffmpeg(['-f', 'lavfi', '-i', 'testsrc2=s=640x360:r=25:d=4', '-f', 'lavfi', '-i', 'sine=f=440:d=4', '-shortest', '-c:v', 'libx264',
       '-pix_fmt', 'yuv420p', '-c:a', 'aac', clip]);
-    let {page, errors} = await newPage(browser, splice, {width: 1440, height: 900}, ['Client review 720p']);
+    let {page, errors} = await newPage(browser, splice, {width: 1440, height: 900}, ['Client review']);
     await project(page, clip);
     await openExport(page);
     await checkFits(page);
@@ -150,7 +150,7 @@ async function main() {
     await page.locator(`${dialog} select[name=preset]`).selectOption('');
     await page.locator(`${dialog} select[name=codec]`).selectOption('h264');
     await page.locator(`${dialog} .export-preset-row button`, {hasText: 'Save preset'}).click();
-    await waitFor(page, () => [...document.querySelector('.studio-dialog[data-dialog=export] select[name=preset]').options].some(o => o.textContent === 'Client review 720p'));
+    await waitFor(page, () => [...document.querySelector('.studio-dialog[data-dialog=export] select[name=preset]').options].some(o => o.textContent === 'Client review'));
 
     // Queue: pause it, add two jobs and a batch of two presets, reorder, hold and cancel.
     await page.locator(`${dialog} .export-open-queue`).click();

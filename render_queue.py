@@ -204,6 +204,107 @@ class RenderQueue:
         self.wake.set()
         return ids
 
+    def add_turnover(self, project, *, formats=None, movie='h264', name=None, folder=None, overwrite=False, span=None,
+                     audio_edl=False):
+        """Queue a turnover package whose reference movie the queue renders.
+
+        The interchange exporter writes the timeline files, the report and REFERENCE-MOVIE-REQUEST.json
+        (range, start timecode, rate); the movie is rendered from that request (timecode and clip-name
+        burn-ins, the timeline's range and start timecode) and the finished package
+        ``<name>-turnover.zip`` holds all of them."""
+        import base64
+        import io
+        import zipfile
+        from fractions import Fraction
+        from interchange.api import export_timeline
+        from interchange.timecode import timecode_frames
+        if movie not in ('h264', 'prores'):
+            raise ValueError('The reference movie is H.264 or ProRes Proxy')
+        if not isinstance(project, dict):
+            raise ValueError('Invalid project')
+        options = {'formats': formats or ['fcpxml'], 'package': True, 'referenceMovie': True, 'audioEdl': bool(audio_edl)}
+        if span is not None:
+            if not isinstance(span, dict):
+                raise ValueError('Invalid range')
+            options['range'] = span
+        result = export_timeline(project, options)
+        package = base64.b64decode(result['package']['base64'])
+        with zipfile.ZipFile(io.BytesIO(package)) as archive:
+            names = archive.namelist()
+            request_name = next(entry for entry in names if entry.endswith('/REFERENCE-MOVIE-REQUEST.json'))
+            request = json.loads(archive.read(request_name))
+        rate = Fraction(request['rate'])
+        first, frames = int(request['range']['startFrame']), int(request['range']['frames'])
+        start = timecode_frames(request['startTimecode'], rate, bool(request['dropFrame']))
+        per_second = round(rate)
+        day = per_second * 86400 - (per_second // 15) * 1296 if request['dropFrame'] else per_second * 86400
+        # The renderer labels frame f of the sequence startTimecode + f: the range's first frame
+        # gets the timeline's start label.
+        rendered = dict(project, startTimecode=(start - first) % day, dropFrame=bool(request['dropFrame']))
+        burn = dict(fields=['timecode', 'clipName'], position='bottom-center', clipNamePosition='top-left', size=4)
+        movie_options = dict(codec='h264', crf=23, burnIns=burn) if movie == 'h264' else dict(codec='prores', profile='proxy', burnIns=burn)
+        movie_options['range'] = dict(start=float(Fraction(first) / rate), end=float(Fraction(first + frames) / rate))
+        base = request_name.split('/')[0]
+        name = _clean_name(name or base)
+        folder = _folder(folder)
+        target = folder / f'{name}-turnover.zip'
+        if target.exists() and not overwrite:
+            raise ConflictError(f'Already in the output folder: {target.name}. Replace it?')
+        spec = delivery.normalize(movie_options)
+        identifier = uuid.uuid4().hex
+        with self.lock:
+            self._project_file(identifier).write_text(json.dumps(rendered), encoding='utf-8')
+            self.jobs.append(dict(
+                id=identifier, state='queued', name=name, preset='Turnover reference movie', options=movie_options,
+                folder=str(folder), overwrite=overwrite, targets=[str(target)], sequence=str(project.get('name') or 'Untitled')[:120],
+                summary=_summary(spec, movie_options) + ' · turnover package', created=time.time(), started=None, finished=None,
+                progress=0, eta=None, error='', warnings=[], report={}, outputs=[], attempts=0,
+                turnover=dict(package=result['package']['base64'], request=request_name, base=base)))
+            self._trim()
+            self._save()
+        self.wake.set()
+        return [identifier]
+
+    def _package(self, job, identifier, spec):
+        """Write the turnover zip: the exporter's files, the rendered movie and the request marked done."""
+        import base64
+        import io
+        import zipfile
+        output, _ = self.exports.outputs(identifier)
+        folder = _folder(job['folder'])
+        target = folder / f'{job["name"]}-turnover.zip'
+        notes = []
+        if target.exists() and not job['overwrite']:
+            for number in range(2, 1000):
+                candidate = folder / f'{job["name"]}-turnover ({number}).zip'
+                if not candidate.exists():
+                    notes.append(f'{target.name} appeared while this job rendered, so the package was saved as {candidate.name}.')
+                    target = candidate
+                    break
+            else:
+                raise ValueError(f'{target.name} already exists in {folder}')
+        turnover = job['turnover']
+        movie_name = f'{turnover["base"]}-reference.{spec["extension"]}'
+        temporary = target.with_name(target.name + '.partial')
+        try:
+            with zipfile.ZipFile(io.BytesIO(base64.b64decode(turnover['package']))) as source, \
+                    zipfile.ZipFile(temporary, 'w', zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
+                for entry in source.namelist():
+                    data = source.read(entry)
+                    if entry == turnover['request']:
+                        request = json.loads(data)
+                        request.update(status='rendered by the Splice render queue', file=movie_name,
+                                       burnIns=['sequence timecode', 'clip name'], codec=spec['profile_label'] or spec['label'])
+                        data = (json.dumps(request, indent=2) + '\n').encode()
+                    archive.writestr(entry, data)
+                # Video is already compressed: store it.
+                archive.write(output, f'{turnover["base"]}/{movie_name}', compress_type=zipfile.ZIP_STORED)
+            os.replace(temporary, target)
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+        return [str(target)], notes
+
     def _trim(self):
         finished = [job for job in self.jobs if job['state'] in FINISHED]
         for job in finished[:max(0, len(finished) - MAX_FINISHED)]:
@@ -214,8 +315,8 @@ class RenderQueue:
     def list(self):
         with self.lock:
             return {'paused': self.paused, 'folder': str(default_folder()),
-                    'jobs': [{key: value for key, value in job.items() if key not in ('options', 'targets')} |
-                             {'options': job['options']} for job in self.jobs]}
+                    'jobs': [{key: value for key, value in job.items() if key not in ('options', 'targets', 'turnover')} |
+                             {'options': job['options'], 'turnover': bool(job.get('turnover'))} for job in self.jobs]}
 
     def set_paused(self, paused):
         if not isinstance(paused, bool):
@@ -374,7 +475,7 @@ class RenderQueue:
             with self.lock:
                 job.update(warnings=status['warnings'], report=status['report'], finished=time.time(), eta=None)
             if status['state'] == 'complete':
-                outputs, notes = self._deliver(job, identifier, spec)
+                outputs, notes = (self._package if job.get('turnover') else self._deliver)(job, identifier, spec)
                 with self.lock:
                     job.update(state='complete', progress=1, outputs=outputs, warnings=job['warnings'] + notes)
             else:

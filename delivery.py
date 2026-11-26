@@ -589,9 +589,21 @@ def _test_encode(spec):
         except OSError as error:
             return f'FFmpeg could not start ({error})'
         if result.returncode or not output.exists() or not output.stat().st_size:
-            lines = [line for line in result.stderr.splitlines() if line.strip()]
-            return 'test encode failed: ' + (lines[-1][:200] if lines else f'exit code {result.returncode}')
+            return _failure_reason(spec, result.stderr, result.returncode)
     return ''
+
+
+def _failure_reason(spec, stderr, code):
+    """The most telling line of a failed test encode, without FFmpeg's '[name @ 0x...]' prefixes."""
+    lines = [re.sub(r'^(\[[^]]*@ 0x[0-9a-f]+\] ?)+', '', line).strip() for line in stderr.splitlines()]
+    lines = [line for line in lines if line and not line.startswith(('Error parsing global options', 'Nothing was written',
+                                                                     'Terminating thread', 'Task finished'))]
+    telling = next((line for line in lines if re.search(r'cannot|could not|no device|not found|failed|unsupported|denied|'
+                                                         r'not supported|invalid', line, re.I)), lines[-1] if lines else '')
+    telling = telling[:120] or f'exit code {code}'
+    if spec.get('hardware'):
+        return f'no usable {HARDWARE[spec["hardware"]]["label"]} device or driver ({telling})'
+    return f'the test encode failed ({telling})'
 
 
 def _lists():

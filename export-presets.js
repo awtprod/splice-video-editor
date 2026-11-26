@@ -520,7 +520,8 @@ window.SpliceDelivery = (() => {
     const pause = el('button', {type: 'button', className: 'queue-pause'});
     const notify = el('input', {type: 'checkbox', name: 'queueNotify', checked: localStorage.getItem('splice-queue-notify') === '1'});
     notify.onchange = () => { localStorage.setItem('splice-queue-notify', notify.checked ? '1' : '0'); if (notify.checked && window.Notification?.permission === 'default') Notification.requestPermission(); };
-    toolbar.append(pause, field('Sound and notification when a job finishes', notify, {className: 'export-check'}));
+    const turnover = el('button', {type: 'button', className: 'queue-turnover', textContent: 'Turnover package…', onclick: () => turnoverDialog(() => refresh())});
+    toolbar.append(pause, turnover, field('Sound and notification when a job finishes', notify, {className: 'export-check'}));
     const list = el('ol', {className: 'queue-list'});
     const status = el('p', {role: 'status', className: 'render-state'});
     const footer = el('footer', {}, el('button', {type: 'button', className: 'primary', textContent: 'Close', onclick: () => panel.close()}));
@@ -583,6 +584,37 @@ window.SpliceDelivery = (() => {
     timer = setInterval(() => { if (!document.hidden) refresh(); }, 1000);
     panel.showModal();
     return panel;
+  }
+  /* A turnover package (timeline files + report) whose reference movie the queue renders, with
+   * timecode and clip-name burn-ins, over the exported timeline's range and start timecode. */
+  function turnoverDialog(done) {
+    const node = modal('Turnover package with reference movie', 'turnover');
+    const form = el('form', {method: 'dialog'});
+    const project = Editor.get().project;
+    const boxes = [['fcpxml', 'FCPXML (Resolve, Final Cut Pro)', true], ['xmeml', 'Final Cut Pro 7 XML (Premiere, Avid)', false],
+      ['edl', 'CMX3600 EDL', true], ['otio', 'OpenTimelineIO', false]].map(([value, text, checked]) =>
+      field(text, el('input', {type: 'checkbox', value, checked}), {className: 'export-check'}));
+    const movie = select('movie', [['h264', 'H.264 review movie (MP4)'], ['prores', 'ProRes 422 Proxy (MOV)']]);
+    const marks = project.marks || {};
+    const range = select('range', [['all', 'Entire sequence'], ...(Number.isFinite(marks.in) || Number.isFinite(marks.out) ? [['marks', 'In to Out marks']] : [])]);
+    const name = el('input', {name: 'name', type: 'text', maxLength: 120, value: (project.name || 'Untitled').replace(/[^A-Za-z0-9_-]+/g, '-')});
+    const status = el('p', {role: 'status', className: 'render-state'});
+    form.append(el('p', {className: 'export-help', textContent: 'The timeline files and report are written now; the reference movie renders in the queue and goes into the same package, matching the timeline’s range and start timecode, with timecode and clip-name burn-ins.'}),
+      ...boxes, field('Reference movie', movie), field('Range', range), field('Package name', name), status,
+      el('footer', {}, el('button', {type: 'button', textContent: 'Cancel', onclick: () => node.close()}), el('button', {className: 'primary', textContent: 'Add to queue'})));
+    form.onsubmit = async event => {
+      event.preventDefault();
+      const formats = boxes.map(label => label.querySelector('input')).filter(box => box.checked).map(box => box.value);
+      if (!formats.length) { status.textContent = 'Choose at least one timeline format.'; return; }
+      const body = {project: await Editor.prepareExport(), formats, movie: movie.value, name: name.value.trim() || undefined};
+      if (range.value === 'marks') body.range = {start: Number.isFinite(marks.in) ? marks.in : 0, end: Number.isFinite(marks.out) ? marks.out : Editor.get().duration};
+      try {
+        try { await post('/api/queue/turnover', body); }
+        catch (error) { if (error.status === 409 && confirm(error.message)) await post('/api/queue/turnover', {...body, overwrite: true}); else throw error; }
+        node.close(); done();
+      } catch (error) { status.textContent = error.message; }
+    };
+    node.append(form); node.showModal();
   }
   function announce(job) {
     try {
