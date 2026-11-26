@@ -812,17 +812,14 @@ select:focus-visible {
   height: 31px;
   border-bottom: 1px solid var(--line);
   position: relative;
-  background: repeating-linear-gradient(
-    90deg,
-    transparent 0,
-    transparent 59px,
-    #3b453a 60px,
-    #3b453a 61px
-  );
 }
 .ruler-tick {
   position: absolute;
-  top: 6px;
+  top: 0;
+  bottom: 0;
+  padding: 6px 0 0 5px;
+  border-left: 1px solid #3b453a;
+  white-space: nowrap;
   color: #839080;
   font:
     9px "IBM Plex Mono",
@@ -949,10 +946,12 @@ select:focus-visible {
   gap: 7px;
   align-items: center;
 }
+/* Toasts sit under the header, over panel headings, never over timeline tracks. */
 .toast {
   position: fixed;
-  bottom: 33px;
+  top: 118px;
   right: 20px;
+  max-width: min(440px, 60vw);
   background: #2e3c29;
   color: #e9f5e3;
   border: 1px solid #728b62;
@@ -1469,3 +1468,48 @@ button svg {
     font-size: 11px;
   }
 }
+/* Track rows take their heights from the timeline (laneHeights in workspace.js); clips fill them. */
+.timeline .timeline-clip{top:4px;height:calc(100% - 8px)}
+.track-head.is-compact .track-controls button{height:22px}
+.track-lane.drop-target{box-shadow:inset 0 0 0 2px #c6f178}
+/* Pool cards: every line stays inside its card. Long paths end in an ellipsis (full path in the tooltip). */
+.media-card{overflow:hidden}
+.media-card .media-meta{overflow-wrap:anywhere}
+.media-card .media-path{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;overflow-wrap:normal}
+/* Large scope dock: replaces the media pool column beside the program monitor while grading. */
+.workspace.scope-docked{grid-template-columns:minmax(506px,38%) minmax(0,1fr) minmax(230px,20%)}
+.workspace.scope-docked>.library{display:none}
+.workspace.scope-docked.source-open{grid-template-columns:minmax(506px,34%) minmax(0,1fr) minmax(0,1fr)}
+@media (min-width:1400px){
+  .workspace.scope-docked.source-open{grid-template-columns:minmax(506px,30%) minmax(0,1fr) minmax(0,1fr) minmax(230px,17%)}
+}
+.scope-dock{display:flex;flex-direction:column;min-width:0;min-height:0}
+.scope-dock-body{flex:1;min-height:0;display:flex;flex-direction:column;padding:10px 12px}
+.scope-dock .splice-scopes{flex:1;min-height:0;display:flex;flex-direction:column;gap:8px}
+.scope-dock .splice-scope{flex:1;min-height:0;height:auto!important}
+.scope-dock .splice-scope-size,.scope-dock .splice-scope-enlarge{display:none}
+.workspace.scope-docked .inspector .splice-scope,.workspace.scope-docked .inspector .splice-scope-size,
+.workspace.scope-docked .inspector .splice-scope-tabs,.workspace.scope-docked .inspector .splice-scope-luma,
+.workspace.scope-docked .inspector .splice-scope-enlarge{display:none}
+.workspace.scope-docked .inspector .splice-scopes::after{content:"The scope is docked beside the program monitor.";font-size:11px;color:#9baa9b}
+.scope-dock-toggle{padding:3px 8px;border:1px solid #465346;border-radius:4px;font-size:11px;color:#b6c9af;background:transparent}
+.scope-dock-toggle.active{color:#e9f6d8;background:#2f3d2b;border-color:#c4ee78}
+/* Short windows (down to the 1024 × 640 minimum): slimmer header and utility bar, and a timeline
+   that leaves the monitors room while keeping V1 and A1 in view. */
+@media (max-height:700px){
+  .app-shell{min-height:640px}
+  .app-header{height:48px;gap:16px;padding:0 16px}
+  .brand-mark{transform:scale(.8)}
+  .export-button{padding:7px 13px}
+  .utility-bar{height:34px;padding:0 16px}
+  .timeline,body:has(.workspace.source-open) .timeline{min-height:0;height:236px}
+  .timeline-header{height:38px}
+  .timeline-footer{height:26px}
+  .toast{top:90px}
+  .monitor-area{padding:8px}
+  .viewer-bottom{height:46px}
+  .panel-top{height:38px}
+}
+/* The smallest supported window is 1024 × 640. Below it the page keeps that layout and scrolls,
+   rather than squeezing panels past the point where they work. */
+body{min-width:1024px}

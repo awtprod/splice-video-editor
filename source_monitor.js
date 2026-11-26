@@ -16,10 +16,47 @@
     if (!dialog?.open) return;
     dialog.querySelector('.source-time').textContent = format(current())+' / '+format(media.duration);
     dialog.querySelector('.source-range').textContent = 'In '+format(markIn())+' · Out '+format(lastFrame())+' · '+format(markOut()-markIn());
-    dialog.querySelector('.source-plan').textContent = plan();
+    const planText = targetsText() + ' · ' + plan();
+    const planNode = dialog.querySelector('.source-plan');
+    if (planNode.textContent !== planText) {
+      planNode.textContent = planText;
+      planNode.title = planText;
+    }
     dialog.querySelector('.source-scrub').value = current();
     dialog.querySelector('.source-scrub').max = media.duration;
     frameRequest = requestAnimationFrame(update);
+  }
+  // Track targeting, as in other editors' source patching. The picture goes to the chosen video
+  // track (or the track it is dropped on); its sound follows to the audio track with the same
+  // number (V2 → A2) unless another audio track, or "in the picture clip", is chosen. A drop
+  // on an audio track places the sound only. Returns {picture, sound}: track numbers or null.
+  function targets(drop = null) {
+    const soundPicker = dialog.querySelector('.source-audio-track');
+    if (media.type === 'audio') {
+      const track = drop ? Number(drop.track) : Number(dialog.querySelector('.source-track').value);
+      return {picture: null, sound: track};
+    }
+    if (drop && drop.kind === 'audio') return {picture: null, sound: hasSound() ? Number(drop.track) : null, soundOnly: true};
+    const chosen = dialog.querySelector('.source-track').value;
+    const picture = drop ? Number(drop.track) : chosen === 'none' ? null : Number(chosen);
+    if (!soundPicker) return {picture, sound: null};
+    const choice = soundPicker.value;
+    if (choice === '') return {picture, sound: null, embedded: true};
+    if (choice === 'follow') return {picture, sound: -Math.max(1, picture ?? 1)};
+    return {picture, sound: Number(choice)};
+  }
+  const hasSound = () => media.type === 'video' && !media.still && media.audioChannels > 0;
+  const lockedTrack = (kind, track) => track !== null && Editor.isTrackLocked(track, kind);
+  function targetsText(drop = null) {
+    const {picture, sound, embedded, soundOnly} = targets(drop);
+    const locked = (kind, track) => lockedTrack(kind, track) ? ' (locked)' : '';
+    if (soundOnly && sound === null) return 'No sound in this clip to place on an audio track';
+    const parts = [];
+    if (picture !== null) parts.push('Picture → V' + picture + locked('video', picture));
+    if (sound !== null) parts.push((picture === null ? 'Sound only → A' : 'sound → A') + Math.abs(sound) + locked('audio', sound));
+    else if (embedded) parts.push('sound in the picture clip');
+    else if (picture !== null && media.type === 'video' && !media.still) parts.push('no sound');
+    return parts.join(', ') || 'Choose a track';
   }
   // Describe how the next edit will be timed: the three-point rule that applies.
   function plan() {
@@ -84,16 +121,25 @@
     committedMarks=JSON.stringify(marks);
     Editor.setSourceSettings(media.id,{sourceMarks:{...marks}});
   }
-  // `drop` places the marked range where it was dragged on the timeline: {track, at}.
+  // `drop` places the marked range where it was dragged on the timeline: {kind, track, at}.
   function place(mode, drop=null) {
     if (!dialog || dialog.dataset.preparing) return;
     show('');
-    const track=drop ? Number(drop.track) : Number(dialog.querySelector('.source-track').value);
-    if (Editor.isTrackLocked(track, media.type)) return show(`Unlock ${media.type} track ${Math.abs(track)} before editing.`);
-    const soundPicker=dialog.querySelector('.source-audio-track');
-    const audioTrack=soundPicker && soundPicker.value!=='' ? Number(soundPicker.value) : null;
+    const {picture, sound, soundOnly} = targets(drop);
+    if (soundOnly && sound === null) return show(media.name + ' has no sound to place on an audio track.');
+    // Never edit a locked track: refuse, naming it, rather than leave part of the edit behind.
+    if (lockedTrack('video', picture)) return show(`Unlock video track ${picture} before editing.`);
+    if (lockedTrack('audio', sound))
+      return show(`Unlock audio track ${Math.abs(sound)} before editing, or send the sound to another audio track.`);
+    const options = {mode, marks: {...marks}};
+    if (media.type === 'audio') options.track = sound;
+    else {
+      options.track = picture;
+      options.audioTrack = sound;
+    }
+    if (drop) options.at = drop.at;
     let result;
-    try { result=Editor.placeSource(media.id,{mode,track,audioTrack,marks:{...marks},...(drop?{at:drop.at}:{})}); }
+    try { result=Editor.placeSource(media.id,options); }
     catch (error) { return show(error.message); }
     if (result.speed!==1) Editor.select(result.clips[0]);
     // The monitor stays open: three-point editing is mark, place, mark, place.
@@ -133,25 +179,30 @@
     if(Number.isFinite(saved.out)) marks.out=Math.max(0,Math.min(media.duration,saved.out));
     if(Number.isFinite(saved.in)) marks.in=Math.max(0,Math.min(markOut(),saved.in));
     if(markOut()<=markIn()) marks={};
-    const soundTracks=Math.min(64,Math.max(state.trackCounts?.audio || 3,
+    // Sound can go to any audio track up to one past the last used, and to the audio track
+    // matching any picture track offered (it is created when the edit uses it).
+    const soundTracks=Math.min(64,Math.max(state.trackCounts?.audio || 3,trackCount,
       ...state.clips.filter(clip=>clip.type==='audio').map(clip=>Math.abs(clip.track)),2)+1);
-    const soundTarget=media.type==='video' && !media.still && media.audioChannels>0 ?
-      `<label class="source-track-label">Camera sound to <select class="source-audio-track"><option value="">Keep inside the picture clip</option>${Array.from({length:soundTracks},(_,i)=>`<option value="${-i-1}"${i===0?' selected':''}>Audio ${i+1}</option>`).join('')}</select></label>` : '';
+    const soundOptions=Array.from({length:soundTracks},(_,i)=>`<option value="${-i-1}">Audio ${i+1}</option>`).join('');
+    const soundTarget=hasSound() ?
+      `<label class="source-target">Sound <select class="source-audio-track" aria-label="Sound goes to"><option value="follow" selected>With picture</option>${soundOptions}<option value="">In picture clip</option></select></label>` : '';
     dialog=document.createElement('dialog');dialog.className='source-dialog';
     dialog.setAttribute('aria-label','Source monitor: '+media.name);
     const tag=media.type==='audio'?'audio':'video';
     const trackOptions=Array.from({length:trackCount},(_,i)=>media.type==='video'?i+1:-i-1)
-      .map(n=>`<option value="${n}">${media.type==='video'?'Video':'Audio'} ${Math.abs(n)}${Math.abs(n)>nativeTrackLimit?' · working project only':''}</option>`).join('');
+      .map(n=>`<option value="${n}">${media.type==='video'?'Video':'Audio'} ${Math.abs(n)}${Math.abs(n)>nativeTrackLimit?' · working project only':''}</option>`).join('')+
+      (hasSound()?'<option value="none">None (sound only)</option>':'');
+    const pictureTarget=`<label class="source-target">${media.type==='video'?'Picture':'Sound'} <select class="source-track" aria-label="${media.type==='video'?'Picture goes to':'Sound goes to'}">${trackOptions}</select></label>`;
     // Head, picture, settings (they scroll when the window is short) and a footer whose transport,
     // mark and edit buttons are always in view.
     dialog.innerHTML=`<div class="source-head"><div><small>SOURCE</small><strong>${esc(media.name)}</strong></div><button class="source-close" aria-label="Close source monitor">×</button></div>`+
       `<div class="source-stage"><${tag} controls playsinline preload="auto"></${tag}></div>`+
       `<div class="source-controls"><input class="source-scrub" type="range" min="0" max="${media.duration}" step="${1/fps}" value="0" aria-label="Source playhead">`+
-      `<div class="source-readout"><span class="source-time"></span><span class="source-range"></span></div><small class="source-plan"></small>`+
+      `<div class="source-readout"><span class="source-time"></span><span class="source-range"></span></div>`+
       `<small class="source-shortcuts">I · O mark (both frames included) · J K L shuttle · , insert · . overwrite</small>`+
-      `<label class="source-track-label">Timeline track <select class="source-track">${trackOptions}</select></label>${soundTarget}`+
       `<label class="source-bin">Bin path <input type="text" value="${esc(media.bin || '')}" placeholder="e.g. Interview / Camera A" aria-label="Media bin path"></label></div>`+
-      `<div class="source-footer"><p class="source-status" role="status"></p><div class="source-bar">`+
+      `<div class="source-footer"><p class="source-plan"></p><p class="source-status" role="status"></p><div class="source-bar">`+
+      `<div class="source-targets" role="group" aria-label="Edit targets">${pictureTarget}${soundTarget}</div>`+
       `<div class="source-buttons"><button data-action="back" title="Back one frame (←)">−1</button><button data-action="play" title="Play / pause (Space)">Play</button><button data-action="forward" title="Forward one frame (→)">+1</button><button data-action="in" title="Mark In on this frame (I)">Mark In</button><button data-action="out" title="Mark Out on this frame, included (O)">Mark Out</button></div>`+
       `<div class="source-actions"><button data-action="append">Append</button><button data-action="overwrite" title="Overwrite (.)">Overwrite</button><button class="source-primary" data-action="insert" title="Insert (,)">Insert</button></div></div></div>`;
     // A panel of the workspace, left of the program monitor (the inspector makes room).
@@ -280,5 +331,10 @@
       trackPicker.onchange();
     }
   }
-  window.SpliceSource={open,place,isOpen:()=>!!dialog?.open,mediaId:()=>media?.id??null,mediaType:()=>media?.type??null};
+  // Where a drop on a timeline lane would put picture and sound: shown while dragging.
+  function describeDrop(drop) {
+    if (!dialog || !media) return '';
+    return targetsText(drop);
+  }
+  window.SpliceSource={open,place,describeDrop,isOpen:()=>!!dialog?.open,mediaId:()=>media?.id??null,mediaType:()=>media?.type??null};
 })();
