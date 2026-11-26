@@ -42,7 +42,13 @@ body:has(.workspace.source-open) .timeline{height:clamp(245px,36vh,510px)}
 .source-bin input,.source-track-label select{width:min(260px,62%);min-width:0;padding:5px;color:#eef8e9;background:#252e25;border:1px solid #4b5948;border-radius:5px}
 .source-proxy{justify-self:start}
 .source-footer{flex:none;display:grid;gap:4px;padding:6px 10px 7px;border-top:1px solid #374335;background:#1b211c}
-.source-plan{color:#c6dba8;font:11px 'IBM Plex Mono',monospace}
+/* The plan says where the next edit lands and how it is timed: one line, full text in its tooltip. */
+.source-plan{margin:0;color:#c6dba8;font:11px 'IBM Plex Mono',monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* Track targets (source patching) share the bar with the buttons, so they are always in view. */
+.source-targets{display:flex;flex-wrap:wrap;gap:4px 10px;align-items:center}
+.source-target{display:flex;align-items:center;gap:5px;font-size:12px;color:#b3c2ac;white-space:nowrap}
+.source-target select{max-width:150px;padding:3px 4px;color:#eef8e9;background:#252e25;border:1px solid #4b5948;border-radius:5px;font-size:12px}
+.source-target select:focus-visible{outline:2px solid #c6f178;outline-offset:1px}
 /* The status line keeps its height when empty, so a message after an edit never moves the picture. */
 .source-status{margin:0;min-height:1.35em;line-height:1.35em;color:#b9d79a;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .source-status.error{color:#e4b5a2}
@@ -53,5 +59,7 @@ body:has(.workspace.source-open) .timeline{height:clamp(245px,36vh,510px)}
 @container source (max-width:520px){
   .source-dialog button:not(.source-close){padding:3px 6px;font-size:11px}
   .source-bar,.source-buttons,.source-actions{gap:4px}
+  .source-target{font-size:11px}
+  .source-target select{font-size:11px;max-width:118px}
 }
 .source-dialog{container:source/inline-size}
