@@ -99,29 +99,28 @@ void main() {
   gl_Position = vec4(pixel.x/u_canvas.x*2.0-1.0, 1.0-pixel.y/u_canvas.y*2.0, 0.0, 1.0);
   v_uv = a_corner + 0.5;
 }`;
-  const FRAGMENT = `#version 300 es
+  // Compiled once per feature set (SOURCE, SETS, HUE, LOOK, INPUT): a plain layer runs a short
+  // program; uniform branches in one large shader cost a software rasteriser several times more.
+  const FRAGMENT = defines => `#version 300 es
+${defines}
 precision highp float; precision highp int; precision highp sampler3D;
 in vec2 v_uv;
 out vec4 outColor;
-uniform int u_source;            // 0 RGB(A) texture, 1 I420 planes, 2 NV12 planes, 3 I420 + alpha plane
 uniform sampler2D u_y, u_u, u_v, u_planeAlpha;
 uniform mat3 u_yuv;              // columns: Y, Cb, Cr contributions
 uniform vec2 u_yuvOffset;
-uniform int u_sets;              // 0 no grade, 1 one grade, 2 two grades mixed (keyframes)
 uniform float u_keyWeight;
 uniform sampler2D u_tab0, u_tab1; // 4096 x 2: row 0 pre, row 1 post (RGB)
 uniform ivec2 u_flags;           // per set: 1 pre, 2 matrix, 4 post
 uniform mat3 u_mat0, u_mat1;
-uniform int u_hue;               // 1 when the hue-vs-saturation lattice applies
 uniform sampler3D u_hs;
-uniform int u_look;              // 0 none, 1 lattice, 2 1D curve
+// LOOK: 0 none, 1 lattice, 2 1D curve. SOURCE: 0 RGB(A), 1 I420, 2 NV12, 3 I420 + alpha.
 uniform sampler3D u_look3; uniform sampler2D u_look1;
 uniform int u_lookSize; uniform int u_lookWidth; uniform vec3 u_lookMin, u_lookMax; uniform float u_lookMix;
-uniform int u_in;                // input (technical) LUT, same encoding as the look, at 100 %
+// INPUT: the source's technical LUT, encoded as LOOK, at 100 %.
 uniform sampler3D u_in3; uniform sampler2D u_in1;
 uniform int u_inSize; uniform int u_inWidth; uniform vec3 u_inMin, u_inMax;
 uniform float u_alpha, u_gain;
-uniform int u_view;              // monitoring view, see VIEW in gl-preview.js
 uniform vec4 u_wipe;             // x: wipe edge in pixels (or -1), y: canvas height
 float tab(sampler2D t, int row, float x, int channel) {
   float p = clamp(x, 0.0, 1.0)*${TABLE - 1}.0; int i0 = int(p); int i1 = min(i0+1, ${TABLE - 1});
@@ -157,24 +156,43 @@ vec3 primaries(vec3 x, sampler2D t, int flags, mat3 m) {
 }
 vec3 grade(vec3 x, sampler2D t, int flags, mat3 m) {
   x = primaries(x, t, flags, m);
-  if (u_hue == 1) x = lattice(u_hs, ${HS}, x);
-  if (u_look != 0) x = look(u_look, u_look3, u_look1, u_lookSize, u_lookWidth, u_lookMin, u_lookMax, u_lookMix, x);
+#if HUE == 1
+  x = lattice(u_hs, ${HS}, x);
+#endif
+#if LOOK != 0
+  x = look(LOOK, u_look3, u_look1, u_lookSize, u_lookWidth, u_lookMin, u_lookMax, u_lookMix, x);
+#endif
   return clamp(x, 0.0, 1.0);
 }
 void main() {
   vec4 source;
-  if (u_source == 0) source = texture(u_y, v_uv);
-  else {
-    float Y = texture(u_y, v_uv).r - u_yuvOffset.x;
-    vec2 C = u_source == 2 ? texture(u_u, v_uv).rg : vec2(texture(u_u, v_uv).r, texture(u_v, v_uv).r);
-    C -= u_yuvOffset.y;
-    source = vec4(u_yuv*vec3(Y, C), u_source == 3 ? texture(u_planeAlpha, v_uv).r : 1.0);
-  }
+#if SOURCE == 0
+  source = texture(u_y, v_uv);
+#else
+  float Y = texture(u_y, v_uv).r - u_yuvOffset.x;
+#if SOURCE == 2
+  vec2 C = texture(u_u, v_uv).rg;
+#else
+  vec2 C = vec2(texture(u_u, v_uv).r, texture(u_v, v_uv).r);
+#endif
+  C -= u_yuvOffset.y;
+#if SOURCE == 3
+  source = vec4(u_yuv*vec3(Y, C), texture(u_planeAlpha, v_uv).r);
+#else
+  source = vec4(u_yuv*vec3(Y, C), 1.0);
+#endif
+#endif
   vec3 x = source.rgb;
-  if (u_in != 0) x = clamp(look(u_in, u_in3, u_in1, u_inSize, u_inWidth, u_inMin, u_inMax, 1.0, x), 0.0, 1.0);
-  if (u_sets == 1) x = grade(x, u_tab0, u_flags.x, u_mat0);
-  else if (u_sets == 2) { vec3 a = grade(x, u_tab0, u_flags.x, u_mat0), b = grade(x, u_tab1, u_flags.y, u_mat1); x = a + (b-a)*u_keyWeight; }
-  else x = clamp(x, 0.0, 1.0);
+#if INPUT != 0
+  x = clamp(look(INPUT, u_in3, u_in1, u_inSize, u_inWidth, u_inMin, u_inMax, 1.0, x), 0.0, 1.0);
+#endif
+#if SETS == 1
+  x = grade(x, u_tab0, u_flags.x, u_mat0);
+#elif SETS == 2
+  vec3 a = grade(x, u_tab0, u_flags.x, u_mat0), b = grade(x, u_tab1, u_flags.y, u_mat1); x = a + (b-a)*u_keyWeight;
+#else
+  x = clamp(x, 0.0, 1.0);
+#endif
   x *= u_gain;
   if (u_wipe.x >= 0.0 && gl_FragCoord.x >= u_wipe.x) discard;
   outColor = vec4(x, source.a*u_alpha);
@@ -183,12 +201,12 @@ void main() {
   const PASS_VERTEX = `#version 300 es
 in vec2 a_corner; out vec2 v_uv;
 void main() { v_uv = a_corner + 0.5; gl_Position = vec4(a_corner*2.0, 0.0, 1.0); }`;
-  const PASS_FRAGMENT = `#version 300 es
+  const PASS_FRAGMENT = defines => `#version 300 es
+${defines}
 precision highp float;
 in vec2 v_uv; out vec4 outColor;
 uniform sampler2D u_a, u_b;
 uniform float u_mix;
-uniform int u_view;
 uniform vec4 u_split;            // x: split position 0..1 (or -1), y: 1 to flip vertically
 uniform sampler2D u_before;
 float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
@@ -206,15 +224,19 @@ void main() {
   vec2 uv = u_split.y > 0.5 ? vec2(v_uv.x, 1.0-v_uv.y) : v_uv;
   vec4 a = texture(u_a, uv), b = texture(u_b, uv);
   vec4 c = a + (b-a)*u_mix;
+#if VIEW == 0 && SPLIT == 0
+  outColor = c;
+  return;
+#endif
   if (u_split.x >= 0.0 && uv.x > u_split.x) c = texture(u_before, uv);
   float y = luma(c.rgb);
-  if (u_view == 1) c.rgb = vec3(y);
-  else if (u_view == 2) c.rgb = vec3(c.r);
-  else if (u_view == 3) c.rgb = vec3(c.g);
-  else if (u_view == 4) c.rgb = vec3(c.b);
-  else if (u_view == 5) c.rgb = falseColor(y);
-  else if (u_view == 6) { if (y*255.0 > 235.0 || y*255.0 < 16.0) c.rgb = mod(floor(gl_FragCoord.x/4.0)+floor(gl_FragCoord.y/4.0), 2.0) < 1.0 ? vec3(1.0, 0.0, 1.0) : c.rgb; }
-  else if (u_view == 7) { if (max(c.r, max(c.g, c.b)) >= 0.98) c.rgb = mod(floor((gl_FragCoord.x+gl_FragCoord.y)/6.0), 2.0) < 1.0 ? vec3(0.0) : vec3(1.0); }
+  if (VIEW == 1) c.rgb = vec3(y);
+  else if (VIEW == 2) c.rgb = vec3(c.r);
+  else if (VIEW == 3) c.rgb = vec3(c.g);
+  else if (VIEW == 4) c.rgb = vec3(c.b);
+  else if (VIEW == 5) c.rgb = falseColor(y);
+  else if (VIEW == 6) { if (y*255.0 > 235.0 || y*255.0 < 16.0) c.rgb = mod(floor(gl_FragCoord.x/4.0)+floor(gl_FragCoord.y/4.0), 2.0) < 1.0 ? vec3(1.0, 0.0, 1.0) : c.rgb; }
+  else if (VIEW == 7) { if (max(c.r, max(c.g, c.b)) >= 0.98) c.rgb = mod(floor((gl_FragCoord.x+gl_FragCoord.y)/6.0), 2.0) < 1.0 ? vec3(0.0) : vec3(1.0); }
   outColor = c;
 }`;
   const VIEW = {normal:0, luma:1, red:2, green:3, blue:4, falseColor:5, legal:6, zebra:7};
@@ -232,7 +254,19 @@ void main() {
       this.gl = gl;
       this.setup();
     }
+    // One linked program per feature set, kept for the life of the context.
+    program(kind, features) {
+      const key = kind+JSON.stringify(features);
+      let program = this.variants.get(key);
+      if (!program) {
+        const defines = Object.entries(features).map(([name, value]) => `#define ${name} ${value}`).join('\n');
+        program = kind === 'layer' ? this.link(VERTEX, FRAGMENT(defines)) : this.link(PASS_VERTEX, PASS_FRAGMENT(defines));
+        this.variants.set(key, program); this.programs.push(program.program);
+      }
+      return program;
+    }
     released() {
+      this.variants = new Map();
       this.textures = new Map(); this.planeTextures = new WeakMap(); this.targets = []; this.programs = null; this.frameTextures = new Map();
       stats.textureBytes = 0; stats.textures = 0;
     }
@@ -256,9 +290,9 @@ void main() {
         for (let i = 0; i < count; i++) { const info = gl.getActiveUniform(program, i); uniforms[info.name] = gl.getUniformLocation(program, info.name); }
         return {program, uniforms};
       };
-      this.layer = link(VERTEX, FRAGMENT);
-      this.pass = link(PASS_VERTEX, PASS_FRAGMENT);
-      this.programs = [this.layer.program, this.pass.program];
+      this.link = link;
+      this.variants = new Map();
+      this.programs = [];
       this.quad = gl.createBuffer();
       gl.bindBuffer(gl.ARRAY_BUFFER, this.quad);
       gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-.5,-.5, .5,-.5, -.5,.5, .5,.5]), gl.STATIC_DRAW);
@@ -388,8 +422,6 @@ void main() {
     }
     bindGrade(u, grade) {
       const gl = this.gl;
-      const sets = grade ? (grade.b ? 2 : 1) : 0;
-      gl.uniform1i(u.u_sets, sets);
       const flags = prepared => (prepared.tables.pre ? 1 : 0) | (prepared.tables.matrix ? 2 : 0) | (prepared.tables.post ? 4 : 0);
       const matrix = prepared => new Float32Array(prepared.tables.matrix ? [0,1,2].flatMap(c => [0,1,2].map(r => prepared.tables.matrix[r][c])) : [1,0,0,0,1,0,0,0,1]);
       const a = grade?.a, b = grade?.b || grade?.a;
@@ -401,28 +433,32 @@ void main() {
       gl.uniform1f(u.u_keyWeight, grade?.weight || 0);
       const hs = a?.tables.hueSat;
       gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_3D, hs ? this.latticeTexture('hs|'+a.tables.key, HS, hs) : this.dummy3D); gl.uniform1i(u.u_hs, 5);
-      gl.uniform1i(u.u_hue, hs ? 1 : 0);
       this.bindLook(u, 'look', a?.look ? this.lutBinding(a.look) : null, a?.lookIntensity ?? 0, 6);
       this.bindLook(u, 'in', grade?.input ? this.lutBinding(grade.input) : null, 100, 8);
     }
     bindLook(u, name, binding, intensity, unit) {
       const gl = this.gl;
-      gl.uniform1i(u[`u_${name}`], binding ? binding.kind : 0);
       gl.activeTexture(gl.TEXTURE0+unit); gl.bindTexture(gl.TEXTURE_3D, binding?.kind === 1 ? binding.texture : this.dummy3D); gl.uniform1i(u[`u_${name}3`], unit);
       gl.activeTexture(gl.TEXTURE0+unit+1); gl.bindTexture(gl.TEXTURE_2D, binding?.kind === 2 ? binding.texture : this.dummy2D); gl.uniform1i(u[`u_${name}1`], unit+1);
       gl.uniform1i(u[`u_${name}Size`], binding?.size || 2); gl.uniform1i(u[`u_${name}Width`], binding?.width || 1);
       gl.uniform3fv(u[`u_${name}Min`], binding?.lut.domainMin || [0,0,0]); gl.uniform3fv(u[`u_${name}Max`], binding?.lut.domainMax || [1,1,1]);
       if (u[`u_${name}Mix`]) gl.uniform1f(u[`u_${name}Mix`], Math.max(0, Math.min(1, intensity/100)));
     }
+    features(sourceKind, grade) {
+      const a = grade?.a;
+      const lookKind = lut => !lut ? 0 : lut.curve ? 2 : 1;
+      return {SOURCE:sourceKind, SETS:grade ? (grade.b ? 2 : 1) : 0, HUE:a?.tables.hueSat ? 1 : 0,
+        LOOK:lookKind(a?.look), INPUT:lookKind(grade?.input)};
+    }
     drawLayer(op, width, height) {
-      const gl = this.gl, {program, uniforms:u} = this.layer;
-      gl.useProgram(program);
+      const gl = this.gl;
       const source = this.sourceTextures(op);
+      const {program, uniforms:u} = this.program('layer', this.features(source.kind === 1 && source.frame.format === 'I420A' ? 3 : source.kind, op.grade));
+      gl.useProgram(program);
       gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, source.state.y); gl.uniform1i(u.u_y, 0);
       gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, source.state.u); gl.uniform1i(u.u_u, 1);
       gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, source.state.v); gl.uniform1i(u.u_v, 2);
       gl.activeTexture(gl.TEXTURE10); gl.bindTexture(gl.TEXTURE_2D, source.state.a); gl.uniform1i(u.u_planeAlpha, 10);
-      gl.uniform1i(u.u_source, source.kind === 1 && source.frame.format === 'I420A' ? 3 : source.kind);
       if (source.kind) {
         const m = G.inputMatrix(op.input.matrix, source.frame.colorSpace?.fullRange ?? op.input.fullRange);
         gl.uniformMatrix3fv(u.u_yuv, false, new Float32Array([m.rows[0][0], m.rows[1][0], m.rows[2][0], m.rows[0][1], m.rows[1][1], m.rows[2][1], m.rows[0][2], m.rows[1][2], m.rows[2][2]]));
@@ -443,13 +479,13 @@ void main() {
     }
     // Copy `from` into `to` (or mix two composites, or apply the monitoring view on the way out).
     passTo(framebuffer, a, b, mix, view = 0, flip = false, before = null, split = -1) {
-      const gl = this.gl, {program, uniforms:u} = this.pass;
+      const gl = this.gl, {program, uniforms:u} = this.program('pass', {VIEW:view, SPLIT:before ? 1 : 0});
       gl.useProgram(program);
       gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
       gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, a); gl.uniform1i(u.u_a, 0);
       gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, b || a); gl.uniform1i(u.u_b, 1);
       gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, before || a); gl.uniform1i(u.u_before, 2);
-      gl.uniform1f(u.u_mix, mix); gl.uniform1i(u.u_view, view); gl.uniform4f(u.u_split, before ? split : -1, flip ? 1 : 0, 0, 0);
+      gl.uniform1f(u.u_mix, mix); gl.uniform4f(u.u_split, before ? split : -1, flip ? 1 : 0, 0, 0);
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     }
     // An adjustment clip: grade what lies beneath, mixed in by the clip's opacity.
@@ -458,10 +494,9 @@ void main() {
       this.passTo(scratch.framebuffer, acc.texture, null, 0);
       gl.bindFramebuffer(gl.FRAMEBUFFER, acc.framebuffer);
       gl.viewport(0, 0, width, height);
-      const {program, uniforms:u} = this.layer;
+      const {program, uniforms:u} = this.program('layer', this.features(0, op.grade));
       gl.useProgram(program);
       gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, scratch.texture); gl.uniform1i(u.u_y, 0);
-      gl.uniform1i(u.u_source, 0);
       this.bindGrade(u, op.grade);
       gl.uniform2f(u.u_canvas, width, height); gl.uniform2f(u.u_center, width/2, height/2); gl.uniform2f(u.u_size, width, -height);
       gl.uniform1f(u.u_angle, 0); gl.uniform1f(u.u_alpha, op.alpha); gl.uniform1f(u.u_gain, 1); gl.uniform4f(u.u_wipe, -1, height, 0, 0);
