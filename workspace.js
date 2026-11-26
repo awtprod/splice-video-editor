@@ -22,7 +22,7 @@
   let lastProject = "";
   let lastSelection = null;
   let lastMedia = "";
-  let toastTimer;
+  let toastTimer, lastOpenedReport=-1;
   const px = (seconds) => seconds * pps;
   const waveformCache = new Map();
   async function waveform(src, stream = null) {
@@ -474,19 +474,41 @@
     scroll.scrollTop=top;
     viewport.top=top;
   }
-  // Show every track that holds clips (and V1 and A1) when they fit, centred; otherwise centre
-  // the V1/A1 boundary, as other editors keep the picture/sound divider in view.
+  // Show every track that holds clips (and V1 and A1) when they fit, centred. When they do not,
+  // the tracks that hold clips come first: centred when they fit by themselves, otherwise the
+  // view that shows the most of them (nearest the V1/A1 boundary on a tie). With no clips, the
+  // V1/A1 boundary is centred, as other editors keep the picture/sound divider in view.
   function centreTracks() {
     const visible=viewport.height-rulerHeight;
-    const required=new Set(["video:1","audio:-1",...layout.counts.keys()]);
-    const span=laneSpan(required);
-    if(span&&span.to-span.from<=visible){
-      placeTracks((span.from+span.to)/2-rulerHeight-visible/2);
-      return;
-    }
+    const centre=span=>placeTracks((span.from+span.to)/2-rulerHeight-visible/2);
+    const used=new Set(layout.counts.keys());
+    const all=laneSpan(new Set(["video:1","audio:-1",...used]));
+    if(all&&all.to-all.from<=visible)return centre(all);
     const firstAudio=layout.lanes.findIndex(lane=>lane.kind==="audio");
     const divider=layout.heights.slice(0,Math.max(0,firstAudio)).reduce((sum,height)=>sum+height,0);
-    placeTracks(divider-visible/2);
+    const clipSpan=laneSpan(used);
+    if(!clipSpan)return placeTracks(divider-visible/2);
+    if(clipSpan.to-clipSpan.from<=visible)return centre(clipSpan);
+    placeTracks(bestTracksView(used,visible,divider));
+  }
+  // The scroll position, among those that put a used track at the top or bottom of the view,
+  // that shows the most used tracks whole.
+  function bestTracksView(used, visible, divider) {
+    const boxes=[];
+    let top=0;
+    layout.lanes.forEach((lane,index)=>{
+      const height=layout.heights[index];
+      if(used.has(laneKey(lane)))boxes.push({from:top,to:top+height});
+      top+=height;
+    });
+    const total=top, candidates=boxes.flatMap(box=>[box.from,box.to-visible]).map(at=>clamp(at,0,Math.max(0,total-visible)));
+    let best=null;
+    for(const at of candidates){
+      const shown=boxes.filter(box=>box.from>=at-1&&box.to<=at+visible+1).length;
+      const distance=Math.abs(at+visible/2-divider);
+      if(!best||shown>best.shown||(shown===best.shown&&distance<best.distance))best={at,shown,distance};
+    }
+    return best.at;
   }
   function revealLanes(keys) {
     const span=laneSpan(keys);
@@ -663,6 +685,19 @@
     if (!projectChanged) return;
     const issueCount=SpliceDialogs.compatibility(state.project).length;
     $('compatibility').textContent=issueCount?'Project compatibility ('+issueCount+')…':'Project compatibility…';
+    // The count is also shown beside the sequence name, where it is seen when a project opens.
+    const badge=$('compat-badge');
+    badge.hidden=!issueCount;
+    badge.textContent='⚠ '+issueCount+' compatibility note'+(issueCount===1?'':'s');
+    badge.title='Open the project compatibility report';
+    if(state.opened!==lastOpenedReport){
+      lastOpenedReport=state.opened;
+      const disabled=state.project.clips.filter(clip=>clip.enabled===false).length;
+      const parts=[];
+      if(issueCount)parts.push(issueCount+' compatibility note'+(issueCount===1?'':'s')+' (see ⚠ beside the sequence name)');
+      if(disabled)parts.push(disabled+' disabled clip'+(disabled===1?'':'s')+' (marked OFF; Shift+E enables)');
+      if(parts.length)notify('Opened with '+parts.join(' and ')+'.');
+    }
     const sequences=state.project.resolveTimelines||state.project.premiereSequences||[], selector=$('sequence-select');
     selector.hidden=sequences.length<2;
     if(!selector.hidden){
@@ -1178,6 +1213,7 @@
   $("snap-toggle").onclick=toggleSnap;
   $("ripple-toggle").onclick=toggleRipple;
   $("compatibility").onclick=()=>SpliceDialogs.projectReport();
+  $("compat-badge").onclick=()=>SpliceDialogs.projectReport();
   $("versions").onclick=()=>busy(()=>SpliceSession.history());
   $("save-as").onclick=()=>busy(()=>SpliceSession.saveAs("prproj"));
   $("sequence-settings").onclick=()=>sequenceSettings();

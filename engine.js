@@ -1682,10 +1682,14 @@
       };
       const first = Math.max(0, Math.floor(from * fps)), last = Math.ceil(to * fps);
       if (step < 1) {
-        // Frame steps: frames whose label's frame field is a multiple of the step.
+        // Frame steps: frames whose label's frame field is a multiple of the step, and in
+        // drop-frame minutes the first real frame (;02 or ;04), whose labels before it are skipped.
         const every = Math.max(1, Math.round(step * nominal));
-        for (let frame = first; frame <= last; frame++)
-          if ((labelCount(frame + start, fps, drop) % nominal) % every === 0) add(frame);
+        for (let frame = first; frame <= last; frame++) {
+          const count = labelCount(frame + start, fps, drop);
+          const afterSkip = drop && frame + start > 0 && count - labelCount(frame + start - 1, fps, drop) > 1;
+          if ((count % nominal) % every === 0 || afterSkip) add(frame);
+        }
         return ticks;
       }
       const perTick = Math.round(step) * nominal;
