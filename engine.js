@@ -1578,7 +1578,10 @@
   // A new edit from a source. Camera media with sound becomes a linked picture/sound pair;
   // without a picture track only the sound is placed.
   function sourceClips(item, selection, start, videoTrack, audioTrack) {
-    const base = {mediaId: item.id, start, title: "", volume: 100, transition: "none", ...selection};
+    const extra = {};
+    if (item.multicam) extra.multicamAngle = 0;
+    if (item.nestedSequence != null) extra.nestedSequence = item.nestedSequence;
+    const base = {mediaId: item.id, start, title: "", volume: 100, transition: "none", ...extra, ...selection};
     if (item.type === "audio" || videoTrack == null) return [{id: uid(), type: "audio", track: audioTrack, ...base}];
     const picture = {id: uid(), type: "video", track: videoTrack, color: {brightness: 100, contrast: 100, saturation: 100}, ...base};
     if (audioTrack == null || !hasSound(item)) return [picture];
