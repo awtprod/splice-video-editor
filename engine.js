@@ -577,15 +577,14 @@
       const key=`${clip.type}:${clip.track}:${Math.round(clip.start*project.fps)}`;
       if(!soundCuts.has(key)) soundCuts.set(key,clip);
     }
-    for(const clip of project.clips) if(clip.type!=='title') {
-      const next=soundCuts.get(`${clip.type}:${clip.track}:${Math.round((clip.start+clip.duration)*project.fps)}`);
-      if(next && next.id!==clip.id) soundOut.set(clip.id,{next,sound:soundIn.get(next.id)});
-    }
     for(const clip of project.clips) if(['dissolve','wipe'].includes(clip.transition) || (clip.type==='video' && clip.transition==='fade'))
       cuts.set(`${clip.type}:${clip.track}:${Math.round(clip.start*project.fps)}`,clip);
+    if (!cuts.size && !soundCuts.size) return;
     for(const clip of project.clips) {
-      const next=cuts.get(`${clip.type}:${clip.track}:${Math.round((clip.start+clip.duration)*project.fps)}`);
+      const key=`${clip.type}:${clip.track}:${Math.round((clip.start+clip.duration)*project.fps)}`;
+      const next=cuts.get(key), nextSound=soundCuts.get(key);
       if(next && next.id!==clip.id) (next.transition==='fade'?videoDipFollowers:transitionFollowers).set(clip.id,next);
+      if(nextSound && nextSound.id!==clip.id) soundOut.set(clip.id,{next:nextSound,sound:soundIn.get(nextSound.id)});
     }
   }
   const audibility = clip => {

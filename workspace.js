@@ -657,7 +657,7 @@
       (projectChanged &&
         !document.activeElement?.closest?.("#inspector-content"))
     ) {
-      window.SpliceInspector?.render(state, $("inspector-content"), editor);
+      window.SpliceInspector?.render(state, $("inspector-content"), editor, true);
       lastSelection = state.selectedId;
     }
     if (!projectChanged) return;
