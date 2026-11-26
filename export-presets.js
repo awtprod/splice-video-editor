@@ -13,14 +13,20 @@ window.SpliceDelivery = (() => {
     frame: 'Frame number', watermark: 'Watermark'};
 
   async function json(url, init) {
-    const response = await fetch(url, init);
-    const body = await response.json().catch(() => ({}));
+    const response = await fetch(url, {signal: AbortSignal.timeout(120000), ...init});
+    let body;
+    try {
+      body = await response.json();
+    } catch (cause) {
+      throw new Error(`Invalid response from ${url} (HTTP ${response.status})`, {cause});
+    }
     if (!response.ok) { const error = new Error(body.error || response.statusText); error.status = response.status; error.body = body; throw error; }
     return body;
   }
   const post = (url, body) => json(url, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
   function capabilities(refresh = false) {
-    if (refresh || !loading) loading = json('/api/delivery/capabilities' + (refresh ? '?refresh=1' : '')).then(value => (table = value));
+    if (refresh || !loading) loading = json('/api/delivery/capabilities' + (refresh ? '?refresh=1' : '')).then(value => (table = value))
+      .catch(error => { loading = null; throw error; });
     return loading;
   }
   const variantKey = o => [o.codec || '', o.profile || '', o.alpha ?? '', o.container || '', o.encoder || ''].join('|');
@@ -514,7 +520,7 @@ window.SpliceDelivery = (() => {
     return seconds >= 3600 ? Math.floor(seconds / 3600) + ' h ' + Math.floor(seconds / 60 % 60) + ' min' : seconds >= 60 ? Math.floor(seconds / 60) + ' min ' + seconds % 60 + ' s' : seconds + ' s';
   }
   function queuePanel() {
-    if (panel?.isConnected) { panel.open || panel.showModal(); refresh(); return panel; }
+    if (panel?.isConnected) { panel.open || panel.showModal(); panel.refresh(); return panel; }
     panel = modal('Render queue', 'queue');
     const toolbar = el('div', {className: 'queue-toolbar'});
     const pause = el('button', {type: 'button', className: 'queue-pause'});
@@ -571,13 +577,24 @@ window.SpliceDelivery = (() => {
         row.append(actions);
         // A job that just finished: optional sound and notification.
         if (lastStates[job.id] === 'rendering' && job.state !== 'rendering' && localStorage.getItem('splice-queue-notify') === '1') announce(job);
-        lastStates[job.id] = job.state;
         return row;
       }));
+      lastStates = Object.fromEntries(data.jobs.map(job => [job.id, job.state]));
       if (!data.jobs.length) list.append(el('li', {className: 'export-help', textContent: 'No exports queued. Use “Add to queue” or “Batch…” in the Export dialog.'}));
     }
+    let refreshing = false;
+    const currentPanel = panel;
     async function refresh() {
-      try { render(await json('/api/queue')); } catch (error) { status.textContent = error.message; }
+      if (refreshing) return;
+      refreshing = true;
+      try {
+        const data = await json('/api/queue');
+        if (currentPanel.open) render(data);
+      } catch (error) {
+        status.textContent = error.message;
+      } finally {
+        refreshing = false;
+      }
     }
     panel.refresh = refresh;
     refresh();
@@ -622,10 +639,10 @@ window.SpliceDelivery = (() => {
       tone.frequency.value = job.state === 'complete' ? 880 : 330; gain.gain.value = .08;
       tone.connect(gain).connect(audio.destination); tone.start(); tone.stop(audio.currentTime + .25);
       tone.onended = () => audio.close();
-    } catch { /* no audio output */ }
+    } catch (error) { console.warn('Could not play the render queue notification', error); }
     if (window.Notification?.permission === 'granted') new Notification('Splice · ' + (STATE_TEXT[job.state] || job.state), {body: job.name});
   }
   // Check the queue once at start: a restarted server resumes waiting jobs as soon as Splice opens.
-  addEventListener('load', () => { json('/api/queue').catch(() => {}); });
+  addEventListener('load', () => { json('/api/queue').catch(error => console.warn('Could not resume the render queue', error)); });
   return {enhance, queuePanel, capabilities, timecodeLabel};
 })();
