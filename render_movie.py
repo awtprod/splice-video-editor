@@ -38,12 +38,33 @@ AUDIO_CHUNK_EVENTS = 32
 AUDIO_PREROLL_SECONDS = 0.5   # 10x the limiter's release time
 AUDIO_POSTROLL_SECONDS = 0.1  # the limiter looks ahead past the chunk's last sample
 AUDIO_SHARED_INPUT_SECONDS = 60
+# atempo drops its last fragment; read this much more source (in output seconds).
+TEMPO_TAIL_SECONDS = 0.25
+# A reversed stateful event is pre-rendered whole only up to this much source
+# (areverse holds the span in memory); longer ones restart at chunk seams.
+AUDIO_REVERSE_PRERENDER_SECONDS = 600
+# Pictures seek this far before the first source read so the frame on screen
+# at the in point (which may start earlier) is decoded.
+SEEK_MARGIN_SECONDS = .05
+# MPEG transport and program streams (AVCHD .mts, .m2ts, .ts, .mpg) seek by
+# decode time and can land on the keyframe after the one needed.
+STREAM_FORMATS = {'mpegts', 'mpeg', 'mpegvideo'}
+SEEK_MARGIN_STREAM_SECONDS = .5
+# The monitor shows a reversed clip at source time t-1e-6 (engine.js sourceTime).
+REVERSE_SAMPLE_BIAS = 1e-6
+# A forward sample point counts a frame starting this little after it as shown.
+FORWARD_SAMPLE_TOLERANCE = 1e-6
 VIDEO_WINDOW_SECONDS = 6
 VIDEO_WINDOW_CUTS = 24
 # Reversed pictures are buffered uncompressed. Shorten windows to stay inside this.
 REVERSE_BUFFER_BYTES = 768 * 1024 * 1024
 DEFAULT_STALL_SECONDS = 300
 DEFAULT_LIMITER_CEILING_DB = -1.0
+# Lossy (AAC) deliveries limit true peak (4x oversampled). The encoder adds
+# overshoot of its own (about 2 dB on some programs), so the decoded file is
+# measured and re-encoded quieter until it is under the ceiling.
+TRUE_PEAK_OVERSAMPLE = 4
+AAC_PEAK_ATTEMPTS = 6
 WORK_PREFIXES = ('splice-export-', 'splice-segments-', 'splice-audio-', 'splice-lut-', 'splice-render-')
 LOCK_NAME = '.splice-owner.lock'
 
@@ -71,7 +92,15 @@ def work_root():
     """Directory for render intermediates: SPLICE_TEMP_DIR, else under Splice's data directory."""
     override = os.environ.get('SPLICE_TEMP_DIR')
     root = Path(override).expanduser() if override else data_directory() / 'render-work'
-    root.mkdir(parents=True, exist_ok=True)
+    where = 'SPLICE_TEMP_DIR' if override else "Splice's data folder"
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise ValueError(f'Cannot create the render scratch folder {root} ({error.strerror or error}). '
+                         f'It comes from {where}; set SPLICE_TEMP_DIR to a writable folder.') from None
+    if not os.access(root, os.W_OK | os.X_OK):
+        raise ValueError(f'The render scratch folder {root} is not writable. '
+                         f'It comes from {where}; set SPLICE_TEMP_DIR to a writable folder.')
     return root.resolve()
 
 
@@ -249,6 +278,7 @@ def _run_ffmpeg(command, cancelled=None, heartbeat=None):
             raise ValueError('FFmpeg render failed: ' + ''.join(errors)[-1500:])
         if heartbeat:
             heartbeat()
+        return ''.join(errors)
     finally:
         if process.poll() is None:
             process.kill()
@@ -258,20 +288,29 @@ def _run_ffmpeg(command, cancelled=None, heartbeat=None):
             pass  # Killed; the OS reaps it once it leaves uninterruptible I/O.
         for reader in readers:
             reader.join(timeout=2)
-        process.stdout.close()
-        process.stderr.close()
+        if all(not reader.is_alive() for reader in readers):
+            process.stdout.close()
+            process.stderr.close()
+        # Otherwise a process FFmpeg started still holds its pipes: closing
+        # them would block until it exits. The daemon readers end with it.
 
 
 def _probe(path):
     from media_proxy import MAX_AUDIO_STREAMS
     result = subprocess.run(['ffprobe', '-v', 'error', '-protocol_whitelist', 'file', '-show_entries',
-                            'stream=codec_type,channels,width,height,color_primaries,color_transfer,color_space:format=duration', '-of', 'json', str(path)],
+                            'stream=codec_type,channels,sample_rate,width,height,color_primaries,color_transfer,color_space,time_base'
+                            ':format=duration,start_time,format_name', '-of', 'json', str(path)],
                             capture_output=True, text=True, timeout=30, check=True)
     data = json.loads(result.stdout)
     streams = data.get('streams', [])
     if not isinstance(streams, list) or any(not isinstance(stream, dict) for stream in streams):
         raise ValueError(f'Could not read the streams of {Path(path).name}')
     audio = [stream.get('channels', 2) for stream in streams if stream.get('codec_type') == 'audio']
+    rates = []
+    for stream in streams:
+        if stream.get('codec_type') == 'audio':
+            try: rates.append(int(stream.get('sample_rate') or 0))
+            except (TypeError, ValueError): rates.append(0)
     if len(audio) > MAX_AUDIO_STREAMS:
         raise ValueError(f'Media has more than {MAX_AUDIO_STREAMS} audio streams')
     video = next((stream for stream in streams if stream.get('codec_type') == 'video'), {})
@@ -279,9 +318,22 @@ def _probe(path):
         duration = float(data.get('format', {}).get('duration', 0))
     except (TypeError, ValueError):
         duration = 0.0
+    # FFmpeg shifts packet timestamps by (seek + container start) rounded to the
+    # stream's time base; keep both so picture clocks can use the exact shift.
+    try:
+        start = Fraction(str(data.get('format', {}).get('start_time', '0')))
+    except (TypeError, ValueError, ZeroDivisionError):
+        start = Fraction(0)
+    try:
+        time_base = Fraction(str(video.get('time_base')))
+        if time_base <= 0: raise ValueError
+    except (TypeError, ValueError, ZeroDivisionError):
+        time_base = None
     return {'kinds': {stream.get('codec_type') for stream in streams}, 'duration': duration, 'audio': audio,
             'width': int(video.get('width') or 0), 'height': int(video.get('height') or 0),
-            'profile': tuple(video.get(key) for key in ('color_primaries', 'color_transfer', 'color_space'))}
+            'profile': tuple(video.get(key) for key in ('color_primaries', 'color_transfer', 'color_space')),
+            'start': start, 'time_base': time_base, 'rates': rates,
+            'format': str(data.get('format', {}).get('format_name') or '')}
 
 
 def _stereo_pan(pan, channels):
@@ -492,9 +544,15 @@ def _picture_input(index, source, length, speed, width, height, fps, reverse, st
         frames = max(1, math.ceil(length*float(fps)-1e-6))
     if index is None:
         return f'color=c=black:s={width}x{height}:r={fps}:d={frames/float(fps):.6f},setpts=PTS-STARTPTS,trim=end_frame={frames}'
-    # A 10 microsecond bias absorbs timestamp rounding without moving a frame boundary.
-    clock = f"(T-({source:.9f}))/{speed:.9f}-({origin:.9f})-0.00001"
-    return (f"[{index}:v]settb=1/1000000,setpts='({clock})/TB',"
+    # Timestamps are kept in nanoseconds so rounding stays far below the biases,
+    # which are in source seconds. Forward: a frame that starts up to 1
+    # microsecond after the sample point counts as on screen (absorbs
+    # floating-point in points). Reversed: the monitor samples 1 microsecond
+    # before the point, so a frame that starts exactly there is not yet shown
+    # (engine.js sourceTime).
+    bias = f'+{REVERSE_SAMPLE_BIAS/speed:.12f}' if reverse else f'-{FORWARD_SAMPLE_TOLERANCE/speed:.12f}'
+    clock = f"(T-({source:.9f}))/{speed:.9f}-({origin:.9f}){bias}"
+    return (f"[{index}:v]settb=1/1000000000,setpts='({clock})/TB',"
             f'fps=fps={fps}:round=up:start_time=0,trim=end_frame={frames}')
 
 
@@ -569,15 +627,43 @@ def _horizontal_position(clip, width, overlay_width, clock):
     return f'({width}-{overlay_width})/2+{width/100:.3f}*({keyframes})'
 
 
-def _transform(clip, width, height, local_offset=0):
+def _frames(seconds, rate):
+    """``seconds`` in frames, snapped to a whole frame when it is within rounding of one."""
+    value = seconds*rate
+    return round(value) if abs(value-round(value)) < 1e-6 else value
+
+
+def _keyframe_clock(clip, fps, variable, zero):
+    """Clip time for keyframes, as an FFmpeg expression of a filter's time ``variable``.
+
+    ``zero`` is the filter time at which the clip's keyframe clock reads 0 in
+    this window. A window that starts inside a clip keeps the clip's own
+    keyframes and shifts the clock by ``_keyframeShift`` instead of re-basing
+    the keyframe values. The time is counted in whole frames before the one
+    division, so the same timeline frame evaluates to the same number in
+    every window and positions, scales and opacities cannot change by a
+    rounding step at a window seam.
+    """
+    shift = float(clip.get('_keyframeShift', 0) or 0)
+    if fps is None:
+        return f'({variable}-{zero:.9f}+{shift:.9f})'
+    rate = float(fps)
+    constant = _frames(shift, rate) - _frames(zero, rate)
+    if abs(constant-round(constant)) < 1e-6:
+        constant = round(constant)
+    return f'((round({variable}*{rate!r})+({constant!r}))/{rate!r})'
+
+
+def _transform(clip, width, height, local_offset=0, fps=None):
     t = clip.get('transform') or {}
     scale = _number(t.get('scale',100),'scale',10,400)/100
     y = _number(t.get('y',0),'vertical position',-100,100)/100
     angle = _number(t.get('rotation',0),'rotation',-180,180)
-    local_clock=f'(t-{local_offset:.6f})' if local_offset else 't'
+    local_clock=_keyframe_clock(clip,fps,'t',local_offset)
     scale_expr=_keyframe_expr(clip,'scale',scale*100,10,400,local_clock)
-    horizontal=_horizontal_position(clip,width,'overlay_w',f'(t-{float(clip["start"]):.6f})')
-    y_expr=_keyframe_expr(clip,'y',y*100,-100,100,f'(t-{float(clip["start"]):.6f})')
+    timeline_clock=_keyframe_clock(clip,fps,'t',float(clip['start']))
+    horizontal=_horizontal_position(clip,width,'overlay_w',timeline_clock)
+    y_expr=_keyframe_expr(clip,'y',y*100,-100,100,timeline_clock)
     angle_expr=_keyframe_expr(clip,'rotation',angle,-180,180,local_clock)
     scale_keys = (clip.get('keyframes') or {}).get('scale')
     angle_keys = (clip.get('keyframes') or {}).get('rotation')
@@ -602,6 +688,17 @@ def _transform(clip, width, height, local_offset=0):
             filters += f",rotate=a='({angle_expr})*PI/180':ow=hypot(iw\\,ih):oh=ow:c=none"
         else:
             filters += f',rotate={angle:.5f}*PI/180:ow=rotw(iw):oh=roth(ih):c=none'
+    elif scale_keys:
+        # Filters after an animated scale (opacity, wipe and dip masks, the
+        # overlay) keep the frame size of the first frame they see, which
+        # depends on where the window starts. Center every frame on a canvas
+        # sized for the largest scale so the size never changes.
+        # Windows keep the whole clip's keyframes, so every window uses one
+        # canvas and rounds the centering offset the same way.
+        peak = max(float(point['value']) for point in scale_keys)/100
+        canvas_width, canvas_height = 2*math.ceil(width*peak/2), 2*math.ceil(height*peak/2)
+        filters += (f',pad=w={canvas_width}:h={canvas_height}:x=(ow-iw)/2:y=(oh-ih)/2'
+                    f':color=black@0:eval=frame')
     position = f"x='{horizontal}':y='(main_h-overlay_h)/2+{height/100:.3f}*({y_expr})'"
     return filters, position
 
@@ -614,7 +711,9 @@ def _keyframe_expr(clip, key, base, low, high, clock):
     ordered=[]
     for point in points:
         if not isinstance(point,dict): raise ValueError(f'Invalid {key} keyframe')
-        at=_number(point.get('time'),f'{key} keyframe time',0,float(clip['duration'])+.001)
+        # A keyframe after the clip's end (left there by a trim) still shapes the
+        # ramp up to the end, as in the monitor.
+        at=_number(point.get('time'),f'{key} keyframe time',0,MAX_TIMELINE_SECONDS)
         value=_number(point.get('value'),f'{key} keyframe value',low,high)
         ordered.append((at,value))
     ordered.sort()
@@ -703,7 +802,7 @@ def _draw_title(filters, active, number, clip, height, fps, directory, hdr_profi
     x=_number(style.get('x',50),'title horizontal',0,100)/100
     y=_number(style.get('y',78),'title vertical',0,100)/100
     opacity = _number(clip.get('opacity',100),'title opacity',0,100)
-    alpha = _keyframe_expr(clip,'opacity',opacity,0,100,f'(t-{begin:.9f})')
+    alpha = _keyframe_expr(clip,'opacity',opacity,0,100,_keyframe_clock(clip,fps,'t',begin))
     color=str(style.get('color','#ffffff'))
     if len(color)!=7 or not color.startswith('#') or any(c not in '0123456789abcdefABCDEF' for c in color[1:]):
         raise ValueError('Invalid title color')
@@ -821,8 +920,9 @@ def _media_info(item, probes, heartbeat=None):
     if probe is None:
         probe = probes[path] = _probe(path)
         if heartbeat: heartbeat()
-    item.update(_kinds=probe['kinds'], _actualDuration=probe['duration'], _audioStreams=probe['audio'],
-                _sourceProfile=probe['profile'])
+    item.update(_kinds=probe['kinds'], _actualDuration=probe['duration'], _audioStreams=probe['audio'], _audioRates=probe['rates'],
+                _sourceProfile=probe['profile'], _startTime=probe['start'], _videoTimeBase=probe['time_base'],
+                _seekMargin=SEEK_MARGIN_STREAM_SECONDS if set(probe['format'].split(',')) & STREAM_FORMATS else SEEK_MARGIN_SECONDS)
     return item
 
 
@@ -860,6 +960,25 @@ def _check_clip(clip, media_by_id, probes, heartbeat=None):
     if clip['type'] not in item['_kinds']:
         raise ValueError(f"{item.get('name', 'Media')} lacks a {clip['type']} stream")
     return item
+
+
+def _input_time_shift(item, seek_us):
+    """Source time (from the container start) of timestamp zero in a seeked input.
+
+    FFmpeg subtracts the seek point plus the container start time, converted to
+    the stream time base with round-to-nearest, from every packet. With a
+    coarse time base (1/600, 1/1000) that rounding moves frames by up to half a
+    tick, so the picture clock uses the shift FFmpeg actually applies.
+    """
+    start = item.get('_startTime') or Fraction(0)
+    time_base = item.get('_videoTimeBase')
+    total = Fraction(seek_us, 1_000_000) + Fraction(round(start*1_000_000), 1_000_000)
+    if time_base:
+        ticks = total/time_base
+        # av_rescale_q rounds to nearest, halves away from zero.
+        whole = math.floor(ticks + Fraction(1, 2)) if ticks >= 0 else -math.floor(-ticks + Fraction(1, 2))
+        total = whole*time_base
+    return float(total - start)
 
 
 def _frame_span(render_start, render_length, fps):
@@ -970,14 +1089,16 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
         for run in runs:
             # Seek to the keyframe before the run without dropping earlier
             # frames: a frame that starts before the in point is still on screen.
-            offset = math.floor(max(0, run['low']-.05)*1_000_000)/1_000_000
+            margin = media_by_id[identity].get('_seekMargin', SEEK_MARGIN_SECONDS)
+            seek_us = math.floor(max(0, run['low']-margin)*1_000_000)
             index = len(inputs)
-            seek = ['-noaccurate_seek', '-ss', f'{offset:.6f}'] if offset > 0 else []
+            seek = ['-noaccurate_seek', '-ss', f'{seek_us/1_000_000:.6f}'] if seek_us > 0 else []
             # No input -t: without accurate seek it counts from the keyframe,
             # not the seek point. Each chain's trim ends its reads instead.
             inputs.append([*seek, '-threads', '2', '-protocol_whitelist', 'file', '-i', str(media_by_id[identity]['_path'])])
+            shift = _input_time_shift(media_by_id[identity], seek_us)
             for key in run['keys']:
-                input_of[key] = (index, offset)
+                input_of[key] = (index, shift)
     stills = {}
     for number in plans:
         for identity in (video_clips[number]['mediaId'], video_clips[predecessors[number]]['mediaId'] if number in predecessors else None):
@@ -992,8 +1113,8 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
             return stills[identity], 0
         if item.get('nativeGenerator') is not None:
             return None, 0
-        index, offset = input_of[key]
-        return index, source-offset
+        index, shift = input_of[key]
+        return index, source-shift
 
     command = ['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-filter_complex_threads', '3', '-y',
                *(argument for entry in inputs for argument in entry),
@@ -1021,7 +1142,7 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
         reverse = bool(clip.get('reverse'))
         index, render_source = source_input(item['id'], ('main', number), plan['render_source'])
         color = clip.get('color') or {}
-        transform,position=_transform(clip,width,height,before)
+        transform,position=_transform(clip,width,height,before,fps)
         lut_filter=_lut_filter(color,Path(directory)/f'clip-{number}.cube',preserve_headroom=bool(
             hdr_profile and (item.get('_sourceProfile') or REC709)[1] in HDR_TRANSFERS))
         opacity=_number(clip.get('opacity',100),'opacity',0,100)/100
@@ -1037,7 +1158,7 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
         flip = ',reverse' if reverse and not still_frames and index is not None else ''
         chain = f'{prefix},{fit}{flip}{transform}'
         if opacity_keys:
-            opacity_expr=_keyframe_expr(clip,'opacity',opacity*100,0,100,f'(T-{before:.6f})')
+            opacity_expr=_keyframe_expr(clip,'opacity',opacity*100,0,100,_keyframe_clock(clip,fps,'T',before))
             chain += _mask_alpha(f'({opacity_expr})/100',alpha_format,full_alpha)
         elif opacity!=1:
             chain += _mask_alpha(f'{opacity:.6f}',alpha_format,full_alpha)
@@ -1049,12 +1170,19 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
             # Use the same lower layers under both sides of the dissolve.
             filters.append(f'[{active}]split[with{number}][without{next_number}]')
             active = f'with{number}'
+        dipped = False
         if dip_head>0:
             chain += f',format={dip_rgb},fade=t=in:st=0:d={dip_head:.6f}'
+            dipped = True
         if following and following.get('transition') == 'fade':
             dip_tail = float(following.get('transitionBefore',0) or 0)
             if dip_tail>0:
                 chain += f',format={dip_rgb},fade=t=out:st={max(0,render_length-dip_tail):.6f}:d={dip_tail:.6f}'
+                dipped = True
+        if clip.get('_dipFormat') and not dipped:
+            # The rest of a clip that dips elsewhere: take the same RGB round
+            # trip so its pixels match the window that holds the dip.
+            chain += f',format={dip_rgb}'
         overlap_transition = previous is not None and clip.get('transition') in ('dissolve','wipe')
         if overlap_transition:
             prior_item = media_by_id[previous['mediaId']]
@@ -1074,7 +1202,7 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
                     terminal=sorted(points,key=lambda point:point['time'])[-1]['value']
                     if key=='opacity': prior_tail['opacity']=terminal
                     else: prior_tail['transform'][key]=terminal
-            prior_transform,prior_position=_transform(prior_tail,width,height)
+            prior_transform,prior_position=_transform(prior_tail,width,height,fps=fps)
             prior_color=previous.get('color') or {}
             prior_lut=_lut_filter(prior_color,Path(directory)/f'tail-{number}.cube',preserve_headroom=bool(
                 hdr_profile and (prior_item.get('_sourceProfile') or REC709)[1] in HDR_TRANSFERS))
@@ -1096,9 +1224,12 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
         elif clip.get('transition') == 'dissolve':
             chain += f',fade=t=in:st=0:d={transition_duration:.6f}:alpha=1'
         if clip.get('transition') == 'wipe':
-            left = _horizontal_position(clip,width,'W',f'(T-{before:.6f})')
+            left = _horizontal_position(clip,width,'W',_keyframe_clock(clip,fps,'T',before))
             mask = f'if(gte(T,{transition_duration:.6f}),1,lt(X+({left}),{width}*T/{transition_duration:.6f}))'
             chain += _mask_alpha(mask,alpha_format,full_alpha)
+        elif clip.get('_wipeMask'):
+            # Same format round trip as the window that holds the wipe.
+            chain += _mask_alpha('1',alpha_format,full_alpha)
         chain += f',setpts=PTS+{first_frame}[clip{number}]'
         filters.append(chain)
         if overlap_transition and clip.get('transition') == 'dissolve':
@@ -1210,9 +1341,13 @@ def _audio_events(clips, media_by_id, fps, probes, track_mix, solo, span, heartb
             head = (lambda t, b=before, f=fade_in: f'max(0,({t}-{b:.9f})/{f:.9f})') if fade_in else (lambda t: '1')
             tail = (lambda t, r=render_length, f=fade_out: f'max(0,({r:.9f}-{t})/{f:.9f})') if fade_out else (lambda t: '1')
             envelope.append(lambda t, head=head, tail=tail: f'min(1,min({head(t)},{tail(t)}))')
+        rates = item.get('_audioRates') or []
+        # Tempo and resampling carry state from sample to sample: such an event
+        # is rendered in one piece when a chunk seam falls inside it.
+        stateful = abs(speed-1) > 1e-9 or any((rates[number] if number < len(rates) else 0) != AUDIO_RATE for number in streams)
         events.append(dict(path=item['_path'], streams=streams, source=source_in if reverse else source_in-before*speed,
                            length=render_length, speed=speed, reverse=reverse, start=start-before,
-                           processing=processing, envelope=envelope))
+                           processing=processing, envelope=envelope, stateful=stateful))
         if after>=1/float(fps):
             available=(source_in/speed if reverse else (item['_actualDuration']-source_in-length*speed)/speed)
             if available+1e-3<after: raise ValueError('Audio crossfade needs more outgoing source footage')
@@ -1220,7 +1355,7 @@ def _audio_events(clips, media_by_id, fps, probes, track_mix, solo, span, heartb
             if volume_keys:
                 terminal=sorted(volume_keys,key=lambda point:point['time'])[-1]['value']
                 tail_processing+=f",volume={_number(terminal,'volume keyframe',0,200)/100:.6f}"
-            events.append(dict(path=item['_path'], streams=streams,
+            events.append(dict(path=item['_path'], streams=streams, stateful=stateful,
                                source=source_in-after*speed if reverse else source_in+length*speed,
                                length=after, speed=speed, reverse=reverse, start=start+length, processing=tail_processing,
                                envelope=[lambda t, n=next_clip, b=next_before, d=next_duration:
@@ -1230,9 +1365,19 @@ def _audio_events(clips, media_by_id, fps, probes, track_mix, solo, span, heartb
 
 
 def _limiter_filter(limiter):
+    """``limiter`` is None or (ceiling dBFS, true_peak).
+
+    Sample-peak limiting leaves material below the ceiling bit-exact (PCM
+    deliveries). True-peak limiting runs the limiter at 4x the sample rate so
+    peaks between samples are held too (lossy deliveries).
+    """
     if limiter is None:
         return ''
-    return f',alimiter=limit={10**(limiter/20):.9f}:level=0:latency=1'
+    ceiling, true_peak = limiter
+    limit = f'alimiter=limit={10**(ceiling/20):.9f}:level=0:latency=1'
+    if true_peak:
+        return f',aresample={TRUE_PEAK_OVERSAMPLE*AUDIO_RATE},{limit},aresample={AUDIO_RATE}'
+    return ','+limit
 
 
 def _render_audio_chunk(events, origin_sample, keep_from, keep_samples, limiter, target, directory, cancelled, heartbeat):
@@ -1246,10 +1391,7 @@ def _render_audio_chunk(events, origin_sample, keep_from, keep_samples, limiter,
         if u1-u0 <= 1/AUDIO_RATE:
             continue
         speed = event['speed']
-        if event['reverse']:
-            low, high = event['source']+(event['length']-u1)*speed, event['source']+(event['length']-u0)*speed
-        else:
-            low, high = event['source']+u0*speed, event['source']+u1*speed
+        low, high = _event_source_span(event, u0, u1)
         slices.append((event, u0, low, high))
     # Slices of one file that sit close together in the source share a seeked
     # input; the shared span is bounded so buffered audio stays small.
@@ -1276,11 +1418,15 @@ def _render_audio_chunk(events, origin_sample, keep_from, keep_samples, limiter,
         index, offset = offsets[number]
         chain = _trim_audio(filters, f'mix{number}', index, event['streams'], low-offset, high-low, event['reverse'])
         chain += event['processing']
+        delay = round((event['start']+u0-origin)*AUDIO_RATE)
+        if abs(event['speed']-1) > 1e-9:
+            # The tempo filter was given extra source past the slice (it drops
+            # its last fragment); keep exactly the slice's own samples.
+            chain += f",apad,atrim=end_sample={max(1, round((event['start']+u1-origin)*AUDIO_RATE)-max(0, delay))}"
         clock = f'(t+{u0:.9f})' if u0 else 't'
         envelope = [term(clock) for term in event['envelope']]
         if envelope:
             chain += f",aeval=exprs='val(ch)*{'*'.join(envelope)}':channel_layout=stereo"
-        delay = round((event['start']+u0-origin)*AUDIO_RATE)
         filters.append(chain + f',adelay={max(0, delay)}S:all=1[audio{number}]')
         labels.append(f'[audio{number}]')
     total = keep_from+keep_samples
@@ -1295,6 +1441,45 @@ def _render_audio_chunk(events, origin_sample, keep_from, keep_samples, limiter,
                *_graph_args(';'.join(filters), directory, Path(target).stem), '-map', '[aout]',
                '-c:a', 'pcm_f32le', '-ar', str(AUDIO_RATE), '-ac', '2', str(target)]
     _run_ffmpeg(command, cancelled, heartbeat)
+
+
+def _event_source_span(event, u0, u1):
+    """Source seconds read for event-local times u0..u1 (with tempo margin)."""
+    speed = event['speed']
+    if event['reverse']:
+        low, high = event['source']+(event['length']-u1)*speed, event['source']+(event['length']-u0)*speed
+    else:
+        low, high = event['source']+u0*speed, event['source']+u1*speed
+    if abs(speed-1) > 1e-9 and u1 >= event['length']-1e-9:
+        # FFmpeg's atempo drops the last part of its input; feed it more of
+        # the source than it must play (trimmed afterwards).
+        if event['reverse']: low = max(0.0, low-TEMPO_TAIL_SECONDS*speed)
+        else: high += TEMPO_TAIL_SECONDS*speed
+    return low, high
+
+
+def _prerender_event(event, u0, u1, target, directory, cancelled, heartbeat):
+    """Render event-local u0..u1 of a stateful event (tempo, resampling) in one
+    FFmpeg run, reading only that span of its source. Returns a plain 48 kHz
+    stereo event that chunks can slice without restarting any filter state."""
+    low, high = _event_source_span(event, u0, u1)
+    offset = math.floor(max(0.0, low-.25)*1_000_000)/1_000_000
+    seek = ['-ss', f'{offset:.6f}'] if offset > 0 else []
+    filters = []
+    chain = _trim_audio(filters, 'pre', 0, event['streams'], low-offset, high-low, event['reverse'])
+    samples = math.ceil((u1-u0)*AUDIO_RATE)+2
+    filters.append(chain + event['processing'] +
+                   f',aformat=sample_fmts=flt:sample_rates={AUDIO_RATE}:channel_layouts=stereo,apad,atrim=end_sample={samples},'
+                   'asetpts=PTS-STARTPTS[aout]')
+    command = ['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
+               *seek, '-t', f'{high-offset+.25:.6f}', '-protocol_whitelist', 'file', '-i', str(event['path']),
+               *_graph_args(';'.join(filters), directory, Path(target).stem), '-map', '[aout]',
+               '-c:a', 'pcm_f32le', '-ar', str(AUDIO_RATE), '-ac', '2', str(target)]
+    _run_ffmpeg(command, cancelled, heartbeat)
+    shift = u0
+    envelope = [(lambda t, term=term, shift=shift: term(f'({t}+{shift:.9f})')) for term in event['envelope']]
+    return dict(path=Path(target), streams={0: 2}, source=0.0, length=u1-u0, speed=1.0, reverse=False,
+                start=event['start']+u0, processing='anull', envelope=envelope, stateful=False, prerendered=True)
 
 
 def _render_audio(events, first_sample, stop_sample, limiter, directory, cancelled, heartbeat, progress=None):
@@ -1314,17 +1499,35 @@ def _render_audio(events, first_sample, stop_sample, limiter, directory, cancell
         chunks.append((current, min(end, stop_sample)))
         current = chunks[-1][1]
     paths, active, pointer = [], [], 0
+    origins = [max(0, begin-preroll) for begin, _ in chunks]
+    last_needed = stop_sample/AUDIO_RATE+AUDIO_POSTROLL_SECONDS
+    prerendered = 0
     for number, (begin, end) in enumerate(chunks):
         if cancelled and cancelled.is_set(): raise InterruptedError('Export cancelled')
-        origin = max(0, begin-preroll)
+        origin = origins[number]
         while pointer < len(events) and events[pointer]['start'] < end/AUDIO_RATE+AUDIO_POSTROLL_SECONDS:
-            active.append(events[pointer]); pointer += 1
+            event = events[pointer]; pointer += 1
+            u0 = max(0.0, origin/AUDIO_RATE-event['start'])
+            spans_seam = number+1 < len(origins) and event['start']+event['length'] > origins[number+1]/AUDIO_RATE
+            reversed_span = event['length']*event['speed'] if event['reverse'] else 0
+            if event.get('stateful') and (u0 > 0 or spans_seam) and reversed_span <= AUDIO_REVERSE_PRERENDER_SECONDS:
+                u1 = min(event['length'], last_needed-event['start'])
+                if u1-u0 > 1/AUDIO_RATE:
+                    target = Path(directory)/f'event-{prerendered:06d}.wav'; prerendered += 1
+                    event = _prerender_event(event, u0, u1, target, directory, cancelled, heartbeat)
+            active.append(event)
+        for event in active:
+            if event.get('prerendered') and event['start']+event['length'] <= origin/AUDIO_RATE:
+                Path(event['path']).unlink(missing_ok=True)
         active = [event for event in active if event['start']+event['length'] > origin/AUDIO_RATE]
         target = Path(directory)/f'audio-{number:05d}.wav'
         _render_audio_chunk([event for event in active if event['start'] < end/AUDIO_RATE+AUDIO_POSTROLL_SECONDS], origin, begin-origin, end-begin,
                             limiter, target, directory, cancelled, heartbeat)
         paths.append(target)
         if progress: progress((number+1)/len(chunks))
+    for event in active:
+        if event.get('prerendered'):
+            Path(event['path']).unlink(missing_ok=True)
     return paths
 
 
@@ -1334,11 +1537,14 @@ def _concat_list(directory, name, paths):
     return manifest
 
 
-def render_to_file(project, output_path, *, options=None, progress=None, cancelled=None, heartbeat=None, _nested_depth=0):
+def render_to_file(project, output_path, *, options=None, progress=None, cancelled=None, heartbeat=None,
+                   work_directory=None, _nested_depth=0):
     """Resolve imported nested Premiere sequences, then render the parent timeline.
 
     ``heartbeat`` is called whenever FFmpeg makes progress, so a supervisor
-    can tell a long render from a stuck one.
+    can tell a long render from a stuck one. ``work_directory`` is where the
+    render's scratch folder is made (default: work_root()); an export job
+    passes its own folder so killing the job leaves nothing elsewhere.
     """
     import copy
     if not isinstance(project,dict) or not isinstance(project.get('media'),list): raise ValueError('Invalid project')
@@ -1347,7 +1553,8 @@ def render_to_file(project, output_path, *, options=None, progress=None, cancell
     options = {key: value for key, value in (options or {}).items() if isinstance(key, str) and not key.startswith('_')}
     if _nested_depth>4: raise ValueError('Nested Premiere sequences exceed four levels')
     if not any(isinstance(item,dict) and item.get('nestedProject') for item in project['media']):
-        return _render_prepared(project,output_path,options=options,progress=progress,cancelled=cancelled,heartbeat=heartbeat)
+        return _render_prepared(project,output_path,options=options,progress=progress,cancelled=cancelled,heartbeat=heartbeat,
+                                work_directory=work_directory)
     MEDIA_ROOT.mkdir(parents=True,exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='splice-nested-',dir=MEDIA_ROOT) as directory:
         prepared=copy.deepcopy(project)
@@ -1359,14 +1566,16 @@ def render_to_file(project, output_path, *, options=None, progress=None, cancell
             target=Path(directory)/f'nested-{index}{suffix}'
             child_options={**options,'codec':'prores' if suffix=='.mov' else 'h264'}
             child_options.pop('range',None)
-            render_to_file(child,target,options=child_options,cancelled=cancelled,heartbeat=heartbeat,_nested_depth=_nested_depth+1)
+            render_to_file(child,target,options=child_options,cancelled=cancelled,heartbeat=heartbeat,work_directory=work_directory,
+                           _nested_depth=_nested_depth+1)
             item['src']='/media/'+str(target.relative_to(MEDIA_ROOT))
             item['duration']=max((float(c['start'])+float(c['duration']) for c in child['clips']),default=0)
             item.pop('nestedSequence',None)
             item.pop('nestedProject',None)
             for clip in prepared['clips']:
                 if clip.get('mediaId')==item['id']: clip.pop('nestedSequence',None)
-        return _render_prepared(prepared,output_path,options=options,progress=progress,cancelled=cancelled,heartbeat=heartbeat)
+        return _render_prepared(prepared,output_path,options=options,progress=progress,cancelled=cancelled,heartbeat=heartbeat,
+                                work_directory=work_directory)
 
 
 def _track_hidden(track_state, kind, track):
@@ -1420,7 +1629,8 @@ def _validate_timeline(project):
     if total <= 0:
         raise ValueError('The timeline is empty')
     if total > MAX_TIMELINE_SECONDS + 1e-6:
-        raise ValueError(f'The timeline is {total/3600:.2f} hours long; export supports at most {_duration_text(MAX_TIMELINE_SECONDS)}')
+        raise ValueError(f'The timeline is {total-MAX_TIMELINE_SECONDS:.3f} seconds longer than the export limit of '
+                         f'{_duration_text(MAX_TIMELINE_SECONDS)} ({total/3600:.4f} hours)')
     track_state = project.get('trackState') or {}
     if not isinstance(track_state, dict) or any(not isinstance(key, str) or not isinstance(value, dict) for key, value in track_state.items()):
         raise ValueError('Invalid track state')
@@ -1435,7 +1645,7 @@ def _estimated_bytes(width, height, fps, seconds, codec):
     return video, seconds*AUDIO_RATE*2*4
 
 
-def _render_prepared(project, output_path, *, options=None, progress=None, cancelled=None, heartbeat=None):
+def _render_prepared(project, output_path, *, options=None, progress=None, cancelled=None, heartbeat=None, work_directory=None):
     """Render bounded picture windows and audio chunks, then mux them in one pass."""
     import copy
     options = dict(options or {})
@@ -1515,7 +1725,7 @@ def _render_prepared(project, output_path, *, options=None, progress=None, cance
     else:
         events = _audio_events(project['clips'], media_by_id, fps, probes, track_mix, solo,
                                (max(0, out_start-AUDIO_PREROLL_SECONDS), out_end), heartbeat)
-    root = work_root()
+    root = Path(work_directory) if work_directory else work_root()
     video_bytes, audio_bytes = _estimated_bytes(width, height, fps, out_duration, codec)
     output = Path(output_path)
     final_bytes = video_bytes + (out_duration*AUDIO_RATE*2*3 if codec != 'h264' else out_duration*40_000)
@@ -1527,18 +1737,29 @@ def _render_prepared(project, output_path, *, options=None, progress=None, cance
         return (lambda fraction: progress(low+(high-low)*fraction)) if progress else None
     with WorkDirectory('splice-segments-', root) as directory:
         if codec=='wav':
-            chunks = _render_audio(events, first_sample, stop_sample, limiter, directory, cancelled, heartbeat, stage(0, .95))
+            chunks = _render_audio(events, first_sample, stop_sample, None if limiter is None else (limiter, False),
+                                   directory, cancelled, heartbeat, stage(0, .95))
             _run_ffmpeg(['ffmpeg','-nostdin','-hide_banner','-loglevel','error','-y','-f','concat','-safe','0',
                          '-i',str(_concat_list(directory,'audio.txt',chunks)),'-c:a','pcm_s24le','-ar',str(AUDIO_RATE),
-                         '-t',f'{out_duration:.6f}',str(output)],cancelled,heartbeat)
+                         str(output)],cancelled,heartbeat)
             if progress: progress(1.0)
             return output.stat().st_size
         segments = _render_picture(project, picture_clips, first, stop, total_frames, fps, width, height, codec, options,
                                    directory, suffix, cancelled, heartbeat, stage(0, .8))
-        chunks = _render_audio(events, first_sample, stop_sample, limiter, directory, cancelled, heartbeat, stage(.8, .95))
+        lossy = codec != 'prores'
+        mix_limiter = None if limiter is None else (limiter, lossy)
+        chunks = _render_audio(events, first_sample, stop_sample, mix_limiter, directory, cancelled, heartbeat, stage(.8, .92))
+        audio_list = _concat_list(directory,'audio.txt',chunks)
+        if lossy:
+            bitrate = str(int(_number(options.get('audioBitrate',192),'audio bitrate',64,320)))+'k'
+            audio_file = _encode_aac(audio_list, bitrate, limiter, directory, cancelled, heartbeat)
+            audio_input = ['-i',str(audio_file)]
+        else:
+            audio_input = ['-f','concat','-safe','0','-i',str(audio_list)]
+        if progress: progress(.96)
         command=['ffmpeg','-nostdin','-hide_banner','-loglevel','error','-y',
                  '-f','concat','-safe','0','-i',str(_concat_list(directory,'segments.txt',segments)),
-                 '-f','concat','-safe','0','-i',str(_concat_list(directory,'audio.txt',chunks))]
+                 *audio_input]
         with_captions = validated_captions and options.get('captions',True)
         if with_captions:
             subtitle=Path(directory)/'captions.srt'
@@ -1550,16 +1771,51 @@ def _render_prepared(project, output_path, *, options=None, progress=None, cance
         if codec=='prores':
             command.extend(['-c:a','pcm_s24le','-ar',str(AUDIO_RATE)])
         else:
-            command.extend(['-c:a','aac','-b:a',str(int(_number(options.get('audioBitrate',192),'audio bitrate',64,320)))+'k'])
+            command.extend(['-c:a','copy'])
         if with_captions:
             command.extend(['-c:s','mov_text','-metadata:s:s:0',f'language={language}','-disposition:s:0','default'])
         command.extend(_color_tags(profile, codec))
         flags = '+write_colr' if codec=='prores' else '+faststart+write_colr'
-        command.extend(['-t',f'{out_duration:.6f}','-movflags',flags,str(output)])
+        # The segments and chunks already have the exact frame and sample
+        # counts; -t only guards against a stray packet, so give it half a
+        # frame (a -t of the exact duration drops the last audio sample).
+        command.extend(['-t',f'{out_duration+.5/fps:.6f}','-movflags',flags,str(output)])
         _run_ffmpeg(command,cancelled,heartbeat)
         if cancelled and cancelled.is_set(): raise InterruptedError('Export cancelled')
         if progress: progress(1.0)
         return output.stat().st_size
+
+
+def _true_peak_db(path, cancelled, heartbeat):
+    """Decoded true peak (dBTP, 4x oversampled, ITU-R BS.1770) of an audio file."""
+    report = _run_ffmpeg(['ffmpeg','-nostdin','-hide_banner','-nostats','-loglevel','info','-i',str(path),
+                          '-af','ebur128=peak=true:framelog=quiet','-f','null','-'],cancelled,heartbeat)
+    tail = report[report.rfind('True peak:'):]
+    import re
+    match = re.search(r'Peak:\s+(-?[0-9.]+|-inf)\s+dBFS', tail)
+    if not match:
+        raise ValueError('Could not measure the exported audio peak')
+    return -math.inf if match.group(1) == '-inf' else float(match.group(1))
+
+
+def _encode_aac(audio_list, bitrate, ceiling, directory, cancelled, heartbeat):
+    """Encode the mix to AAC; with a limiter ceiling, keep the decoded true peak under it."""
+    target = Path(directory)/'audio.m4a'
+    gain = 0.0
+    for attempt in range(AAC_PEAK_ATTEMPTS):
+        volume = ['-af', f'volume={gain:.3f}dB'] if gain else []
+        _run_ffmpeg(['ffmpeg','-nostdin','-hide_banner','-loglevel','error','-y','-f','concat','-safe','0',
+                     '-i',str(audio_list),*volume,'-c:a','aac','-b:a',bitrate,str(target)],cancelled,heartbeat)
+        if ceiling is None:
+            return target
+        peak = _true_peak_db(target, cancelled, heartbeat)
+        if peak <= ceiling:
+            return target
+        # Overshoot does not scale exactly with level: lower by the excess plus a margin.
+        gain -= peak-ceiling+.1
+    import warnings
+    warnings.warn(f'The exported AAC audio peaks at {peak:.1f} dBTP, above the {ceiling:g} dBFS limiter ceiling', stacklevel=2)
+    return target
 
 
 def _render_picture(project, picture, first, stop, total_frames, fps, width, height, codec, options, directory,
@@ -1576,7 +1832,11 @@ def _render_picture(project, picture, first, stop, total_frames, fps, width, hei
         starts.append(frame)
         if clip.get('transition') in ('dissolve', 'wipe', 'fade'):
             end = start + float(clip.get('transitionDuration', .5))
-            protected.append((frame - 1, math.ceil(end * fps - 1e-6)))
+            # Keep at least the cut's first frame with the transition: a
+            # transition that ends at the cut ("end at cut") would otherwise
+            # leave a window holding only the lead-in, with no clip after it.
+            cut_frame = math.ceil(float(clip['start']) * fps - 1e-6)
+            protected.append((frame - 1, max(math.ceil(end * fps - 1e-6), cut_frame + 1)))
         if clip.get('type') == 'video' and clip.get('reverse'):
             reversed_spans.append((frame, math.ceil((float(clip['start'])+float(clip['duration']))*fps-1e-6)+1))
     starts.sort()
@@ -1607,6 +1867,25 @@ def _render_picture(project, picture, first, stop, total_frames, fps, width, hei
         frames.append(min(total_frames, proposed))
     windows = [(a,b) for a,b in zip(frames,frames[1:]) if b>first and a<stop]
     media_by_id = {item['id']: item for item in project['media']}
+    # A clip's chain takes the same pixel-format round trips in every window
+    # (dips go through RGB, wipes through 4:4:4), or its pixels would change
+    # at a window seam. Record which clips have them in the whole timeline.
+    video = sorted((clip for clip in picture if clip.get('type') == 'video'),
+                   key=lambda clip: (clip.get('track', 0), float(clip['start'])))
+    fps_value = float(fps)
+    _, followers = _picture_transitions(video, media_by_id, fps_value)
+    dip_format, wipe_mask = set(), set()
+    for number, clip in enumerate(video):
+        before = float(clip.get('transitionBefore', 0) or 0)
+        if clip.get('transition') == 'fade':
+            duration = min(float(clip.get('transitionDuration', .5)), float(clip['duration'])+before)
+            if duration-before > 0:
+                dip_format.add(id(clip))
+        if clip.get('transition') == 'wipe':
+            wipe_mask.add(id(clip))
+        following = video[followers[number]] if number in followers else None
+        if following is not None and following.get('transition') == 'fade' and float(following.get('transitionBefore', 0) or 0) > 0:
+            dip_format.add(id(clip))
     # Sweep the clips once: each window sees only the clips that overlap it.
     ordered = sorted(picture, key=lambda clip: float(clip['start'])-float(clip.get('transitionBefore',0) or 0))
     active, pointer = [], 0
@@ -1625,6 +1904,12 @@ def _render_picture(project, picture, first, stop, total_frames, fps, width, hei
             if overlap_end - overlap_start < .5/fps: continue
             clip=dict(original)
             speed=_number(clip.get('speed',1),'speed',.1,16)
+            for key in [key for key in clip if isinstance(key, str) and key.startswith('_')]:
+                del clip[key]
+            # Keyframes stay whole: the window's clip reads them through a
+            # shifted clock (_keyframe_clock), so values match every window.
+            if clip.get('keyframes'):
+                _slice_keyframes(clip['keyframes'], 0, float(original['duration']))  # validation only
             if before and overlap_start <= cut+.5/fps:
                 clip['start']=cut-begin
                 clip['duration']=overlap_end-cut
@@ -1632,16 +1917,15 @@ def _render_picture(project, picture, first, stop, total_frames, fps, width, hei
                     # Reversed playback ends at the in point: dropping the
                     # clip's end moves the in point, not the start.
                     clip['in']=float(clip.get('in',0)) + (b-overlap_end)*speed
-                if clip.get('keyframes'):
-                    clip['keyframes']=_slice_keyframes(clip['keyframes'],0,clip['duration'])
             else:
                 clip['start']=overlap_start-begin
                 clip['duration']=overlap_end-overlap_start
                 clip['in']=float(clip.get('in',0)) + ((b-overlap_end) if clip.get('reverse') else (overlap_start-cut))*speed
                 clip['transitionBefore']=0
                 if overlap_start > cut+.5/fps: clip['transition']='none'
-                if clip.get('keyframes'):
-                    clip['keyframes']=_slice_keyframes(clip['keyframes'],overlap_start-cut,clip['duration'])
+                clip['_keyframeShift']=overlap_start-cut
+            if id(original) in dip_format: clip['_dipFormat'] = True
+            if id(original) in wipe_mask: clip['_wipeMask'] = True
             clips.append(clip)
         # Gaps still need a black base track to keep exact segment duration.
         clips.append({'type':'title','start':0,'duration':end-begin,'in':0,'title':''})

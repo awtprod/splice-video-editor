@@ -87,7 +87,7 @@ class Limits(ScaleCase):
         title = dict(type='title', start=0, duration=1, title='')
         cases = [
             (dict(clips=[title]*20_001), r'at most 20,000'),
-            (dict(clips=[dict(title, start=12*3600)]), r'at most 12 hours'),
+            (dict(clips=[dict(title, start=12*3600)]), r'1\.000 seconds longer than the export limit of 12 hours'),
             (dict(media=[dict(id=str(n), src='/media/none.mp4') for n in range(5_001)],
                   clips=[dict(type='audio', mediaId=str(n), track=-1, start=0, duration=1) for n in range(5_001)]),
              r'uses 5,001 media files; export supports at most 5,000'),

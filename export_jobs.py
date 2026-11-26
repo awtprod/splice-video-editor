@@ -40,7 +40,10 @@ def _worker(project, options, output, progress, beat, cancelled, connection):
 
         with warnings.catch_warnings(record=True) as notices:
             warnings.simplefilter('once')
-            render_to_file(project, output, options=options, progress=advance, cancelled=cancelled, heartbeat=alive)
+            # Scratch files go inside the job's own folder, which the parent
+            # removes even when it has to kill this process.
+            render_to_file(project, output, options=options, progress=advance, cancelled=cancelled, heartbeat=alive,
+                           work_directory=Path(output).parent)
         connection.send(('done', list(dict.fromkeys(str(note.message) for note in notices))))
     except Exception as error:
         connection.send(('error', str(error)))
