@@ -752,3 +752,83 @@ class StaleStagingTests(SaveCase):
             resolve_http.remember_library(self.dir / 'gone' / 'Resolve Projects')
             resolve_http.clean_staging_at_start().join(10)
         self.assertFalse(self.staging().exists())
+
+
+class TransitionChangeTests(SaveCase):
+    def carrier(self, project):
+        return next(c for c in project['clips'] if c.get('resolveTransitionId'))
+
+    def transitions(self, db):
+        conn = sqlite3.connect(f'file:{db}?mode=ro&immutable=1', uri=True)
+        try:
+            return sorted(conn.execute("SELECT Start, Duration, PrettyType FROM Sm2TiItem WHERE DbType = "
+                                       "'Sm2TiTransition'").fetchall())
+        finally:
+            conn.close()
+
+    def test_a_changed_resolve_crossfade_is_written_anew_or_reported(self):
+        project = self.opened()
+        fps = project['fps']
+        carrier = self.carrier(project)
+        seed = self.transitions(self.db)
+        cut = round(carrier['start'] * fps) + project['startFrame']
+        carrier.update(transitionDuration=12 / fps, transitionBefore=6 / fps)
+        result = self.run_save(self.payload(project, name='Length'))
+        got = self.transitions(result['project']['path'])
+        self.assertEqual(len(got), len(seed))
+        self.assertIn((str(cut - 6), '12', 'Cross Fade +3DB'), got)
+        self.assertTrue(any(line['what'].startswith('Resolve sound crossfades changed') for line in result['lines']))
+        again = self.carrier(self.opened(Path(result['project']['path'])))
+        self.assertEqual(round(again['transitionDuration'] * fps), 12)
+        # The kind.
+        project = self.opened()
+        carrier = self.carrier(project)
+        kind = 'Constant Gain' if carrier['transitionMatchName'] == 'Constant Power' else 'Constant Power'
+        carrier['transitionMatchName'] = kind
+        result = self.run_save(self.payload(project, name='Kind'))
+        self.assertEqual(self.carrier(self.opened(Path(result['project']['path'])))['transitionMatchName'], kind)
+        # Outside the evidence: the Resolve crossfade stays as it was, and the report says so.
+        project = self.opened()
+        self.carrier(project).update(transitionDuration=18 / fps, transitionBefore=9 / fps)
+        result = self.run_save(self.payload(project, name='Too long'))
+        self.assertEqual(self.transitions(result['project']['path']), seed)
+        line = next(line for line in result['lines'] if line['what'].startswith('Changes to Resolve transitions'))
+        self.assertEqual(line['status'], writer.NOT_WRITTEN)
+
+    def test_a_crossfade_without_its_resolve_id_never_adds_a_second_one(self):
+        project = self.opened()
+        fps = project['fps']
+        carrier = self.carrier(project)
+        seed = self.transitions(self.db)
+        carrier.pop('resolveTransitionId')
+        result = self.run_save(self.payload(project, name='Same'))
+        self.assertEqual(self.transitions(result['project']['path']), seed)
+        project = self.opened()
+        carrier = self.carrier(project)
+        carrier.pop('resolveTransitionId')
+        carrier.update(transitionDuration=8 / fps, transitionBefore=4 / fps)
+        result = self.run_save(self.payload(project, name='Other'))
+        self.assertEqual(self.transitions(result['project']['path']), seed)
+        self.assertTrue(any(line['what'].startswith('Transitions on a cut that keeps a Resolve transition')
+                            for line in result['lines']))
+
+    def test_the_self_check_compares_transitions_per_cut(self):
+        project = self.opened()
+        original = writer.Writer._transitions
+
+        def doubled(self_, placed, timeline, start, name):
+            # The writer's old fault: a second crossfade written on a cut that keeps one.
+            out = original(self_, placed, timeline, start, name)
+            first = next(t for t in out if t['kind'] == 'audio')
+            row, _join = items.author_transition('Cross Fade +3 dB', first['track'], 0,
+                                                 first['start'] + items.frames_before(4), 4, timeline.rate,
+                                                 self_.fresh())
+            self_.inserts.append(('Sm2TiItem', row))
+            return out + [{'id': row['Sm2TiItem_id'], 'track': first['track'], 'start': first['start'],
+                           'duration': 4, 'seed': False, 'kind': 'audio', 'pretty': row['PrettyType']}]
+        before = tree_state(self.library)
+        with mock.patch.object(writer.Writer, '_transitions', doubled):
+            with self.assertRaises(writer.WriteError) as caught:
+                self.run_save(self.payload(project, name='Doubled'))
+        self.assertIn('overlap', str(caught.exception))
+        self.assertEqual(tree_state(self.library), before)

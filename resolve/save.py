@@ -17,7 +17,7 @@ import sqlite3
 import tempfile
 from pathlib import Path
 
-from . import importer, items, mediapool
+from . import blobs, importer, items, mediapool
 from .facts import check_mappings, mapped, measure
 from .place import PlaceError, Staging, check_name, check_new, library_users, pick_user, project_db_inside
 from .source import ResolveError, load_library, snapshot
@@ -114,6 +114,52 @@ def _track_numbers(timeline):
     return out
 
 
+def _whole_frames(value):
+    try:
+        return int(str(value).split('|')[0])
+    except ValueError:
+        return None
+
+
+def transitions_per_cut(seed, timeline, transitions, name):
+    """Every track's transitions in the written project, compared with what was meant: as many,
+    each of the meant start, length and kind, none overlapping another (two on one cut), and each
+    on a clip's edge (alignment). The differences as text."""
+    out = []
+    for kind in ('video', 'audio'):
+        for number, track in enumerate(timeline.tracks[kind], 1):
+            track_id = track['Sm2TiTrack_id']
+            members = [seed.row('Sm2TiItem', link['DbAssociate']) for link in seed.rows(
+                'Sm2TiItem_Sm2TiTrack', "DbOwner = ? AND DbPropertyName = 'Items' ORDER BY DbIndex", (track_id,))]
+            members = [m for m in members if m is not None]
+            found = sorted((_whole_frames(m['Start']), round(_seed_length(m)), m.get('PrettyType'))
+                           for m in members if m['DbType'] == items.TRANSITION)
+            meant = sorted((t['start'], t['duration'], t.get('pretty')) for t in transitions if t['track'] == track_id)
+            label = f'{name} · {kind.title()} {number}'
+            if found != meant:
+                out.append(f'{label}: {len(found)} transition(s) read back, {len(meant)} meant'
+                           + ('' if len(found) != len(meant) else ' (another length, start or kind)'))
+            for a, b in zip(found, found[1:]):
+                if None not in (a[0], b[0]) and b[0] < a[0] + a[1]:
+                    out.append(f'{label}: two transitions overlap at frame {b[0]} (one cut holds one transition)')
+            edges = set()
+            for m in members:
+                if m['DbType'] != items.TRANSITION and _whole_frames(m['Start']) is not None:
+                    edges |= {_whole_frames(m['Start']), _whole_frames(m['Start']) + round(_seed_length(m))}
+            for start, length, _pretty in found:
+                if start is not None and not any(start <= edge <= start + length for edge in edges):
+                    out.append(f'{label}: a transition at frame {start} is on no clip edge')
+    return out
+
+
+def _seed_length(row):
+    try:
+        whole, fraction = blobs.parse_frames(row.get('Duration'))
+    except (blobs.BlobError, TypeError):
+        return 0
+    return whole + (fraction or 0.0)
+
+
 def read_back(path, writer, scratch):
     """The written project read with Splice's own reader and compared with what was meant; the
     differences as text (an empty list when there are none)."""
@@ -159,6 +205,7 @@ def read_back(path, writer, scratch):
                         str(row['Start']).split('|')[0] != str(transition['start']) and not transition['seed'] or \
                         str(row['Duration']).split('|')[0] != str(transition['duration']) and not transition['seed']:
                     differences.append(f'{name}: a transition is not where it was meant to be')
+            differences += transitions_per_cut(seed, timeline, transitions, name)
     finally:
         seed.conn.close()
     return differences

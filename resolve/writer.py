@@ -827,16 +827,74 @@ class Writer:
         else:
             self._update('Sm2TiItem', item_id, {column: value})
 
+    def _crossfade_gate(self, entry, by_track, rate):
+        """``(problem or None, frames, frames before the cut, Resolve name, outgoing entry)`` of
+        the sound crossfade a Splice clip asks for at its head: the one gate every sound
+        crossfade the writer authors passes (new ones and changed Resolve ones alike)."""
+        clip, kind, track_id, s = entry[0], entry[2], entry[3], entry[4]
+        style = clip.get('transition')
+        frames = round(clip['transitionDuration'] * rate)
+        before = round((clip.get('transitionBefore') or 0) * rate)
+        outgoing = [o for o in by_track.get(track_id, []) if o is not entry and o[4] + o[5] == s]
+        resolve_name = items.SPLICE_FADES.get(clip.get('transitionMatchName') or 'Constant Power')
+        problem = items.transition_problem(resolve_name or str(clip.get('transitionMatchName')), frames, rate)
+        if problem is None and style != 'dissolve':
+            problem = 'a fade at the start of a clip is not a crossfade between two clips'
+        if problem is None and len(outgoing) != 1:
+            problem = 'it does not sit between two clips that meet'
+        if problem is None and before != items.frames_before(frames):
+            problem = f'it is not centred on the cut the way Resolve centres one ({items.frames_before(frames)} ' \
+                      f'frames before it)'
+        if problem is None:
+            other = outgoing[0]
+            after = frames - before
+            if other[7] is None and other[8] is None or entry[8] is None:
+                problem = 'the media its neighbours play cannot be read'
+            elif entry[6] < before:
+                problem = 'the incoming clip has too few frames before its in point'
+            elif other[6] + other[5] + after > (other[8].frames if other[8].picture and other[2] == 'video'
+                                                 else other[8].sound_frames or 0):
+                problem = 'the outgoing clip has too few frames after its out point'
+            elif after > entry[5] or before > other[5]:
+                problem = 'it is longer than one of its clips'
+        return problem, frames, before, resolve_name, outgoing
+
+    @staticmethod
+    def _asked(clip, rate):
+        """What a Splice clip asks for at its head: ``(style, frames, frames before, match name)``
+        in the reader's terms, or None for a cut."""
+        style = clip.get('transition')
+        if style in (None, 'none') or not (clip.get('transitionDuration') or 0) > 0:
+            return None
+        return (style, round(clip['transitionDuration'] * rate), round((clip.get('transitionBefore') or 0) * rate),
+                clip.get('transitionMatchName') if clip.get('type') == 'audio' else None)
+
+    @staticmethod
+    def _as_read(row, kind, s, d, cut):
+        """What the reader made of a seed transition at ``cut`` (as :meth:`_asked` puts it)."""
+        pretty = row.get('PrettyType')
+        if kind == 'audio':
+            style, match = 'dissolve', importer._AUDIO_FADES.get(pretty)
+        else:
+            style, match = ('fade' if cut == s else 'dissolve') if pretty in (None, 'Cross Dissolve') else pretty, None
+        return (style, round(d), round(cut - s) if style != 'fade' else 0, match)
+
     def _transitions(self, placed, timeline, start, name):
-        """Seed transitions that still sit on their cut are kept; sound crossfades Splice added are
-        written where the evidence covers them; the rest is reported."""
+        """Seed transitions that still sit on their cut are kept as they are, unless Splice changed
+        them: a changed sound crossfade the evidence covers is written anew (the seed's removed),
+        any other change is reported and the seed's transition kept. Sound crossfades Splice added
+        are written where the evidence covers them; the rest is reported. A Splice crossfade on a
+        cut that keeps a Resolve transition never adds a second one."""
         out = []
         by_track = {}
         for entry in placed:
             by_track.setdefault(entry[3], []).append(entry)
         kept = set()
+        replaced = set()      # Splice clips whose seed transition is written anew
         carriers = {entry[0].get('resolveTransitionId'): entry for entry in placed
                     if entry[0].get('resolveTransitionId')}
+        touched = {u[1] for u in self.updates if set(u[2]) & {'Start', 'Duration', 'In', 'Sm2TiTrack_id'}}
+        kept_spans = {}       # track id -> [(start, end, seed item id)]
         for item_id, (kind, track_id, row) in timeline.items.items():
             if row['DbType'] != items.TRANSITION:
                 continue
@@ -847,7 +905,6 @@ class Writer:
             order = timeline.order.get(track_id, [])
             at = order.index(item_id) if item_id in order else -1
             around = [order[at - 1] if at > 0 else None, order[at + 1] if 0 <= at < len(order) - 1 else None]
-            touched = {u[1] for u in self.updates if set(u[2]) & {'Start', 'Duration', 'In', 'Sm2TiTrack_id'}}
             placed_ids = {e[1] for e in neighbours}
             if not self.delta and all(n in placed_ids and n not in touched for n in around):
                 meets = True  # both clips it joins are where they were
@@ -857,15 +914,34 @@ class Writer:
                     for e in neighbours)
             carrier = carriers.get(item_id)
             removed = carrier is not None and carrier[0].get('transition') in (None, 'none')
+            where = f'{name} · {row.get("PrettyType") or "Transition"}'
+            if meets and not removed and carrier is not None and s is not None and d is not None:
+                asked = self._asked(carrier[0], timeline.rate)
+                seen = self._as_read(row, kind, _whole(row, 'Start') + self.delta, d, carrier[4])
+                if asked is not None and asked != seen:
+                    if kind == 'audio' and asked[0] == 'dissolve':
+                        problem = self._crossfade_gate(carrier, by_track, timeline.rate)[0]
+                    else:
+                        problem = 'picture transitions are not written (no Resolve sample proves their rows)'
+                    if problem is None and self._work(item_id, row):
+                        problem = 'the Resolve transition carries other Resolve work'
+                    if problem is None:
+                        self._delete(item_id, row, timeline, name, transition=True, changed=True)
+                        replaced.add(carrier[0].get('id'))
+                        continue
+                    self.report.add(NOT_WRITTEN, 'Changes to Resolve transitions (length, alignment or kind) not '
+                                    f'written: the transition stays as it is in Resolve ({problem})',
+                                    f'{where} at {carrier[0].get("start", 0):.2f} s')
             if meets and not removed:
                 kept.add(item_id)
-                out.append({'id': item_id, 'track': track_id, 'start': round(s), 'duration': round(d), 'seed': True,
-                            'kind': kind})
+                out.append({'id': item_id, 'track': track_id, 'start': _whole(row, 'Start') + self.delta,
+                            'duration': round(d), 'seed': True,
+                            'kind': kind, 'pretty': row.get('PrettyType')})
+                kept_spans.setdefault(track_id, []).append((s, s + d, item_id))
                 if self.delta:
                     self._shift(item_id, row)
                 if carrier is None and row.get('PrettyType') not in items.SOUND_KINDS.values():
-                    self.report.add(EXACT, 'Resolve transitions Splice does not show, kept on their cut',
-                                    f'{name} · {row.get("PrettyType") or "Transition"}')
+                    self.report.add(EXACT, 'Resolve transitions Splice does not show, kept on their cut', where)
             else:
                 self._delete(item_id, row, timeline, name, transition=True, removed=removed)
         for entry in placed:
@@ -877,34 +953,24 @@ class Writer:
             if seed_id in kept:
                 continue
             where = f'{name} · {clip.get("title") or "Clip"} at {clip.get("start", 0):.2f} s'
+            frames = round(clip['transitionDuration'] * timeline.rate)
+            before = round((clip.get('transitionBefore') or 0) * timeline.rate)
+            span = (s - before, s - before + frames)
+            on_cut = [k for k in kept_spans.get(track_id, ()) if k[0] < span[1] and span[0] < k[1]]
+            if on_cut and clip.get('id') not in replaced:
+                # A Splice crossfade on a cut where a Resolve transition is kept (a clip that lost
+                # its link to it): the Resolve one stays, and a second one is never added.
+                seed_row = timeline.items[on_cut[0][2]][2]
+                seen = self._as_read(seed_row, kind, _whole(seed_row, 'Start') + self.delta,
+                                     on_cut[0][1] - on_cut[0][0], s)
+                if self._asked(clip, timeline.rate) != seen:
+                    self.report.add(NOT_WRITTEN, 'Transitions on a cut that keeps a Resolve transition (the Resolve '
+                                    'one stays as it is; a second one is not added)', where)
+                continue
             if kind == 'video':
                 self.report.add(NOT_WRITTEN, 'Picture transitions and fades (no Resolve sample proves their rows)', where)
                 continue
-            frames = round(clip['transitionDuration'] * timeline.rate)
-            before = round((clip.get('transitionBefore') or 0) * timeline.rate)
-            outgoing = [o for o in by_track.get(track_id, []) if o is not entry and o[4] + o[5] == s]
-            resolve_name = items.SPLICE_FADES.get(clip.get('transitionMatchName') or 'Constant Power')
-            problem = items.transition_problem(resolve_name or str(clip.get('transitionMatchName')), frames,
-                                               timeline.rate)
-            if problem is None and style != 'dissolve':
-                problem = 'a fade at the start of a clip is not a crossfade between two clips'
-            if problem is None and len(outgoing) != 1:
-                problem = 'it does not sit between two clips that meet'
-            if problem is None and before != items.frames_before(frames):
-                problem = f'it is not centred on the cut the way Resolve centres one ({items.frames_before(frames)} ' \
-                          f'frames before it)'
-            if problem is None:
-                other = outgoing[0]
-                after = frames - before
-                if other[7] is None and other[8] is None or entry[8] is None:
-                    problem = 'the media its neighbours play cannot be read'
-                elif entry[6] < before:
-                    problem = 'the incoming clip has too few frames before its in point'
-                elif other[6] + other[5] + after > (other[8].frames if other[8].picture and other[2] == 'video'
-                                                     else other[8].sound_frames or 0):
-                    problem = 'the outgoing clip has too few frames after its out point'
-                elif after > entry[5] or before > other[5]:
-                    problem = 'it is longer than one of its clips'
+            problem, frames, before, resolve_name, _outgoing = self._crossfade_gate(entry, by_track, timeline.rate)
             if problem:
                 self.report.add(NOT_WRITTEN, f'Sound crossfades Resolve cannot take as written ({problem})', where)
                 continue
@@ -912,30 +978,45 @@ class Writer:
             row, _join = items.author_transition(resolve_name, track_id, 0, s, frames, timeline.rate, transition_id)
             self.inserts.append(('Sm2TiItem', row))
             out.append({'id': transition_id, 'track': track_id, 'start': s - items.frames_before(frames),
-                        'duration': frames, 'seed': False, 'kind': 'audio', 'name': resolve_name})
+                        'duration': frames, 'seed': False, 'kind': 'audio', 'name': resolve_name,
+                        'pretty': items.SOUND_KINDS[resolve_name]})
+            kept_spans.setdefault(track_id, []).append((s - before, s - before + frames, transition_id))
             self.operations.add('add_sound_transitions')
-            self.report.add(EXACT, 'Sound crossfades (Cross Fade 0 dB or +3 dB, centred on the cut)', where)
+            if clip.get('id') in replaced:
+                self.report.add(EXACT, 'Resolve sound crossfades changed (length or kind): written anew the way '
+                                'Resolve writes one, centred on the cut', where)
+            else:
+                self.report.add(EXACT, 'Sound crossfades (Cross Fade 0 dB or +3 dB, centred on the cut)', where)
         return out
 
-    def _delete(self, item_id, row, timeline, name, transition=False, removed=False):
+    def _work(self, item_id, row):
+        """The Resolve work an item carries (grade, Fusion, effects, markers, rows that belong to
+        it, items it owns), named; empty when it carries none."""
         owned = [table for table, columns in self.seed.columns.items()
                  if 'Sm2TiItem_id' in columns and table != 'Sm2TiItem' and
                  self.seed.conn.execute(f'SELECT 1 FROM {_q(table)} WHERE Sm2TiItem_id = ? LIMIT 1', (item_id,)).fetchone()]
         later = [tag for column, tag in items.LATER_COLUMNS.items() if row.get(column) is not None]
         markers = self.seed.rows('BtLockableBlob', 'BlobOwner = ?', (item_id,))
         children = self.seed.rows('Sm2TiItem', 'Sm2TiItem_Owner_id = ?', (item_id,))
+        return sorted(set(later + (['markers'] if markers else []) + owned + (['owned items'] if children else [])))
+
+    def _delete(self, item_id, row, timeline, name, transition=False, removed=False, changed=False):
+        work = self._work(item_id, row)
         where = f'{name} · {row.get("Name") or "Item"}'
-        if owned or later or markers or children:
-            what = ', '.join(sorted(set(later + (['markers'] if markers else []) + owned)))
+        if work:
+            what = ', '.join(work)
             self.report.add(NOT_WRITTEN, 'Deleted clips that carry Resolve work (grade, Fusion, effects, markers): '
                             'Splice does not delete them, so they stay in the Resolve timeline', f'{where} ({what})')
             self.kept_decorated = getattr(self, 'kept_decorated', set()) | {item_id}
-            return
+            return False
         self.deletes.append(item_id)
         self.operations.add('remove_items')
+        if changed:
+            return True  # reported with the crossfade written in its place
         what = ('Transitions removed in Splice' if removed else 'Transitions removed because their cut changed') \
             if transition else 'Clips deleted'
         self.report.add(EXACT, what, where)
+        return True
 
     def _orders(self, placed, transitions, timeline, start):
         """Every track's ``Items`` vector in record order (a transition before a clip starting on
