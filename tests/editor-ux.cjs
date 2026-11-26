@@ -264,8 +264,9 @@ async function ruler(page) {
       // steady multiple of the step in the frame field.
       const fields = labels.map(label => label.split(/[:;]/).map(Number));
       const counts = fields.map(([hours, minutes, seconds, frames]) => ((hours * 60 + minutes) * 60 + seconds) * nominal + frames);
-      const step = Math.min(...counts.slice(1).map((count, index) => count - counts[index]));
       const dropStart = ([, minutes, seconds, frames]) => drop && seconds === 0 && minutes % 10 !== 0 && frames === dropped;
+      // The step between regular ticks; a drop-frame minute's first frame is ticked as well.
+      const step = Math.min(...counts.slice(1).map((count, index) => dropStart(fields[index + 1]) || dropStart(fields[index]) ? Infinity : count - counts[index]));
       const frameTicks = step > 0 && fields.every(field => field[3] % step === 0 || dropStart(field));
       const whole = fields.every(field => field[3] === 0 || dropStart(field));
       assert.ok(whole || frameTicks, `fps ${fps} zoom ${zoom}: ${labels.join(' ')}`);

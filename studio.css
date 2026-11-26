@@ -1480,7 +1480,7 @@ button svg {
 /* The program monitor keeps at least 360 px; the dock gives way first (from 506 px down to
    360 px in small windows). With the source monitor open too the dock narrows further, and below
    1100 px wide the three cannot share the window: the dock closes and says so (workspace.js). */
-.workspace.scope-docked{grid-template-columns:minmax(min(506px,calc(100vw - 700px)),38%) minmax(360px,1fr) minmax(230px,20%)}
+.workspace.scope-docked{grid-template-columns:minmax(min(506px,calc(100vw - 640px)),38%) minmax(360px,1fr) minmax(230px,20%)}
 .workspace.scope-docked>.library{display:none}
 .workspace.scope-docked.source-open{grid-template-columns:minmax(360px,30%) minmax(300px,1fr) minmax(360px,1fr)}
 @media (min-width:1400px){
