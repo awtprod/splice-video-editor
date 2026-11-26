@@ -799,8 +799,34 @@
   $("export-video").onclick=()=>SpliceDialogs.exportVideo();
   // A large scope docked beside the program monitor, for grading. It takes the media pool's
   // column while open; the inspector's small scope steps aside so only one scope is painted.
+  // Below 1100 px wide the dock, the source monitor and a usable program monitor do not fit side
+  // by side: the dock gives way (it only shows the program frame) and says why.
+  const dockAndSourceWidth=1100;
+  let stopDockWatch=null;
+  function dockHasRoom() {
+    const workspace=document.querySelector(".workspace");
+    if(!workspace.classList.contains("source-open")||window.innerWidth>=dockAndSourceWidth)return true;
+    toggleScopeDock(false);
+    notify("Large scope closed to make room for the source monitor. Close the source monitor (or widen the window to "+dockAndSourceWidth+" px) to dock it again.");
+    return false;
+  }
+  function watchDockRoom(workspace) {
+    const observer=new MutationObserver(dockHasRoom);
+    observer.observe(workspace,{attributes:true,attributeFilter:["class"]});
+    window.addEventListener("resize",dockHasRoom);
+    stopDockWatch=()=>{
+      observer.disconnect();
+      window.removeEventListener("resize",dockHasRoom);
+      stopDockWatch=null;
+    };
+  }
   function toggleScopeDock(open=!document.querySelector(".scope-dock")) {
     const workspace=document.querySelector(".workspace"), toggle=$("scope-dock-toggle");
+    stopDockWatch?.();
+    if(open&&workspace.classList.contains("source-open")&&window.innerWidth<dockAndSourceWidth){
+      notify("The large scope needs the source monitor closed at this window size (or a window "+dockAndSourceWidth+" px wide).");
+      open=false;
+    }
     document.querySelector(".scope-dock")?.remove();
     workspace.classList.toggle("scope-docked",open);
     toggle.setAttribute("aria-pressed",String(open));
@@ -815,6 +841,7 @@
       workspace.prepend(dock);
       SpliceScopes.bind(dock);
       dock.querySelector(".scope-dock-close").onclick=()=>toggleScopeDock(false);
+      watchDockRoom(workspace);
     }
     requestAnimationFrame(()=>window.SpliceInspector?.paintScope?.(undefined,true));
   }

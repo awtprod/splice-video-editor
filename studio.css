@@ -1477,11 +1477,14 @@ button svg {
 .media-card .media-meta{overflow-wrap:anywhere}
 .media-card .media-path{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;overflow-wrap:normal}
 /* Large scope dock: replaces the media pool column beside the program monitor while grading. */
-.workspace.scope-docked{grid-template-columns:minmax(506px,38%) minmax(0,1fr) minmax(230px,20%)}
+/* The program monitor keeps at least 360 px; the dock gives way first (from 506 px down to
+   360 px in small windows). With the source monitor open too the dock narrows further, and below
+   1100 px wide the three cannot share the window: the dock closes and says so (workspace.js). */
+.workspace.scope-docked{grid-template-columns:minmax(min(506px,calc(100vw - 700px)),38%) minmax(360px,1fr) minmax(230px,20%)}
 .workspace.scope-docked>.library{display:none}
-.workspace.scope-docked.source-open{grid-template-columns:minmax(506px,34%) minmax(0,1fr) minmax(0,1fr)}
+.workspace.scope-docked.source-open{grid-template-columns:minmax(360px,30%) minmax(300px,1fr) minmax(360px,1fr)}
 @media (min-width:1400px){
-  .workspace.scope-docked.source-open{grid-template-columns:minmax(506px,30%) minmax(0,1fr) minmax(0,1fr) minmax(230px,17%)}
+  .workspace.scope-docked.source-open{grid-template-columns:minmax(360px,28%) minmax(300px,1fr) minmax(360px,1fr) minmax(230px,16%)}
 }
 .scope-dock{display:flex;flex-direction:column;min-width:0;min-height:0}
 .scope-dock-body{flex:1;min-height:0;display:flex;flex-direction:column;padding:10px 12px}
@@ -1555,3 +1558,12 @@ body{min-width:1024px}
   color: #f2f2ee;
   background: #2b2d2a;
 }
+/* The narrowest program monitor (360 px, beside the scope dock and source monitor): the timecode
+   and duration stack and the transport tightens so all five buttons stay inside the panel. */
+@container viewer (max-width:440px){
+  .viewer-info{flex-direction:column;gap:0}
+  .viewer-bottom{gap:6px;padding-left:10px;padding-right:10px}
+  .transport{gap:6px}
+}
+/* Status toasts are text only: a click under one reaches the control beneath. */
+.toast{pointer-events:none}
