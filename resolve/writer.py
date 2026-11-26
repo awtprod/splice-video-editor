@@ -169,14 +169,18 @@ def _fraction(text):
     return value if value > 0 else None
 
 
-def _frames(seconds, rate, what, where, report):
+ROUNDED = 'Clip positions between frames rounded to the nearest frame (Resolve stores whole frames)'
+
+
+def _frames(seconds, rate, what, where, rounded):
+    """Whole frames of a time in seconds; ``what`` is added to ``rounded`` when the time lies
+    between frames (reported only where the rounded value is written)."""
     if not isinstance(seconds, (int, float)) or isinstance(seconds, bool) or not math.isfinite(seconds):
         raise WriteError(f'{where}: its {what} is not a number.')
     exact = seconds * rate.numerator / rate.denominator
     whole = round(exact)
     if abs(exact - whole) > 1e-3:
-        report.add(EXACT, 'Clip positions between frames rounded to the nearest frame (Resolve stores whole frames)',
-                   where)
+        rounded.add(what)
     return whole
 
 
@@ -556,9 +560,10 @@ class Writer:
             if seed is not None:
                 claimed.add(rid)
             return None
-        rel = _frames(clip.get('start'), timeline.rate, 'start', where, report)
-        duration = _frames(clip.get('duration'), timeline.rate, 'duration', where, report)
-        source_in = _frames(clip.get('in') or 0, timeline.rate, 'source in point', where, report)
+        rounded = set()
+        rel = _frames(clip.get('start'), timeline.rate, 'start', where, rounded)
+        duration = _frames(clip.get('duration'), timeline.rate, 'duration', where, rounded)
+        source_in = _frames(clip.get('in') or 0, timeline.rate, 'source in point', where, rounded)
         if rel < 0 or duration < 1 or source_in < 0:
             report.add(NOT_WRITTEN, 'Clips before the timeline start or shorter than one frame', where)
             return None
@@ -613,6 +618,9 @@ class Writer:
                 view = self.view(self.clips[row['MediaRef']])
             else:
                 view = None
+            written = {'start': 'Start', 'duration': 'Duration', 'source in point': 'In'}
+            if any(written[w] in update for w in rounded):
+                report.add(EXACT, ROUNDED, where)
             if update:
                 self.updates.append(('Sm2TiItem', rid, update))
                 if set(update) & {'Start', 'Sm2TiTrack_id'}:
@@ -651,6 +659,8 @@ class Writer:
         except mediapool.MediaPoolError as error:
             report.add(NOT_WRITTEN, f'New clips the item writer refuses ({error.message[:200]})', where)
             return None
+        if rounded:
+            report.add(EXACT, ROUNDED, where)
         if kind == 'video' and clip.get('enabled') is False:
             row['Flags'] = CLIP_OFF
             report.add(EXACT, 'Clips disabled or enabled', where)

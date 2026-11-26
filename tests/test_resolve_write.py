@@ -832,3 +832,23 @@ class TransitionChangeTests(SaveCase):
                 self.run_save(self.payload(project, name='Doubled'))
         self.assertIn('overlap', str(caught.exception))
         self.assertEqual(tree_state(self.library), before)
+
+
+class RoundingReportTests(SaveCase):
+    def test_rounding_is_reported_only_where_a_rounded_value_is_written(self):
+        last = self.ids['pictures'][-1]
+        conn = sqlite3.connect(self.db)
+        start = conn.execute('SELECT Start FROM Sm2TiItem WHERE Sm2TiItem_id = ?', (last,)).fetchone()[0]
+        conn.execute('UPDATE Sm2TiItem SET Start = ? WHERE Sm2TiItem_id = ?',
+                     (f'{start}|' + struct.pack('<d', 0.25).hex(), last))
+        conn.commit()
+        conn.close()
+        shutil.copyfile(self.db, self.kept)
+        project = self.opened()
+        result = self.run_save(self.payload(project, confirm=False))
+        self.assertNotIn(writer.ROUNDED, [line['what'] for line in result['lines']])
+        clip = next(c for c in project['clips'] if c['resolveItemId'] == last)
+        clip['start'] += 10 / project['fps']
+        result = self.run_save(self.payload(project, confirm=False))
+        line = next(line for line in result['lines'] if line['what'] == writer.ROUNDED)
+        self.assertEqual(line['count'], 1)
