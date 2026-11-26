@@ -448,12 +448,15 @@ void main() {
       gl.uniform1f(u.u_keyWeight, grade?.weight || 0);
       const hs = a?.tables.hueSat;
       gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_3D, hs ? this.latticeTexture('hs|'+a.tables.key, HS, hs) : this.dummy3D); gl.uniform1i(u.u_hs, 5);
-      this.bindLook(u, 'look', a?.look ? this.lutBinding(a.look) : null, a?.lookIntensity ?? 0, 6);
-      this.bindLook(u, 'in', grade?.input ? this.lutBinding(grade.input) : null, 100, 8);
+      this.bindLook(u, 'look', a?.look, a?.lookIntensity ?? 0, 6);
+      this.bindLook(u, 'in', grade?.input, 100, 8);
     }
-    bindLook(u, name, binding, intensity, unit) {
+    bindLook(u, name, lut, intensity, unit) {
       const gl = this.gl;
-      gl.activeTexture(gl.TEXTURE0+unit); gl.bindTexture(gl.TEXTURE_3D, binding?.kind === 1 ? binding.texture : this.dummy3D); gl.uniform1i(u[`u_${name}3`], unit);
+      // A cache miss uploads on the active unit. Use this look's unit before allocating.
+      gl.activeTexture(gl.TEXTURE0+unit);
+      const binding = this.lutBinding(lut);
+      gl.bindTexture(gl.TEXTURE_3D, binding?.kind === 1 ? binding.texture : this.dummy3D); gl.uniform1i(u[`u_${name}3`], unit);
       gl.activeTexture(gl.TEXTURE0+unit+1); gl.bindTexture(gl.TEXTURE_2D, binding?.kind === 2 ? binding.texture : this.dummy2D); gl.uniform1i(u[`u_${name}1`], unit+1);
       gl.uniform1i(u[`u_${name}Size`], binding?.size || 2); gl.uniform1i(u[`u_${name}Width`], binding?.width || 1);
       gl.uniform3fv(u[`u_${name}Min`], binding?.lut.domainMin || [0,0,0]); gl.uniform3fv(u[`u_${name}Max`], binding?.lut.domainMax || [1,1,1]);

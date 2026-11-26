@@ -102,6 +102,11 @@ async function main() {
     one('master curve', {grade:{curves:{master:[[0, 0], [.25, .18], [.75, .84], [1, 1]]}}});
     one('RGB curves', {grade:{curves:{red:[[0, .03], [.5, .56], [1, .97]], green:[[0, 0], [.6, .55], [1, 1]], blue:[[0, .06], [1, .9]]}}});
     one('hue vs saturation', {grade:{hueSat:[[0, 1.4], [.33, .6], [.66, 1.2]]}});
+    cases.push(
+      {name:'first frame with hue curve and creative 3D LUT', source:'tag709', coldLuts:true, times:[.48],
+        clips:[{track:1, color:{grade:{hueSat:[[0, 1.4], [.33, .6], [.66, 1.2]]}, lut:luts.lut33}}]},
+      {name:'first frame with input and creative 1D LUTs', source:'flat', coldLuts:true, times:[.48],
+        clips:[{track:1, color:{lut:luts.short1D}}]});
     for (const [lut, intensity] of [['lut33', 100], ['lut33', 40], ['lut65', 100], ['lut65', 40], ['short1D', 100], ['long1D', 100], ['long1D', 55], ['domain1D', 100], ['domain1D', 60]])
       one(`${lut} at ${intensity}%`, {lut:luts[lut], lutIntensity:intensity});
     one('LUT after wheels and curves', {grade:{gain:[1.05, 1, .95, 1], curves:{master:[[0, 0], [.5, .46], [1, 1]]}}, lut:luts.lut65, lutIntensity:80});
@@ -198,14 +203,20 @@ async function main() {
         await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
         await page.waitForFunction(() => SplicePicture.stats.exactDecode && SplicePicture.stats.stale === 0);
         costs.push(await page.evaluate(() => SplicePicture.stats.frameMs));
-        out.push(await page.evaluate(({centers}) => {
-          const ctx = document.querySelector('#preview-canvas').getContext('2d');
+        out.push(await page.evaluate(({centers, coldLuts}) => {
+          const canvas = document.querySelector('#preview-canvas');
+          if (coldLuts && SplicePicture.stats.renderer === 'webgl2') {
+            const plan = Editor.framePlan(canvas);
+            SplicePicture.reset();
+            SplicePicture.render(canvas, plan);
+          }
+          const ctx = canvas.getContext('2d');
           return centers.map(([x, y]) => {
             const d = ctx.getImageData(x-3, y-3, 6, 6).data, sum = [0, 0, 0];
             for (let i = 0; i < d.length; i += 4) for (let c = 0; c < 3; c++) sum[c] += d[i+c];
             return sum.map(v => v/36);
           });
-        }, {centers}));
+        }, {centers, coldLuts:sample.item.coldLuts}));
       }
       costs.sort((a,b) => a-b);
       console.log(await page.evaluate(() => SplicePicture.stats.renderer), 'median monitor draw (ms at 640x360):', costs[Math.floor(costs.length/2)]);
