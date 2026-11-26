@@ -495,7 +495,8 @@
       if (trackLocked(clip.type, clip.track, after) && !sameValue(clip, oldClips.get(clip.id)))
         throw new Error(`Unlock ${clip.type} track ${Math.abs(clip.track)} before editing.`);
   };
-  // The topmost clip of a kind at a time. Hidden picture tracks never reach the program monitor.
+  // The topmost clip of a kind at a time. Hidden picture tracks never reach the program monitor;
+  // their clips still get media elements (see syncMedia's layers), so embedded camera sound plays.
   const at = (kind, t) =>
     project.clips
       .filter(

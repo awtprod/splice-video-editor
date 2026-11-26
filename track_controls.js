@@ -37,7 +37,10 @@
       controls.append(node);
     };
     if (lane.kind !== 'audio') {
-      // Track output toggle: a hidden picture track is left out of the program monitor and the render.
+      // Track output toggle, picture only (as in Premiere): a hidden track's pictures and titles
+      // leave the program monitor and the render (trackState['video:N'].hidden; a title lane shares
+      // its video track's state), while camera sound embedded in its clips keeps playing in both.
+      // The render side of this contract is in render_movie.py (PR #6).
       const hidden = state.hidden === true;
       button(eyeIcon(hidden), `${hidden ? 'Show' : 'Hide'} ${lane.name}`, hidden,
         () => editor.setTrackState(lane.track, lane.kind, {hidden: !hidden}));
