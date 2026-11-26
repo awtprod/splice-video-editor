@@ -1396,14 +1396,13 @@ def _render_audio_chunk(events, origin_sample, keep_from, keep_samples, limiter,
         u1 = min(event['length'], chunk_end-event['start'])
         if u1-u0 <= 1/AUDIO_RATE:
             continue
-        speed = event['speed']
         low, high = _event_source_span(event, u0, u1)
-        slices.append((event, u0, low, high))
+        slices.append((event, u0, u1, low, high))
     # Slices of one file that sit close together in the source share a seeked
     # input; the shared span is bounded so buffered audio stays small.
     inputs, offsets = [], {}
     runs = {}
-    for number, (event, _, low, high) in sorted(enumerate(slices), key=lambda row: (str(row[1][0]['path']), row[1][2])):
+    for number, (event, _, _, low, high) in sorted(enumerate(slices), key=lambda row: (str(row[1][0]['path']), row[1][3])):
         run = runs.get(event['path'])
         if run is None or low > run['high']+5 or max(high, run['high'])-run['low'] > AUDIO_SHARED_INPUT_SECONDS:
             run = runs[event['path']] = {'low': low, 'high': high, 'numbers': []}
@@ -1420,7 +1419,9 @@ def _render_audio_chunk(events, origin_sample, keep_from, keep_samples, limiter,
         path = slices[run['numbers'][0]][0]['path']
         arguments.append([*seek, '-t', f"{run['high']-offset+.25:.6f}", '-protocol_whitelist', 'file', '-i', str(path)])
     filters, labels = [], []
-    for number, (event, u0, low, high) in enumerate(slices):
+    # Every value below comes from this slice's own tuple: nothing is carried
+    # over from the loop above (a stale end silenced speed-changed clips).
+    for number, (event, u0, u1, low, high) in enumerate(slices):
         index, offset = offsets[number]
         chain = _trim_audio(filters, f'mix{number}', index, event['streams'], low-offset, high-low, event['reverse'])
         chain += event['processing']
