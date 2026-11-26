@@ -19,3 +19,5 @@
 .resolve-report details summary { opacity: .75; cursor: pointer; }
 .resolve-report details ol { max-height: 160px; overflow: auto; }
 .resolve-save footer { display: flex; gap: 8px; justify-content: flex-end; }
+.resolve-report details [data-show-all] { margin: 4px 0 0 18px; font-size: 12px; }
+.toast [data-compatibility] { margin-left: 8px; }

@@ -67,7 +67,15 @@ window.SpliceResolve = (() => {
     const summary = (project.resolveSource?.summary || []).filter(line => typeof line === 'string').slice(0, 4);
     const parts = [extra, ...summary, issues ? 'Opened from Resolve. ' + issues + ' item' + (issues === 1 ? '' : 's') + ' listed in File → Project compatibility.' : ''];
     const notice = parts.filter(Boolean).join(' ');
-    if (notice) toast(notice, extra || summary.length ? 12 : 6);
+    if (notice) {
+      const node = toast(notice, extra || summary.length || issues ? 12 : 6);
+      if (issues) {
+        const more = document.createElement('button');
+        more.type = 'button'; more.textContent = 'Details…'; more.dataset.compatibility = '';
+        more.onclick = () => { node.remove(); showCompatibility(project); };
+        node.append(' ', more);
+      }
+    }
   }
   // A fresh open of a Resolve project: every timeline's working copy belongs to this open.
   function fresh(project) {
@@ -97,6 +105,49 @@ window.SpliceResolve = (() => {
   async function pickFolder(initial = '') {
     if (!window.SpliceLink?.pickFolder) return null;
     return window.SpliceLink.pickFolder({title:'Choose the Resolve library folder', initial});
+  }
+  // A grouped line's places (clips): the first SHOWN, and a button that shows the rest.
+  const SHOWN = 20;
+  function placesList(places, summaryText) {
+    const details = document.createElement('details'), summary = document.createElement('summary');
+    summary.textContent = summaryText;
+    const list = document.createElement('ol');
+    const add = items => { for (const place of items) { const li = document.createElement('li'); li.textContent = place; list.append(li); } };
+    add(places.slice(0, SHOWN));
+    details.append(summary, list);
+    if (places.length > SHOWN) {
+      const more = document.createElement('button');
+      more.type = 'button'; more.dataset.showAll = ''; more.textContent = 'Show all ' + places.length;
+      more.onclick = () => { add(places.slice(SHOWN)); more.remove(); };
+      details.append(more);
+    }
+    return details;
+  }
+  // File → Resolve compatibility details: every grouped line of the open timeline's import, each
+  // with the clips it stands for on demand.
+  function showCompatibility(project = Editor.get().project) {
+    const warnings = (project?.compatibilityWarnings || []).filter(line => typeof line === 'string');
+    const details = project?.compatibilityDetails && typeof project.compatibilityDetails === 'object' ? project.compatibilityDetails : {};
+    if (!project?.resolveSource) { toast('This timeline was not opened from Resolve.'); return null; }
+    const node = document.createElement('dialog');
+    node.className = 'studio-dialog resolve-library resolve-compatibility';
+    node.innerHTML = '<h2>Resolve compatibility details</h2><p class="resolve-note">What Splice did not import from the ' +
+      'Resolve project, one line per kind. Open a line to see the clips it stands for.</p><div class="resolve-report"><ul></ul></div>' +
+      '<footer><button type="button" data-close>Close</button></footer>';
+    const list = node.querySelector('ul');
+    if (!warnings.length) list.innerHTML = '<li>Nothing: everything in this timeline was imported.</li>';
+    for (const line of warnings) {
+      const item = document.createElement('li'), text = document.createElement('span');
+      text.textContent = line; item.append(text);
+      const places = Array.isArray(details[line]) ? details[line].filter(place => typeof place === 'string') : [];
+      if (places.length) item.append(placesList(places, places.length + ' clip' + (places.length === 1 ? '' : 's')));
+      list.append(item);
+    }
+    document.body.append(node);
+    node.addEventListener('close', () => node.remove(), {once:true});
+    node.querySelector('[data-close]').onclick = () => node.close();
+    node.showModal();
+    return node;
   }
   const when = seconds => seconds ? new Date(seconds * 1000).toLocaleString() : 'Unknown';
   function openLibrary() {
@@ -284,13 +335,8 @@ window.SpliceResolve = (() => {
         const item = document.createElement('li'); item.dataset.status = status;
         const what = document.createElement('span'); what.textContent = line.what + (line.count > 1 ? ' — ' + line.count : '');
         item.append(what);
-        if (line.all?.length) {
-          const details = document.createElement('details'), summary = document.createElement('summary');
-          summary.textContent = line.examples.join(' · ') + (line.all.length > line.examples.length ? ' …' : '');
-          const all = document.createElement('ol');
-          for (const place of line.all) { const li = document.createElement('li'); li.textContent = place; all.append(li); }
-          details.append(summary, all); item.append(details);
-        }
+        if (line.all?.length)
+          item.append(placesList(line.all, line.examples.join(' · ') + (line.all.length > line.examples.length ? ' …' : '')));
         list.append(item);
       }
       wrap.append(heading, list);
@@ -433,5 +479,6 @@ window.SpliceResolve = (() => {
   input.onchange = () => { const file = input.files[0]; if (file) run(() => openDrp(file)); };
   $('open-resolve-library').onclick = () => openLibrary();
   $('save-resolve-library').onclick = () => run(saveToLibrary);
-  return {openDrp, openLibrary, timeline, pickFolder, saveToLibrary, parsePathMap};
+  $('resolve-compatibility').onclick = () => showCompatibility();
+  return {openDrp, openLibrary, timeline, pickFolder, saveToLibrary, parsePathMap, showCompatibility, placesList};
 })();

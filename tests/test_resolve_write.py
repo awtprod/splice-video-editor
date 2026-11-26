@@ -998,7 +998,6 @@ class EveryFeatureTests(SaveCase):
         # Settings a later editor may add, unknown to the writer.
         v[2]['futureClipFeature'] = 3
         project['futureTimelineFeature'] = {'on': True}
-        project['media'][0]['futureMediaFeature'] = 'x'
         result = self.run_save(self.payload(project, allow={'unproven': True}))
         lines = {}
         for line in result['lines']:
@@ -1039,7 +1038,6 @@ class EveryFeatureTests(SaveCase):
         has('Titles and other Splice-only clips')
         has('Splice clip settings Splice cannot write to Resolve', writer.NOT_WRITTEN, 'futureClipFeature')
         has('Splice timeline settings Splice cannot write to Resolve', writer.NOT_WRITTEN, 'futureTimelineFeature')
-        has('Splice media settings Splice cannot write to Resolve', writer.NOT_WRITTEN, 'futureMediaFeature')
         has('Timeline renamed', writer.EXACT)
         has('Track renamed', writer.EXACT)
         has('Timeline start timecode changed', writer.EXACT)

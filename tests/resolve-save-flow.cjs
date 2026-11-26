@@ -59,6 +59,27 @@ async function main() {
     });
     const wanted = await shape();
 
+    // File → Resolve compatibility details…: the grouped lines of the import, each opening to its
+    // clips (the first 20, then "Show all").
+    await fileMenu('#resolve-compatibility');
+    const details = page.locator('dialog.resolve-compatibility');
+    await details.waitFor();
+    const shown = await page.evaluate(() => Editor.get().project.compatibilityWarnings?.length || 0);
+    assert.equal(await details.locator('.resolve-report > ul > li').count(), Math.max(1, shown));
+    await details.locator('[data-close]').click();
+    await page.evaluate(() => {
+      const line = 'Clips with Fusion compositions — 45 clips';
+      SpliceResolve.showCompatibility({resolveSource:{}, compatibilityWarnings:[line, 'Another line'],
+        compatibilityDetails:{[line]:Array.from({length:45}, (_, n) => 'Clip ' + (n + 1))}});
+    });
+    const crafted = page.locator('dialog.resolve-compatibility');
+    await crafted.locator('details summary').click();
+    assert.equal(await crafted.locator('details ol li').count(), 20);
+    await crafted.locator('[data-show-all]').click();
+    assert.equal(await crafted.locator('details ol li').count(), 45);
+    assert.equal(await crafted.locator('[data-show-all]').count(), 0);
+    await crafted.locator('[data-close]').click();
+
     // File → Save to Resolve library…: the library, a new name, the .drp seed needs the opt-in.
     await fileMenu('#save-resolve-library');
     const dialog = page.locator('dialog.resolve-save');
@@ -82,6 +103,10 @@ async function main() {
     const report = await dialog.locator('.resolve-report').innerText();
     for (const line of ['Clips disabled or enabled', 'Clip volume changes', 'Seed made from the .drp', 'Everything else in the seed'])
       assert.ok(report.includes(line), report);
+    // The editor's own bookkeeping is no edit: nothing it adds while opening and editing is reported.
+    for (const line of ['cannot write to Resolve', 'Opacity changes', 'Timeline markers', 'Track sync lock', 'Splice color',
+      'Clip names changed', 'Track mixer'])
+      assert.ok(!report.includes(line), report);
     assert.ok(await dialog.locator('[data-save]').isEnabled());
     await dialog.locator('[data-save]').click();
     await dialog.locator('[role=status]', {hasText:'Saved “Cut from Splice”'}).waitFor();

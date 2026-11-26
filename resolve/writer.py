@@ -71,7 +71,8 @@ TRANSFORM_FIELDS = {'x': 0, 'y': 0, 'scale': 100, 'rotation': 0}
 KEYFRAME_FIELDS = ('opacity', 'x', 'y', 'scale', 'rotation', 'volume')
 TRACK_STATE_FIELDS = {'locked': 'written', 'hidden': 'written', 'syncLocked': 'reported'}
 TRACK_MIX_FIELDS = {'mute': 'written', 'gain': 'reported', 'pan': 'reported', 'solo': 'reported'}
-#: Media fields: what the writer reads; ``name`` (a rename in Splice) is reported.
+#: Media fields the project format names: what the writer reads; ``name`` (a rename in Splice) is
+#: reported. Fields Splice adds when it measures or links a file are facts of the file, not edits.
 MEDIA_FIELDS = {
     'id': 'meta', 'name': 'reported', 'src': 'written', 'type': 'written', 'duration': 'meta', 'path': 'written',
     'offline': 'meta', 'bin': 'meta', 'thumb': 'meta', 'resolveMediaId': 'written', 'resolveAudioTracks': 'meta',
@@ -930,15 +931,8 @@ class Writer:
             if old is not None and media.get('name') != old.get('name'):
                 report.add(NOT_WRITTEN, 'Media renamed in Splice (Resolve keeps its media-pool names)',
                            f'{old.get("name")} → {media.get("name")}')
-            for field in media:
-                if field in MEDIA_FIELDS or field.startswith('_'):
-                    continue
-                if old is not None and _same(media.get(field), old.get(field)):
-                    continue
-                if old is None and media.get(field) in (None, False, 0, '', [], {}):
-                    continue
-                report.add(NOT_WRITTEN, 'Splice media settings Splice cannot write to Resolve',
-                           f'{media.get("name") or "Media"} ({field})')
+            # Other media fields are what Splice measured or linked (path, fingerprint, rate, HDR
+            # and the like): facts of the file, not edits; the file itself is what is written.
         for field in project:
             if field in PROJECT_FIELDS or field.startswith('_'):
                 continue
