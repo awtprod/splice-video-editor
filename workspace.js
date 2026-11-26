@@ -802,7 +802,6 @@
       item.onclick=()=>{close();safeEdit(()=>editor.bringIntoSync(id,how));};
       menu.append(item);
     }
-    menu.onkeydown=event=>{if(event.key==="Escape")close();};
     window.addEventListener("pointerdown",dismiss,true);
     document.body.append(menu);
     menu.querySelector("button").focus();
@@ -1148,6 +1147,8 @@
   }
   window.SpliceKeys={keyBelongsToControl};
   document.addEventListener("keydown", (e) => {
+    // Escape closes the sync menu wherever focus is.
+    if (e.key === "Escape" && closeSyncMenu) { e.preventDefault(); closeSyncMenu(); return; }
     if (document.querySelector("dialog:modal") || e.target?.closest?.(".source-dialog, .sync-menu")) return;
     const typing=keyBelongsToControl(document.activeElement,e);
     const binding=keymap.find(row=>row.test&&(row.anywhere||!typing)&&row.test(e));

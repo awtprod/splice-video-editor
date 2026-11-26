@@ -929,13 +929,16 @@
     clip.keyframes = Math.abs(shift)<1e-6 && Math.abs(original.duration-clip.duration)<1e-6 ?
       structuredClone(original.keyframes) : clipKeyframeWindow(original.keyframes,shift,shift+clip.duration);
   }
-  function splitClipAt(clip,cut) {
+  // `source` is the project being edited, which may already differ from the current one
+  // (a lift drops the transitions it cuts through before cutting the clips around them).
+  function splitClipAt(clip,cut,source=project) {
     const offset=cut-clip.start, duration=clip.duration;
     if (offset<=1e-6 || offset>=duration-1e-6) return null;
     if (['dissolve','wipe','fade'].includes(clip.transition) && offset<transitionLength(clip)-transitionBefore(clip)-1e-6)
       throw new Error('Move the cut outside the transition before splitting this clip.');
     if (clip.transition==='native') throw new Error('Replace the imported transition before splitting this clip.');
-    const following = followingTransition(clip);
+    const indexed = followingTransition(clip);
+    const following = indexed && source.clips.find(other=>other.id===indexed.id && ['dissolve','wipe'].includes(other.transition));
     if (following && cut>following.start-transitionBefore(following)+1e-6)
       throw new Error('Move the cut outside the start of the following transition.');
     const speed=Number(clip.speed)||1;
@@ -1407,13 +1410,13 @@
       if (!crossing(clip)) { kept.push(clip); continue; }
       const head = clip.start < from - 1e-6, tail = clip.start + clip.duration > to + 1e-6;
       if (head && tail) {
-        const middle = splitClipAt(clip, from);
-        kept.push(clip, regroup(splitClipAt(middle, to)));
+        const middle = splitClipAt(clip, from, source);
+        kept.push(clip, regroup(splitClipAt(middle, to, source)));
       } else if (head) {
-        splitClipAt(clip, from);
+        splitClipAt(clip, from, source);
         kept.push(clip);
       } else if (tail) {
-        const right = splitClipAt(clip, to);
+        const right = splitClipAt(clip, to, source);
         const native = {};
         for (const key of ["premiereIndex", "premiereTrack"]) if (key in clip) native[key] = clip[key];
         kept.push({...right, ...native, id: clip.id});
@@ -1430,7 +1433,7 @@
       if (!lanes.has(laneOf(clip)) && !syncLocked(clip.type, clip.track, source)) continue;
       if (clip.start >= at - 1e-5) clip.start += length;
       else if (clip.start + clip.duration > at + 1e-5) {
-        const right = splitClipAt(clip, at);
+        const right = splitClipAt(clip, at, source);
         if (!right) continue;
         right.start += length;
         additions.push(regroup(right));
@@ -1449,7 +1452,7 @@
     const rights = [];
     for (const clip of source.clips) {
       if (crossing.has(clip.id)) {
-        const right = splitClipAt(clip, cut);
+        const right = splitClipAt(clip, cut, source);
         if (!right) continue;
         if (clip.linkGroup) right.linkGroup = groups.get(clip.linkGroup);
         rights.push(right);
