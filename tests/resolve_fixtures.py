@@ -437,20 +437,6 @@ def write_library(spec, folder, user='guest'):
     return project / 'Project.db'
 
 
-if __name__ == '__main__':
-    mode, out, video, audio = sys.argv[1:5]
-    spec = sample(video, audio, generator='--no-generator' not in sys.argv[5:])
-    if '--states' in sys.argv[5:]:
-        spec['timelines'][0]['tracks'][1]['flags'] = 3
-    if '--reverse' in sys.argv[5:]:  # Resolve reordered the timelines and saved again
-        spec['timelines'].reverse()
-        spec['saved'] += 60
-    if mode == 'drp':
-        Path(out).write_bytes(drp_bytes(spec))
-    else:
-        print(write_library(spec, out))
-
-
 # --------------------------------------------------------------------------- Resolve 21.1 seeds
 #
 # A synthetic project laid out the way Resolve 21.1 (project version 17) stores a disk-library
@@ -494,6 +480,29 @@ SEED_TABLES = {
     'ListMgt::LmVersionTable': ['ListMgt::LmVersionTable_id', 'DbType', 'Sm2TiItem_id', 'Sm2MpMedia_id'],
     'TriggerControl': ['Name', 'Enable'],
 }
+_BLOBS = {'FieldsBlob', 'Clip', 'Time', 'Geometry', 'Radiometry', 'Proxy', 'VideoMetadata', 'MediaMetadata',
+          'TracksBA', 'FrameRate', 'Resolution', 'MediaExtents', 'MarkersBA', 'MediaTimemapBA', 'EffectFiltersBA',
+          'PreConformMediaExtents', 'ImportExportMetadataBA', 'MediaFrameRate', 'VirtualAudioTrackBA', 'RenderCacheBA',
+          'AudioMixerBA', 'PinsBA', 'SlateTC'}
+_INTEGERS = {'ProjectVersion', 'LastModTimeInSecs', 'DbSavedTime', 'Type', 'SubType', 'Flags', 'UiMemento',
+             'PriorityIndex', 'ThumbnailDirtyFlag', 'RenderTextEnabled', 'RenderTextGanged', 'RenderTextPrefixed',
+             'LastChangedTime', 'LastRenderedTime', 'IsMarkedForCaching', 'IsForceConformed', 'MatchConflictState',
+             'MediaTrackIdx', 'IsPreConformed', 'UseOppositeSrcForLeftEye', 'UseOppositeSrcForRightEye', 'WasDisbanded',
+             'CurrentSelectorIdx', 'AlignmentType', 'Position', 'VideoType', 'Enable'}
+_DOUBLES = {'MediaStartTime', 'MixedFrameRateAlignment'}
+
+
+def declared(column):
+    """The type Resolve's schema declares for a column (as far as these tests need)."""
+    if column in _BLOBS:
+        return 'BLOB'
+    if column in _INTEGERS:
+        return 'integer'
+    if column in _DOUBLES:
+        return 'double precision'
+    return 'character varying'
+
+
 SEED_JOINS = ['SM_Project_Sm2Timeline', 'Sm2MpFolder_Sm2MpMedia', 'BtAudioInfo_Sm2MpMedia',
               'Sm2SequenceContainer_Sm2TiTrack', 'Sm2TiItem_Sm2TiTrack']
 SEED_TRIGGERS = [
@@ -725,7 +734,7 @@ def write_seed(path, pic, snd, *, name='Seed project', with_grade=False, timelin
     try:
         conn.execute('PRAGMA journal_mode=DELETE')
         for table, columns in SEED_TABLES.items():
-            conn.execute(f'CREATE TABLE "{table}" (' + ', '.join(f'"{c}"' for c in columns) + ')')
+            conn.execute(f'CREATE TABLE "{table}" (' + ', '.join(f'"{c}" {declared(c)}' for c in columns) + ')')
         for join in SEED_JOINS:
             conn.execute(f'CREATE TABLE "{join}" {JOIN}')
         for trigger in SEED_TRIGGERS:
@@ -839,3 +848,70 @@ def make_media(folder):
     subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i', 'sine=f=440:r=48000:d=3', '-ac', '2',
                     '-c:a', 'pcm_s24le', str(snd)], check=True)
     return pic, snd
+
+
+def drp_from_db(db_path, out_path):
+    """A ``.drp`` laid out from a library ``Project.db`` the way the reader lays rows out as XML
+    (binary columns as hex), so a test can open the seed as a .drp."""
+    import xml.etree.ElementTree as ET
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from resolve import source
+    conn = source.connect(db_path, 10 ** 12)
+    try:
+        layout = source._Layout(source._Rows(conn))
+        project, bins, containers = layout.project(), layout.bins(), layout.containers()
+    finally:
+        conn.close()
+
+    def hexed(node):
+        for el in node.iter():
+            if isinstance(el.text, bytes):
+                el.text = el.text.hex()
+        return HEADER.replace('DbPrjVer="15"', 'DbPrjVer="17"') + ET.tostring(node, encoding='unicode')
+    parents = {f.get('DbId'): (f.findtext('Name'), f.findtext('MpFolder')) for f in bins}
+
+    def folder_path(fid):
+        names, seen = [], set()
+        while fid in parents and fid not in seen:
+            seen.add(fid)
+            names.append(parents[fid][0])
+            fid = parents[fid][1]
+        return '/'.join(reversed(names))
+    with zipfile.ZipFile(out_path, 'w', zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr('project.xml', hexed(project))
+        for folder in bins:
+            archive.writestr(f'MediaPool/{folder_path(folder.get("DbId"))}/MpFolder.xml', hexed(folder))
+        for container in containers:
+            archive.writestr(f'SeqContainer/{container.get("DbId")}.xml', hexed(container))
+
+
+def _seed_main(argv):
+    """``seed LIBRARY MEDIA_FOLDER DRP_OUT``: FFmpeg media in MEDIA_FOLDER, a library holding a
+    Resolve 21.1-shaped seed project that names them by their paths here, the same project as a
+    .drp at DRP_OUT, and a second project in the library (the schema donor a .drp save needs)."""
+    library, folder, drp_out = argv
+    pic, snd = make_media(folder)
+    db, made = seed_library(library, (str(pic), str(pic)), (str(snd), str(snd)), name='Seed project')
+    import shutil
+    donor = Path(library) / 'Resolve Projects' / 'Users' / 'guest' / 'Projects' / 'Template'
+    donor.mkdir()
+    shutil.copyfile(db, donor / 'Project.db')
+    drp_from_db(db, drp_out)
+    print(json.dumps({'db': str(db), 'pic': str(pic), 'snd': str(snd), 'start': made['start']}))
+
+
+if __name__ == '__main__' and sys.argv[1:2] == ['seed']:
+    import json
+    _seed_main(sys.argv[2:])
+elif __name__ == '__main__':
+    mode, out, video, audio = sys.argv[1:5]
+    spec = sample(video, audio, generator='--no-generator' not in sys.argv[5:])
+    if '--states' in sys.argv[5:]:
+        spec['timelines'][0]['tracks'][1]['flags'] = 3
+    if '--reverse' in sys.argv[5:]:  # Resolve reordered the timelines and saved again
+        spec['timelines'].reverse()
+        spec['saved'] += 60
+    if mode == 'drp':
+        Path(out).write_bytes(drp_bytes(spec))
+    else:
+        print(write_library(spec, out))

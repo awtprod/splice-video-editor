@@ -298,8 +298,8 @@ def make_seed(drp_path, donor, target, report, allow_unproven):
                          'into a library project first, and that conversion is not proven exact.')
     conv, statements, page, encoding, version, carried = convert(drp_path, donor)
     project = conv.rows.get('SM_Project', {})
-    versions = {r.get('ProjectVersion') for r in project.values()}
-    if versions != {version}:
+    versions = {str(r.get('ProjectVersion')) for r in project.values()}
+    if versions != {str(version)}:
         raise WriteError(f'The .drp is of another project version ({sorted(map(str, versions))}) than this library\'s '
                          f'Resolve ({version}); open it in Resolve 21 and export it again.')
     write(conv, statements, page, encoding, carried, target)
