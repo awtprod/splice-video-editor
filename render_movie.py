@@ -60,11 +60,14 @@ VIDEO_WINDOW_CUTS = 24
 REVERSE_BUFFER_BYTES = 768 * 1024 * 1024
 DEFAULT_STALL_SECONDS = 300
 DEFAULT_LIMITER_CEILING_DB = -1.0
-# Lossy (AAC) deliveries limit true peak (4x oversampled). The encoder adds
-# overshoot of its own (about 2 dB on some programs), so the decoded file is
-# measured and re-encoded quieter until it is under the ceiling.
+# Lossy (AAC) deliveries limit true peak (4x oversampled) before the encoder.
+# The encoder adds overshoot of its own (about 2 dB on some programs): the
+# decoded file is measured once and reported, with a warning when it is over
+# the ceiling. Only the opt-in aacPeakSafe option lowers the whole program to
+# fit, in fixed steps from the measured excess.
 TRUE_PEAK_OVERSAMPLE = 4
 AAC_PEAK_ATTEMPTS = 6
+AAC_PEAK_STEP_DB = .5
 # A disabled clip next to a transition is kept as a transparent stand-in with
 # this media id, so its neighbour's transition runs against nothing.
 DISABLED_MEDIA = '\x00disabled'
@@ -258,6 +261,20 @@ def _graph_args(graph, directory, name):
     return [_graph_file_option(), str(script)]
 
 
+def _stop_tree(process, force=True):
+    """Stop FFmpeg. On Windows stop its whole process tree (taskkill /T); on
+    POSIX anything it started stays in the export job's process group, which
+    the job kills when its worker ends (export_jobs)."""
+    if os.name == 'nt':
+        taskkill = Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32' / 'taskkill.exe'
+        try:
+            subprocess.run([str(taskkill), '/PID', str(process.pid), '/T', '/F'], capture_output=True, timeout=4)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    if process.poll() is None:
+        process.kill() if force else process.terminate()
+
+
 def _run_ffmpeg(command, cancelled=None, heartbeat=None):
     """Run FFmpeg until it exits. Fail only when it makes no progress for the stall limit."""
     if command[0] != 'ffmpeg':
@@ -294,7 +311,7 @@ def _run_ffmpeg(command, cancelled=None, heartbeat=None):
     try:
         while process.poll() is None:
             if cancelled and cancelled.is_set():
-                process.terminate()
+                _stop_tree(process, force=False)
                 raise InterruptedError('Export cancelled')
             with lock:
                 last = state['progress']
@@ -303,7 +320,7 @@ def _run_ffmpeg(command, cancelled=None, heartbeat=None):
                 if heartbeat:
                     heartbeat()
             if time.monotonic() - last > stall:
-                process.kill()
+                _stop_tree(process)
                 raise TimeoutError(f'FFmpeg made no progress for {stall:g} seconds, so the export was stopped '
                                    '(limit set by SPLICE_EXPORT_STALL_SECONDS)')
             time.sleep(.2)
@@ -316,7 +333,7 @@ def _run_ffmpeg(command, cancelled=None, heartbeat=None):
         return ''.join(errors)
     finally:
         if process.poll() is None:
-            process.kill()
+            _stop_tree(process)
         try:
             process.wait(timeout=30)
         except subprocess.TimeoutExpired:
@@ -1548,8 +1565,9 @@ def _prerender_event(event, u0, u1, target, directory, cancelled, heartbeat):
                 start=event['start']+u0, processing='anull', envelope=envelope, stateful=False, prerendered=True)
 
 
-def _render_audio(events, first_sample, stop_sample, limiter, directory, cancelled, heartbeat, progress=None):
-    """Render the mix as consecutive chunk files; returns their paths in order."""
+def _audio_chunk_spans(events, first_sample, stop_sample):
+    """The (begin, end) sample spans the mix is rendered in: a minute at most,
+    shorter where more than AUDIO_CHUNK_EVENTS events start in one."""
     import bisect
     starts = [event['start'] for event in events]
     preroll = round(AUDIO_PREROLL_SECONDS*AUDIO_RATE)
@@ -1564,23 +1582,65 @@ def _render_audio(events, first_sample, stop_sample, limiter, directory, cancell
             end = max(current+AUDIO_RATE, min(end, limit))
         chunks.append((current, min(end, stop_sample)))
         current = chunks[-1][1]
-    paths, active, pointer = [], [], 0
+    return chunks
+
+
+def _audio_schedule(events, first_sample, stop_sample):
+    """Walk the chunks in render order. Yields (number, begin, end, origin,
+    arrivals, chunk count): arrivals are (event, prerender span or None) for the
+    events that join at this chunk. A stateful event (tempo, resampling) that
+    crosses a seam is pre-rendered from u0 to u1 when it arrives."""
+    chunks = _audio_chunk_spans(events, first_sample, stop_sample)
+    preroll = round(AUDIO_PREROLL_SECONDS*AUDIO_RATE)
     origins = [max(0, begin-preroll) for begin, _ in chunks]
     last_needed = stop_sample/AUDIO_RATE+AUDIO_POSTROLL_SECONDS
-    prerendered = 0
+    pointer = 0
     for number, (begin, end) in enumerate(chunks):
-        if cancelled and cancelled.is_set(): raise InterruptedError('Export cancelled')
         origin = origins[number]
+        arrivals = []
         while pointer < len(events) and events[pointer]['start'] < end/AUDIO_RATE+AUDIO_POSTROLL_SECONDS:
             event = events[pointer]; pointer += 1
+            span = None
             u0 = max(0.0, origin/AUDIO_RATE-event['start'])
             spans_seam = number+1 < len(origins) and event['start']+event['length'] > origins[number+1]/AUDIO_RATE
             reversed_span = event['length']*event['speed'] if event['reverse'] else 0
             if event.get('stateful') and (u0 > 0 or spans_seam) and reversed_span <= AUDIO_REVERSE_PRERENDER_SECONDS:
                 u1 = min(event['length'], last_needed-event['start'])
                 if u1-u0 > 1/AUDIO_RATE:
-                    target = Path(directory)/f'event-{prerendered:06d}.wav'; prerendered += 1
-                    event = _prerender_event(event, u0, u1, target, directory, cancelled, heartbeat)
+                    span = (u0, u1)
+            arrivals.append((event, span))
+        yield number, begin, end, origin, arrivals, len(chunks)
+
+
+def _prerender_bytes(u0, u1):
+    """Size of a pre-rendered event file (32-bit float stereo WAV)."""
+    return (math.ceil((u1-u0)*AUDIO_RATE)+2)*2*4 + 4096
+
+
+def _prerender_peak_bytes(events, first_sample, stop_sample):
+    """Most pre-rendered event bytes on disk at once, following _render_audio's
+    order exactly: files are made as their events arrive and deleted once a
+    chunk starts after their end."""
+    alive, peak = [], 0
+    for _, _, _, origin, arrivals, _ in _audio_schedule(events, first_sample, stop_sample):
+        for event, span in arrivals:
+            if span:
+                alive.append((event['start']+span[1], _prerender_bytes(*span)))
+        peak = max(peak, sum(size for _, size in alive))
+        alive = [(finish, size) for finish, size in alive if finish > origin/AUDIO_RATE]
+    return peak
+
+
+def _render_audio(events, first_sample, stop_sample, limiter, directory, cancelled, heartbeat, progress=None):
+    """Render the mix as consecutive chunk files; returns their paths in order."""
+    paths, active = [], []
+    prerendered = 0
+    for number, begin, end, origin, arrivals, count in _audio_schedule(events, first_sample, stop_sample):
+        if cancelled and cancelled.is_set(): raise InterruptedError('Export cancelled')
+        for event, span in arrivals:
+            if span:
+                target = Path(directory)/f'event-{prerendered:06d}.wav'; prerendered += 1
+                event = _prerender_event(event, *span, target, directory, cancelled, heartbeat)
             active.append(event)
         for event in active:
             if event.get('prerendered') and event['start']+event['length'] <= origin/AUDIO_RATE:
@@ -1590,7 +1650,7 @@ def _render_audio(events, first_sample, stop_sample, limiter, directory, cancell
         _render_audio_chunk([event for event in active if event['start'] < end/AUDIO_RATE+AUDIO_POSTROLL_SECONDS], origin, begin-origin, end-begin,
                             limiter, target, directory, cancelled, heartbeat)
         paths.append(target)
-        if progress: progress((number+1)/len(chunks))
+        if progress: progress((number+1)/count)
     for event in active:
         if event.get('prerendered'):
             Path(event['path']).unlink(missing_ok=True)
@@ -1604,13 +1664,15 @@ def _concat_list(directory, name, paths):
 
 
 def render_to_file(project, output_path, *, options=None, progress=None, cancelled=None, heartbeat=None,
-                   work_directory=None, _nested_depth=0):
+                   work_directory=None, report=None, _nested_depth=0):
     """Resolve imported nested Premiere sequences, then render the parent timeline.
 
     ``heartbeat`` is called whenever FFmpeg makes progress, so a supervisor
     can tell a long render from a stuck one. ``work_directory`` is where the
     render's scratch folder is made (default: work_root()); an export job
     passes its own folder so killing the job leaves nothing elsewhere.
+    ``report``, when a dict, receives measurements of the delivered file
+    (``report['audio']``: decoded AAC true peak, loudness, any gain applied).
     """
     import copy
     if not isinstance(project,dict) or not isinstance(project.get('media'),list): raise ValueError('Invalid project')
@@ -1622,7 +1684,7 @@ def render_to_file(project, output_path, *, options=None, progress=None, cancell
     enabled_media = {clip.get('mediaId') for clip in project.get('clips') or [] if isinstance(clip, dict) and clip_enabled(clip)}
     if not any(isinstance(item,dict) and item.get('nestedProject') for item in project['media']):
         return _render_prepared(project,output_path,options=options,progress=progress,cancelled=cancelled,heartbeat=heartbeat,
-                                work_directory=work_directory)
+                                work_directory=work_directory,report=report)
     MEDIA_ROOT.mkdir(parents=True,exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='splice-nested-',dir=MEDIA_ROOT) as directory:
         prepared=copy.deepcopy(project)
@@ -1643,7 +1705,7 @@ def render_to_file(project, output_path, *, options=None, progress=None, cancell
             for clip in prepared['clips']:
                 if clip.get('mediaId')==item['id']: clip.pop('nestedSequence',None)
         return _render_prepared(prepared,output_path,options=options,progress=progress,cancelled=cancelled,heartbeat=heartbeat,
-                                work_directory=work_directory)
+                                work_directory=work_directory,report=report)
 
 
 def _track_hidden(track_state, kind, track):
@@ -1663,12 +1725,14 @@ def _export_settings(options):
     enabled = options.get('limiter', True)
     if not isinstance(enabled, bool): raise ValueError('Invalid limiter setting: use true or false')
     ceiling = _number(options.get('limiterCeiling', DEFAULT_LIMITER_CEILING_DB), 'limiter ceiling (dBFS)', -24, 0)
+    peak_safe = options.get('aacPeakSafe', False)
+    if not isinstance(peak_safe, bool): raise ValueError('Invalid aacPeakSafe setting: use true or false')
     _number(options.get('crf',20),'quality',14,32)
     _number(options.get('audioBitrate',192),'audio bitrate',64,320)
     language = options.get('subtitleLanguage', 'und')
     if not isinstance(language, str) or len(language) != 3 or not language.isascii() or not language.isalpha() or not language.islower():
         raise ValueError('Invalid subtitle language: use a three-letter ISO 639-2 code such as eng, spa or und')
-    return codec, color_space, (ceiling if enabled else None), language
+    return codec, color_space, (ceiling if enabled else None), language, peak_safe
 
 
 def _validate_timeline(project):
@@ -1713,11 +1777,12 @@ def _estimated_bytes(width, height, fps, seconds, codec):
     return video, seconds*AUDIO_RATE*2*4
 
 
-def _render_prepared(project, output_path, *, options=None, progress=None, cancelled=None, heartbeat=None, work_directory=None):
+def _render_prepared(project, output_path, *, options=None, progress=None, cancelled=None, heartbeat=None, work_directory=None,
+                     report=None):
     """Render bounded picture windows and audio chunks, then mux them in one pass."""
     import copy
     options = dict(options or {})
-    codec, color_space, limiter, language = _export_settings(options)
+    codec, color_space, limiter, language, peak_safe = _export_settings(options)
     # One private copy: probe results are cached on its media items.
     project = copy.deepcopy(project)
     total = _validate_timeline(project)
@@ -1800,10 +1865,10 @@ def _render_prepared(project, output_path, *, options=None, progress=None, cance
     root = Path(work_directory) if work_directory else work_root()
     video_bytes, audio_bytes = _estimated_bytes(width, height, fps, out_duration, codec)
     # A speed-changed or resampled clip that crosses a chunk seam is rendered
-    # whole first (32-bit float stereo); the longest one is on disk at a time.
+    # whole first (32-bit float stereo). Count the most of those files that are
+    # on disk at once, following the mix's own schedule (overlapping ones add up).
     # Lossy deliveries also keep an AAC file until the mux.
-    longest_stateful = max((event['length'] for event in events if event.get('stateful')), default=0)
-    audio_bytes += min(longest_stateful, out_duration+AUDIO_PREROLL_SECONDS)*AUDIO_RATE*2*4
+    audio_bytes += _prerender_peak_bytes(events, first_sample, stop_sample)
     if codec == 'h264':
         audio_bytes += out_duration*40_000
     output = Path(output_path)
@@ -1831,7 +1896,9 @@ def _render_prepared(project, output_path, *, options=None, progress=None, cance
         audio_list = _concat_list(directory,'audio.txt',chunks)
         if lossy:
             bitrate = str(int(_number(options.get('audioBitrate',192),'audio bitrate',64,320)))+'k'
-            audio_file = _encode_aac(audio_list, bitrate, limiter, directory, cancelled, heartbeat)
+            audio_file, measured = _encode_aac(audio_list, bitrate, limiter, peak_safe, directory, cancelled, heartbeat)
+            if report is not None and measured:
+                report['audio'] = measured
             audio_input = ['-i',str(audio_file)]
         else:
             audio_input = ['-f','concat','-safe','0','-i',str(audio_list)]
@@ -1865,36 +1932,81 @@ def _render_prepared(project, output_path, *, options=None, progress=None, cance
         return output.stat().st_size
 
 
-def _true_peak_db(path, cancelled, heartbeat):
-    """Decoded true peak (dBTP, 4x oversampled, ITU-R BS.1770) of an audio file."""
+def _measure_decoded(path, cancelled, heartbeat):
+    """Decoded true peak (dBTP, 4x oversampled) and integrated loudness (LUFS), ITU-R BS.1770."""
     report = _run_ffmpeg(['ffmpeg','-nostdin','-hide_banner','-nostats','-loglevel','info','-i',str(path),
                           '-af','ebur128=peak=true:framelog=quiet','-f','null','-'],cancelled,heartbeat)
-    tail = report[report.rfind('True peak:'):]
     import re
-    match = re.search(r'Peak:\s+(-?[0-9.]+|-inf)\s+dBFS', tail)
-    if not match:
+    summary = report[report.rfind('Integrated loudness:'):]
+    peak = re.search(r'True peak:\s+Peak:\s+(-?[0-9.]+|-inf)\s+dBFS', summary)
+    loudness = re.search(r'I:\s+(-?[0-9.]+|-inf|nan)\s+LUFS', summary)
+    if not peak:
         raise ValueError('Could not measure the exported audio peak')
-    return -math.inf if match.group(1) == '-inf' else float(match.group(1))
+    value = lambda text: -math.inf if text == '-inf' else float(text)
+    return value(peak.group(1)), (value(loudness.group(1)) if loudness and loudness.group(1) != 'nan' else -math.inf)
 
 
-def _encode_aac(audio_list, bitrate, ceiling, directory, cancelled, heartbeat):
-    """Encode the mix to AAC; with a limiter ceiling, keep the decoded true peak under it."""
+def _true_peak_db(path, cancelled, heartbeat):
+    """Decoded true peak (dBTP, 4x oversampled, ITU-R BS.1770) of an audio file."""
+    return _measure_decoded(path, cancelled, heartbeat)[0]
+
+
+def _db_text(value):
+    return f'{value:+.1f}'.replace('+', '+' if value > 0 else '').replace('-', '\u2212') if math.isfinite(value) else '-inf'
+
+
+def _encode_aac(audio_list, bitrate, ceiling, peak_safe, directory, cancelled, heartbeat):
+    """Encode the limited mix to AAC once at unity gain and measure the decoded file.
+
+    Returns (path, measurements). Without a ceiling (limiter off) nothing is
+    measured. By default the program level is never changed here: a decoded
+    true peak over the ceiling (AAC overshoot) is reported with a warning.
+    With ``peak_safe`` (export option aacPeakSafe) the whole program is
+    re-encoded quieter until the decoded true peak fits: the first gain is the
+    measured excess rounded up to the next AAC_PEAK_STEP_DB, then one step more
+    per attempt. Every step depends only on the decoded measurements, so the
+    same mix always gets the same gain.
+    """
+    import warnings
     target = Path(directory)/'audio.m4a'
-    gain = 0.0
-    for attempt in range(AAC_PEAK_ATTEMPTS):
-        volume = ['-af', f'volume={gain:.3f}dB'] if gain else []
+
+    def encode(gain):
+        volume = ['-af', f'volume={gain:.2f}dB'] if gain else []
         _run_ffmpeg(['ffmpeg','-nostdin','-hide_banner','-loglevel','error','-y','-f','concat','-safe','0',
                      '-i',str(audio_list),*volume,'-c:a','aac','-b:a',bitrate,str(target)],cancelled,heartbeat)
-        if ceiling is None:
-            return target
-        peak = _true_peak_db(target, cancelled, heartbeat)
+    encode(0)
+    if ceiling is None:
+        return target, None
+    peak, loudness = _measure_decoded(target, cancelled, heartbeat)
+    measured = {'ceilingDb': ceiling, 'decodedTruePeakDb': round(peak, 2), 'loudnessLufs': round(loudness, 2),
+                'aacPeakSafe': peak_safe, 'gainDb': 0.0}
+    if peak <= ceiling:
+        return target, measured
+    if not peak_safe:
+        warnings.warn(f'The MP4 audio peaks at {_db_text(peak)} dBTP once decoded, above the {_db_text(ceiling)} dBTP ceiling: '
+                      'the mix is limited to the ceiling, and AAC encoding adds the overshoot. Program loudness was left '
+                      f'unchanged ({_db_text(loudness)} LUFS). To deliver under the ceiling, lower the limiter ceiling, export with '
+                      'the aacPeakSafe option (it lowers the whole program until the decoded peak fits), or export WAV or ProRes.',
+                      stacklevel=2)
+        return target, measured
+    excess = peak-ceiling
+    gain = -math.ceil(excess/AAC_PEAK_STEP_DB-1e-9)*AAC_PEAK_STEP_DB
+    for attempt in range(AAC_PEAK_ATTEMPTS):
+        encode(gain)
+        peak, loudness = _measure_decoded(target, cancelled, heartbeat)
         if peak <= ceiling:
-            return target
-        # Overshoot does not scale exactly with level: lower by the excess plus a margin.
-        gain -= peak-ceiling+.1
-    import warnings
-    warnings.warn(f'The exported AAC audio peaks at {peak:.1f} dBTP, above the {ceiling:g} dBFS limiter ceiling', stacklevel=2)
-    return target
+            break
+        if attempt+1 < AAC_PEAK_ATTEMPTS:
+            gain -= AAC_PEAK_STEP_DB
+    measured.update(decodedTruePeakDb=round(peak, 2), loudnessLufs=round(loudness, 2), gainDb=round(gain, 2))
+    if peak <= ceiling:
+        warnings.warn(f'aacPeakSafe lowered the whole program by {-gain:.1f} dB '
+                      f'(now {_db_text(loudness)} LUFS) so the decoded MP4 audio peaks at {_db_text(peak)} dBTP, '
+                      f'under the {_db_text(ceiling)} dBTP ceiling.', stacklevel=2)
+    else:
+        warnings.warn(f'aacPeakSafe lowered the whole program by {-gain:.1f} dB, but the decoded MP4 audio still '
+                      f'peaks at {_db_text(peak)} dBTP, above the {_db_text(ceiling)} dBTP ceiling.', stacklevel=2)
+    return target, measured
 
 
 def _render_picture(project, picture, first, stop, total_frames, fps, width, height, codec, options, directory,

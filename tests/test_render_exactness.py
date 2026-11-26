@@ -160,6 +160,24 @@ class FrameSampling(ExactCase):
         cuts = [(k/25 - eps, 2, False) for k in range(10, 380, 25) for eps in (.001, .03, .045)]
         self.assertAllShown(self.cuts(source, 25, cuts))
 
+    def test_container_start_that_is_not_on_the_picture_time_base(self):
+        # Round 2, finding 5: the container starts at the audio's first sample
+        # (about 0.011 s), the picture at 0.25 s on a 1/600 time base. Ignoring the
+        # container start moved 151 of 2,799 frames in the fix-check.
+        plain = numbered(self.directory / 'plain.mp4', 30000/1001, 24, extra=('-g', '12', '-bf', '2'))
+        source = self.directory / 'off-start.mov'
+        ffmpeg('-itsoffset', '0.25', '-i', str(plain), '-itsoffset', '0.011995', '-f', 'lavfi', '-i', 'sine=r=44100:d=20',
+               '-map', '0:v', '-map', '1:a', '-c:v', 'copy', '-c:a', 'pcm_s16le', '-video_track_timescale', '600', str(source))
+        info = json.loads(subprocess.check_output(['ffprobe', '-v', 'error', '-show_entries', 'stream=start_time:format=start_time',
+                                                   '-of', 'json', str(source)], timeout=30))
+        start = float(info['format']['start_time'])
+        self.assertTrue(.005 < start < .02 and abs(start*600-round(start*600)) > .1, start)
+        rng = random.Random(21)
+        cuts = [(rng.uniform(.3, 22), rng.choice((2, 3, 4)), rng.random() < .3) for _ in range(60)]
+        for fps in (24, 30000/1001, 25):
+            with self.subTest(fps=fps):
+                self.assertAllShown(self.cuts(source, fps, cuts))
+
     def test_fractional_clip_start_samples_from_the_clip_clock(self):
         # Timeline frame f shows source in + (f/fps - start): the first frame is
         # the first whole frame at or after the start, sampled 0.6 frame in.

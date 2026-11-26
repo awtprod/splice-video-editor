@@ -226,6 +226,35 @@ class WorkSpace(ScaleCase):
             with self.assertRaisesRegex(ValueError, 'Not enough free disk space.*SPLICE_TEMP_DIR'):
                 render_to_file(project, self.directory/'out.mp4')
 
+    def test_free_space_counts_every_audio_pre_render_on_disk_at_once(self):
+        # Round 2, finding 4: several speed-changed clips crossing chunk seams are
+        # pre-rendered and on disk together; the estimate counted only the longest.
+        sweep = self.directory/'tone.wav'
+        ffmpeg('-f', 'lavfi', '-i', 'sine=f=300:r=48000:d=60', '-ac', '2', '-c:a', 'pcm_f32le', str(sweep))
+        media = [dict(id='s', src=self.src(sweep))]
+        clips = [dict(type='audio', mediaId='s', track=k+1, start=.5*k, duration=9-k, speed=(.5, 1.5, .8, 1.25)[k], **{'in': 1})
+                 for k in range(4)]
+        on_disk, needed = [], []
+        real_chunk, real_space = render_movie._render_audio_chunk, render_movie._ensure_space
+
+        def chunk(events, origin, keep_from, keep_samples, limiter, target, directory, *rest):
+            on_disk.append(sum(path.stat().st_size for path in Path(directory).glob('event-*.wav')))
+            return real_chunk(events, origin, keep_from, keep_samples, limiter, target, directory, *rest)
+
+        def space(directory, bytes_needed, purpose):
+            needed.append(bytes_needed)
+            return real_space(directory, bytes_needed, purpose)
+        project = dict(width=64, height=36, fps=24, media=media, clips=clips)
+        with mock.patch.multiple(render_movie, AUDIO_CHUNK_SECONDS=2, _render_audio_chunk=chunk, _ensure_space=space):
+            render_to_file(project, self.directory/'mix.wav', options={'codec': 'wav'})
+            plain = dict(project, clips=[dict(clip, speed=1) for clip in clips])
+            render_to_file(plain, self.directory/'plain.wav', options={'codec': 'wav'})
+        peak = max(on_disk)
+        self.assertGreater(peak, 2*48000*2*4*7, 'the clips were not pre-rendered together')
+        extra = needed[0]-needed[1]
+        self.assertGreaterEqual(extra, peak)
+        self.assertLess(extra, peak*1.05+65536)
+
     def test_stale_directories_are_reaped_and_live_ones_kept(self):
         root = self.directory/'work'
         root.mkdir()

@@ -13,6 +13,7 @@ import threading
 import time
 import unittest
 from unittest import mock
+import warnings
 
 from premiere import MEDIA_ROOT
 import render_movie
@@ -30,12 +31,36 @@ def probe(path, entries):
                                               timeout=30))
 
 
-def true_peak(path):
-    """Decoded true peak in dBTP (ITU-R BS.1770, as measured by FFmpeg's ebur128)."""
-    report = subprocess.run(['ffmpeg', '-nostdin', '-nostats', '-v', 'info', '-i', str(path), '-vn',
-                             '-af', 'ebur128=peak=true:framelog=quiet', '-f', 'null', '-'],
+def measure(path):
+    """Decoded integrated loudness (LUFS, to 0.001) and true peak (dBTP, to 0.1), ITU-R BS.1770 as measured by
+    FFmpeg's ebur128."""
+    log = Path(path).with_name(Path(path).name+'.r128.txt')
+    report = subprocess.run(['ffmpeg', '-nostdin', '-nostats', '-v', 'info', '-i', str(path), '-vn', '-af',
+                             'ebur128=peak=true:framelog=quiet:metadata=1,ametadata=mode=print:file='
+                             + render_movie._filter_path(log), '-f', 'null', '-'],
                             capture_output=True, text=True, timeout=120).stderr
-    return float(re.findall(r'Peak:\s+(-?[\d.]+) dBFS', report[report.rfind('True peak:'):])[0])
+    integrated = float(re.findall(r'lavfi\.r128\.I=(-?[\d.]+)', log.read_text())[-1])
+    log.unlink()
+    summary = report[report.rfind('Integrated loudness:'):]
+    return integrated, float(re.findall(r'Peak:\s+(-?[\d.]+) dBFS', summary[summary.rfind('True peak:'):])[0])
+
+
+def true_peak(path):
+    return measure(path)[1]
+
+
+def alive(pid):
+    try:
+        with open(f'/proc/{pid}/stat') as stat:
+            return stat.read().rsplit(')', 1)[1].split()[0] != 'Z'
+    except FileNotFoundError:
+        return False
+    except OSError:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        return True
 
 
 FAKE_FFMPEG = r'''#!/bin/sh
@@ -45,6 +70,9 @@ for argument in "$@"; do
   case "$stage:$argument" in
     picture:*picture.filtergraph|audio:*/audio-*.filtergraph|mux:*segments.txt)
       : > "$SPLICE_TEST_MARK"; exec sleep 300;;
+    hangchild:*picture.filtergraph)
+      # A process FFmpeg started keeps its pipes open; FFmpeg itself hangs.
+      sleep 300 & echo $! > "$SPLICE_TEST_MARK"; exec sleep 300;;
   esac
 done
 case "$stage" in
@@ -128,6 +156,42 @@ class JobCleanup(FakeFFmpeg):
                 self.assertEqual(status['state'], 'cancelled')
                 self.assertEqual(sorted(path.name for path in scratch.iterdir()), [])
 
+    def assertGone(self, pid):
+        deadline = time.monotonic()+5
+        while alive(pid) and time.monotonic() < deadline:
+            time.sleep(.1)
+        if alive(pid):
+            os.kill(pid, signal.SIGKILL)
+            self.fail('a process FFmpeg started outlived the export job')
+
+    def test_processes_ffmpeg_started_die_with_the_job(self):
+        # Round 2, finding 3: after the renderer's own stall limit killed FFmpeg,
+        # a process FFmpeg had started (holding its pipes) outlived the job.
+        for cancel, stall in ((False, '2'), (True, '60')):
+            with self.subTest(cancel=cancel):
+                status, scratch = self.run_until_hung('hangchild', stall=stall, cancel=cancel)
+                self.assertEqual(status['state'], 'cancelled' if cancel else 'failed')
+                self.assertEqual(sorted(path.name for path in scratch.iterdir()), [])
+                self.assertGone(int(self.mark.read_text()))
+                scratch.rmdir()
+
+    def test_shutdown_kills_a_stuck_job_and_what_it_started(self):
+        from export_jobs import ExportJobs
+        scratch = self.directory/'work-shutdown'
+        scratch.mkdir()
+        with mock.patch.dict(os.environ, {**self.environment, 'SPLICE_TEMP_DIR': str(scratch), 'SPLICE_TEST_HANG': 'hangchild',
+                                          'SPLICE_EXPORT_STALL_SECONDS': '600'}):
+            self.mark.unlink(missing_ok=True)
+            jobs = ExportJobs()
+            identifier = jobs.start(self.project(), {'codec': 'h264'})
+            deadline = time.monotonic()+60
+            while not (self.mark.exists() and self.mark.read_text().strip()) and time.monotonic() < deadline:
+                time.sleep(.1)
+            holder = int(self.mark.read_text())
+            jobs.shutdown()
+        self.assertNotEqual(jobs.status(identifier)['state'], 'rendering')
+        self.assertGone(holder)
+
     def test_watchdog_kill_removes_all_scratch(self):
         # The job watchdog fires (2 s) long before the renderer's own (60 s).
         status, scratch = self.run_until_hung('picture', stall='60', grace=-58, cancel=False)
@@ -181,20 +245,31 @@ class LossyLimiter(Case):
                '-af', f'volume={peak/0.8:.6f}', '-c:a', 'pcm_f32le', str(source))
         return source
 
-    def export(self, source, codec, volume=100, **options):
+    def export(self, source, codec, volume=100, report=None, name='mix', duration=7, **options):
         suffix = {'h264': '.mp4', 'prores': '.mov', 'wav': '.wav'}[codec]
-        output = self.directory/f'mix-{codec}-{volume}{suffix}'
+        output = self.directory/f'{name}-{codec}-{volume}{suffix}'
         render_to_file(dict(width=64, height=36, fps=24, media=[dict(id='p', src=self.src(source))],
-                            clips=[dict(type='audio', mediaId='p', track=1, start=0, duration=7, volume=volume, **{'in': .5})]),
-                       output, options={'codec': codec, **options})
+                            clips=[dict(type='audio', mediaId='p', track=1, start=0, duration=duration, volume=volume, **{'in': .5})]),
+                       output, options={'codec': codec, **options}, report=report)
         return output
 
-    def test_mp4_decoded_true_peak_stays_under_the_ceiling(self):
+    def test_aac_peak_safe_keeps_the_decoded_true_peak_under_the_ceiling(self):
+        # Opt-in (aacPeakSafe): the whole program is lowered until the decoded
+        # AAC fits, and the applied gain is reported.
         full = self.program(1.0)
-        for volume in (100, 200):
-            with self.subTest(volume=volume):
-                self.assertLessEqual(true_peak(self.export(full, 'h264', volume)), -1.0)
-        self.assertLessEqual(true_peak(self.export(full, 'h264', limiterCeiling=-3)), -3.0)
+        for volume, ceiling in ((100, -1.0), (200, -1.0), (100, -3.0)):
+            with self.subTest(volume=volume, ceiling=ceiling):
+                report = {}
+                with warnings.catch_warnings(record=True) as notices:
+                    warnings.simplefilter('always')
+                    output = self.export(full, 'h264', volume, report=report, aacPeakSafe=True, limiterCeiling=ceiling)
+                self.assertLessEqual(true_peak(output), ceiling)
+                gain = report['audio']['gainDb']
+                self.assertEqual(report['audio']['aacPeakSafe'], True)
+                self.assertAlmostEqual(report['audio']['decodedTruePeakDb'], true_peak(output), delta=.15)
+                self.assertEqual(gain % render_movie.AAC_PEAK_STEP_DB, 0)
+                if gain:
+                    self.assertTrue(any(f'{-gain:.1f} dB' in str(notice.message) for notice in notices), [str(n.message) for n in notices])
 
     def test_pcm_deliveries_hold_the_sample_peak_ceiling(self):
         full = self.program(1.0)
@@ -246,6 +321,106 @@ class LossyLimiter(Case):
             self.export(full, 'h264', limiter=False)
         self.assertFalse(any('ebur128' in ' '.join(map(str, command)) for command in runs))
         self.assertFalse(any('volume=' in ' '.join(map(str, command)) and 'aac' in command for command in runs))
+
+
+class ProgramLoudness(Case):
+    """Round 2, finding 2: by default an MP4 export never changes program
+    loudness. The true-peak limiter acts before the encoder; the decoded AAC
+    true peak is measured once and reported, with a warning when AAC overshoot
+    puts it over the ceiling."""
+    program = LossyLimiter.program
+    export = LossyLimiter.export
+
+    def make(self, name, graph, *, loudness=None, peak=None, click=False):
+        source = self.directory/f'{name}.wav'
+        raw = self.directory/f'{name}-raw.wav'
+        ffmpeg('-f', 'lavfi', '-i', graph, '-t', '12', '-ar', '48000', '-ac', '2', '-c:a', 'pcm_f32le', str(raw))
+        integrated, true = measure(raw)
+        gain = loudness-integrated if loudness is not None else peak-true
+        chain = f'volume={gain:.4f}dB'
+        if click:
+            chain += ",aeval='if(between(t,6,6+1/48000),1,val(ch))':c=stereo"   # one full-scale sample
+        ffmpeg('-i', str(raw), '-af', chain, '-c:a', 'pcm_f32le', str(source))
+        return source
+
+    def programs(self):
+        tones = ("aevalsrc='0.45*sin(2*PI*220*t)*(0.6+0.4*sin(2*PI*0.5*t))+0.35*sin(2*PI*1375*t)|"
+                 "0.45*sin(2*PI*330*t)+0.35*sin(2*PI*997*t)*(0.6+0.4*sin(2*PI*0.3*t))':s=48000:d=12")
+        speech = ("anoisesrc=c=pink:a=0.5:r=48000:seed=7,bandpass=f=900:w=1400,"
+                  "aeval='val(0)*pow(max(0,sin(2*PI*3.7*t)),2)*gt(sin(2*PI*0.31*t),-0.4)|"
+                  "val(0)*pow(max(0,sin(2*PI*3.7*t+0.3)),2)*gt(sin(2*PI*0.31*t),-0.4)':c=stereo")
+        dense = ("aevalsrc='0.2*sin(2*PI*55*t)+0.15*sin(2*PI*110*t)*(0.5+0.5*sin(2*PI*2*t))+0.12*sin(2*PI*440*t)"
+                 "+0.1*sin(2*PI*659*t)+0.08*sin(2*PI*2637*t)*(0.5+0.5*sin(2*PI*4*t))+0.25*(random(0)-0.5)|"
+                 "0.2*sin(2*PI*55*t+1)+0.15*sin(2*PI*165*t)+0.12*sin(2*PI*554*t)+0.1*sin(2*PI*880*t)"
+                 "+0.08*sin(2*PI*3520*t)+0.25*(random(1)-0.5)':s=48000:d=12")
+        dialogue = ("anoisesrc=c=pink:a=0.5:r=48000:seed=3,bandpass=f=900:w=1400,"
+                    "aeval='val(0)*pow(max(0,sin(2*PI*3.7*t)),2)|val(0)*pow(max(0,sin(2*PI*3.7*t+0.3)),2)':c=stereo")
+        return {'music mastered to -1.2 dBTP': self.make('music', tones, peak=-1.2),
+                'speech bursts at -3 dBTP': self.make('speech', speech, peak=-3),
+                'dense music at -14 LUFS': self.make('dense', dense, loudness=-14),
+                'dialogue at -23 LUFS with one full-scale click': self.make('dialogue', dialogue, loudness=-23, click=True)}
+
+    def test_default_mp4_has_the_loudness_of_the_wav_and_reports_its_peak(self):
+        overs = 0
+        for label, source in self.programs().items():
+            with self.subTest(program=label):
+                wav_loudness, _ = measure(self.export(source, 'wav', duration=11))
+                report = {}
+                with warnings.catch_warnings(record=True) as notices:
+                    warnings.simplefilter('always')
+                    movie = self.export(source, 'h264', duration=11, report=report)
+                loudness, peak = measure(movie)
+                self.assertLessEqual(abs(loudness-wav_loudness), .3, f'MP4 {loudness} LUFS, WAV {wav_loudness} LUFS')
+                audio = report['audio']
+                self.assertEqual((audio['gainDb'], audio['aacPeakSafe'], audio['ceilingDb']), (0, False, -1.0))
+                self.assertAlmostEqual(audio['decodedTruePeakDb'], peak, delta=.15)
+                self.assertAlmostEqual(audio['loudnessLufs'], loudness, delta=.15)
+                messages = [str(notice.message) for notice in notices]
+                if audio['decodedTruePeakDb'] > -1.0:
+                    overs += 1
+                    self.assertEqual(len(messages), 1, messages)
+                    self.assertIn(f"{audio['decodedTruePeakDb']:.1f}".replace('-', '\u2212'), messages[0])
+                    self.assertIn('aacPeakSafe', messages[0])
+                else:
+                    self.assertEqual(messages, [])
+        self.assertGreater(overs, 0, 'no program put AAC overshoot over the ceiling: the warning went untested')
+
+    def test_the_warning_threshold_is_the_ceiling(self):
+        # A program 3 dB under the ceiling: the limiter is idle and the decoded
+        # peak does not depend on the ceiling. Set the ceiling a quarter dB under
+        # the decoded peak: the export must warn, and aacPeakSafe must fit it.
+        source = self.make('quiet', "aevalsrc='0.45*sin(2*PI*220*t)+0.35*sin(2*PI*1375*t)|0.45*sin(2*PI*330*t)"
+                                    "+0.35*sin(2*PI*997*t)':s=48000:d=12", peak=-6)
+        report = {}
+        self.export(source, 'h264', report=report)
+        decoded = report['audio']['decodedTruePeakDb']
+        ceiling = round(decoded-.25, 2)
+        self.assertLess(-6, ceiling)
+        with warnings.catch_warnings(record=True) as notices:
+            warnings.simplefilter('always')
+            report = {}
+            movie = self.export(source, 'h264', report=report, limiterCeiling=ceiling)
+        self.assertAlmostEqual(report['audio']['decodedTruePeakDb'], decoded, delta=.05)
+        self.assertGreater(true_peak(movie), ceiling)
+        self.assertEqual(len(notices), 1)
+        report = {}
+        movie = self.export(source, 'h264', report=report, limiterCeiling=ceiling, aacPeakSafe=True, name='safe')
+        self.assertLessEqual(true_peak(movie), ceiling)
+        self.assertLess(report['audio']['gainDb'], 0)
+
+    def test_aac_peak_safe_is_deterministic_and_range_exports_use_the_same_rule(self):
+        source = self.program(1.0)
+        runs = []
+        for attempt in range(2):
+            report = {}
+            movie = self.export(source, 'h264', 160, report=report, aacPeakSafe=True, name=f'run{attempt}')
+            runs.append((report['audio'], subprocess.check_output(['ffmpeg', '-nostdin', '-v', 'error', '-i', str(movie),
+                                                                    '-vn', '-f', 'f32le', 'pipe:1'], timeout=60)))
+        self.assertEqual(runs[0], runs[1])
+        report = {}
+        ranged = self.export(source, 'h264', 160, report=report, aacPeakSafe=True, name='range', range={'start': 2, 'end': 5})
+        self.assertLessEqual(true_peak(ranged), -1.0)
+        self.assertEqual(report['audio']['gainDb'] % render_movie.AAC_PEAK_STEP_DB, 0)
 
 
 class Delivery(Case):

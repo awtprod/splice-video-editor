@@ -165,6 +165,28 @@ class SpeedChangedSound(ToneCase):
         self.assertLevels(samples, 875, inside((6.9, 10.9)), block=.05)
         self.assertLevels(samples, 625, inside(*spans), block=.05)
 
+    def test_range_export_keeps_the_envelope_of_a_speed_changed_clip(self):
+        # Finding 5: a range that starts inside a speed-changed clip pre-renders
+        # it from the range start; its fades and volume keyframes must keep the
+        # clip's own clock (12-25 dB off when the shift was dropped).
+        media = [dict(id='a', src=self.tone(375)), dict(id='b', src=self.tone(625, 44100))]
+        keys = {'volume': [dict(time=0, value=100), dict(time=8, value=30), dict(time=16, value=160)]}
+        for speed, source in ((.5, 'a'), (1.5, 'b')):
+            frequency = 375 if source == 'a' else 625
+            clips = [dict(type='audio', mediaId=source, track=1, start=1, duration=20, speed=speed, fadeIn=3, fadeOut=6,
+                          keyframes=keys, **{'in': 2})]
+            full = self.render(clips, media, name='full')
+            for begin, end in ((7, 19), (13, 21)):
+                with self.subTest(speed=speed, range=(begin, end)):
+                    ranged = self.render(clips, media, name='range', range={'start': begin, 'end': end})
+                    offset = round(begin*RATE)
+                    self.assertEqual(len(ranged), round((end-begin)*RATE))
+                    shifted = full[offset:offset+len(ranged)]
+                    for at in [k*.25 for k in range(int((end-begin)/.25))]:
+                        want = tone_level(shifted, frequency, at, at+.25)
+                        got = tone_level(ranged, frequency, at, at+.25)
+                        self.assertLess(abs(got-want), .05*want+.004, f'{begin+at:.2f} s: range {got:.4f}, full export {want:.4f}')
+
 
 class DipSound(ToneCase):
     """Finding 7: a dip to black is a picture transition. Its sound follows the
