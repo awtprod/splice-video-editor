@@ -317,6 +317,9 @@ def describe(src):
 # FFmpeg renders any text file as a picture through its tty demuxer (and
 # reads BBS art formats): never media a user meant to edit.
 TEXT_FORMATS = frozenset({'tty', 'bin', 'xbin', 'adf', 'idf'})
+# Playlist and script demuxers read other files (or URLs) named inside a text file: a renamed
+# playlist must never be registered or served as media.
+TEXT_FORMATS |= frozenset({'concat', 'ffconcat', 'hls', 'applehttp', 'dash', 'imf', 'webm_dash_manifest', 'mpl2'})
 TEXT_CODECS = frozenset({'ansi', 'bintext', 'xbin', 'idf'})
 
 

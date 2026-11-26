@@ -1037,6 +1037,16 @@ class ProbeDetails(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'cannot decode'):
                 decodable(notes, name)
 
+    def test_playlists_renamed_as_movies_are_not_media(self):
+        from media_proxy import decodable
+        clip = self.dir / 'take.mp4'
+        ffmpeg('-f', 'lavfi', '-i', 'testsrc2=s=32x18:r=25:d=0.2', '-c:v', 'mpeg4', clip)
+        decodable(clip, clip.name)
+        playlist = self.dir / 'playlist.mov'
+        playlist.write_text(f"ffconcat version 1.0\nfile '{clip.name}'\n")
+        with self.assertRaisesRegex(ValueError, 'cannot decode'):
+            decodable(playlist, playlist.name)
+
     def test_a_probe_timeout_is_reported_as_a_timeout(self):
         import media_proxy
         original = media_proxy.run_bounded
