@@ -946,7 +946,8 @@ select:focus-visible {
   gap: 7px;
   align-items: center;
 }
-/* Toasts sit under the header, over panel headings, never over timeline tracks. */
+/* Toasts go in the utility bar's empty middle (.in-bar, placed by workspace.js); without room
+   there they sit under the header, over panel headings, never over timeline tracks. */
 .toast {
   position: fixed;
   top: 118px;
@@ -1565,7 +1566,10 @@ body{min-width:1024px}
   .viewer-bottom{gap:6px;padding-left:10px;padding-right:10px}
   .transport{gap:6px}
 }
-/* Status toasts are text only: a click under one reaches the control beneath. */
-.toast{pointer-events:none}
+/* Status toasts in the utility bar's empty middle (see placeToast in workspace.js): two lines at
+   most, the full text in the tooltip; a click dismisses one. */
+.toast{cursor:pointer}
+.toast.in-bar{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden;padding:2px 12px;
+  box-shadow:none;font-size:11.5px;line-height:14px;max-width:none}
 .compat-badge{margin-left:10px;padding:2px 8px;border:1px solid #b8913f;border-radius:10px;font-size:11px;color:#f3d48b;background:#3a311c;white-space:nowrap;cursor:pointer}
 .compat-badge[hidden]{display:none}

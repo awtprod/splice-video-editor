@@ -6,7 +6,7 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const {startSplice, openPage, makeCamera} = require('./browser-harness.cjs');
+const {startSplice, openPage, makeCamera, ffmpeg} = require('./browser-harness.cjs');
 
 const evidence = process.env.SPLICE_EVIDENCE_DIR;
 const state = (page, fn, arg) => page.evaluate(fn, arg);
@@ -111,30 +111,97 @@ async function preview(page, splice) {
   console.log('Preview: disabled V2 shows V1, disabled clips are black and silent, re-enabled clips play.');
 }
 
-// 2. Transitions next to a disabled clip. The rule: a transition belongs to the clip it starts;
-// a disabled clip takes its transition with it (the clip before simply ends with a cut); a
-// transition after a disabled clip still plays, against what is underneath (black here).
-async function transitions(page) {
-  const cut = () => [picture('a', 'ridge', 1, 0, 2), picture('b', 'valley', 1, 2, 2, {transition: 'dissolve', transitionDuration: .8})];
-  await load(page, cut());
-  const mixed = await programColor(page, 2.4);
-  await state(page, () => Editor.toggleEnabled(['a']));
-  const fromBlack = await programColor(page, 2.4);
-  const bAlone = await programColor(page, 3.5);
-  assert.ok(luma(fromBlack) < luma(bAlone) * .75, 'dissolve after a disabled clip rises from black: ' + JSON.stringify({mixed, fromBlack, bAlone}));
-  await load(page, cut());
-  await state(page, () => Editor.toggleEnabled(['b']));
-  const before = await programColor(page, 1.5);
-  const after = await programColor(page, 2.4);
-  assert.ok(luma(before) > 10 && luma(after) < 4, 'a disabled clip takes its dissolve: the clip before cuts to black ' + JSON.stringify({before, after}));
-  console.log('Transitions: after a disabled clip the dissolve rises from black; a disabled clip takes its own dissolve.');
+// 2. Transitions next to a disabled clip follow the renderer's rule (render_movie._disabled_stand_ins):
+// the transition still plays for the enabled clip and the disabled side is transparent and silent.
+// Solid colours: V1 green under V2 red (a, 0-2 s) then blue (b, 2-4 s) with a centred 0.8 s
+// transition. Also: a dissolve with no clip before it rises from what is underneath (not black), and
+// a disabled title draws nothing.
+async function solidMedia(page, splice) {
+  const files = ['red', 'blue', 'lime'].map(color => {
+    const file = path.join(splice.temp, `solid-${color}.mp4`);
+    if (!fs.existsSync(file)) ffmpeg(['-y', '-f', 'lavfi', '-i', `color=c=${color}:s=160x90:r=25:d=8`, '-c:v', 'libx264',
+      '-preset', 'ultrafast', '-g', '1', '-pix_fmt', 'yuv420p', file]);
+    return file;
+  });
+  const tone = path.join(splice.temp, 'solid-tone.wav');
+  if (!fs.existsSync(tone)) ffmpeg(['-y', '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:d=8', tone]);
+  await state(page, () => SpliceSession.newProject({name: 'Solid', width: 160, height: 90, fps: 25}));
+  await page.locator('#media-input').setInputFiles([...files, tone]);
+  await page.waitForFunction(() => Editor.get().project.media.length === 4);
+  return state(page, () => Object.fromEntries(Editor.get().project.media.map(item => [item.name.replace(/\..*$/, '').replace('solid-', ''), item.id])));
+}
+async function setClips(page, clips) {
+  await state(page, next => Editor.editProject(project => { project.clips = next; }), clips);
+  await settle(page);
+}
+async function solidColor(page, time) {
+  await state(page, t => Editor.seek(t), time);
+  await page.waitForFunction(() => [...document.querySelectorAll('body > video')].filter(element => element.getAttribute('src'))
+    .every(element => element.readyState >= 2 && !element.seeking));
+  await page.waitForTimeout(150);
+  return programColor(page, time);
+}
+const mix = (a, b, part) => a.map((value, index) => value * (1 - part) + b[index] * part);
+const near = (actual, expected, label) =>
+  assert.ok(distance(actual, expected) < 14, label + ': ' + JSON.stringify({actual, expected: expected.map(Math.round)}));
+async function transitions(page, splice) {
+  const ids = await solidMedia(page, splice);
+  const clip = (id, mediaId, track, start, duration, extra) => picture(id, mediaId, track, start, duration, extra);
+  const cut = (kind, off) => [clip('low', ids.lime, 1, 0, 5), clip('a', ids.red, 2, 0, 2, off === 'a' ? {enabled: false} : {}),
+    clip('b', ids.blue, 2, 2, 2, {transition: kind, transitionDuration: .8, transitionBefore: .4, ...(off === 'b' ? {enabled: false} : {})})];
+  await setClips(page, cut('dissolve'));
+  const green = await solidColor(page, 4.5), red = await solidColor(page, 1), blue = await solidColor(page, 3.5);
+  // Dissolve carried by a disabled clip: the clip before dissolves out to V1 (it does not cut).
+  await setClips(page, cut('dissolve', 'b'));
+  near(await solidColor(page, 1.8), mix(red, green, .25), 'disabled B: A dissolves out to V1 before the cut');
+  near(await solidColor(page, 2.2), mix(red, green, .75), 'disabled B: A keeps dissolving out after the cut');
+  // Dissolve after a disabled clip: B dissolves in from V1, not from black.
+  await setClips(page, cut('dissolve', 'a'));
+  near(await solidColor(page, 1.8), mix(green, blue, .25), 'disabled A: B dissolves in from V1');
+  // Dip to black carried by a disabled clip: A still dips to black; after the cut V1 shows.
+  await setClips(page, cut('fade', 'b'));
+  near(await solidColor(page, 1.8), mix(red, [0, 0, 0], .5), 'disabled B: A dips to black');
+  near(await solidColor(page, 2.2), green, 'disabled B: nothing after the dip');
+  // Wipe carried by a disabled clip: A is wiped off to reveal V1.
+  await setClips(page, cut('wipe', 'b'));
+  near(await solidColor(page, 2), mix(red, green, .5), 'disabled B: A is wiped off to V1');
+  // A dissolve with no clip before it (a gap) rises from what is underneath.
+  await setClips(page, [clip('low', ids.lime, 1, 0, 5), clip('b', ids.blue, 2, 2, 2, {transition: 'dissolve', transitionDuration: .8})]);
+  near(await solidColor(page, 2.4), mix(green, blue, .5), 'dissolve after a gap rises from V1');
+  // Sound: A1 fades out through the crossfade of a disabled clip after it, against silence.
+  await setClips(page, [sound('s1', ids.tone, -1, 0, 2), sound('s2', ids.tone, -1, 2, 2,
+    {transition: 'dissolve', transitionDuration: .8, transitionBefore: .4, enabled: false})]);
+  for (const [time, expected] of [[1.8, .75], [2.2, .25]]) {
+    const gains = await state(page, t => { Editor.seek(t); return Editor.audioGains(); }, time);
+    assert.deepEqual(Object.keys(gains), ['s1'], 'only the enabled clip sounds at ' + time);
+    assert.ok(Math.abs(gains.s1 - expected) < .02, `s1 fades against silence at ${time}: ${JSON.stringify(gains)}`);
+  }
+  // A disabled title draws nothing.
+  const title = {id: 't', mediaId: null, type: 'title', track: 4, start: 0, duration: 4, in: 0, title: 'DISABLED TITLE', color: {},
+    volume: 100, transition: 'none'};
+  const lit = () => state(page, () => {
+    const canvas = document.getElementById('preview-canvas');
+    Editor.drawFrame(canvas);
+    const data = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data;
+    let count = 0;
+    for (let i = 0; i < data.length; i += 4) if (data[i] + data[i + 1] + data[i + 2] > 300) count++;
+    return count;
+  });
+  await setClips(page, [title]);
+  await state(page, () => Editor.seek(1));
+  const shown = await lit();
+  await setClips(page, [{...title, enabled: false}]);
+  const hidden = await lit();
+  assert.ok(shown > 100 && hidden === 0, 'a disabled title draws nothing: ' + JSON.stringify({shown, hidden}));
+  console.log('Transitions: next to a disabled clip they still play against what is underneath (dissolve, dip, wipe, crossfade); disabled titles draw nothing.');
 }
 
 // 3. The timeline marks disabled clips (dimmed, hatched, OFF tag, tooltip) and they stay
 // selectable, trimmable and movable.
 async function timelineLook(page) {
-  await load(page, [picture('v', 'ridge', 1, 0, 3, {linkGroup: 'p'}), sound('a', 'score', -1, 0, 3, {linkGroup: 'p'}),
-    picture('solo', 'valley', 2, 3.6, 2, {enabled: false})]);
+  // Wide enough for the OFF tag beside the whole name (a short clip shows only its name; see followUps).
+  await load(page, [picture('v', 'ridge', 1, 0, 6, {linkGroup: 'p'}), sound('a', 'score', -1, 0, 6, {linkGroup: 'p'}),
+    picture('solo', 'valley', 2, 3.6, 6, {enabled: false})]);
   await clickClip(page, 'v');
   await page.keyboard.press('Shift+E');
   await settle(page);
@@ -158,7 +225,7 @@ async function timelineLook(page) {
 }
 
 // 4. Commands: Shift+E, the Edit menu and the context menu; linked selection; a mixed selection
-// flips each clip; one undo step; locked tracks refuse.
+// acts as one, led by the primary (or right-clicked) clip; one undo step; locked tracks refuse.
 async function commands(page) {
   const clips = () => [picture('v1', 'ridge', 1, 0, 2, {linkGroup: 'p'}), sound('a1', 'score', -1, 0, 2, {linkGroup: 'p'}),
     picture('v2', 'valley', 1, 2, 2)];
@@ -173,12 +240,38 @@ async function commands(page) {
   await clickClip(page, 'v1');
   await page.keyboard.press('Shift+E');
   assert.deepEqual(await flags(page), {v1: false, a1: true, v2: true}, 'linked selection off: only the selected clip');
-  // Mixed selection: each clip flips (Premiere's rule).
+  // Mixed selection acts as one (Premiere's rule): the primary (first selected) clip leads. v1 is
+  // disabled, so the whole selection becomes enabled ...
   await clickClip(page, 'v1');
   await clickClip(page, 'v2', {modifiers: ['Control']});
+  await page.locator('.edit-menu summary').click();
+  assert.match(await page.locator('.edit-menu [data-command=enable]').textContent(), /^Enable clips/);
+  await page.keyboard.press('Escape');
   await page.keyboard.press('Shift+E');
-  assert.deepEqual(await flags(page), {v1: true, a1: true, v2: false}, 'mixed selection: each flips');
-  assert.match(await toast(page), /1 clip disabled, 1 clip enabled/);
+  assert.deepEqual(await flags(page), {v1: true, a1: true, v2: true}, 'mixed selection led by a disabled clip: all enabled');
+  assert.match(await toast(page), /^1 clip enabled$/, 'the toast counts clips that changed');
+  await state(page, () => Editor.undo());
+  assert.deepEqual(await flags(page), {v1: false, a1: true, v2: true}, 'one undo step');
+  // ... led by an enabled clip, the whole selection becomes disabled. (Clicking a1 first clears
+  // the multi-selection; a plain click on a member of it would keep it.)
+  await clickClip(page, 'a1');
+  await clickClip(page, 'v2');
+  await clickClip(page, 'v1', {modifiers: ['Control']});
+  await page.keyboard.press('Shift+E');
+  assert.deepEqual(await flags(page), {v1: false, a1: true, v2: false}, 'mixed selection led by an enabled clip: all disabled');
+  assert.match(await toast(page), /^1 clip disabled$/);
+  await state(page, () => Editor.undo());
+  // The context menu's lead is the clip under the pointer, and the entry says what it will do.
+  await clickClip(page, 'a1');
+  await clickClip(page, 'v2');
+  await clickClip(page, 'v1', {modifiers: ['Control']});
+  await capture(page, `enable-mixed-before-${sizeName(page)}.png`);
+  await page.locator('.timeline-clip[data-clip="v1"]').click({button: 'right', position: {x: 12, y: 8}});
+  const mixedEntry = page.locator('.sync-menu [role=menuitem]').first();
+  assert.match(await mixedEntry.textContent(), /^Enable clips/);
+  await mixedEntry.click();
+  assert.deepEqual(await flags(page), {v1: true, a1: true, v2: true}, 'context menu on the disabled clip of a mixed selection: all enabled');
+  await capture(page, `enable-mixed-after-${sizeName(page)}.png`);
   await page.keyboard.press('Control+Shift+L');
   // Edit menu entry.
   await load(page, clips());
@@ -220,7 +313,7 @@ async function commands(page) {
   assert.ok(await reference.isVisible());
   await capture(page, `enable-keyboard-reference-${sizeName(page)}.png`);
   await page.locator('dialog[open] button', {hasText: 'Close'}).click();
-  console.log('Commands: Shift+E, Edit menu and context menu toggle; linked pairs together; mixed selections flip each; one undo; locked tracks refuse.');
+  console.log('Commands: Shift+E, Edit menu and context menu toggle; linked pairs together; mixed selections act as one, led by the primary or right-clicked clip; one undo; locked tracks refuse.');
 }
 
 // 5. Editing around disabled clips keeps the flag on every piece and treats the clip like any other.
@@ -378,6 +471,152 @@ async function exportRequest(page) {
   console.log('Export: the render request carries enabled: false unchanged.');
 }
 
+// 9. Follow-ups from the validation of this change: the selection highlight after reopening, the
+// open report for a Premiere project, the context menu's keyboard, a short disabled clip's name,
+// toast placement, enabling removes the key, tiny painted clips, and right-click never drags.
+async function followUps(page) {
+  const two = () => [picture('v', 'ridge', 1, 0, 2), picture('w', 'valley', 1, 2, 2)];
+  // Reopening the same file clears the multi-selection highlight (same clip ids).
+  await load(page, two());
+  await clickClip(page, 'v');
+  await clickClip(page, 'w', {modifiers: ['Control']});
+  assert.equal(await page.locator('.timeline-clip.group-selected').count(), 2);
+  await load(page, two());
+  assert.equal(await page.locator('.timeline-clip.group-selected').count(), 0, 'no stale highlight after reopening');
+
+  // Enabling removes the key (re-enabled clips look like never-disabled ones).
+  await state(page, () => { Editor.toggleEnabled(['v']); Editor.toggleEnabled(['v']); });
+  assert.equal(await state(page, () => 'enabled' in Editor.get().project.clips.find(c => c.id === 'v')), false);
+
+  // Right-click and drag does not move a clip.
+  const box = await page.locator('.timeline-clip[data-clip="w"]').boundingBox();
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.down({button: 'right'});
+  await page.mouse.move(box.x + box.width / 2 + 120, box.y + box.height / 2, {steps: 6});
+  await page.mouse.up({button: 'right'});
+  await page.keyboard.press('Escape');
+  assert.equal(await state(page, () => Editor.get().project.clips.find(c => c.id === 'w').start), 2, 'a right-button drag moves nothing');
+
+  // Context menu keyboard: Up/Down (wrapping), Home/End, Enter/Space activate, Escape returns focus.
+  const opened = await page.locator('.timeline-clip[data-clip="v"]');
+  await opened.click({button: 'right', position: {x: 12, y: 8}});
+  const focused = () => state(page, () => document.activeElement?.closest('.sync-menu') ? document.activeElement.textContent : null);
+  assert.match(await focused(), /Disable clip/);
+  await page.keyboard.press('ArrowDown');
+  assert.match(await focused(), /Link/);
+  await capture(page, `enable-context-menu-keyboard-${sizeName(page)}.png`);
+  await page.keyboard.press('ArrowDown');
+  assert.match(await focused(), /Disable clip/, 'Down wraps to the first entry');
+  await page.keyboard.press('ArrowUp');
+  assert.match(await focused(), /Link/, 'Up wraps to the last entry');
+  await page.keyboard.press('Home');
+  assert.match(await focused(), /Disable clip/);
+  await page.keyboard.press('End');
+  assert.match(await focused(), /Link/);
+  await page.keyboard.press('Escape');
+  assert.equal(await page.locator('.sync-menu').count(), 0);
+  assert.equal(await state(page, () => document.activeElement?.closest?.('.timeline-clip')?.dataset.clip ||
+    (document.activeElement?.closest?.('#timeline-lanes,.track-lanes,.timeline') ? 'timeline' : document.activeElement?.tagName)), 'v',
+  'Escape returns focus to the clip');
+  await opened.click({button: 'right', position: {x: 12, y: 8}});
+  await page.keyboard.press('Enter');
+  assert.deepEqual(await flags(page), {v: false, w: true}, 'Enter activates the focused entry');
+  await opened.click({button: 'right', position: {x: 12, y: 8}});
+  await page.keyboard.press(' ');
+  assert.deepEqual(await flags(page), {v: true, w: true}, 'Space activates the focused entry');
+  assert.equal(await state(page, () => Editor.get().time), 0, 'Space in the menu does not start playback');
+
+  // A short disabled clip shows its name; the OFF tag only when both fit.
+  await load(page, [picture('short', 'ridge', 1, 0, 2, {enabled: false}), picture('long', 'valley', 1, 3, 6, {enabled: false})]);
+  const tags = await state(page, () => Object.fromEntries([...document.querySelectorAll('.timeline-clip')].map(node => {
+    const name = node.querySelector('.clip-name');
+    return [node.dataset.clip, {off: !!node.querySelector('.clip-off'), dashed: getComputedStyle(node).borderStyle,
+      nameFits: name.scrollWidth <= name.clientWidth + 1, text: name.textContent}];
+  })));
+  assert.deepEqual([tags.short.off, tags.short.dashed], [false, 'dashed'], 'short disabled clip: no tag, still dashed ' + JSON.stringify(tags));
+  assert.match(tags.short.text, /Ridge/);
+  assert.deepEqual([tags.long.off, tags.long.nameFits], [true, true], 'long disabled clip: tag and whole name ' + JSON.stringify(tags));
+  await capture(page, `enable-short-disabled-${sizeName(page)}.png`);
+
+  // Tiny clips painted on a lane canvas: a disabled one is drawn hollow and dim, not like an enabled one.
+  // (The first clip is selected on open and stays a DOM node, so the far one comes first.)
+  await load(page, [picture('far', 'ridge', 1, 1990, 8), picture('en', 'ridge', 1, 0, 8),
+    picture('dis', 'valley', 1, 20, 8, {enabled: false})]);
+  await page.locator('#zoom-fit').click();
+  await settle(page);
+  const runs = await state(page, () => {
+    const canvas = document.querySelector('.track-lane[data-kind=video][data-track="1"] .lane-density');
+    if (!canvas) return null;
+    const data = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data;
+    const columns = [];
+    for (let x = 0; x < canvas.width; x++) {
+      let sum = 0;
+      for (let y = 0; y < canvas.height; y++) sum += data[(y * canvas.width + x) * 4 + 3];
+      columns.push(sum);
+    }
+    const found = [];
+    for (let x = 0; x < columns.length; x++) {
+      if (!columns[x]) continue;
+      const start = x;
+      let total = 0;
+      while (x < columns.length && columns[x]) total += columns[x++];
+      found.push({start, width: x - start, mean: total / (x - start)});
+    }
+    return found;
+  });
+  assert.ok(runs && runs.length >= 2, 'tiny clips are painted: ' + JSON.stringify(runs));
+  assert.ok(runs[1].mean < runs[0].mean * .5, 'a disabled painted clip is hollow and dim: ' + JSON.stringify(runs.slice(0, 2)));
+
+  // Toasts: in the utility bar's empty middle, covering no control; a click dismisses one.
+  const original = page.viewportSize();
+  await page.setViewportSize({width: 1024, height: 640});
+  await load(page, two());
+  await state(page, () => SpliceSource.open('ridge'));
+  await page.waitForFunction(() => document.querySelector('.workspace.source-open'));
+  await page.locator('#scope-dock-toggle').click();
+  const toastNode = page.locator('.toast');
+  await toastNode.waitFor();
+  assert.match(await toastNode.textContent(), /large scope/i);
+  const covered = await state(page, () => {
+    const toast = document.querySelector('.toast').getBoundingClientRect();
+    const hit = element => {
+      const box = element.getBoundingClientRect();
+      return box.width && box.height && box.left < toast.right && box.right > toast.left && box.top < toast.bottom && box.bottom > toast.top;
+    };
+    return [...document.querySelectorAll('button, select, input, summary, [role=button], .timeline-clip, video')]
+      .filter(element => element.getClientRects().length && !element.closest('.toast') && hit(element))
+      .map(element => element.id || element.className || element.tagName);
+  });
+  assert.deepEqual(covered, [], 'the toast covers no control');
+  await capture(page, `enable-toast-placement-1024x640.png`);
+  await toastNode.click();
+  assert.equal(await page.locator('.toast').count(), 0, 'a click dismisses the toast');
+  await page.locator('.source-close').click();
+  await page.setViewportSize(original);
+  console.log('Follow-ups: selection cleared on reopen, key removed on enable, right-drag inert, menu keyboard, short-clip names, tiny clips, toast placement.');
+}
+
+// 10. Opening a Premiere project that holds disabled clips says how many.
+async function premiereOpen(page) {
+  await load(page, [picture('v', 'ridge', 1, 0, 2), picture('w', 'valley', 2, 0, 2, {enabled: false})]);
+  const download = page.waitForEvent('download', {timeout: 60000});
+  await state(page, () => SpliceSession.saveAs('prproj'));
+  const file = await (await download).path();
+  await state(page, () => {
+    window.seenToasts = [];
+    new MutationObserver(() => {
+      const text = document.querySelector('.toast')?.textContent;
+      if (text && window.seenToasts.at(-1) !== text) window.seenToasts.push(text);
+    }).observe(document.body, {childList: true});
+  });
+  await page.locator('#project-input').setInputFiles({name: 'Disabled.prproj', mimeType: 'application/octet-stream', buffer: fs.readFileSync(file)});
+  await page.waitForFunction(() => window.seenToasts.some(text => /^Project opened/.test(text)), null, {timeout: 60000});
+  const last = await state(page, () => window.seenToasts.at(-1));
+  assert.match(last, /^Project opened with 1 disabled clip \(marked OFF; Shift\+E enables\)\.$/, JSON.stringify(await state(page, () => window.seenToasts)));
+  assert.equal(await page.locator('.timeline-clip.disabled').count(), 1);
+  console.log('Premiere open: "' + last + '"');
+}
+
 const only = process.env.SPLICE_ONLY?.split(',');
 async function main() {
   const splice = await startSplice('splice-enable-');
@@ -385,7 +624,7 @@ async function main() {
     const sections = [
       ['preview', preview], ['transitions', transitions], ['timelineLook', timelineLook], ['commands', commands],
       ['editing', editing], ['persistence', persistence, {once: true}], ['interchange', interchange, {once: true}],
-      ['exportRequest', exportRequest, {once: true}],
+      ['exportRequest', exportRequest, {once: true}], ['followUps', followUps], ['premiereOpen', premiereOpen, {once: true}],
     ];
     let pass = 1;
     for (const viewport of [{width: 1440, height: 900}, {width: 1180, height: 780}]) {

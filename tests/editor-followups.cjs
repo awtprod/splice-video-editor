@@ -127,6 +127,88 @@ async function links(page) {
   console.log('Links: picture-only overwrite keeps both sides with the sound; drifted and lone pieces unlink; later members join the later side.');
 }
 
+// 3b. Linked operations on the pieces of a shot. Two picture-only overwrites cut a linked shot
+// into three picture pieces that stay grouped with the one sound clip under them. Linked
+// operations act on the members they concern: a trim moves only members whose same edge is at
+// that time; delete and enable/disable take only members within the clip; a ripple delete cuts
+// the spanning sound under the removed stretch so later pieces and sound move left together.
+async function pieces(page) {
+  const setup = async () => {
+    await load(page, {clips: [picture('v', 1, 0, f(150), {linkGroup: 'p'}), sound('a', -1, 0, f(150), {linkGroup: 'p'})]});
+    await state(page, ([x1, x2, length]) => {
+      Editor.placeSource('cam', {mode: 'overwrite', track: 1, audioTrack: null, marks: {in: 4, out: 4 + length}, at: x1});
+      Editor.placeSource('cam', {mode: 'overwrite', track: 1, audioTrack: null, marks: {in: 4, out: 4 + length}, at: x2});
+    }, [f(25), f(75), f(24)]);
+  };
+  // "v1:0+25:G1" … one entry per clip, by lane and start; group letters by first appearance.
+  const layout = () => state(page, () => {
+    const names = new Map();
+    const group = key => key ? (names.has(key) || names.set(key, 'G' + (names.size + 1)), names.get(key)) : '-';
+    return Editor.get().project.clips.slice().sort((a, b) => b.track - a.track || a.start - b.start).map(c =>
+      `${c.type[0]}${c.track}:${Math.round(c.start * 25)}+${Math.round(c.duration * 25)}:${c.linkGroup ? 'cam' : 'x'}:${group(c.linkGroup)}` +
+      (Editor.syncOffset(c) ? ':off' : '') + (c.enabled === false ? ':OFF' : ''));
+  });
+  const piece = async n => state(page, n => Editor.get().project.clips.filter(c => c.type === 'video' && c.linkGroup)
+    .sort((a, b) => a.start - b.start)[n], n);
+  await setup();
+  const base = ['v1:0+25:cam:G1', 'v1:25+24:x:-', 'v1:49+26:cam:G1', 'v1:75+24:x:-', 'v1:99+51:cam:G1', 'a-1:0+150:cam:G1'];
+  assert.deepEqual(await layout(), base, 'three picture pieces grouped with the sound');
+  // Trim the head piece's out point: only the head piece (no other member ends there).
+  let head = await piece(0);
+  await state(page, ([id, at]) => Editor.trimEdge(id, 'end', at), [head.id, f(20)]);
+  assert.deepEqual(await layout(), ['v1:0+20:cam:G1', ...base.slice(1)], 'trim head out: only the head piece');
+  // Trim the tail piece's in point: only the tail piece.
+  await setup();
+  const tail = await piece(2);
+  await state(page, ([id, at]) => Editor.trimEdge(id, 'start', at), [tail.id, f(104)]);
+  assert.deepEqual(await layout(), [...base.slice(0, 4), 'v1:104+46:cam:G1', base[5]], 'trim tail in: only the tail piece');
+  // Trim the tail piece's out point: the sound ends there too, so both move.
+  await state(page, ([id, at]) => Editor.trimEdge(id, 'end', at), [tail.id, f(140)]);
+  assert.deepEqual(await layout(), [...base.slice(0, 4), 'v1:104+36:cam:G1', 'a-1:0+140:cam:G1'], 'trim tail out: the tail and the sound');
+  // Roll the cut between the head piece and the first inserted clip: the sound does not move.
+  await setup();
+  head = await piece(0);
+  const x1 = await state(page, () => Editor.get().project.clips.find(c => c.type === 'video' && !c.linkGroup && c.start < 1.5).id);
+  await state(page, ([left, right, at]) => Editor.rollEdit(left, right, at), [head.id, x1, f(30)]);
+  assert.deepEqual(await layout(), ['v1:0+30:cam:G1', 'v1:30+19:x:-', ...base.slice(2)], 'roll: only the pieces at the cut');
+  // Delete the middle piece: only that piece; the sound and the other pieces stay linked.
+  await setup();
+  let middle = await piece(1);
+  await state(page, id => Editor.deleteClips([id]), middle.id);
+  assert.deepEqual(await layout(), [...base.slice(0, 2), ...base.slice(3)], 'delete the middle piece: only that piece');
+  // Disable the middle piece: only that piece.
+  await setup();
+  middle = await piece(1);
+  await state(page, id => Editor.toggleEnabled([id]), middle.id);
+  assert.deepEqual(await layout(), [base[0], base[1], 'v1:49+26:cam:G1:OFF', ...base.slice(3)], 'disable the middle piece: only that piece');
+  // Disabling the sound (it spans every piece) takes every piece.
+  const audio = await state(page, () => Editor.get().project.clips.find(c => c.type === 'audio').id);
+  await state(page, id => Editor.toggleEnabled([id]), audio);
+  assert.equal((await layout()).filter(entry => entry.endsWith(':OFF')).length, 4, 'disable the sound: the shot');
+  // Ripple delete the middle piece: the sound under it is cut out and the rest moves left in sync.
+  await setup();
+  middle = await piece(1);
+  await state(page, id => Editor.deleteClips([id], {ripple: true}), middle.id);
+  assert.deepEqual(await layout(), ['v1:0+25:cam:G1', 'v1:25+24:x:-', 'v1:49+24:x:-', 'v1:73+51:cam:G2', 'a-1:0+49:cam:G1', 'a-1:49+75:cam:G2'],
+    'ripple delete the middle piece');
+  // Ripple delete the first inserted clip: the sound under it is cut, later pieces and sound move left in sync.
+  await setup();
+  await state(page, () => Editor.deleteClips([Editor.get().project.clips.find(c => c.type === 'video' && !c.linkGroup && c.start < 1.5).id], {ripple: true}));
+  assert.deepEqual(await layout(), ['v1:0+25:cam:G1', 'v1:25+26:cam:G2', 'v1:51+24:x:-', 'v1:75+51:cam:G2', 'a-1:0+25:cam:G1', 'a-1:25+101:cam:G2'],
+    'ripple delete the inserted clip');
+  // Deleting one of two grouped pieces leaves a lone clip: it is no longer linked.
+  await load(page, {clips: [picture('p1', 1, 0, f(25), {linkGroup: 'q'}), picture('p2', 1, f(50), f(25), {linkGroup: 'q', in: f(50)})]});
+  await state(page, () => Editor.deleteClips(['p1']));
+  assert.deepEqual(Object.keys(await clips(page)), ['p2']);
+  assert.equal((await clips(page)).p2.linkGroup, undefined, 'a lone piece is unlinked');
+  // A plain linked pair with a J-cut (sound starts earlier) still trims together.
+  await load(page, {clips: [picture('v', 1, f(10), f(40), {linkGroup: 'p', in: f(10)}), sound('a', -1, 0, f(50), {linkGroup: 'p'})]});
+  await state(page, at => Editor.trimEdge('v', 'end', at), f(40));
+  const pair = await clips(page);
+  assert.deepEqual([pair.v.duration, pair.a.duration].map(t => Math.round(t * 25)), [30, 40], 'a J-cut pair trims together');
+  console.log('Pieces of a shot: trims and rolls move members at the same edge, delete and disable take members within, ripple delete keeps sync.');
+}
+
 // 4. Source monitor targets, the drop-frame ruler and compatibility notes.
 async function sourceTargets(page) {
   await load(page, {clips: [picture('v', 1, 0, 2)], trackCounts: {video: 4, audio: 4}});
@@ -214,7 +296,7 @@ async function main() {
   const splice = await startSplice('splice-followups-');
   try {
     const sections = [
-      ['farTracks', farTracks, {small: true}], ['links', links, {once: true}], ['sourceTargets', sourceTargets],
+      ['farTracks', farTracks, {small: true}], ['links', links, {once: true}], ['pieces', pieces, {once: true}], ['sourceTargets', sourceTargets],
       ['trackHeights', trackHeights, {small: true}],
     ];
     let pass = 1;
