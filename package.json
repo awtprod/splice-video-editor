@@ -2,7 +2,7 @@
   "name": "splice-linux",
   "private": true,
   "scripts": {
-    "test": "python3 -m unittest discover -s tests && node tests/track-lock.cjs && node tests/studio-flow.cjs && node tests/restart-flow.cjs && node tests/media-link-flow.cjs && node tests/media-cache-flow.cjs && node tests/recovery-retention.cjs && node tests/editing-core.cjs && node tests/editing-round1.cjs && node tests/editing-scale.cjs"
+    "test": "python3 -m unittest discover -s tests && node tests/track-lock.cjs && node tests/scopes-flow.cjs && node tests/studio-flow.cjs && node tests/restart-flow.cjs && node tests/media-link-flow.cjs && node tests/media-cache-flow.cjs && node tests/recovery-retention.cjs && node tests/resolve-flow.cjs && node tests/interchange-flow.cjs && node tests/editing-core.cjs && node tests/editing-round1.cjs && node tests/editing-scale.cjs"
   },
   "devDependencies": {"playwright-core":"1.65.1"}
 }

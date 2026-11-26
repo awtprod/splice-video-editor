@@ -559,11 +559,11 @@
     if (!projectChanged) return;
     const issueCount=SpliceDialogs.compatibility(state.project).length;
     $('compatibility').textContent=issueCount?'Project compatibility ('+issueCount+')…':'Project compatibility…';
-    const sequences=state.project.premiereSequences||[], selector=$('sequence-select');
+    const sequences=state.project.resolveTimelines||state.project.premiereSequences||[], selector=$('sequence-select');
     selector.hidden=sequences.length<2;
     if(!selector.hidden){
       selector.replaceChildren(...sequences.map((name,i)=>new Option(name,String(i))));
-      selector.value=String(state.project.premiereSequence);
+      selector.value=String(state.project.resolveTimelines?state.project.resolveTimeline:state.project.premiereSequence);
     }
     $('size-label').textContent=state.project.width+' × '+state.project.height;
     const aspect=state.project.width/state.project.height;
@@ -925,7 +925,7 @@
   $("versions").onclick=()=>busy(()=>SpliceSession.history());
   $("save-as").onclick=()=>busy(()=>SpliceSession.saveAs("prproj"));
   $("sequence-settings").onclick=()=>sequenceSettings();
-  $("sequence-select").onchange=e=>busy(()=>SpliceSession.sequence(Number(e.target.value)));
+  $("sequence-select").onchange=e=>busy(()=>editor.get().project.resolveTimelines?SpliceResolve.timeline(Number(e.target.value)):SpliceSession.sequence(Number(e.target.value)));
   $("fullscreen-monitor").onclick = () => {
     if (document.fullscreenElement) document.exitFullscreen();
     else $("monitor-frame").requestFullscreen?.();

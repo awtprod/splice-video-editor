@@ -43,6 +43,7 @@ from premiere import MEDIA_ROOT
 import media_links
 from media_proxy import audition_audio, decodable, describe, nested_preview, proxy
 from media_peaks import waveform
+from resolve import http as resolve_http
 
 MAX_NATIVE_PROJECT = 50 * 1024 * 1024
 # JSON also carries the base64 original graph plus the current editing model.
@@ -265,6 +266,45 @@ def premiere_open(handler, body):
     if part is None:
         raise ValueError('Missing file')
     handler._json(200, {'project': open_project(part.get_payload(decode=True))})
+
+
+def _interchange(handler, action, body):
+    from interchange.api import handle
+    handler._json(200, handle(action, _json_body(body)))
+
+
+@post('/api/interchange/export')
+def interchange_export(handler, body):
+    """Timeline files (FCPXML, FCP 7 XML, EDL, OTIO), the report and an optional turnover zip."""
+    _interchange(handler, 'export', body)
+
+
+@post('/api/interchange/import')
+def interchange_import(handler, body):
+    """A timeline file as a new project; media found on this machine is linked in place."""
+    _interchange(handler, 'import', body)
+
+
+@post('/api/interchange/cancel')
+def interchange_cancel(handler, body):
+    _interchange(handler, 'cancel', body)
+
+
+# DaVinci Resolve projects (package resolve/). The .drp body is read by the handler, which also
+# takes the timeline from the query string.
+@post('/api/resolve/open', limit=resolve_http.MAX_DRP_BYTES, stream=True)
+def resolve_open(handler, length, query):
+    resolve_http.open_route(handler, length, query)
+
+
+@post('/api/resolve/library/list', limit=resolve_http.MAX_JSON)
+def resolve_library_list(handler, body):
+    resolve_http.library_list_route(handler, body)
+
+
+@post('/api/resolve/library/open', limit=resolve_http.MAX_JSON)
+def resolve_library_open(handler, body):
+    resolve_http.library_open_route(handler, body)
 
 
 class Handler(BaseHTTPRequestHandler):

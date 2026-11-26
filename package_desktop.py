@@ -13,7 +13,8 @@ def source_files():
     tracked = subprocess.check_output(["git", "ls-files", "-z"], cwd=ROOT).decode("utf-8").split("\0")
     return sorted({
         Path(name) for name in tracked if name and (
-            name.startswith(("assets/", "vendor/")) or name == "README.md" or
+            name.startswith(("assets/", "vendor/", "interchange/")) or name == "README.md" or
+            (name.startswith("resolve/") and name.endswith(".py")) or
             ("/" not in name and Path(name).suffix in (".py", ".js", ".css", ".html")
              and name != Path(__file__).name)
         )

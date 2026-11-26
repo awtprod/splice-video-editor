@@ -1,0 +1,12 @@
+.interchange-dialog{width:min(560px,92vw)}
+.interchange-dialog fieldset{border:1px solid #435142;border-radius:4px;margin:0 0 6px;padding:6px 12px}
+.interchange-dialog legend{padding:0 4px;color:#b9c4b5}
+.interchange-dialog fieldset label,.interchange-dialog label.interchange-check{display:flex;grid-template-columns:none;align-items:center;gap:8px;margin:8px 0}
+.interchange-dialog label.interchange-sub{margin-left:26px}
+.interchange-dialog .interchange-report pre{max-height:240px;overflow:auto;white-space:pre-wrap;font-size:12px;background:#121612;border:1px solid #333d33;padding:8px}
+.interchange-dialog .interchange-report summary{cursor:pointer;margin:8px 0}
+.interchange-dialog .interchange-note{margin:0 0 6px 26px;font-size:12px;color:#b9c4b5}
+.interchange-dialog .interchange-advanced{margin:8px 0}
+.interchange-dialog .interchange-advanced summary{cursor:pointer;color:#b9c4b5}
+.interchange-dialog .interchange-advanced .interchange-note{margin:6px 0}
+.interchange-dialog .interchange-advanced textarea{width:100%;box-sizing:border-box;font:12px ui-monospace,monospace;background:#121612;color:inherit;border:1px solid #435142;border-radius:4px;padding:6px}
