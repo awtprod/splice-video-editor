@@ -60,8 +60,8 @@ FORBIDDEN_PAGE = (b'<!doctype html><meta charset="utf-8"><title>Splice</title>'
                   b'launch link. Use the desktop launcher, or open the full link that <code>python3 server.py</code> '
                   b'printed in its terminal (it ends in <code>?launch=</code> and a code).</p>'
                   b'<p>If that link was already used (for example before your browser restarted), press Enter in the '
-                  b'terminal where <code>python3 server.py</code> is running, or send that process the USR1 signal '
-                  b'(<code>kill -USR1</code> and its process id), and it prints a new one-time link. Only someone who '
+                  b'terminal where <code>python3 server.py</code> is running, or on macOS and Linux send that process '
+                  b'the USR1 signal (<code>kill -USR1</code> and its process id), and it prints a new one-time link. Only someone who '
                   b'can reach that terminal or signal that process can get one. You can also stop the server and start '
                   b'it again.</p>')
 # A launch from a page on another origin (the desktop launcher's local
@@ -611,10 +611,9 @@ RELAUNCH_HINT = ('Lost the session (a browser restart, another browser)? Press E
                  + (', or run kill -USR1 {pid}.' if hasattr(signal, 'SIGUSR1') else '.'))
 
 
-def print_new_launch(server, stream=None):
-    """Print a fresh one-time link to the operator's console."""
-    stream = stream or sys.stdout
-    print(server.new_launch_url(), file=stream, flush=True)
+def print_new_launch(server):
+    """Print a fresh one-time link to the operator's console (stdout, like the first one)."""
+    print(server.new_launch_url(), flush=True)
     print('That is a new one-time link; the earlier one no longer works.', file=sys.stderr, flush=True)
 
 

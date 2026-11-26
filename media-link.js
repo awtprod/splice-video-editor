@@ -199,6 +199,9 @@ window.SpliceLink = (() => {
             ' files, ' + size(report.linkedBytes) + ' (not copied)' + (report.linkedFiles >= report.maxLinks ? ' — list full' : '')}),
           element('dt', {textContent: 'Free space'}), element('dd', {textContent: size(report.freeBytes)})),
         ...(report.notice ? [element('p', {className: 'link-message', id: 'cache-notice', textContent: report.notice})] : []),
+        ...(report.unclassified ? [element('p', {className: 'link-note', id: 'cache-unclassified', textContent:
+          `${report.unclassified} folder(s) from an earlier Splice version are listed as imported copies until Splice ` +
+          'has checked them; reopen Media cache to continue. The bulk delete never removes them meanwhile.'})] : []),
         element('h3', {textContent: 'Imported copies'}),
         imports.length ? element('table', {id: 'cache-import-list'},
           element('thead', {}, element('tr', {}, ...['', 'File', 'Size', 'Last used', 'Projects'].map(text => element('th', {textContent: text})))),

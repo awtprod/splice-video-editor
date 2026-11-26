@@ -54,6 +54,8 @@ CAMERA_RAW = {
 _lock = threading.RLock()
 _write_lock = threading.Lock()
 _cache = {'stamp': None, 'links': {}, 'recovered': None}
+# A damaged registry whose repair found the lock busy: (stamp, monotonic time to retry).
+_deferred = {'stamp': None, 'until': 0.0}
 REGISTRY_VERSION = 1
 # How long a reader waits for the file lock to repair a damaged registry before serving the
 # last good snapshot instead (a stalled writer elsewhere must not stall playback).
@@ -203,8 +205,8 @@ def _remove_stale_temporaries():
         if _TEMPORARY.fullmatch(entry.name) and entry.is_file(follow_symlinks=False):
             try:
                 os.unlink(entry.path)
-            except FileNotFoundError:
-                pass
+            except OSError:
+                continue  # Gone already, or held open (Windows): the next save tries again.
 
 
 def _read_locked():
@@ -251,7 +253,7 @@ def _links():
     a later read."""
     stamp = _stamp()
     with _lock:
-        if stamp == _cache['stamp']:
+        if stamp == _cache['stamp'] or (stamp == _deferred['stamp'] and time.monotonic() < _deferred['until']):
             return _cache['links']
     snapshot = _snapshot()
     if snapshot is None:
@@ -259,7 +261,8 @@ def _links():
             with _registry_lock(READ_LOCK_SECONDS):
                 snapshot = _read_locked()
         except TimeoutError:
-            with _lock:
+            with _lock:  # Serve the last good list; retry the repair in a few seconds, not every read.
+                _deferred.update(stamp=stamp, until=time.monotonic() + 5)
                 return _cache['links']
     stamp, links, recovered = snapshot
     with _lock:
@@ -635,7 +638,8 @@ class _HashBudget:
 
 
 def _kind(directory, names, budget=None):
-    """'import' or 'proxy', and whether the answer is provisional (the hash budget ran out).
+    """'import' or 'proxy'. An answer the hash ``budget`` could not reach is 'import' and counted
+    in ``budget.deferred`` (provisional: a later report finishes it).
 
     Unmarked folders from earlier versions are imports unless every file in them is named like
     a generated file and NONE holds content that names the folder: imports are stored under
@@ -644,11 +648,11 @@ def _kind(directory, names, budget=None):
     the bulk prune never deletes."""
     markers = {p.name for p in directory.iterdir() if p.name in (IMPORT_MARKER, DERIVED_MARKER)}
     if IMPORT_MARKER in markers:
-        return 'import', False
+        return 'import'
     if DERIVED_MARKER in markers:
-        return 'proxy', False
+        return 'proxy'
     if not names or not all(n in PROXY_NAMES or n.endswith('-audio.wav') for n in names):
-        return 'import', False
+        return 'import'
     budget = budget or _HashBudget(HASH_BYTES_PER_REPORT)
     for name in names:
         target = directory / name
@@ -656,17 +660,17 @@ def _kind(directory, names, budget=None):
         key = (str(target), stat.st_size, stat.st_mtime_ns)
         if key not in _kinds:
             if stat.st_size > HASH_BYTES_PER_REPORT:
-                return 'import', False  # Too large ever to confirm: kept as an import.
+                return 'import'  # Too large ever to confirm: kept as an import.
             if stat.st_size > budget.left:
                 budget.deferred += 1
-                return 'import', True
+                return 'import'
             budget.left -= stat.st_size
             if len(_kinds) >= 100_000:
                 _kinds.clear()  # Bounded; a later report hashes again.
             _kinds[key] = _content_id(target) == directory.name
         if _kinds[key]:
-            return 'import', False
-    return 'proxy', False
+            return 'import'
+    return 'proxy'
 
 
 def cache_report():
@@ -679,7 +683,9 @@ def cache_report():
                 continue
             try:
                 names = sorted(p.name for p in directory.iterdir() if p.is_file() and not p.name.startswith('.'))
-                kind, provisional = _kind(directory, names, budget)
+                deferred = budget.deferred
+                kind = _kind(directory, names, budget)
+                provisional = budget.deferred > deferred
                 size, used = _tree_size(directory)
                 modified = directory.stat().st_mtime
             except OSError:

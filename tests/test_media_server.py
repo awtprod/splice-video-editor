@@ -793,6 +793,7 @@ class IsolatedRegistry(unittest.TestCase):
         media_links.MEDIA_ROOT = self.data / 'media'
         media_links.REGISTRY = self.data / 'linked-media.json'
         media_links._cache.update(stamp=None, links={}, recovered=None)
+        media_links._deferred.update(stamp=None, until=0.0)
 
         def restore():
             for key, value in saved.items():
@@ -1012,6 +1013,10 @@ class LinkRegistry(IsolatedRegistry):
         started = time.monotonic()
         self.assertEqual(self.ml.resolve_media(entry['src']), first.resolve())
         self.assertLess(time.monotonic() - started, self.ml.READ_LOCK_SECONDS + 1)
+        started = time.monotonic()
+        for _ in range(20):
+            self.ml.resolve_media(entry['src'])
+        self.assertLess(time.monotonic() - started, .5, 'the repair is deferred, not retried on every read')
         temporary.write_text(good)
         os.replace(temporary, self.ml.REGISTRY)
         holder.kill()
