@@ -30,6 +30,27 @@ PER_VOLUME = max(1, PROBES // 2)
 LOOKUP_SHARE = 1 / 3
 _children = set()
 _children_lock = threading.Lock()
+# Workers of every open share one cap: a lookup stuck in a filesystem call that never returns (a
+# hung network mount) keeps its thread, so at most MAX_THREADS lookup threads live at once, and a
+# volume with a lookup still unanswered from an earlier open gets no new one until it answers:
+# each hung volume holds at most PER_VOLUME threads however often a project is opened.
+MAX_THREADS = 4 * PROBES
+_flight = threading.Lock()
+_alive = 0          # lookup threads alive (all opens)
+_unanswered = {}    # volume -> work items still running after their open's deadline
+HUNG_MESSAGE = ('its drive did not answer when Splice last looked; Splice looks again once that drive answers '
+                '(reconnect it, then open the project again)')
+
+
+def hung(volume_key):
+    """Whether a lookup on this volume from an earlier open has not returned yet."""
+    with _flight:
+        return _unanswered.get(volume_key, 0) > 0
+
+
+def threads_alive():
+    with _flight:
+        return _alive
 
 
 def _offline(reason, message=None):
@@ -129,51 +150,77 @@ def _volume(item):
     return '/'.join(parts[:2])
 
 
-def _bounded(work, items, deadline, volume=None):
+def _bounded(work, items, deadline, volume=None, on_hung=None):
     """``work(item)`` for each item, ``PROBES`` at a time, until ``deadline`` (time.monotonic()).
 
     Returns {index: result} for the items finished in time. The workers are daemon threads, so one
     stuck in a filesystem call that never returns (a hung network mount) neither delays this past
     the deadline nor keeps the server from exiting. With ``volume(item)``, at most
     :data:`PER_VOLUME` items of one volume run at a time, so files on other volumes are still
-    checked while one volume hangs."""
+    checked while one volume hangs; an item on a volume an earlier call left unanswered is not
+    worked at all (its result is ``on_hung``), and no more than :data:`MAX_THREADS` workers live
+    across all calls, so repeated opens of a project on a hung drive do not pile up threads."""
+    global _alive
     results = {}
     if not items:
         return results
     lock = threading.Condition()
     queue = list(enumerate(items))
     busy = {}
+    running = {}  # index -> volume key of the items being worked
+    late = set()  # indexes still running when the deadline passed (their volume is now unanswered)
 
     def take():
         for position, (index, item) in enumerate(queue):
             key = volume(item) if volume else None
+            if key is not None and hung(key):
+                del queue[position]
+                results[index] = on_hung
+                return take()
             if key is None or busy.get(key, 0) < PER_VOLUME:
                 del queue[position]
                 if key is not None:
                     busy[key] = busy.get(key, 0) + 1
+                running[index] = key
                 return index, item, key
         return None
 
     def worker():
-        while True:
-            with lock:
-                while True:
-                    if not queue or time.monotonic() >= deadline:
-                        lock.notify_all()
-                        return
-                    taken = take()
-                    if taken is not None:
-                        break
-                    lock.wait(min(0.2, max(0.0, deadline - time.monotonic())))
-                index, item, key = taken
-            value = work(item)
-            with lock:
-                results[index] = value
-                if key is not None:
-                    busy[key] -= 1
-                lock.notify_all()
-    threads = [threading.Thread(target=worker, name='splice-resolve-link', daemon=True)
-               for _ in range(min(PROBES, len(items)))]
+        global _alive
+        try:
+            while True:
+                with lock:
+                    while True:
+                        if not queue or time.monotonic() >= deadline:
+                            lock.notify_all()
+                            return
+                        taken = take()
+                        if taken is not None:
+                            break
+                        if not queue:
+                            lock.notify_all()
+                            return
+                        lock.wait(min(0.2, max(0.0, deadline - time.monotonic())))
+                    index, item, key = taken
+                value = work(item)
+                with lock:
+                    results[index] = value
+                    running.pop(index, None)
+                    if key is not None:
+                        busy[key] -= 1
+                    if index in late and key is not None:
+                        with _flight:
+                            _unanswered[key] -= 1
+                            if _unanswered[key] <= 0:
+                                del _unanswered[key]
+                    lock.notify_all()
+        finally:
+            with _flight:
+                _alive -= 1
+    with _flight:
+        count = max(0, min(PROBES, len(items), MAX_THREADS - _alive))
+        _alive += count
+    threads = [threading.Thread(target=worker, name='splice-resolve-link', daemon=True) for _ in range(count)]
     for thread in threads:
         thread.start()
     with lock:
@@ -182,6 +229,12 @@ def _bounded(work, items, deadline, volume=None):
             if left <= 0 or not any(thread.is_alive() for thread in threads):
                 break
             lock.wait(min(left, 0.5))
+        for index, key in running.items():
+            late.add(index)
+            if key is not None:
+                with _flight:
+                    _unanswered[key] = _unanswered.get(key, 0) + 1
+        lock.notify_all()  # idle workers see the deadline and end now
         return dict(results)
 
 
@@ -218,7 +271,8 @@ def link_local(paths, *, seconds=LINK_SECONDS, max_files=MAX_LINK_FILES):
         for index in wanted[text]:
             results[index] = _offline('unchecked', limit)
     texts = texts[:MAX_LOOKUPS]
-    looked = _bounded(lambda text: _look(Path(text)), texts, time.monotonic() + seconds * LOOKUP_SHARE, _volume)
+    looked = _bounded(lambda text: _look(Path(text)), texts, time.monotonic() + seconds * LOOKUP_SHARE, _volume,
+                      _offline('unchecked', HUNG_MESSAGE))
     files = {}  # identity of a real file -> its resolved path
     named = {}  # identity -> the indexes of every path naming it
     for number, text in enumerate(texts):
@@ -237,7 +291,7 @@ def link_local(paths, *, seconds=LINK_SECONDS, max_files=MAX_LINK_FILES):
     identities = identities[:max_files]
     try:
         probed = _bounded(lambda identity: _probe(files[identity], deadline), identities, deadline,
-                          lambda identity: _volume(files[identity]))
+                          lambda identity: _volume(files[identity]), _offline('unchecked', HUNG_MESSAGE))
     finally:
         stop_probes()
     playable = []

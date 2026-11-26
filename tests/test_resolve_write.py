@@ -1188,3 +1188,44 @@ class NewMediaReportTests(SaveCase):
         self.assertTrue(all('colour range - (unset in the file)' in place for place in mov_lines[0]['all']),
                         (mov_lines[0]['what'], mov_lines[0]['all']))
         self.assertIn('unverifiedMedia', result['needs'])
+
+
+class HungVolumeTests(unittest.TestCase):
+    def test_a_hung_volume_holds_its_threads_once_not_once_per_open(self):
+        from resolve import media
+        release = threading.Event()
+
+        def work(text):
+            if text.startswith('/mnt/hung/'):
+                release.wait(30)
+            return 'done ' + text
+        items_ = [f'/mnt/hung/{n}.mov' for n in range(10)] + ['/mnt/fine/a.mov', '/mnt/fine/b.mov']
+        before = media.threads_alive()
+        try:
+            import time
+            first = media._bounded(work, items_, time.monotonic() + 0.4, media._volume, 'hung')
+            self.assertEqual({first[10], first[11]}, {'done /mnt/fine/a.mov', 'done /mnt/fine/b.mov'})
+            self.assertTrue(media.hung('mnt/hung'))
+            settle = time.monotonic() + 2
+            while media.threads_alive() - before > media.PER_VOLUME and time.monotonic() < settle:
+                threading.Event().wait(0.02)  # idle workers end once they see the deadline
+            stuck = media.threads_alive() - before
+            self.assertLessEqual(stuck, media.PER_VOLUME)
+            for _ in range(5):
+                again = media._bounded(work, items_, time.monotonic() + 0.4, media._volume, 'hung')
+                self.assertEqual([again[n] for n in range(10)], ['hung'] * 10)
+                self.assertEqual(again[10], 'done /mnt/fine/a.mov')
+            settle = time.monotonic() + 2
+            while media.threads_alive() - before > stuck and time.monotonic() < settle:
+                threading.Event().wait(0.02)
+            self.assertEqual(media.threads_alive() - before, stuck)
+        finally:
+            release.set()
+        deadline = __import__('time').monotonic() + 10
+        while media.threads_alive() > before and __import__('time').monotonic() < deadline:
+            threading.Event().wait(0.05)
+        self.assertEqual(media.threads_alive(), before)
+        self.assertFalse(media.hung('mnt/hung'))
+        import time
+        answered = media._bounded(work, items_, time.monotonic() + 5, media._volume, 'hung')
+        self.assertEqual(answered[0], 'done /mnt/hung/0.mov')
