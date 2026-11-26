@@ -1489,7 +1489,11 @@
     const value = String(text).replace(/\s+/g, "");
     if (!value || !/^[\d:;.]+$/.test(value)) throw new Error("Type a timecode such as 01:00:10:00.");
     let parts;
+    const dotted = value.split(".");
     if (/[:;]/.test(value)) parts = value.split(/[:;.]/);
+    else if (value.replace(/\./g, "00").length > 8 && dotted.length <= 4 && dotted.every(part => /^\d{1,2}$/.test(part)))
+      // Too long to read "." as "00" (e.g. 01.00.01.00): the dots separate fields.
+      parts = dotted;
     else {
       const digits = value.replace(/\./g, "00");
       if (digits.length > 8) throw new Error("Type at most eight digits: hours, minutes, seconds and frames.");

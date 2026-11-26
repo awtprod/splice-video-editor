@@ -416,6 +416,7 @@ async function timecodeEntry(page) {
   assert.deepEqual(await parse('+1.', base), {ok: '01:00:06;12'});
   assert.match((await parse('1..', base)).error, /does not exist in drop-frame timecode; that minute starts at 01:01:00;02/);
   assert.deepEqual(await parse('1.02', base), {ok: '01:01:00;02'});
+  assert.deepEqual(await parse('01.00.07.00', base), {ok: '01:00:07;00'}, 'too long for "." as 00: dots separate fields');
   assert.match((await parse('01:01:00;00', base)).error, /does not exist in drop-frame/);
   assert.match((await parse('01:01:00;01', base)).error, /does not exist in drop-frame/);
   assert.deepEqual(await parse('01:10:00;00', base), {ok: '01:10:00;00'});
