@@ -263,6 +263,28 @@ class Intra(DeliveryCase):
                 center = H//2 * (W//2) + W//4
                 self.assertGreater(plane[center + W//2] - plane[center], 90)
 
+    def test_nested_sequence_preserves_delivery_chroma(self):
+        # One-pixel Cb rows disappear at 4:2:0 and one-pixel Cr columns disappear at 4:2:2.
+        source = self.media / 'nested-chroma.mkv'
+        ffmpeg('-f', 'lavfi', '-i', f"nullsrc=s={W}x{H},format=yuv444p,"
+               "geq=lum=128:cb='80+96*mod(Y,2)':cr='80+96*mod(X,2)'",
+               '-t', '0.5', '-c:v', 'ffv1', str(source))
+        clip = dict(type='video', track=1, mediaId='m', start=0, duration=.5)
+        child = self.project(extra=dict(media=[dict(id='m', src=self.src(source))], clips=[clip]))
+        parent = self.project(extra=dict(media=[dict(id='m', nestedProject=child)], clips=[clip]))
+        for codec, profile in [('dnxhr', 'hq'), ('prores', '4444'), ('png', '8')]:
+            with self.subTest(codec=codec, profile=profile):
+                path, _ = self.render(parent, dict(codec=codec, profile=profile))
+                frame = sorted(path.glob('*.png'))[0] if path.is_dir() else path
+                pixels = subprocess.check_output(['ffmpeg', '-v', 'error', '-i', str(frame), '-frames:v', '1',
+                                                  '-pix_fmt', 'yuv444p', '-f', 'rawvideo', 'pipe:1'], timeout=60)
+                center = H//2 * W + W//2
+                cb = W*H + center
+                self.assertGreater(pixels[cb + W] - pixels[cb], 70)
+                if codec != 'dnxhr':
+                    cr = 2*W*H + center
+                    self.assertGreater(pixels[cr + 1] - pixels[cr], 70)
+
     def test_dnxhr_profiles_in_mov_and_mxf(self):
         for profile, label, pix, depth in (('lb', 'DNXHR LB', 'yuv422p', 8), ('sq', 'DNXHR SQ', 'yuv422p', 8), ('hq', 'DNXHR HQ', 'yuv422p', 8),
                                            ('hqx', 'DNXHR HQX', 'yuv422p10le', 10), ('444', 'DNXHR 444', 'yuv444p10le', 10)):

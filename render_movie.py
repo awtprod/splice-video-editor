@@ -1718,18 +1718,16 @@ def render_to_file(project, output_path, *, options=None, progress=None, cancell
             child=item.get('nestedProject')
             if not child or item.get('id') not in enabled_media: continue
             if _nested_depth>=4: raise ValueError('Nested Premiere sequences exceed four levels')
-            # A nested sequence is rendered as an intermediate: ProRes 422 HQ under high-depth
-            # deliveries, H.264 under 8-bit ones, with the parent's audio and colour settings.
+            # Chroma detail lost in an intermediate cannot be recovered by the parent compositor.
             parent_spec = _delivery_spec(options)
-            child_codec=delivery.legacy_codec(parent_spec)
-            child_codec='h264' if child_codec=='wav' else child_codec
+            child_codec = 'prores' if parent_spec['high_depth'] or parent_spec['chroma'] != '420' else 'h264'
             suffix='.mov' if child_codec=='prores' else '.mp4'
             target=Path(directory)/f'nested-{index}{suffix}'
             child_options={key:options[key] for key in ('limiter','limiterCeiling','aacPeakSafe','audioBitrate','subtitleLanguage',
                                                          'captions') if key in options}
             child_options['codec']=child_codec
-            if parent_spec['alpha']:
-                child_options.update(profile='4444', alpha=True)
+            if parent_spec['chroma'] == '444':
+                child_options.update(profile='4444', alpha=parent_spec['alpha'])
             if child_codec=='prores' and options.get('colorSpace') in ('rec709','pq'):
                 child_options['colorSpace']=options['colorSpace']
             if child_codec=='h264' and options.get('codec','h264')=='h264' and 'crf' in options and not options.get('rateControl'):

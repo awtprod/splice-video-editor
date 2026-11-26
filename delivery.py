@@ -350,11 +350,6 @@ def _caption_files(options):
     return list(value)
 
 
-def legacy_codec(spec):
-    """The original renderer's codec family for a spec: 'prores' for 10-bit intra masters, else 'h264'."""
-    return 'wav' if spec['kind'] == 'audio' else 'prores' if spec['high_depth'] else 'h264'
-
-
 # ---------------------------------------------------------------------------------------------
 # Frame checks and conversions announced before rendering.
 
