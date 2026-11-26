@@ -791,10 +791,18 @@
     const below=box.bottom+4, height=84;
     menu.style.top=(below+height<=window.innerHeight-8?below:Math.max(8,box.top-height-4))+"px";
     const dismiss=event=>{if(!menu.contains(event.target))close();};
+    // Escape closes it (focus returns to the timeline); scrolling or resizing anything moves the
+    // badge away from it, so those close it too.
+    const onKey=event=>{if(event.key==="Escape"){event.preventDefault();event.stopPropagation();close();}};
     const close=()=>{
       menu.remove();
       window.removeEventListener("pointerdown",dismiss,true);
+      window.removeEventListener("keydown",onKey,true);
+      window.removeEventListener("scroll",close,true);
+      window.removeEventListener("wheel",close,true);
+      window.removeEventListener("resize",close);
       if(closeSyncMenu===close)closeSyncMenu=null;
+      if(document.activeElement===document.body||!document.activeElement)lanes.focus?.({preventScroll:true});
     };
     closeSyncMenu=close;
     for(const [how,label] of [["move","Move into sync"],["slip","Slip into sync"]]){
@@ -803,6 +811,10 @@
       menu.append(item);
     }
     window.addEventListener("pointerdown",dismiss,true);
+    window.addEventListener("keydown",onKey,true);
+    window.addEventListener("scroll",close,true);
+    window.addEventListener("wheel",close,true);
+    window.addEventListener("resize",close);
     document.body.append(menu);
     menu.querySelector("button").focus();
   }
@@ -1155,8 +1167,6 @@
   }
   window.SpliceKeys={keyBelongsToControl};
   document.addEventListener("keydown", (e) => {
-    // Escape closes the sync menu wherever focus is.
-    if (e.key === "Escape" && closeSyncMenu) { e.preventDefault(); closeSyncMenu(); return; }
     if (document.querySelector("dialog:modal") || e.target?.closest?.(".source-dialog, .sync-menu")) return;
     const typing=keyBelongsToControl(document.activeElement,e);
     const binding=keymap.find(row=>row.test&&(row.anywhere||!typing)&&row.test(e));
