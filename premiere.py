@@ -32,6 +32,16 @@ MEDIA_ROOT = data_directory() / 'media'
 
 
 def _media_path(src):
+    """Every media URL a project names, linked originals included: a thin alias for
+    ``media_links.resolve_media``, the one public resolver (imported here, at call time, because
+    media_links imports this module)."""
+    import media_links
+    return media_links.resolve_media(src)
+
+
+def managed_media_path(src):
+    """A managed copy or proxy (``/media/<id>/<name>``) or a bundled asset (``/assets/...``) as a
+    local path. Linked originals are media_links' to resolve; call _media_path for any source."""
     path = unquote(urlparse(src).path)
     if path.startswith('assets/'):
         path = '/' + path
