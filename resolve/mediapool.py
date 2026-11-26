@@ -1028,11 +1028,39 @@ def author(facts, template, placement, *, taken=frozenset(), new_id=lambda: str(
         mismatch = _template_mismatch(template, placement)
         if mismatch:
             unverified.append(mismatch)
+    variant = still_radiometry_variant(template.rows) if file_kind[0] == 'still' else None
+    if variant:
+        unverified.append(variant)
     if unverified and not allow_unverified:
         raise MediaPoolError('unverified', f'the rows of {facts.name} would not be verified: ' + '; '.join(unverified),
                              _UNVERIFIED_HINT)
     return AuthoredClip(file_kind, 'unverified' if unverified else 'verified', writer.media_id, built, unverified,
                         tuple(writer.notes) + (CLIP_26_NOTE,), template.rows.media_id)
+
+
+#: ``BtVideoInfo.Radiometry`` fields every still Resolve 21.1 described in its plain form holds
+#: (some of them); a still whose description holds others (``#14`` = 2 and ``#15`` = 6 on the
+#: real samples) is in Resolve's second form, and what in a file makes Resolve write that form is
+#: not established (identical FFprobe facts give either form).
+PLAIN_STILL_RADIOMETRY = frozenset({1, 2, 5, 6, 19, 27})
+
+
+def still_radiometry_variant(rows):
+    """Why a still authored from the template ``rows`` is not verified because of its colour
+    description (``Radiometry``), or None when the template holds the plain form."""
+    from . import codec
+    try:
+        fields = {number for number, _wire, _value in
+                  blobs.protobuf(codec.unwrap(rows.video.get('Radiometry'), 'BtVideoInfo.Radiometry'))}
+    except (codec.CodecError, blobs.BlobError, AttributeError, TypeError):
+        return ("the template still's colour description (Radiometry) cannot be read, so the new still's cannot be "
+                'checked')
+    extra = sorted(fields - PLAIN_STILL_RADIOMETRY)
+    if extra:
+        return ("the template still's colour description (Radiometry) is Resolve's second form (fields "
+                + ', '.join(f'#{n}' for n in extra) + '), and which file property makes Resolve write that form is '
+                'not established')
+    return None
 
 
 def _template_mismatch(template, placement):

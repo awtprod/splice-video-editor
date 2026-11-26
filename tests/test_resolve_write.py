@@ -1134,3 +1134,19 @@ class MediaStartSaveTests(SaveCase):
         finally:
             conn.close()
         self.assertEqual(len(held), 1)
+
+
+class StillRadiometryTests(unittest.TestCase):
+    def rows(self, *fields):
+        message = codec.pb_encode([[n, 0, v] for n, v in fields])
+        return mock.Mock(video={'Radiometry': codec.envelope(message, version=2, what='Radiometry')})
+
+    def test_the_second_form_of_a_still_colour_description_is_not_verified(self):
+        from resolve import mediapool
+        plain = self.rows((1, 102), (2, 2), (5, 16), (6, 3), (19, 0), (27, 0))
+        second = self.rows((1, 102), (2, 2), (5, 16), (6, 3), (14, 2), (15, 6), (19, 0), (27, 0))
+        self.assertIsNone(mediapool.still_radiometry_variant(plain))
+        why = mediapool.still_radiometry_variant(second)
+        self.assertIn('#14, #15', why)
+        self.assertIn('not established', why)
+        self.assertIn('cannot be read', mediapool.still_radiometry_variant(mock.Mock(video={'Radiometry': b'\x01'})))
