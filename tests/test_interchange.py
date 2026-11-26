@@ -567,19 +567,18 @@ class DesktopPackage(unittest.TestCase):
 
 
 class ServerRoutes(InterchangeCase):
-    def test_export_and_import_over_http(self):
-        from server import create_server
-        server = create_server(0)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        self.addCleanup(server.server_close)
-        self.addCleanup(server.shutdown)
-        base = f'http://127.0.0.1:{server.server_port}/api/interchange/'
+    """The interchange routes run behind the same request checks as every other /api route."""
 
-        def post(route, payload):
-            request = urllib.request.Request(base + route, json.dumps(payload).encode(), {'Content-Type': 'application/json'})
-            with urllib.request.urlopen(request, timeout=30) as response:
-                return json.load(response)
+    def test_export_and_import_over_http(self):
+        from test_media_server import ServerProcess
+        data = Path(self.temp.name) / 'server-data'
+        server = ServerProcess(data)
+        self.addCleanup(server.close)
+
+        def post(route, payload, expect=200):
+            status, body = server.json('POST', '/api/interchange/' + route, payload)
+            self.assertEqual(status, expect, body)
+            return body
         result = post('export', {'project': self.project(), 'options': {'formats': ['fcpxml', 'edl', 'otio', 'xmeml'], 'package': True}})
         self.assertEqual([f['name'].rsplit('.', 1)[1] for f in result['files']], ['fcpxml', 'edl', 'edl', 'edl', 'otio', 'xml'])
         self.assertIn('FCPXML 1.10 (DaVinci Resolve, Final Cut Pro):', result['report'])
@@ -595,10 +594,33 @@ class ServerRoutes(InterchangeCase):
         self.assertIn('(FCP 7 XML)', from_xml['compatibilityWarnings'][0])
         imported = post('import', {'filename': 'x.fcpxml', 'text': result['files'][0]['content']})['project']
         self.assertEqual(len(imported['clips']), len(self.project()['clips']))
-        with self.assertRaises(urllib.error.HTTPError) as caught:
-            post('import', {'filename': 'x.edl', 'text': 'garbage'})
-        self.assertEqual(caught.exception.code, 400)
-        caught.exception.close()
+        post('import', {'filename': 'x.edl', 'text': 'garbage'}, expect=400)
+
+    def test_every_interchange_route_refuses_requests_without_the_session(self):
+        from test_media_server import ServerProcess
+        server = ServerProcess(Path(self.temp.name) / 'refuse-data')
+        self.addCleanup(server.close)
+        payloads = {'export': {'project': self.project(), 'options': {'formats': ['edl']}},
+                    'import': {'filename': 'x.edl', 'text': 'TITLE: x\nFCM: NON-DROP FRAME\n', 'options': {'fps': '25'}},
+                    'cancel': {'jobId': 'no-such-import-2'}}
+        import server as server_module
+        self.assertLessEqual({'/api/interchange/export', '/api/interchange/import', '/api/interchange/cancel'},
+                             set(server_module.POST_ROUTES))
+        for route, payload in payloads.items():
+            path = '/api/interchange/' + route
+            with self.subTest(route=route):
+                for label, options in (('no cookie or token', dict(auth=False)),
+                                       ('cookie without the page token', dict(token=False)),
+                                       ('a cross-site request', dict(headers={'Sec-Fetch-Site': 'cross-site'})),
+                                       ('another origin', dict(headers={'Origin': 'http://127.0.0.1:1'}))):
+                    status, _, body = server.request('POST', path, payload, **options)
+                    self.assertEqual(status, 403, f'{route} with {label}: {body[:200]}')
+                status, body = server.json('POST', path, payload)
+                self.assertIn(status, (200, 400), body)    # the app's own call reaches the handler
+                if route != 'import':
+                    self.assertEqual(status, 200, body)
+                else:
+                    self.assertNotIn('refused', body.get('error', ''))
 
 
 if __name__ == '__main__':

@@ -1,6 +1,6 @@
 /* Browser flow: edit, export FCPXML, FCP 7 XML and EDL from File > Export timeline…, import them back. */
 const assert = require('node:assert/strict');
-const {spawn} = require('node:child_process');
+const {startSplice} = require('./splice-server.cjs');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -9,17 +9,9 @@ const {chromium} = require('playwright-core');
 async function main() {
   const root = path.resolve(__dirname, '..');
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'splice-interchange-'));
-  const server = spawn('python3', ['-u', 'server.py', '--port', '0'], {
-    cwd: root, env: {...process.env, HOME: temp, XDG_DATA_HOME: temp}, stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  let browser, logs = '';
-  server.stderr.on('data', chunk => { logs = (logs + chunk).slice(-4000); });
+  const splice = await startSplice({root, env: {HOME: temp, XDG_DATA_HOME: temp, SPLICE_DATA_DIR: path.join(temp, 'data')}});
+  let browser;
   try {
-    const url = await new Promise((resolve, reject) => {
-      server.stdout.once('data', d => resolve(d.toString().trim()));
-      server.once('error', reject);
-      server.once('exit', code => reject(Error('Server exited ' + code + ' ' + logs)));
-    });
     const executablePath = [process.env.SPLICE_CHROME, '/opt/google/chrome/chrome', '/usr/bin/chromium', '/usr/bin/google-chrome', chromium.executablePath()]
       .find(p => p && fs.existsSync(p));
     assert.ok(executablePath, 'Install Chromium or set SPLICE_CHROME');
@@ -35,8 +27,7 @@ async function main() {
       if (!await page.locator(id).isVisible()) await page.locator('.file-menu summary').click();
       await page.locator(id).click();
     };
-    await page.goto(url);
-    await page.evaluate(() => SpliceSession.ready);
+    await splice.open(page);
     await page.waitForFunction(() => Editor.get().video?.readyState >= 2);
 
     // A short edit on the starter project: a split, a marker, a gain change and a slower clip.
@@ -135,7 +126,7 @@ async function main() {
     assert.deepEqual(errors, []);
   } finally {
     await browser?.close();
-    if (server.exitCode === null) { const end = new Promise(r => server.once('exit', r)); server.kill('SIGTERM'); await end; }
+    await splice.stop();
     fs.rmSync(temp, {recursive: true, force: true});
   }
 }
