@@ -523,6 +523,10 @@ def _join(style: str, parts: list) -> str:
 
 
 WINDOWS_RESERVED = re.compile(r'[\\:?*"<>|]')
+#: device names Windows reserves in every folder, with or without an extension (``nul.txt`` too);
+#: superscript digits count as well (COM\u00b9)
+WINDOWS_DEVICE = re.compile(r'(?:CON|PRN|AUX|NUL|COM[1-9\u00b9\u00b2\u00b3]|LPT[1-9\u00b9\u00b2\u00b3])(?:\..*)?',
+                            re.IGNORECASE)
 
 
 def map_path(path: str, rules: list):
@@ -554,5 +558,13 @@ def invalid_on_target(path: str, rule) -> str | None:
         return None
     _style, parts = _components(path)
     _source_style, head = _components(rule[0])
-    bad = sorted({ch for part in parts[len(head):] for ch in part if WINDOWS_RESERVED.match(ch)})
-    return ('its name contains ' + ' '.join(bad) + ', which Windows does not allow in a path') if bad else None
+    carried = parts[len(head):]
+    bad = sorted({ch for part in carried for ch in part if WINDOWS_RESERVED.match(ch)})
+    if bad:
+        return 'its name contains ' + ' '.join(bad) + ', which Windows does not allow in a path'
+    for part in carried:
+        if WINDOWS_DEVICE.fullmatch(part):
+            return f'"{part}" is a name Windows reserves for a device (CON, PRN, AUX, NUL, COM1-9, LPT1-9)'
+        if part.endswith(('.', ' ')):
+            return f'"{part}" ends in a {"dot" if part.endswith(".") else "space"}, which Windows removes from a name'
+    return None

@@ -64,6 +64,11 @@ def parse(data: bytes, *, max_elements: int = MAX_ELEMENTS) -> ET.Element:
         parser.Parse(bytes(data), True)
     except expat.ExpatError as error:
         raise ValueError(f'The timeline file is not well-formed XML: {error}') from None
+    except LookupError:
+        # expat asks Python's codecs for an encoding it does not know itself; an unknown name
+        # (``encoding="x"``) or a codec that is not a text encoding (``zlib``) raises LookupError
+        raise ValueError('The timeline file declares a character encoding Splice cannot read; '
+                         'save it as UTF-8') from None
     try:
         return builder.close()
     except AssertionError:  # TreeBuilder asserts when no element was closed
