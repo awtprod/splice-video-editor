@@ -19,8 +19,9 @@ def open_drp(data, index=0, link_media=None, timeline_id=None):
     return importer.to_splice(model, _index(model, index, timeline_id), link_media, {'format': 'drp'})
 
 
-def open_library_project(path, index=0, link_media=None, scratch=None, timeline_id=None):
-    """Splice's project for one timeline of a disk library ``Project.db`` (read via a snapshot)."""
-    model = importer.read(load_library(path, scratch if scratch is not None else scratch_folder()))
+def open_library_project(path, index=0, link_media=None, scratch=None, timeline_id=None, keep=None):
+    """Splice's project for one timeline of a disk library ``Project.db`` (read via a snapshot;
+    ``keep(snapshot, sha256)`` may keep the snapshot as a later save's seed)."""
+    model = importer.read(load_library(path, scratch if scratch is not None else scratch_folder(), keep=keep))
     return importer.to_splice(model, _index(model, index, timeline_id), link_media,
                               {'format': 'library', 'path': str(path)})
