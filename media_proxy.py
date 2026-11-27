@@ -27,8 +27,8 @@ STILL_PREVIEW_VERSION = 1
 # BT.2408 reference white is 203 cd/m². Leave enough room in the SDR
 # highlight shoulder to distinguish bright patches on an 8-bit display.
 HDR_LINEAR_REC709 = 'zscale=t=linear:npl={peak:.9f},format=gbrpf32le,zscale=p=bt709'
-HDR_TONE_MAP = 'tonemap=mobius:param=0.78:desat=0:peak=4.926108,zscale=t=bt709:m=bt709:r=limited,format=yuv444p10le'
-HDR_TO_REC709 = HDR_LINEAR_REC709.format(peak=203) + ',' + HDR_TONE_MAP
+HDR_TONE_MAP = 'tonemap=mobius:param=0.78:desat=0:peak=4.926108,zscale=t=bt709:m=bt709:r=limited'
+HDR_TO_REC709 = HDR_LINEAR_REC709.format(peak=203) + ',' + HDR_TONE_MAP + ',format=yuv444p10le'
 # Compand signed linear Rec.709 before reducing to proxy precision. Quantizing
 # PQ BT.2020 first magnifies errors when saturated channels cancel in the
 # gamut matrix. Reserve most codes for displayable values, with log tails
@@ -234,6 +234,22 @@ def _rotation(stream):
         return 0
 
 
+def _time_reference(fmt):
+    value = _tag(fmt.get('tags'), 'time_reference')
+    if not value or not value.isascii() or not value.isdecimal() or len(value) > 19:
+        return None
+    reference = int(value)
+    return reference if reference < 2**63 else None
+
+
+def _sample_rate(audio):
+    try:
+        rate = int(audio.get('sample_rate') or 0)
+    except (TypeError, ValueError):
+        return None
+    return rate if 0 < rate <= 768000 else None
+
+
 def _color(value):
     return value if isinstance(value, str) and value not in ('unknown', 'unspecified', 'reserved') else None
 
@@ -297,6 +313,8 @@ def _describe_file(path, size, modified):
                 fps=fps, rate=_rational(rate) if rate else None, vfr=vfr,
                 timecode=(':'.join(timecode.group(1, 2, 3)) + (';' if drop else ':') + timecode.group(5)) if timecode else None,
                 dropFrame=drop, reel=reel,
+                # Dual-system sync: a BWF recorder file's start (samples since midnight) and its rate.
+                timeReference=_time_reference(fmt), audioSampleRate=_sample_rate(audio),
                 videoCodec=vcodec, audioCodec=acodec, audioChannels=2 if len(audio_streams)>1 else audio.get('channels',0),
                 audioStreams=len(audio_streams),
                 audioStreamDetails=[dict(index=i, streamIndex=s.get('index'), channels=s.get('channels', 1),

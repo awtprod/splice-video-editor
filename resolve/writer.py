@@ -51,7 +51,7 @@ PROJECT_FIELDS = {
     'startFrame': 'derived', 'resolveSource': 'meta', 'resolveTimeline': 'meta', 'resolveTimelineIds': 'meta',
     'resolveTimelines': 'meta', 'resolveTrackFlags': 'meta', 'compatibilityWarnings': 'meta',
     'compatibilityDetails': 'meta', 'premiereSequences': 'meta', 'id': 'meta', 'version': 'meta',
-    'savedAt': 'meta', 'revision': 'meta'}
+    'savedAt': 'meta', 'revision': 'meta', 'masterFx': 'reported'}
 #: Clip fields (see :data:`PROJECT_FIELDS`).
 CLIP_FIELDS = {
     'id': 'meta', 'type': 'written', 'track': 'written', 'start': 'written', 'duration': 'written', 'in': 'written',
@@ -60,6 +60,7 @@ CLIP_FIELDS = {
     'transitionBefore': 'written', 'transitionMatchName': 'written', 'speed': 'reported', 'reverse': 'reported',
     'keyframes': 'reported', 'color': 'reported', 'opacity': 'reported', 'fadeIn': 'reported',
     'fadeOut': 'reported', 'pan': 'reported', 'title': 'reported', 'titleStyle': 'reported', 'text': 'reported',
+    'audioFx': 'reported', 'audioTransition': 'reported', 'channelMap': 'reported',
     'markers': 'reported', 'embeddedAudio': 'reported', 'audioStream': 'reported',
     'nativeTimeRemap': 'reported', 'nativeUnsupported': 'written', 'resolveItemId': 'meta',
     'resolveFrames': 'meta', 'resolveFlags': 'meta', 'resolveTransitionId': 'meta', 'premiereTrack': 'meta',
@@ -71,7 +72,8 @@ TRANSFORM_FIELDS = {'x': 0, 'y': 0, 'scale': 100, 'rotation': 0}
 KEYFRAME_FIELDS = ('opacity', 'x', 'y', 'scale', 'rotation', 'volume',
                    'exposure', 'temperature', 'tint', 'brightness', 'contrast', 'saturation')
 TRACK_STATE_FIELDS = {'locked': 'written', 'hidden': 'written', 'syncLocked': 'reported'}
-TRACK_MIX_FIELDS = {'mute': 'written', 'gain': 'reported', 'pan': 'reported', 'solo': 'reported'}
+TRACK_MIX_FIELDS = {'mute': 'written', 'gain': 'reported', 'pan': 'reported', 'solo': 'reported',
+                    'channels': 'reported', 'fx': 'reported', 'keyframes': 'reported', 'route': 'reported', 'stem': 'reported'}
 #: Media fields the project format names: what the writer reads; ``name`` (a rename in Splice) is
 #: reported. Fields Splice adds when it measures or links a file are facts of the file, not edits.
 MEDIA_FIELDS = {
@@ -898,6 +900,10 @@ class Writer:
             elif seed is None and clip.get('embeddedAudio') is not False and self._has_sound(clip):
                 report.add(NOT_WRITTEN, 'Sound a picture clip plays in Splice (a Resolve picture item carries no sound; '
                            'give the picture a linked sound clip)', where)
+        for field, neutral, label in [('audioFx', {}, 'Clip audio effects'), ('audioTransition', 'auto', 'Sound transition override'),
+                                      ('channelMap', 'stereo', 'Clip channel mapping')]:
+            if changed(field, neutral):
+                report.add(NOT_WRITTEN, label, where)
         if changed('pan'):
             report.add(NOT_WRITTEN, 'Clip pan', where)
         for field in clip:
@@ -978,6 +984,8 @@ class Writer:
                            media.get('name') or 'Media')
             # Other media fields are what Splice measured or linked (path, fingerprint, rate, HDR
             # and the like): facts of the file, not edits; the file itself is what is written.
+        if not _same(project.get('masterFx') or {}, base.get('masterFx') or {}):
+            report.add(NOT_WRITTEN, 'Master bus effects', name)
         for field in project:
             if field in PROJECT_FIELDS or field.startswith('_'):
                 continue

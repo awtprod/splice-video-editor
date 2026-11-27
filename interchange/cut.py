@@ -226,7 +226,29 @@ def build_cut(project: dict, options: dict | None = None) -> Cut:
         if isinstance(mix, dict) and (mix.get('gain', 100) != 100 or mix.get('pan', 0) or mix.get('mute') or mix.get('solo')):
             report.note(f'Audio track A{abs(int(key))} mixer settings (gain, pan, mute or solo) are not carried; '
                         'interchange formats have no track mixer.')
+        if isinstance(mix, dict):
+            lost = [*_effects_named(mix.get('fx')),
+                    *(['volume automation'] if (mix.get('keyframes') or {}).get('volume') else []),
+                    *(['pan automation'] if (mix.get('keyframes') or {}).get('pan') else []),
+                    *([f'stem "{mix["stem"]}"'] if mix.get('stem') else []),
+                    *([f'5.1 placement ({mix["route"]})'] if mix.get('route') not in (None, 'front') else []),
+                    *(['mono track'] if mix.get('channels') == 'mono' else [])]
+            if lost:
+                report.note(f'Audio track A{abs(int(key))}: {", ".join(lost)} not carried; interchange formats have no '
+                            'track effects, automation or stems. Export stems or iso WAVs for the mixer.')
+    master = _effects_named(project.get('masterFx'))
+    if master:
+        report.note(f'Master bus {" and ".join(master)} not carried; deliver a printed mix or stems.')
     return cut
+
+
+def _effects_named(fx) -> list:
+    """Names of the enabled audio effects in a clip, track or master setting."""
+    names = {'eq': 'EQ', 'comp': 'compressor', 'gate': 'gate', 'denoise': 'de-noise'}
+    if not isinstance(fx, dict):
+        return []
+    return [name for key, name in names.items() if isinstance(fx.get(key), dict) and fx[key].get('enabled', True) is not False
+            and (key != 'eq' or fx[key].get('bands'))]
 
 
 def _event(cut: Cut, clip: dict) -> Event | None:
@@ -327,6 +349,16 @@ def _event(cut: Cut, clip: dict) -> Event | None:
         report.note(f'{label}: the untagged color matrix override of its source ({source.color_matrix}) is not carried.')
     if clip.get('pan') not in (None, 0):
         report.note(f'{label}: clip pan is not carried by timeline interchange.')
+    effects = _effects_named(clip.get('audioFx'))
+    if effects:
+        report.note(f'{label}: its audio {", ".join(effects)} {"is" if len(effects) == 1 else "are"} not carried; '
+                    'receiving apps play the clip unprocessed.')
+    if clip.get('channelMap') not in (None, 'stereo'):
+        report.note(f'{label}: its channel mapping ({clip["channelMap"]}) is not carried.')
+    if clip.get('audioTransition') not in (None, 'auto'):
+        report.note(f'{label}: its sound transition override ({clip["audioTransition"]}) is not carried.')
+    if any(isinstance(point, dict) and point.get('ease') for point in (clip.get('keyframes') or {}).get('volume') or []):
+        report.note(f'{label}: eased volume keyframes are exported as linear ramps.')
     if clip.get('nativeVolumeOutsideTrim'):
         report.note(f'{label}: its Premiere volume keyframes outside the trimmed part of the clip are not carried.')
     if clip.get('nativeTimeRemap'):

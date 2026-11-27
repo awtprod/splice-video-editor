@@ -1660,3 +1660,46 @@ body{min-width:1024px}
 @media (min-width:1400px){
   .workspace.color-page.scope-docked.source-open{grid-template-columns:minmax(360px,28%) minmax(300px,1fr) minmax(360px,1fr) minmax(230px,16%)}
 }
+
+/* Delivery (export-presets.js): presets, format groups, notices and the render queue panel. */
+.studio-dialog[data-dialog=export] .export-preset-row{display:grid;grid-template-columns:1fr auto auto;gap:8px;align-items:center}
+.studio-dialog[data-dialog=export] .export-preset-row label{margin:6px 0;grid-template-columns:auto 1fr}
+.studio-dialog .export-small{padding:6px 9px;font-size:12px}
+.export-purpose{margin:0 0 8px}
+.export-purpose[hidden],.export-hdr[hidden],.export-notices[hidden],.export-group[hidden],.studio-dialog fieldset label[hidden]{display:none}
+.export-format,.export-hdr{border:1px solid #3a4538;border-radius:6px;margin:10px 0 4px;padding:2px 12px 8px}
+.export-format legend,.export-hdr legend{padding:0 6px;font-weight:600;color:#c9d6c4}
+.export-format label,.export-hdr label,.export-group label{margin:8px 0}
+.export-group{border:1px solid #3a4538;border-radius:6px;margin:8px 0;padding:6px 12px}
+.export-group summary{cursor:pointer;font-weight:600;color:#c9d6c4;padding:3px 0}
+.export-group[open] summary{margin-bottom:4px}
+.studio-dialog label.export-check{grid-template-columns:auto 1fr;align-items:start}
+.studio-dialog label.export-check input{order:-1;justify-self:start;width:16px;height:16px;margin:2px 0 0;accent-color:#bde773}
+.export-notices{margin:8px 0;padding:8px 12px 8px 28px;border-radius:6px;background:#262d24;font-size:13px;line-height:1.4}
+.export-notices .export-problem{color:#ff9b85}
+.export-notices .export-conversion{color:#ffd77a}
+.export-queue-row{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;margin-top:10px}
+.studio-dialog option:disabled{color:#7e877b}
+.delivery-dialog{width:min(640px,92vw)}
+.delivery-dialog[data-dialog=queue]{width:min(760px,94vw)}
+.queue-toolbar{display:flex;gap:16px;align-items:center;flex-wrap:wrap}
+.queue-toolbar label{margin:0}
+.queue-list{list-style:none;margin:12px 0;padding:0;display:grid;gap:8px}
+.queue-job{border:1px solid #3a4538;border-radius:6px;padding:10px 12px;background:#202620}
+.queue-job.state-rendering{border-color:#7fa64a}
+.queue-job.state-failed,.queue-job.state-interrupted{border-color:#a9583f}
+.queue-head{display:flex;justify-content:space-between;gap:12px}
+.queue-state{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:#a5b3a1}
+.queue-detail,.queue-eta,.queue-output,.queue-note{font-size:12px;color:#b9c6b4;margin:4px 0 0;overflow-wrap:anywhere}
+.queue-note{color:#d9c98f}
+.queue-error{color:#ff9b85;font-size:13px;margin:6px 0 0}
+.queue-job progress{width:100%;margin-top:6px}
+.queue-actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+.studio-dialog .queue-actions button{padding:5px 9px;font-size:12px}
+.batch-list{display:grid;gap:2px;max-height:50vh;overflow:auto}
+.preset-list{list-style:none;padding:0;display:grid;gap:6px}
+.preset-list li{display:flex;gap:6px;align-items:center}
+.preset-list li span{flex:1}
+.studio-dialog[data-dialog=export] fieldset{min-inline-size:0}
+.studio-dialog[data-dialog=export] .export-format label{grid-template-columns:minmax(0,1fr) minmax(0,1.4fr)}
+.studio-dialog[data-dialog=export] label>select,.studio-dialog[data-dialog=export] label>input:not([type=checkbox]){width:100%;min-width:0;box-sizing:border-box}

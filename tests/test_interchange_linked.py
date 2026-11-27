@@ -192,8 +192,7 @@ class LinkedMediaInterchange(unittest.TestCase):
             media.probe_file, media_links.MEDIA_ROOT, media_links.REGISTRY, premiere.MEDIA_ROOT = saved
 
     def test_sound_files_keep_their_broadcast_wav_start_and_sample_rate(self):
-        """describe() carries no sample rate or BWF time reference, so sound-only sources are
-        probed for them: a WAV whose time reference is 01:00:00:00 at 23.976 starts there."""
+        """A WAV with stored BWF metadata starts at 01:00:00:00 at 23.976."""
         wav = self.card / 'room_tone_bwf.wav'
         ffmpeg('-f', 'lavfi', '-i', 'sine=frequency=330:sample_rate=22050:d=2', '-c:a', 'pcm_s16le', '-write_bext', '1',
                '-metadata', 'time_reference=79459380', wav)       # 3603.6 s at 22050 Hz

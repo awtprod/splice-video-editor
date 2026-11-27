@@ -634,6 +634,7 @@
         surface.append(clipNode(clip,lane,project,selectedId,group));
       }
       paintDensity(surface,tiny,lane.kind);
+      if(lane.kind==="audio")window.SpliceAutomation?.renderLane(surface,lane,project,editor,{px,seconds:duration});
     });
     // Rebuilt headers can lose their scroll offset; level them with the lanes at the next frame
     // rather than forcing a synchronous layout of the rebuilt timeline here. A newly opened
@@ -718,6 +719,7 @@
       renderTimeline(state);
       lastProject = signature;
     }
+    window.SpliceAudioPanel?.refresh(state);
     const mediaSignature = [state.revision, tab, $("bin-filter").value, $("media-search").value, $("media-filter").value,
       mediaView, mediaSort.key, mediaSort.direction].join("|");
     if (mediaSignature !== lastMedia) {
@@ -853,6 +855,8 @@
         document
           .querySelectorAll("[data-workspace]")
           .forEach((b) => b.classList.toggle("active", b === button));
+        // The Audio workspace swaps the media pool for the mixer and loudness meter.
+        window.SpliceAudioPanel?.toggle(button.dataset.workspace === "audio");
         if (
           button.dataset.workspace === "color" ||
           button.dataset.workspace === "audio"
@@ -896,6 +900,7 @@
   $("save-project").onclick = () =>
     busy(() => window.SpliceSession?.save?.("prproj") ?? editor.saveProject("prproj"), "Project saved");
   $("export-video").onclick=()=>SpliceDialogs.exportVideo();
+  $("render-queue").onclick=()=>SpliceDelivery.queuePanel();
   // A large scope docked beside the program monitor, for grading. It takes the media pool's
   // column while open; the inspector's small scope steps aside so only one scope is painted.
   // Below 1100 px wide the dock, the source monitor and a usable program monitor do not fit side
@@ -1462,6 +1467,7 @@
     clearMarks:()=>editor.clearMarks(),
     rippleStart:()=>rippleTrimToPlayhead("start"),
     rippleEnd:()=>rippleTrimToPlayhead("end"),
+    syncSound:()=>window.SpliceSync?.open(),
   };
   const mod=e=>e.ctrlKey||e.metaKey;
   // A binding matches e.code or the (lower-cased) key, with exactly these modifiers held.
@@ -1549,6 +1555,7 @@
     return e.key===" " || e.key==="Enter";
   }
   window.SpliceKeys={keyBelongsToControl};
+  window.SpliceWorkspace={refresh:()=>renderTimeline(editor.get()),selection:()=>selection().map(clip=>clip.id)};
   document.addEventListener("keydown", (e) => {
     if (document.querySelector("dialog:modal") || e.target?.closest?.(".source-dialog, .sync-menu")) return;
     const typing=keyBelongsToControl(document.activeElement,e);

@@ -32,7 +32,7 @@ window.SpliceDialogs = (() => {
     if(activeExport?.isConnected&&activeExport.open){activeExport.showModal();return;}
     const node=dialog('Export video');activeExport=node;node.dataset.dialog='export';
     const state=Editor.get(), form=document.createElement('form');
-    form.innerHTML='<p class="export-spec"></p><label>Format<select name="codec"><option value="h264">H.264 / AAC · MP4</option><option value="prores">ProRes 422 HQ / PCM · MOV</option><option value="wav">Audio mix · WAV</option></select></label><label>Range<select name="rangeMode"><option value="all">Entire sequence</option><option value="custom">In to out (seconds)</option></select></label><label hidden>In (seconds)<input name="rangeStart" type="number" min="0" step="any"></label><label hidden>Out (seconds)<input name="rangeEnd" type="number" min="0" step="any"></label><label>Quality<select name="quality"><option value="16">Master · CRF 16</option><option value="20" selected>Delivery · CRF 20</option><option value="26">Review copy · CRF 26</option></select></label><fieldset class="export-audio"><legend>Audio</legend><label>Audio bitrate<select name="bitrate"><option>128</option><option selected>192</option><option>320</option></select></label><label>Limiter<input name="limiter" type="checkbox" checked></label><label>Ceiling (dBFS)<input name="limiterCeiling" type="number" min="-24" max="0" step="any" value="-1" aria-describedby="export-ceiling-help"></label><p class="export-help" id="export-ceiling-help">−24 to 0 dBFS. The limiter holds the mix at or below it before encoding.</p><label class="export-check">Keep decoded AAC under the ceiling (may lower the whole mix)<input name="aacPeakSafe" type="checkbox" aria-describedby="export-peak-safe-help"></label><p class="export-help" id="export-peak-safe-help">Lowers program level in 0.5 dB steps and reports the gain it applied.</p><label>Subtitle language<select name="subtitleLanguage" aria-describedby="export-language-help"></select></label><label hidden>Language code<input name="subtitleLanguageCode" type="text" maxlength="3" autocomplete="off" spellcheck="false" placeholder="e.g. nld" aria-describedby="export-language-help"></label><p class="export-help" id="export-language-help">ISO 639-2 code written into the subtitle track.</p></fieldset><progress max="1" value="0" hidden></progress><p role="status" class="render-state"></p><div class="export-report" hidden></div><footer><button type="button" data-cancel>Close</button><button type="submit" class="primary">Render MP4</button></footer>';
+    form.innerHTML='<p class="export-spec"></p><label>Format<select name="codec"><option value="h264">H.264 / AAC · MP4</option><option value="prores">ProRes 422 HQ / PCM · MOV</option><option value="wav">Audio mix · WAV</option></select></label><label>Range<select name="rangeMode"><option value="all">Entire sequence</option><option value="custom">In to out (seconds)</option></select></label><label hidden>In (seconds)<input name="rangeStart" type="number" min="0" step="any"></label><label hidden>Out (seconds)<input name="rangeEnd" type="number" min="0" step="any"></label><label>Quality<select name="quality"><option value="16">Master · CRF 16</option><option value="20" selected>Delivery · CRF 20</option><option value="26">Review copy · CRF 26</option></select></label><fieldset class="export-audio"><legend>Audio</legend><label>Audio bitrate<select name="bitrate"><option>128</option><option selected>192</option><option>320</option></select></label><label>Limiter<input name="limiter" type="checkbox" checked></label><label>Ceiling (dBTP)<input name="limiterCeiling" type="number" min="-24" max="0" step="any" value="-1" aria-describedby="export-ceiling-help"></label><p class="export-help" id="export-ceiling-help">−24 to 0 dBTP. The limiter holds the mix at or below it before encoding.</p><label class="export-check">Keep decoded AAC under the ceiling (may lower the whole mix)<input name="aacPeakSafe" type="checkbox" aria-describedby="export-peak-safe-help"></label><p class="export-help" id="export-peak-safe-help">Lowers program level in 0.5 dB steps and reports the gain it applied.</p><label>Subtitle language<select name="subtitleLanguage" aria-describedby="export-language-help"></select></label><label hidden>Language code<input name="subtitleLanguageCode" type="text" maxlength="3" autocomplete="off" spellcheck="false" placeholder="e.g. nld" aria-describedby="export-language-help"></label><p class="export-help" id="export-language-help">ISO 639-2 code written into the subtitle track.</p></fieldset><progress max="1" value="0" hidden></progress><p role="status" class="render-state"></p><div class="export-report" hidden></div><footer><button type="button" data-cancel>Close</button><button type="submit" class="primary">Render MP4</button></footer>';
     const rangeFields=[form.elements.rangeStart,form.elements.rangeEnd];
     // Audio: the renderer's limiter, MP4 peak-safe gain and subtitle language options.
     const limiter=form.elements.limiter, ceiling=form.elements.limiterCeiling, peakSafe=form.elements.aacPeakSafe;
@@ -46,12 +46,13 @@ window.SpliceDialogs = (() => {
       ceiling.disabled=!limiter.checked;
       languageCode.closest('label').hidden=language.value!=='other';
       const value=ceiling.valueAsNumber;
-      ceiling.setCustomValidity(!limiter.checked||Number.isFinite(value)&&value>=-24&&value<=0?'':'Enter a ceiling from −24 to 0 dBFS.');
+      ceiling.setCustomValidity(!limiter.checked||Number.isFinite(value)&&value>=-24&&value<=0?'':'Enter a ceiling from −24 to 0 dBTP.');
       const code=languageCode.value.trim();
       languageCode.setCustomValidity(languageCode.closest('label').hidden||language.closest('label').hidden||/^[a-z]{3}$/i.test(code)?'':
         'Enter a three-letter ISO 639-2 code, such as nld or swe.');
     };
     limiter.onchange=language.onchange=ceiling.oninput=languageCode.oninput=syncAudio;
+    window.SpliceExportAudio?.extend(audioGroup);
     form.elements.codec.closest('label').insertAdjacentHTML('afterend',
       '<label hidden>Color space<select name="colorSpace"><option value="source">Preserve source color space</option><option value="rec709">Rec. 709 SDR</option><option value="pq">Rec. 2100 PQ HDR</option></select></label>');
     rangeFields[0].value=String(Math.min(state.time,Math.max(0,state.duration-1/state.project.fps)).toFixed(6));
@@ -102,7 +103,17 @@ window.SpliceDialogs = (() => {
       const start=custom?rangeFields[0].valueAsNumber:0, end=custom?rangeFields[1].valueAsNumber:Infinity;
       return (state.project.captions||[]).some(c=>typeof c?.text==='string'&&Math.min(c.start+c.duration,end)>Math.max(c.start,Number.isFinite(start)?start:0));
     };
-    let controller, renderWarnings=[], renderReport={};
+    let controller, renderWarnings=[], renderReport={}, deliveryFields=null;
+    // Delivery formats, presets, timecode, burn-ins and the render queue (export-presets.js).
+    const delivery={state,captionsInRange,syncFormat:()=>syncFormat(),prepareProject:()=>Editor.prepareExport(),requestOptions:()=>buildOptions(),
+      status:text=>{status.textContent=text;},formProblem:()=>{syncAudio();return form.checkValidity()?'':(form.querySelector(':invalid')?.validationMessage||'Check the highlighted field.');}};
+    const formatName=()=>{
+      if(form.elements.audioDeliver?.value==='stems')return 'Stems';
+      const options=delivery.deliveryOptions?.()||{}, codec=form.elements.codec.value;
+      if(codec==='wav')return 'WAV';
+      if(['png','tiff','dpx','exr'].includes(codec))return codec.toUpperCase()+' sequence';
+      return (options.container||({h264:'mp4',hevc:'mp4',av1:'mp4',prores:'mov',dnxhr:'mov'}[codec]||'mp4')).toUpperCase();
+    };
     const syncFormat=()=>{
       const h264=form.elements.codec.value==='h264';
       const prores=form.elements.codec.value==='prores';
@@ -112,16 +123,19 @@ window.SpliceDialogs = (() => {
       form.elements.colorSpace.closest('label').hidden=!prores;
       peakSafe.closest('label').hidden=help('export-peak-safe-help').hidden=!h264;
       // Only MP4 and MOV carry a subtitle stream, and only when captions fall inside the range.
-      const subtitles=form.elements.codec.value!=='wav'&&captionsInRange();
+      const subtitles=form.elements.codec.value!=='wav'&&form.elements.audioDeliver?.value!=='stems'&&captionsInRange();
       language.closest('label').hidden=help('export-language-help').hidden=!subtitles;
       if(!subtitles)languageCode.closest('label').hidden=true;
       syncAudio();
       colorNotice.hidden=!pq&&(!hdr||!(h264||prores&&form.elements.colorSpace.value==='rec709'));
       colorNotice.textContent=pq?'Maps SDR reference white to 203 nits and converts HDR footage to PQ.':
         'This export tone-maps HDR footage to Rec. 709.';
-      render.textContent='Render '+({h264:'MP4',prores:'MOV',wav:'WAV'}[form.elements.codec.value]);
+      render.textContent='Render '+formatName();
+      deliveryFields?.sync();
     };
     form.elements.codec.onchange=form.elements.colorSpace.onchange=syncFormat;
+    form.elements.audioDeliver?.addEventListener('change',syncFormat);
+    if(window.SpliceDelivery)deliveryFields=SpliceDelivery.enhance(form,delivery);
     const rangeChanged=form.elements.rangeMode.onchange;
     form.elements.rangeMode.onchange=()=>{rangeChanged();syncFormat();};
     for(const field of rangeFields)field.addEventListener('input',syncFormat);
@@ -134,13 +148,14 @@ window.SpliceDialogs = (() => {
       if(audio&&typeof audio==='object'){
         const parts=[];
         // A silent file has no peak (null); its loudness is only the meter's floor.
+        for(const text of window.SpliceExportAudio?.describe(audio)||[]){const line=document.createElement('p');line.className='export-measured';line.textContent=text;report.append(line);}
         const silent=!Number.isFinite(audio.decodedTruePeakDb);
         parts.push(silent?'silent':'peak '+dB(audio.decodedTruePeakDb)+' dBTP');
         if(!silent&&Number.isFinite(audio.loudnessLufs))parts.push(dB(audio.loudnessLufs)+' LUFS');
         if(audio.aacPeakSafe)parts.push(audio.gainDb?'lowered '+Math.abs(audio.gainDb).toFixed(1)+' dB to fit the ceiling':'no gain needed');
-        const line=document.createElement('p');line.className='export-measured';
-        line.textContent='Decoded audio: '+parts.join(' · ');
-        report.append(line);
+        if(!audio.output){const line=document.createElement('p');line.className='export-measured';
+          line.textContent='Decoded audio: '+parts.join(' · ');
+          report.append(line);}
       }
       if(warnings.length){
         const list=document.createElement('ul');list.className='export-warnings';list.setAttribute('aria-label','Export warnings');
@@ -151,27 +166,40 @@ window.SpliceDialogs = (() => {
     };
     cancel.onclick=()=>{if(controller){controller.abort();cancel.disabled=true;status.textContent='Cancelling…';}else node.close();};
     node.oncancel=e=>{if(controller){e.preventDefault();cancel.click();}};
+    function buildOptions(){
+      const opts={codec:form.elements.codec.value,crf:Number(form.elements.quality.value),audioBitrate:Number(form.elements.bitrate.value)};
+      if(!form.elements.colorSpace.closest('label').hidden)opts.colorSpace=form.elements.colorSpace.value;
+      // Types as the renderer validates them: booleans, a number, a lowercase three-letter string.
+      opts.limiter=limiter.checked;
+      if(limiter.checked)opts.limiterCeiling=ceiling.valueAsNumber;
+      if(!peakSafe.closest('label').hidden)opts.aacPeakSafe=peakSafe.checked;
+      if(!language.closest('label').hidden)opts.subtitleLanguage=language.value==='other'?languageCode.value.trim().toLowerCase():language.value;
+      if(form.elements.rangeMode.value==='custom')opts.range={start:rangeFields[0].valueAsNumber,end:rangeFields[1].valueAsNumber};
+      Object.assign(opts,delivery.deliveryOptions?.()||{});
+      window.SpliceExportAudio?.apply(form,opts);
+      return opts;
+    }
     form.onsubmit=async e=>{
       e.preventDefault();if(controller)return;
       syncAudio();
       if(!form.checkValidity()){form.reportValidity();return;}
       controller=new AbortController();renderWarnings=[];renderReport={};showReport(null,[]);render.disabled=true;cancel.textContent='Cancel render';progress.hidden=false;
-      const settings=[form.elements.codec,form.elements.colorSpace,form.elements.quality,form.elements.rangeMode,...rangeFields,audioGroup];
+      const settings=[form.elements.codec,form.elements.colorSpace,form.elements.quality,form.elements.rangeMode,...rangeFields,audioGroup,
+        ...form.querySelectorAll('.export-format,.export-group,.export-preset-row,.export-queue-row')];
       for(const field of settings)field.disabled=true;
       status.textContent='Preparing media…';
       try {
-        const opts={codec:form.elements.codec.value,crf:Number(form.elements.quality.value),audioBitrate:Number(form.elements.bitrate.value)};
-        if(opts.codec==='prores')opts.colorSpace=form.elements.colorSpace.value;
-        // Types as the renderer validates them: booleans, a number, a lowercase three-letter string.
-        opts.limiter=limiter.checked;
-        if(limiter.checked)opts.limiterCeiling=ceiling.valueAsNumber;
-        if(opts.codec==='h264')opts.aacPeakSafe=peakSafe.checked;
-        if(!language.closest('label').hidden)opts.subtitleLanguage=language.value==='other'?languageCode.value.trim().toLowerCase():language.value;
-        if(form.elements.rangeMode.value==='custom')opts.range={start:rangeFields[0].valueAsNumber,end:rangeFields[1].valueAsNumber};
+        const opts=buildOptions();
+        if(delivery.queueOnly?.()){
+          // Deliver multi-file exports together in the selected output folder.
+          await delivery.renderViaQueue();progress.hidden=true;return;
+        }
+        const blocked=await delivery.validate?.(opts,controller.signal);
+        if(blocked){status.textContent=blocked;progress.hidden=true;return;}
         const result=await Editor.exportVideo(opts,job=>{
           renderWarnings=Array.isArray(job.warnings)?job.warnings:[]; renderReport=job.report||{}; progress.value=job.progress;status.textContent='Rendering · '+Math.round(100*job.progress)+'%';
         },controller.signal);
-        progress.value=1;status.textContent=({h264:'MP4',prores:'MOV',wav:'WAV'}[form.elements.codec.value])+' exported.'+(result?.url?' Review the render below.':'');
+        progress.value=1;status.textContent=formatName()+' exported.'+(result?.url?' Review the render below.':'');
         showReport(renderReport.audio,renderWarnings);
         // The result is what the editor looks for next: bring it above the footer.
         (report.hidden?status:report).scrollIntoView({block:'nearest'});

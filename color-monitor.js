@@ -7,7 +7,8 @@
   const VIEWS = {normal:'Normal', luma:'Luma only', red:'Red channel', green:'Green channel', blue:'Blue channel',
     falseColor:'False colour', legal:'Legal range warning', zebra:'Zebra (clipping)'};
   const GUIDES = {none:'No guides', safe:'Title/action safe', '2.39':'2.39:1', '1.85':'1.85:1', '4:3':'4:3', '1:1':'1:1', '9:16':'9:16'};
-  let quality = localStorage.getItem(QUALITY_KEY) in QUALITIES ? localStorage.getItem(QUALITY_KEY) : 'auto';
+  const savedQuality = localStorage.getItem(QUALITY_KEY);
+  let quality = Object.hasOwn(QUALITIES, savedQuality) ? savedQuality : 'auto';
   // Auto steps down a level during playback while frames take longer than the frame period.
   let autoLevel = 0, slowFrames = 0, fastFrames = 0;
   const editor = () => window.Editor;

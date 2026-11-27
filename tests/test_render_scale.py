@@ -237,9 +237,9 @@ class WorkSpace(ScaleCase):
         on_disk, needed = [], []
         real_chunk, real_space = render_movie._render_audio_chunk, render_movie._ensure_space
 
-        def chunk(events, origin, keep_from, keep_samples, limiter, target, directory, *rest):
-            on_disk.append(sum(path.stat().st_size for path in Path(directory).glob('event-*.wav')))
-            return real_chunk(events, origin, keep_from, keep_samples, limiter, target, directory, *rest)
+        def chunk(events, origin, keep_from, keep_samples, target, directory, *rest):
+            on_disk.append(sum(path.stat().st_size for path in Path(directory).glob('*event-*.wav')))
+            return real_chunk(events, origin, keep_from, keep_samples, target, directory, *rest)
 
         def space(directory, bytes_needed, purpose):
             needed.append(bytes_needed)

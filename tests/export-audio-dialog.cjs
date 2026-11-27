@@ -89,7 +89,7 @@ async function render(page, seen) {
 async function reportShown(page) {
   return state(page, () => ({
     hidden: document.querySelector('.studio-dialog[data-dialog=export] .export-report').hidden,
-    measured: document.querySelector('.studio-dialog[data-dialog=export] .export-measured')?.textContent ?? null,
+    measured: [...document.querySelectorAll('.studio-dialog[data-dialog=export] .export-measured')].map(line => line.textContent).join('\n'),
     warnings: [...document.querySelectorAll('.studio-dialog[data-dialog=export] .export-warnings li')].map(item => item.textContent),
   }));
 }
@@ -117,7 +117,7 @@ async function capture(page, name) {
 async function behaviour(splice, page, clip, seen) {
   await project(page, clip);
   await openDialog(page);
-  // Defaults: limiter on at −1 dBFS, peak-safe gain off (MP4 only), subtitle language und.
+  // Defaults: limiter on at −1 dBTP, peak-safe gain off (MP4 only), subtitle language und.
   assert.equal(await field(page, 'limiter').isChecked(), true);
   assert.equal(await field(page, 'limiterCeiling').inputValue(), '-1');
   assert.deepEqual(await state(page, () => {
@@ -162,7 +162,7 @@ async function behaviour(splice, page, clip, seen) {
   for (const value of ['-30', '0.5', '']) {
     await field(page, 'limiterCeiling').fill(value);
     await page.locator(`${dialog} [type=submit]`).click();
-    assert.equal(await page.locator(`${dialog} .render-state`).textContent(), 'Enter a ceiling from −24 to 0 dBFS.', `ceiling ${JSON.stringify(value)} refused`);
+    assert.equal(await page.locator(`${dialog} .render-state`).textContent(), 'Enter a ceiling from −24 to 0 dBTP.', `ceiling ${JSON.stringify(value)} refused`);
   }
   assert.equal(seen.posts.length, posts, 'no export request for invalid input');
 
@@ -181,8 +181,9 @@ async function behaviour(splice, page, clip, seen) {
   assert.ok(audio && audio.aacPeakSafe === true && Number.isFinite(audio.decodedTruePeakDb) && Number.isFinite(audio.loudnessLufs), JSON.stringify(safe.job.report));
   let shown = await reportShown(page);
   assert.equal(shown.hidden, false);
-  assert.equal(shown.measured, 'Decoded audio: peak ' + signed(audio.decodedTruePeakDb) + ' dBTP · ' + signed(audio.loudnessLufs) + ' LUFS · ' +
-    (audio.gainDb ? 'lowered ' + Math.abs(audio.gainDb).toFixed(1) + ' dB to fit the ceiling' : 'no gain needed'));
+  assert.ok(shown.measured.includes(signed(audio.output.integratedLufs) + ' LUFS integrated'));
+  assert.ok(shown.measured.includes(signed(audio.output.truePeakDbtp) + ' dBTP true peak'));
+  assert.ok(shown.measured.includes('Lowered ' + Math.abs(audio.aacGainDb).toFixed(1) + ' dB more'));
   assert.ok(audio.gainDb < 0, 'this loud program needs a gain to fit');
   assert.deepEqual(shown.warnings, safe.job.warnings);
   const output = path.join(splice.temp, 'peak-safe.mp4');
@@ -199,15 +200,18 @@ async function behaviour(splice, page, clip, seen) {
   shown = await reportShown(page);
   assert.deepEqual(shown.warnings, plain.job.warnings);
   assert.ok(shown.warnings.some(text => /above the .* ceiling/.test(text)), 'the over-ceiling warning is shown: ' + JSON.stringify(plain.job));
-  assert.doesNotMatch(shown.measured, /lowered|no gain/, 'no gain line without aacPeakSafe');
+  assert.ok(shown.warnings.some(text => text.includes('Keep decoded AAC under the ceiling')));
+  assert.doesNotMatch(shown.measured, /lowered|no gain/i, 'no gain line without aacPeakSafe');
   console.log('Default MP4 warning shown: ' + shown.warnings[0].slice(0, 70) + '…');
 
-  // Limiter off: no ceiling is sent, nothing is measured.
+  // Limiter off: no ceiling is sent, but the delivered file is still measured.
   await field(page, 'limiter').uncheck();
   const unlimited = await render(page, seen);
   assert.equal(unlimited.options.limiter, false);
   assert.equal('limiterCeiling' in unlimited.options, false);
-  assert.equal((await reportShown(page)).measured, null);
+  const unlimitedReport = (await reportShown(page)).measured;
+  assert.match(unlimitedReport, /dBTP true peak/);
+  assert.doesNotMatch(unlimitedReport, /True-peak limiter/);
   await field(page, 'limiter').check();
 
   // WAV: no AAC option, no subtitle language.
@@ -229,7 +233,7 @@ async function behaviour(splice, page, clip, seen) {
   assert.equal('subtitleLanguage' in silent.options, false);
   assert.equal(silent.job.report.audio?.decodedTruePeakDb, null);
   const silentLine = (await reportShown(page)).measured;
-  assert.equal(silentLine, 'Decoded audio: silent');
+  assert.match(silentLine, /^MP4 \(AAC\) · stereo: silent/m);
   assert.doesNotMatch(silentLine, /null|Infinity|NaN/);
   await closeDialog(page);
   console.log('Silent MP4: ' + silentLine);

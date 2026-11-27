@@ -287,8 +287,8 @@
       paste() { if (clipboard) editor.updateClip(current().id, {color:{...structuredCloneGrade(clipboard)}}); rerender(); },
       source() {
         const active = current(), color = active.color || {};
-        const targets = editor.get().project.clips.filter(item => item.type === 'video' && item.mediaId === active.mediaId && item.id !== active.id);
-        if (!targets.length) return window.alert('No other clip uses this source.');
+        const targets = editor.get().project.clips.filter(item => item.type === 'video' && item.mediaId === active.mediaId && item.id !== active.id && !editor.isTrackLocked?.(item.track, item.type));
+        if (!targets.length) return window.alert('No other unlocked clip uses this source.');
         editor.editProject(project => { for (const target of project.clips) if (targets.some(item => item.id === target.id)) target.color = structuredCloneGrade(color); });
         rerender();
       },
