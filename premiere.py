@@ -553,9 +553,72 @@ def _merged_track_states(states):
     return merged
 
 
+def _native_fade_keys(item, clips, fps, has_sound):
+    """Map a decomposed clip's local clock to Premiere's linear automation."""
+    from render_movie import AUDIO_RATE, _fade_clock
+    keys = dict(item.get('keyframes') or {})
+    length = float(item['duration'])
+    dip = item.get('pictureDip')
+    fades = item.get('fadeIn', 0) or item.get('fadeOut', 0)
+
+    def envelope(key, clock, frequency, head, tail):
+        origin, rate, duration = clock
+        if frequency == AUDIO_RATE:
+            origin = round(origin * frequency) / frequency
+        if rate < 0:
+            origin -= 1 / frequency
+        if not all(isinstance(fade, (int, float)) and math.isfinite(fade) and fade >= 0 for fade in (head, tail)):
+            raise ValueError('Invalid audio fade')
+        head, tail = min(head, duration), min(tail, duration)
+        if keys.get(key):
+            raise ValueError(f'Premiere cannot combine retimed fades and existing {key} automation.')
+        knots = [0, head, duration-tail, duration]
+        if head + tail > duration:
+            knots.append(duration * head / (head + tail))
+        times = {0, length, *(max(0, min(length, (k-origin)/rate)) for k in knots)}
+        base = float(item.get(key, 100))
+        # The native writer rounds local times. An endpoint wins its bucket so
+        # its gain is evaluated at the actual clip boundary.
+        native_times = {round(t, 5): t for t in sorted(times)}
+        for endpoint in (0, length):
+            native_times[round(endpoint, 5)] = endpoint
+        points = []
+        for time in native_times.values():
+            t = origin + time * rate
+            gain = max(0, min(1, t/head if head else 1, (duration-t)/tail if tail else 1))
+            points.append({'time': time, 'value': base*gain})
+        keys[key] = points
+
+    if fps <= 0:
+        raise ValueError('Invalid sequence frame rate')
+    if dip:
+        clock = _fade_clock(item, 'pictureDip')
+        if item['type'] != 'audio':
+            if any(c['type'] != 'audio' and c.get('enabled', True) and c['track'] < item['track']
+                   and c['start'] < item['start'] + length and c['start'] + c['duration'] > item['start']
+                   for c in clips):
+                raise ValueError('Premiere opacity automation cannot preserve a retimed dip over a lower layer.')
+            envelope('opacity', clock, fps, clock[2], 0)
+        if has_sound:
+            if fades or item.get('transitionMatchName') == 'Constant Power':
+                raise ValueError('Premiere cannot preserve this combined or constant-power retimed audio fade.')
+            envelope('volume', clock, AUDIO_RATE, clock[2], 0)
+    if has_sound and item.get('fadeClock') and fades:
+        envelope('volume', _fade_clock(item, 'fadeClock'), AUDIO_RATE,
+                 item.get('fadeIn', 0), item.get('fadeOut', 0))
+    return {**item, 'keyframes': keys, 'fadeIn': 0, 'fadeOut': 0}
+
+
 def save_project(data):
     if not isinstance(data, dict):
         raise ValueError('Invalid project')
+    media_by_id = {item.get('id'): item for item in data.get('media', [])}
+    if any(item.get('parentMediaId') for item in media_by_id.values()):
+        from render_movie import resolve_subclip_source
+        data = {**data, 'clips': [resolve_subclip_source(clip, media_by_id) for clip in data['clips']]}
+    if any(media_by_id.get(c.get('mediaId'), {}).get('multicam') for c in data['clips']):
+        raise ValueError('Flatten multicam clips on the timeline before saving to Premiere. '
+                         'Save a Splice project to keep the editable angles.')
     lanes = {}
     for item in data.get('clips', []):
         lane = ('audio' if item.get('type') == 'audio' else 'video', int(item.get('track', 1)))
@@ -566,10 +629,17 @@ def save_project(data):
             if float(current['start']) < float(previous['start']) + float(previous['duration']) - .001:
                 raise ValueError(f'Premiere track {lane[1]} contains overlapping clips')
     for clip in data.get('clips', []):
+        if clip.get('transitionClock'):
+            raise ValueError('Premiere cannot write a partially cropped transition. Save a Splice project or replace the transition.')
         if (clip.get('color') or {}).get('lut'):
             raise ValueError('Premiere export cannot write imported LUTs; save a Splice project or remove the LUT')
     if any(mix.get('solo', False) for mix in (data.get('trackMix') or {}).values()):
         raise ValueError('Premiere export cannot write track solo; save a Splice project or disable solo')
+    used_audio_tracks = {str(c.get('track')) for c in data['clips']
+                         if c.get('type') == 'audio' or (c.get('type') == 'video' and c.get('embeddedAudio', True))}
+    if any(str(track) in used_audio_tracks and mix.get('outputStages')
+           for track, mix in (data.get('trackMix') or {}).items()):
+        raise ValueError('Premiere cannot write the cascaded nested track mix. Export the audio mix or save a Splice project.')
     original = data.get('premiereOriginal')
     if original and len(original) > 70 * 1024 * 1024:
         raise ValueError('Original Premiere project is too large')
@@ -779,6 +849,8 @@ def save_project(data):
         collect(project.root_item)
     bin_cache = {}
     for item in data.get('media', []):
+        if item.get('multicam'):
+            continue  # The virtual pool item has no single source file.
         src = item.get('src', '')
         if original and item.get('premiereItemUID') in existing_uid:
             available[item['id']] = existing_uid[item['premiereItemUID']]
@@ -805,7 +877,6 @@ def save_project(data):
         available[item['id']] = project.import_files([path])[0]
         if item.get('bin'):
             available[item['id']].move_to(_ensure_bin(project, item['bin'], bin_cache))
-    media_by_id = {item.get('id'): item for item in data.get('media',[])}
     generated_audio = {}
 
     def source_audio(clip):
@@ -964,6 +1035,8 @@ def save_project(data):
         if source_changed or length_changed or 'premiereIndex' not in item:
             clip.out_point = py_premiere.Time.from_seconds(start + duration * speed)
             clip.end = py_premiere.Time.from_seconds(float(item.get('start', 0)) + duration)
+        if item.get('pictureDip') or item.get('fadeClock'):
+            item = _native_fade_keys(item, items, requested_fps, is_audio or companion is not None)
         if companion is not None:
             if abs(speed-companion.speed)>.000001:
                 _set_clip_speed(companion,speed)

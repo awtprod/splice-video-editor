@@ -222,7 +222,8 @@ def upload_media(handler, length, query):
 
 @post('/api/media/nested-preview')
 def media_nested_preview(handler, body):
-    handler._json(200, {'src': nested_preview(_json_body(body)['project'])})
+    payload = _json_body(body)
+    handler._json(200, {'src': nested_preview(payload['project'], payload.get('minimumDuration', 0))})
 
 
 @post('/api/media/proxy')

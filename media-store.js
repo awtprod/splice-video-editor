@@ -156,19 +156,32 @@ window.SpliceMedia = (() => {
     return {...info,src,originalSrc,name:file.name,path:linked?linked.sourcePath:file.name,linked:!!linked,
             sourceFingerprint:linked?.fingerprint,offline:false,seekOptimized:false,audioStream:null};
   }
+  const isNestedItem = (item) =>
+    Boolean(item?.nestedProject) || Number.isInteger(item?.nestedSequence) ||
+    (typeof item?.nestedSequence === 'string' && item.nestedSequence.length > 0);
   const nestedRequests=new WeakMap();
+  function invalidateNested(item) {
+    if (!item) return;
+    nestedRequests.delete(item);
+    item.src = '';
+    delete item.proxyState;
+    delete item.proxyError;
+  }
   function prepareNested(item,retry=false) {
-    if(!item?.nestedProject || item.src) return;
+    if(!item?.nestedProject) return;
+    if(retry) invalidateNested(item);
+    if(item.src) return;
     if(nestedRequests.has(item) && !retry)return nestedRequests.get(item);
     const task=(async()=>{
       try {
         item.proxyState='preparing';
         const project=await forPremiere(item.nestedProject);
+        const minimumDuration = typeof item.nestedSequence === 'string' ? item.duration : 0;
         const response=await fetch('/api/media/nested-preview',{method:'POST',headers:{'Content-Type':'application/json'},
-                                 body:JSON.stringify({project}),signal:AbortSignal.timeout(3600000)});
+                                 body:JSON.stringify({project,minimumDuration}),signal:AbortSignal.timeout(3600000)});
         const body=await response.json();
         if(!response.ok||!localMedia(body.src))throw Error(body.error||'Nested preview failed');
-        item.src=body.src;item.proxyState='ready';item.offline=false;
+        item.src=body.src;item.colorSpace='bt709';item.proxyState='ready';item.offline=false;
       }catch(e){item.proxyState='unavailable';item.proxyError=e.message;}
       window.Editor?.refreshMedia?.();
     })();
@@ -196,10 +209,13 @@ window.SpliceMedia = (() => {
         item.offline=false;
         continue;
       }
-      if (Number.isInteger(item.nestedSequence)) {
+      if (isNestedItem(item)) {
         if(item.nestedProject) await restore(item.nestedProject);
         if(item.src && (!localMedia(item.src)||!await exists(item.src)))item.src='';
         item.offline=false;
+        continue;
+      }
+      if (item.multicam || item.parentMediaId) {
         continue;
       }
       if ((bundled(item.src) || localMedia(item.src)) && await exists(item.src)) {
@@ -245,6 +261,32 @@ window.SpliceMedia = (() => {
         item.offline = true;
       }
     }
+    const byId = new Map(project.media.map(m => [m.id, m]));
+    for (const item of project.media) {
+      if (item.parentMediaId) {
+        let cur = item, seen = new Set([item.id]);
+        while (cur?.parentMediaId && !seen.has(cur.parentMediaId)) {
+          seen.add(cur.parentMediaId);
+          cur = byId.get(cur.parentMediaId);
+        }
+        if (cur && cur !== item) {
+          item.src = cur.src || '';
+          if (cur.originalSrc) item.originalSrc = cur.originalSrc;
+          item.offline = !!cur.offline;
+        } else {
+          item.src = '';
+          item.offline = true;
+        }
+      }
+    }
+    for (const item of project.media) {
+      if (item.multicam) {
+        const angles = Array.isArray(item.multicam.angles) ? item.multicam.angles : [];
+        const first = angles.map(a => byId.get(a.mediaId)).find(Boolean);
+        item.src = first?.src || '';
+        item.offline = angles.length > 0 && angles.every(a => byId.get(a.mediaId)?.offline);
+      }
+    }
     return project;
   }
   async function forPremiere(project) {
@@ -252,7 +294,8 @@ window.SpliceMedia = (() => {
     const db = await open();
     for (const item of copy.media) {
       delete item.thumb;
-      if(Number.isInteger(item.nestedSequence)) {if(item.nestedProject) item.nestedProject=await forPremiere(item.nestedProject);continue;}
+      if(isNestedItem(item)) {if(item.nestedProject) item.nestedProject=await forPremiere(item.nestedProject);continue;}
+      if(item.multicam || item.parentMediaId) continue;
       if(localMedia(item.originalSrc) || bundled(item.originalSrc)) {item.src=item.originalSrc;continue;}
       if (!item.src || bundled(item.src) || localMedia(item.src)) continue;
       const record = await read(
@@ -282,7 +325,18 @@ window.SpliceMedia = (() => {
       }
       item.src = record.serverSrc;
     }
+    const byId = new Map(copy.media.map(m => [m.id, m]));
+    for (const item of copy.media) {
+      if (item.parentMediaId) {
+        let cur = item, seen = new Set([item.id]);
+        while (cur?.parentMediaId && !seen.has(cur.parentMediaId)) {
+          seen.add(cur.parentMediaId);
+          cur = byId.get(cur.parentMediaId);
+        }
+        if (cur && cur !== item && cur.src) item.src = cur.src;
+      }
+    }
     return copy;
   }
-  return { importFile, remember, rememberMany, makeProxy, prepareNested, preparePreview, hdrPreviewStatus, restore, matches, matchFolder, forPremiere };
+  return { importFile, remember, rememberMany, makeProxy, prepareNested, invalidateNested, preparePreview, hdrPreviewStatus, restore, matches, matchFolder, forPremiere };
 })();

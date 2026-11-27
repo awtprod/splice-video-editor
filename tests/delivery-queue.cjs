@@ -101,8 +101,9 @@ async function main() {
   const scratch = path.join(temp, 'scratch');
   const env = {HOME: temp, XDG_DATA_HOME: temp, SPLICE_NO_REVEAL: '1', SPLICE_EXPORT_DIR: out, SPLICE_TEMP_DIR: scratch};
   let splice = await startSplice({root, env});
-  const browser = await browserFor(splice);
+  let browser;
   try {
+    browser = await browserFor(splice);
     const clip = path.join(temp, 'clip.mp4');
     ffmpeg(['-f', 'lavfi', '-i', 'testsrc2=s=640x360:r=25:d=4', '-f', 'lavfi', '-i', 'sine=f=440:d=4', '-shortest', '-c:v', 'libx264',
       '-pix_fmt', 'yuv420p', '-c:a', 'aac', clip]);
@@ -360,7 +361,7 @@ async function main() {
     assert.deepEqual(errors, []);
     console.log('Delivery queue passed.');
   } finally {
-    await browser.close().catch(() => {});
+    await browser?.close().catch(() => {});
     await splice.stop();
     fs.rmSync(temp, {recursive: true, force: true});
   }

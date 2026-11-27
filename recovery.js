@@ -144,10 +144,11 @@ window.SpliceSession = (() => {
     if (node) node.textContent = message;
   }
   const signal = message => { status(message); console.warn(message); };
+  const rootProject = () => window.SpliceNested?.rootProject?.() || editor.get().project;
   function persist(checkpoint = false) {
     if (suppress) return chain;
     status('Saving draft…');
-    const source = editor.get().project;
+    const source = rootProject();
     if (source.premiereOriginal !== original) {
       original = source.premiereOriginal;
       originalKey = original ? uuid() : null;
@@ -328,7 +329,7 @@ window.SpliceSession = (() => {
     let handle = !forceAs && savedFormat===format ? fileHandle : null;
     const reusing=!!handle;
     const suffix = format==='prproj'?'.prproj':'.splice.json';
-    const filename = (editor.get().project.name.replace(/[\\/:*?"<>|]/g,'-')||'Untitled')+suffix;
+    const filename = (rootProject().name.replace(/[\\/:*?"<>|]/g,'-')||'Untitled')+suffix;
     try {
       if (!handle && window.showSaveFilePicker)
         handle=await showSaveFilePicker({suggestedName:filename,types:pickerTypes(format),id:'splice-project'});
@@ -339,7 +340,7 @@ window.SpliceSession = (() => {
     if(persisting) await chain;
     if(reusing && handle!==fileHandle)throw Error('Another editing window was recovered. Use Save as to choose a separate project file.');
     const savedRevision = editor.get().revision;
-    const project = structuredClone(editor.get().project);
+    const project = structuredClone(rootProject());
     let blob;
     if (format==='prproj') {
       const prepared = await SpliceMedia.forPremiere(project);
@@ -417,7 +418,7 @@ window.SpliceSession = (() => {
     await ready;
     const db=await dbReady, found=new Set();
     const scan=value=>{for(const match of JSON.stringify(value).matchAll(/\/media\/(?:linked\/)?[a-f0-9]{32}\/[^"\\]*/g))found.add(match[0]);};
-    scan(editor.get().project);
+    scan(rootProject());
     for(const store of ['sessions','versions'])
       for(const row of await request(db.transaction(store).objectStore(store).getAll()))scan(row.data);
     return [...found];

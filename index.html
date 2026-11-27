@@ -14,6 +14,7 @@
     <link rel="stylesheet" href="resolve-dialogs.css" />
     <link rel="stylesheet" href="media-link.css" />
     <link rel="stylesheet" href="interchange-dialogs.css" />
+    <link rel="stylesheet" href="multicam.css" />
     <link rel="stylesheet" href="audio-finishing.css" />
   </head>
   <body>
@@ -80,6 +81,11 @@
             <button data-command="link">Link / unlink <kbd>Ctrl+L</kbd></button>
             <button data-command="syncSound">Sync picture to sound…</button>
             <button data-command="enable">Enable / disable clip <kbd>Shift+E</kbd></button>
+            <button data-command="nest">Nest…</button>
+            <button data-command="unnest">Unnest / Decompose in place</button>
+            <button data-command="createMulticam">Create multicam clip…</button>
+            <button data-command="toggleMulticamView">Multicam monitor</button>
+            <button data-command="flattenMulticam">Flatten multicam</button>
             <button id="new-adjustment-clip" title="An adjustment clip grades every track beneath it for its duration">New adjustment clip</button>
           </div></details><button id="import-media" class="menu-button">
             Import media <span>+</span></button
@@ -130,6 +136,14 @@
               <span id="hdr-preview-status" role="status" hidden></span>
               <span id="monitor-resolution">Fit</span
               ><button
+                class="quiet multicam-toggle"
+                id="multicam-toggle"
+                type="button"
+                aria-pressed="false"
+                title="Toggle live multi-angle Multicam Monitor (keys 1–9 switch angles)"
+              >
+                Multicam</button
+              ><button
                 class="quiet scope-dock-toggle"
                 id="scope-dock-toggle"
                 type="button"
@@ -154,6 +168,7 @@
                 height="720"
                 aria-label="Video preview"
               ></canvas>
+              <div id="multicam-grid" class="multicam-grid" hidden></div>
               <div id="monitor-caption" hidden></div>
               <div id="preview-title" class="preview-title"></div>
               <div id="preview-empty" class="preview-empty">
@@ -226,6 +241,7 @@
             ><button id="zoom-fit" title="Zoom to fit the whole timeline (\)">Fit</button>
           </div>
         </div>
+        <div id="nested-breadcrumb" class="nested-breadcrumb" hidden></div>
         <div class="timeline-body" id="timeline-body">
           <div class="track-heads" id="track-heads">
             <div class="ruler-head">TIMECODE</div>
@@ -281,6 +297,9 @@
     <script src="audio-dsp.js"></script>
     <script src="audio-mixer.js"></script>
     <script src="engine.js"></script>
+    <script src="nested.js"></script>
+    <script src="multicam.js"></script>
+    <script src="bins.js"></script>
     <script src="scopes.js"></script>
     <script src="inspector.js"></script>
     <script src="source_monitor.js"></script>

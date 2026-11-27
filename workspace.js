@@ -118,6 +118,7 @@
     node.onpointerenter = () => clearTimeout(toastTimer);
     node.onpointerleave = () => { clearTimeout(toastTimer); toastTimer = setTimeout(() => node.remove(), 2000); };
   };
+  window.SpliceNotify = notify;
   const safeEdit = action => { try { return action(); } catch (error) { notify(error.message); return null; } };
   let pending = false;
   let relinkTarget = null;
@@ -166,12 +167,19 @@
   const mediaFor = (project, clip) =>
     project.media.find((m) => m.id === clip.mediaId);
   function mediaLabel(media) {
-    if(Number.isInteger(media.nestedSequence))return media.proxyState==='preparing'?'Preparing nested preview':media.proxyState==='unavailable'?'Nested preview unavailable':'Nested sequence';
+    if(Number.isInteger(media.nestedSequence) || window.SpliceNested?.isNativeNested?.(media))
+      return media.proxyState==='preparing'?'Preparing nested preview':media.proxyState==='unavailable'?'Nested preview unavailable':'Nested sequence';
+    if(window.SpliceMulticam?.isMulticamItem?.(media))
+      return 'Multicam · '+media.multicam.angles.length+' angles';
+    if(media.parentMediaId)
+      return 'Subclip · '+Math.round(media.duration||0)+'s';
     if(Number.isInteger(media.nativeGenerator))return [1112293707,1414680150].includes(media.nativeGenerator)?'Premiere generator':'Native generator · Premiere preview';
     if(media.nativeUnsupported)return 'Native source · Premiere preview';
     if(media.offline || !media.src)return 'Offline · Relink media';
     return (media.type==='audio'?'Audio':'Video')+' · '+Math.round(media.duration||0)+'s'+(media.originalSrc && media.src!==media.originalSrc?' · Proxy':'');
   }
+  const selectedPoolMedia = new Set();
+  let lastPoolAnchor = null;
   let mediaView = "grid";
   let mediaSort = {key: "name", direction: 1};
   // Optional source metadata (camera rate, timecode, reel...) appears only when the media carries it.
@@ -191,13 +199,19 @@
     {key: "reel", label: "Reel", value: (media) => media.reel || ""},
     {key: "audio", label: "Audio", value: (media) => media.audioStreams ?? -1, show: mediaAudio},
     {key: "bin", label: "Bin", value: (media) => media.bin || ""},
+    {key: "scene", label: "Scene", value: (media) => media.scene || ""},
+    {key: "shot", label: "Shot", value: (media) => media.shot || ""},
+    {key: "take", label: "Take", value: (media) => media.take || ""},
+    {key: "logNote", label: "Log Note", value: (media) => media.logNote || ""},
+    {key: "colorLabel", label: "Label", value: (media) => media.colorLabel || ""},
   ];
   function mediaMatches(media, project) {
     const term = $("media-search").value.trim().toLowerCase();
     const filter = $("media-filter").value, bin = $("bin-filter").value;
-    if (bin && (bin === "@root" ? media.bin : media.bin !== bin)) return false;
+    if (bin && !(window.SpliceBins ? window.SpliceBins.mediaMatchesBin(media, bin) : (bin === "@root" ? !media.bin : media.bin === bin))) return false;
     if (filter !== "all" && filter !== media.type && !(filter === "offline" && media.offline)) return false;
-    const text = [media.name, media.bin, media.path, media.sourcePath, media.reel, mediaTimecode(media)].filter(Boolean).join(" ");
+    const text = [media.name, media.bin, media.path, media.sourcePath, media.reel, mediaTimecode(media),
+      media.scene, media.camera, media.shot, media.take, media.logNote, media.colorLabel].filter(Boolean).join(" ");
     return !term || text.toLowerCase().includes(term);
   }
   function sortedMedia(items, project) {
@@ -211,7 +225,17 @@
   }
   function mediaDetails(media, withPath = true) {
     return [mediaRate(media) && mediaRate(media) + " fps", mediaTimecode(media) && "TC " + mediaTimecode(media),
-      media.reel && "Reel " + media.reel, mediaAudio(media), withPath && media.sourcePath].filter(Boolean).join(" · ");
+      media.scene && "Sc " + media.scene, media.shot && "Sh " + media.shot, media.take && "Tk " + media.take,
+      media.reel && "Reel " + media.reel, mediaAudio(media), media.logNote, withPath && media.sourcePath].filter(Boolean).join(" · ");
+  }
+  function mediaKindPill(media) {
+    if (window.SpliceNested?.isNativeNested?.(media) || Number.isInteger(media.nestedSequence))
+      return '<span class="media-badge-pill nested">NEST</span>';
+    if (window.SpliceMulticam?.isMulticamItem?.(media))
+      return `<span class="media-badge-pill multicam">MC ${media.multicam.angles.length}</span>`;
+    if (media.parentMediaId)
+      return '<span class="media-badge-pill subclip">SUB</span>';
+    return '';
   }
   // A card's linked-media path is one line, cut short with an ellipsis; the tooltip has it in full.
   function mediaCard(media, project) {
@@ -221,17 +245,34 @@
     const tooltip = [media.name, mediaDetails(media)].filter(Boolean).join("\n");
     const extra = details ? `<span class="media-meta media-extra">${esc(details)}</span>` : "";
     const path = media.sourcePath ? `<span class="media-meta media-path" title="${esc(media.sourcePath)}">${esc(media.sourcePath)}</span>` : "";
-    return `<button class="media-card" draggable="true" data-media="${esc(media.id)}" title="${esc(tooltip)}"><div class="media-thumb ${audio ? "audio-thumb" : ""}">${picture}<span class="media-icon">${audio ? "♫" : "▶"}</span><span class="media-duration">${fmt(media.duration, project.fps).slice(3, 8)}</span></div><span class="media-name">${esc(media.name)}</span><span class="media-meta">${esc(mediaLabel(media))}</span>${extra}${path}</button>`;
+    const sel = selectedPoolMedia.has(media.id) ? " pool-selected" : "";
+    const colorAttr = media.colorLabel ? ` data-label-color="${esc(media.colorLabel)}"` : "";
+    return `<button class="media-card${sel}" draggable="true" data-media="${esc(media.id)}"${colorAttr} title="${esc(tooltip)}"><div class="media-thumb ${audio ? "audio-thumb" : ""}">${picture}${mediaKindPill(media)}<span class="media-icon">${audio ? "♫" : "▶"}</span><span class="media-duration">${fmt(media.duration, project.fps).slice(3, 8)}</span></div><span class="media-name">${esc(media.name)}</span><span class="media-meta">${esc(mediaLabel(media))}</span>${extra}${path}</button>`;
   }
   function mediaTable(items, project) {
     const arrow = (key) => mediaSort.key === key ? (mediaSort.direction > 0 ? " ▲" : " ▼") : "";
     const head = mediaColumns.map((column) => `<button type="button" role="columnheader" data-sort="${column.key}" aria-sort="${mediaSort.key === column.key ? (mediaSort.direction > 0 ? "ascending" : "descending") : "none"}">${column.label}${arrow(column.key)}</button>`).join("");
-    const rows = items.map((media) => `<button class="media-row" role="row" draggable="true" data-media="${esc(media.id)}" title="${esc(media.sourcePath || media.path || media.name)}">` +
-      mediaColumns.map((column) => `<span role="cell">${esc(column.show ? column.show(media, project) : column.value(media, project))}</span>`).join("") + "</button>").join("");
+    const rows = items.map((media) => {
+      const sel = selectedPoolMedia.has(media.id) ? " pool-selected" : "";
+      const colorAttr = media.colorLabel ? ` data-label-color="${esc(media.colorLabel)}"` : "";
+      return `<button class="media-row${sel}" role="row" draggable="true" data-media="${esc(media.id)}"${colorAttr} title="${esc(media.sourcePath || media.path || media.name)}">` +
+        mediaColumns.map((column) => `<span role="cell">${esc(column.show ? column.show(media, project) : column.value(media, project))}</span>`).join("") + "</button>";
+    }).join("");
     return `<div class="media-table" role="table" aria-label="Media list"><div class="media-table-head" role="row">${head}</div>${rows}</div>`;
+  }
+  function syncPoolSelectionUI() {
+    const body = $("library-body");
+    if (!body) return;
+    body.querySelectorAll("[data-media]").forEach(el => {
+      el.classList.toggle("pool-selected", selectedPoolMedia.has(el.dataset.media));
+    });
+    const moveBtn = $("bin-move-btn");
+    if (moveBtn) moveBtn.disabled = selectedPoolMedia.size === 0;
   }
   function renderLibrary(state) {
     const { project } = state;
+    const validIds = new Set(project.media.map(m => m.id));
+    for (const id of [...selectedPoolMedia]) if (!validIds.has(id)) selectedPoolMedia.delete(id);
     project.media.forEach(makeThumb);
     $("asset-count").textContent = project.media.length;
     $("asset-footer").textContent = `${project.media.length} assets in project`;
@@ -240,16 +281,28 @@
     if(tab==='captions'){SpliceCaptions.render(body,state,notify);return;}
     if (tab === "media") {
       const previousBin=$('bin-filter').value;
+      const allBinPaths = window.SpliceBins ? window.SpliceBins.allBins(project) : [...new Set(project.media.map(m=>m.bin).filter(Boolean))].sort();
       $('bin-filter').replaceChildren(new Option('All bins',''),new Option('Unfiled','@root'),
-        ...[...new Set(project.media.map(m=>m.bin).filter(Boolean))].sort().map(f=>new Option(f,f)));
+        ...allBinPaths.map(f=>new Option(f,f)));
       if ([...$('bin-filter').options].some(o=>o.value===previousBin)) $('bin-filter').value=previousBin;
       const shown = sortedMedia(project.media.filter(media => mediaMatches(media, project)), project);
+      const shownIds = shown.map(m => m.id);
       const offline = project.media.some(m=>m.offline) ?
         '<button class="asset-add" id="relink-assets">↻ &nbsp; Relink offline media</button><button class="asset-add" id="relink-folder">Relink from folder…</button>' : "";
       const items = mediaView === "list" ? mediaTable(shown, project) :
         '<div class="media-grid">' + shown.map(media => mediaCard(media, project)).join("") + '</div>';
       body.innerHTML = '<div class="library-section">Imported media</div>' + offline + items +
         '<button class="asset-add" id="asset-add">＋ &nbsp; Import your own footage or audio</button>';
+      window.SpliceBins?.renderBinBrowser?.(body, state, {
+        currentBin: $('bin-filter').value,
+        onSelectBin: binPath => {
+          $('bin-filter').value = binPath;
+          lastMedia = "";
+          renderLibrary(editor.get());
+        },
+        selectedMediaIds: selectedPoolMedia,
+        notify,
+      });
       body.querySelectorAll("[data-sort]").forEach(button => {
         button.onclick = () => {
           mediaSort = {key: button.dataset.sort, direction: mediaSort.key === button.dataset.sort ? -mediaSort.direction : 1};
@@ -258,17 +311,71 @@
         };
       });
       body.querySelectorAll("[data-media]").forEach((el) => {
-        if (project.media.find(m => m.id === el.dataset.media)?.offline) {
-          el.onclick = () => { relinkTarget = el.dataset.media; $("specific-relink-input").click(); };
-        }
-        if(!el.onclick) el.onclick=()=>SpliceSource.open(el.dataset.media);
-        const media=project.media.find(m=>m.id===el.dataset.media);
-        // The tooltip says what a click does, then the card's details (its full path included).
-        let action=media?.offline?"Relink this source":"Open source monitor";
-        if(Number.isInteger(media?.nestedSequence)){el.onclick=()=>busy(()=>SpliceSession.sequence(media.nestedSequence));action="Open nested sequence";}
-        el.title=action+(el.title?"\n"+el.title:"");
+        const id = el.dataset.media;
+        const media = project.media.find(m => m.id === id);
+        let action = media?.offline ? "Relink this source" : "Open source monitor";
+        if (Number.isInteger(media?.nestedSequence) || window.SpliceNested?.isNativeNested?.(media)) action = "Open nested sequence";
+        el.title = action + (el.title ? "\n" + el.title : "");
+        el.onclick = (e) => {
+          if (e.ctrlKey || e.metaKey) {
+            e.preventDefault();
+            if (selectedPoolMedia.has(id)) selectedPoolMedia.delete(id);
+            else selectedPoolMedia.add(id);
+            lastPoolAnchor = id;
+            syncPoolSelectionUI();
+            return;
+          }
+          if (e.shiftKey && lastPoolAnchor && shownIds.includes(lastPoolAnchor)) {
+            e.preventDefault();
+            const a = shownIds.indexOf(lastPoolAnchor), b = shownIds.indexOf(id);
+            selectedPoolMedia.clear();
+            for (let i = Math.min(a, b); i <= Math.max(a, b); i++) selectedPoolMedia.add(shownIds[i]);
+            syncPoolSelectionUI();
+            return;
+          }
+          selectedPoolMedia.clear();
+          selectedPoolMedia.add(id);
+          lastPoolAnchor = id;
+          syncPoolSelectionUI();
+          if (media?.offline) { relinkTarget = id; $("specific-relink-input").click(); return; }
+          if (Number.isInteger(media?.nestedSequence)) { busy(() => SpliceSession.sequence(media.nestedSequence)); return; }
+          if (window.SpliceNested?.isNativeNested?.(media)) { busy(() => SpliceNested.enter(media.id)); return; }
+          SpliceSource.open(id);
+        };
+        el.oncontextmenu = (e) => {
+          e.preventDefault();
+          if (!selectedPoolMedia.has(id)) {
+            selectedPoolMedia.clear();
+            selectedPoolMedia.add(id);
+            lastPoolAnchor = id;
+            syncPoolSelectionUI();
+          }
+          const ids = [...selectedPoolMedia];
+          const entries = [];
+          if (window.SpliceNested?.isNativeNested?.(media)) {
+            entries.push(["Open nested sequence", () => busy(() => SpliceNested.enter(media.id))]);
+          } else if (Number.isInteger(media?.nestedSequence)) {
+            entries.push(["Open nested sequence", () => busy(() => SpliceSession.sequence(media.nestedSequence))]);
+          } else if (!media?.offline) {
+            entries.push(["Open in Source Monitor", () => SpliceSource.open(id)]);
+          }
+          if (!media?.offline) entries.push(["Add to timeline", () => safeEdit(() => editor.addToTimeline(id))]);
+          entries.push(["Metadata & color label…", () => window.SpliceBins?.openMetadataDialog(id, notify)]);
+          entries.push([ids.length > 1 ? `Move ${ids.length} items to bin…` : "Move to bin…", () => window.SpliceBins?.openMoveToBinDialog(ids, notify)]);
+          if (ids.length >= 2 && ids.length <= 9) {
+            entries.push(["Create multicam clip…", () => window.SpliceMulticam?.openCreateDialog(ids, notify)]);
+          }
+          if (media?.parentMediaId) {
+            entries.push([media.subclipLimits === false ? "Restore subclip limits" : "Remove subclip limits", () => safeEdit(() => {
+              const lim = window.SpliceBins.toggleSubclipLimits(id);
+              notify(lim ? "Subclip trim limits enforced" : "Subclip limits removed");
+            })]);
+          }
+          entries.push([ids.length > 1 ? `Delete ${ids.length} items…` : "Delete from project", () => window.SpliceBins?.deleteMedia(ids, notify)]);
+          popupMenu({ left: e.clientX, top: e.clientY, bottom: e.clientY }, '[data-media="' + CSS.escape(id) + '"]', entries);
+        };
         el.ondragstart = (e) =>
-          e.dataTransfer.setData("text/plain", el.dataset.media);
+          e.dataTransfer.setData("text/plain", id);
       });
       $("asset-add").onclick = () => $("media-input").click();
       if ($("relink-folder")) $("relink-folder").onclick=()=>$("folder-relink-input").click();
@@ -429,16 +536,25 @@
     const offset=clip.linkGroup?editor.syncOffset(clip):null;
     const embedded=editor.hasEmbeddedAudio(clip);
     const disabled=clip.enabled===false;
+    const isNativeNest=!!window.SpliceNested?.isNativeNested?.(media);
+    const isMulticam=!!window.SpliceMulticam?.isMulticamItem?.(media);
+    const isSubclip=!!media?.parentMediaId;
+    const labelColor=clip.colorLabel||media?.colorLabel||"";
     node.className="timeline-clip "+lane.kind+(disabled?" disabled":"")+(clip.id===selectedId?" selected":"")+(group.has(clip.id)?" group-selected":"")+
       (clip.linkGroup?" linked":"")+(offset?" out-of-sync":"")+(embedded?" has-audio":"")+
+      (isNativeNest?" is-nested":"")+(isMulticam?" is-multicam":"")+(isSubclip?" is-subclip":"")+
       (selectedEdit?.id===clip.id?" edit-"+selectedEdit.edge:"");
+    if (labelColor) node.dataset.labelColor=labelColor;
     node.style.left=px(clip.start)+"px";node.style.width=Math.max(tinyClipWidth,px(clip.duration)-1)+"px";
     node.dataset.clip=clip.id;
+    const angleIdx=isMulticam?(Number.isInteger(clip.multicamAngle)?clip.multicamAngle:0):0;
+    const angleName=isMulticam?(media.multicam.angles[angleIdx]?.name||`Angle ${angleIdx+1}`):"";
     const name=clip.title||media?.name||"Title";
-    const state=[disabled?"disabled: no picture or sound (Shift+E enables)":"",clip.linkGroup?"linked":"",embedded?"with camera sound":"",offset?`${Math.abs(offset)} frames ${offset>0?"late":"early"} against its linked partner`:""].filter(Boolean).join(", ");
+    const kindTag=isNativeNest?'<span class="clip-kind-tag nest">NEST</span>':isMulticam?`<span class="clip-kind-tag mc">MC${angleIdx+1}</span>`:isSubclip?'<span class="clip-kind-tag sub">SUB</span>':"";
+    const state=[disabled?"disabled: no picture or sound (Shift+E enables)":"",isNativeNest?"nested sequence":"",isMulticam?`multicam Angle ${angleIdx+1} (${angleName})`:"",isSubclip?"subclip":"",clip.linkGroup?"linked":"",embedded?"with camera sound":"",offset?`${Math.abs(offset)} frames ${offset>0?"late":"early"} against its linked partner`:""].filter(Boolean).join(", ");
     node.title=name+" · "+tc(clip.start)+(state?" · "+state:"");
     node.innerHTML='<span class="clip-overlay"></span>'+(lane.kind==="audio"?'<canvas class="clip-wave"></canvas>':embedded?'<canvas class="clip-wave camera-wave"></canvas>':"")+
-      '<span class="clip-name">'+(disabled&&offTagFits(clip,name,offset)?'<span class="clip-off" aria-label="Disabled">OFF</span>':"")+(clip.linkGroup?linkIcon:"")+esc(name)+'</span>'+
+      '<span class="clip-name">'+(disabled&&offTagFits(clip,name,offset)?'<span class="clip-off" aria-label="Disabled">OFF</span>':"")+(clip.linkGroup?linkIcon:"")+kindTag+esc(name)+'</span>'+
       (offset?`<span class="sync-badge" role="button" tabindex="-1" data-sync="${esc(clip.id)}" title="Out of sync by ${Math.abs(offset)} frames. Click to move or slip into sync.">${offset>0?"+":"−"}${Math.abs(offset)}</span>`:"")+
       '<span class="trim-handle trim-left" title="Trim in · Alt+drag trims only this side of a linked clip"></span><span class="trim-handle trim-right" title="Trim out · Alt+drag trims only this side of a linked clip"></span>';
     if (thumbOf(media)) {
@@ -447,9 +563,8 @@
       image.className="clip-image";image.alt="";image.src=thumbOf(media);
       node.prepend(image);
     }
-    if (Number.isInteger(clip.nestedSequence)) {
+    if (isNativeNest || Number.isInteger(clip.nestedSequence)) {
       node.title += ' · Double-click to open nested sequence';
-      node.ondblclick=()=>busy(()=>SpliceSession.sequence(clip.nestedSequence));
     }
     const waveWidth=Math.max(tinyClipWidth,px(clip.duration)-1)-6;
     if((lane.kind==="audio"||embedded)&&waveWidth>=waveformMinWidth)
@@ -714,6 +829,7 @@
     if (state.opened !== lastOpenedGroup) {
       lastOpenedGroup = state.opened;
       group.clear();
+      selectedPoolMedia.clear();
     }
     if (projectChanged && !gesture) {
       renderTimeline(state);
@@ -950,6 +1066,7 @@
     requestAnimationFrame(()=>window.SpliceInspector?.paintScope?.(undefined,true));
   }
   $("scope-dock-toggle").onclick=()=>toggleScopeDock();
+  if ($("multicam-toggle")) $("multicam-toggle").onclick=()=>commands.toggleMulticamView();
   document.addEventListener("click",event=>{
     if(event.target.closest?.("[data-scope-dock]"))toggleScopeDock(true);
   });
@@ -1081,7 +1198,7 @@
     const onKey=event=>{
       if(event.key==="Escape"){
         event.preventDefault();event.stopPropagation();close();
-        const back=lanes.querySelector(anchorSelector)||(opener?.isConnected&&opener!==document.body?opener:null);
+        const back=document.querySelector(anchorSelector)||(opener?.isConnected&&opener!==document.body?opener:null);
         back?.focus({preventScroll:true});
         return;
       }
@@ -1094,12 +1211,12 @@
     // timeline (selecting the clip does) fires scroll events on its containers without moving
     // anything, and must not close the menu it was opened with.
     let scrollCheck=0;
-    const origin=lanes.querySelector(anchorSelector)?.getBoundingClientRect()||box;
+    const origin=document.querySelector(anchorSelector)?.getBoundingClientRect()||box;
     const onScroll=()=>{
       if(scrollCheck)return;
       scrollCheck=requestAnimationFrame(()=>{
         scrollCheck=0;
-        const now=lanes.querySelector(anchorSelector)?.getBoundingClientRect();
+        const now=document.querySelector(anchorSelector)?.getBoundingClientRect();
         if(!now||Math.abs(now.left-origin.left)>1||Math.abs(now.top-origin.top)>1)close();
       });
     };
@@ -1129,20 +1246,78 @@
     document.body.append(menu);
     menu.querySelector("button").focus();
   }
-  // Right-click a clip: enable or disable it, link or unlink. A clip outside the current
-  // multi-selection becomes the selection first, as in other editors.
+  function openClipColorDialog(clipIds) {
+    if (!window.SpliceBins) return;
+    const ids = Array.isArray(clipIds) ? clipIds : [clipIds];
+    const current = editor.get().project.clips.find(c => ids.includes(c.id))?.colorLabel || "";
+    const existing = document.getElementById("clip-color-dialog");
+    if (existing) existing.remove();
+    const dialog = document.createElement("dialog");
+    dialog.id = "clip-color-dialog";
+    dialog.className = "studio-dialog meta-dialog";
+    const swatches = window.SpliceBins.COLOR_LABELS.map(c =>
+      `<button type="button" class="label-swatch-btn${c.key === current ? " active" : ""}" data-color="${esc(c.key)}" ${c.key ? `data-label-color="${esc(c.key)}"` : ""}><span class="label-dot"></span>${esc(c.name)}</button>`
+    ).join("");
+    dialog.innerHTML =
+      `<h2>Clip color label</h2>` +
+      `<div class="label-swatch-row">${swatches}</div>` +
+      `<footer><button type="button" data-close>Close</button></footer>`;
+    document.body.append(dialog);
+    dialog.querySelector("[data-close]").onclick = () => dialog.close();
+    dialog.addEventListener("close", () => dialog.remove(), { once: true });
+    dialog.querySelectorAll(".label-swatch-btn").forEach(btn => {
+      btn.onclick = () => {
+        safeEdit(() => window.SpliceBins.setClipColorLabel(ids, btn.dataset.color || ""));
+        dialog.close();
+      };
+    });
+    dialog.showModal();
+  }
+  // Right-click a clip: enable or disable it, link or unlink, nest/unnest, multicam, subclip, color label.
+  // A clip outside the current multi-selection becomes the selection first, as in other editors.
   lanes.addEventListener("contextmenu",e=>{
     const node=e.target.closest(".timeline-clip");
     if(!node)return;
-    const clip=editor.get().project.clips.find(c=>c.id===node.dataset.clip);
+    const state=editor.get();
+    const clip=state.project.clips.find(c=>c.id===node.dataset.clip);
     if(!clip)return;
     e.preventDefault();
     if(!group.has(clip.id)){group.clear();editor.select(clip.id);}
+    const chosen=selection();
+    const chosenIds=chosen.map(c=>c.id);
+    const media=mediaFor(state.project,clip);
+    const entries=[
+      [enableLabel(clip)+"  (Shift+E)",()=>toggleEnabled(clip.id)],
+      ["Link / unlink  (Ctrl+L)",toggleLink],
+    ];
+    if (window.SpliceNested) {
+      if (chosen.length > 1) entries.push(["Nest\u2026",()=>commands.nest()]);
+      if (window.SpliceNested.isNativeNested(media)) {
+        entries.push(["Open nested sequence",()=>busy(()=>window.SpliceNested.enter(media.id))]);
+        entries.push(["Unnest / Decompose in place",()=>commands.unnest()]);
+      }
+    }
+    if (window.SpliceMulticam) {
+      if (window.SpliceMulticam.isMulticamItem(media)) {
+        entries.push([window.SpliceMulticam.isViewEnabled()?"Close multicam monitor":"Open multicam monitor",()=>commands.toggleMulticamView()]);
+        entries.push(["Flatten multicam",()=>commands.flattenMulticam()]);
+      }
+      const uniqueMedia=[...new Set(chosen.map(c=>c.mediaId).filter(Boolean))];
+      if (uniqueMedia.length>=2&&uniqueMedia.length<=9) {
+        entries.push(["Create multicam clip\u2026",()=>window.SpliceMulticam.openCreateDialog(uniqueMedia,notify)]);
+      }
+    }
+    if (media?.parentMediaId && window.SpliceBins) {
+      entries.push(["Remove subclip limits",()=>{safeEdit(()=>window.SpliceBins.removeClipSubclipLimits(clip.id));notify("Removed subclip limits on clip");}]);
+    }
+    if (window.SpliceBins && chosen.length > 1) {
+      entries.push(["Color label\u2026",()=>openClipColorDialog(chosenIds)]);
+    }
     const box={left:e.clientX,top:e.clientY,bottom:e.clientY};
     // The clip under the pointer leads: the whole selection takes the state opposite to its own.
-    popupMenu(box,'.timeline-clip[data-clip="'+CSS.escape(clip.id)+'"]',
-      [[enableLabel(clip)+"  (Shift+E)",()=>toggleEnabled(clip.id)],["Link / unlink  (Ctrl+L)",toggleLink]]);
+    popupMenu(box,'.timeline-clip[data-clip="'+CSS.escape(clip.id)+'"]',entries);
   });
+  let lastClipTap = { id: null, time: 0 };
   lanes.addEventListener("pointerdown",e=>{
     if(e.button===2)return;
     const badge=e.target.closest(".sync-badge");
@@ -1170,6 +1345,26 @@
       lastProject="";refresh(editor.get());e.preventDefault();return;
     }
     const edge=e.target.closest(".trim-handle");
+    if (!edge && !e.altKey && !e.shiftKey) {
+      const now = performance.now();
+      if (lastClipTap.id === clip.id && now - lastClipTap.time < 420) {
+        lastClipTap = { id: null, time: 0 };
+        const media = mediaFor(editor.get().project, clip);
+        if (window.SpliceNested?.isNativeNested?.(media)) {
+          e.preventDefault();
+          busy(() => window.SpliceNested.enter(media.id));
+          return;
+        }
+        if (Number.isInteger(clip.nestedSequence)) {
+          e.preventDefault();
+          busy(() => SpliceSession.sequence(clip.nestedSequence));
+          return;
+        }
+      }
+      lastClipTap = { id: clip.id, time: now };
+    } else {
+      lastClipTap = { id: null, time: 0 };
+    }
     selectedEdit=edge?{id:clip.id,edge:edge.classList.contains("trim-left")?"start":"end"}:null;
     if (!group.has(clip.id) || edge || e.altKey) group.clear();
     const originals=withLinked(editor.get().project.clips.filter(c=>group.has(c.id)||c.id===clip.id))
@@ -1467,6 +1662,32 @@
     clearMarks:()=>editor.clearMarks(),
     rippleStart:()=>rippleTrimToPlayhead("start"),
     rippleEnd:()=>rippleTrimToPlayhead("end"),
+    nest:()=>window.SpliceNested?.openNestDialog(selection().map(c=>c.id),notify),
+    unnest:()=>{
+      const chosen=selection(), primary=chosen.find(c=>c.id===editor.get().selectedId)||chosen[0];
+      if(!primary)return notify("Select a nested clip on the timeline to unnest.");
+      const expanded=safeEdit(()=>window.SpliceNested.unnestClip(primary.id));
+      if(expanded)notify(`Unnested ${expanded.length} clip${expanded.length===1?"":"s"} in place`);
+    },
+    createMulticam:()=>{
+      if(!window.SpliceMulticam)return;
+      let ids=[...selectedPoolMedia];
+      if(ids.length<2){
+        const fromClips=[...new Set(selection().map(c=>c.mediaId).filter(Boolean))];
+        if(fromClips.length>=2&&fromClips.length<=9)ids=fromClips;
+      }
+      window.SpliceMulticam.openCreateDialog(ids,notify);
+    },
+    toggleMulticamView:()=>{
+      if(!window.SpliceMulticam)return;
+      const on=window.SpliceMulticam.toggleMulticamView();
+      if(on&&!window.SpliceMulticam.activeMulticamClip(editor.get()))notify("Multicam monitor on — park playhead on a multicam clip to switch angles.");
+    },
+    flattenMulticam:()=>{
+      if(!window.SpliceMulticam)return;
+      const produced=safeEdit(()=>window.SpliceMulticam.flattenClips(selection().map(c=>c.id)));
+      if(produced)notify(`Flattened multicam into ${produced.length} clip${produced.length===1?"":"s"}`);
+    },
     syncSound:()=>window.SpliceSync?.open(),
   };
   const mod=e=>e.ctrlKey||e.metaKey;
@@ -1496,6 +1717,16 @@
       run:e=>e.code==="Quote"?commands.extract():commands.lift()},
     {keys:", · .",action:"Insert · overwrite from the source monitor (three-point edit)",test:press(["Comma","Period"]),
       run:e=>fromSource(e.code==="Period"?"overwrite":"insert")},
+    {keys:"1–9 · Shift + 1–9",action:"Cut to multicam angle 1–9 · switch active clip angle without cutting",
+      test:e=>!mod(e)&&!e.altKey&&/^Digit[1-9]$/.test(e.code)&&!!window.SpliceMulticam?.activeMulticamClip?.(editor.get()),
+      run:e=>{
+        const idx=Number(e.code.slice(5))-1;
+        const res=safeEdit(()=>window.SpliceMulticam.switchAngle(idx,{cut:!e.shiftKey}));
+        if(res)notify((res.cut?"Cut to":"Switched to")+` Angle ${idx+1}`);
+      }},
+    {keys:"Ctrl/Cmd + U",action:"Make subclip from Source Monitor In/Out marks",
+      test:e=>press("u",{ctrl:true})(e)&&!!window.SpliceSource?.isOpen?.(),
+      run:()=>window.SpliceSource?.makeSubclip?.()},
     {keys:"S · Ctrl/Cmd + K",action:"Add edit to the selected clip at the playhead",test:e=>press("s")(e)||press("k",{ctrl:true})(e),run:()=>safeEdit(()=>editor.split())},
     {keys:"Ctrl/Cmd + Shift + K",action:"Add edit on all unlocked tracks",test:press("k",{ctrl:true,shift:true}),run:commands.addEditAll},
     {keys:"Q · W",action:"Ripple trim clip start · end to the playhead",test:press(["q","w"]),run:e=>rippleTrimToPlayhead(e.key.toLowerCase()==="q"?"start":"end")},

@@ -239,6 +239,7 @@ class Source:
     vfr: bool = False
     notes: list = field(default_factory=list)
     nested: bool = False
+    multicam: bool = False
     generator: bool = False
     adjustment: bool = False    # a Splice adjustment clip (a generator that grades the tracks beneath)
     input_lut: str | None = None  # title of the source's technical input LUT, for the loss report
@@ -375,8 +376,11 @@ def resolve_source(item: dict, sequence_rate: Fraction, budget: ProbeBudget) -> 
     name = clean(item.get('name') or item.get('id') or 'Media') or 'Media'
     source = Source(id=str(item.get('id')), name=name, path=None, local=None,
                     kind='audio' if item.get('type') == 'audio' else 'video')
-    if isinstance(item.get('nestedSequence'), int):
+    if isinstance(item.get('nestedSequence'), (int, str)) and item.get('nestedSequence') != '' and not isinstance(item.get('nestedSequence'), bool) or item.get('nestedProject'):
         source.nested = True
+        return source
+    if item.get('multicam'):
+        source.multicam = True
         return source
     if item.get('nativeGenerator') is not None or item.get('nativeUnsupported'):
         source.generator = True
