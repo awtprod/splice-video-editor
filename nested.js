@@ -164,12 +164,8 @@ window.SpliceNested = (() => {
       clips: childClips,
       duration: span,
     };
-    if (project.trackMix) {
-      const usedAudioTracks = new Set(childClips.filter(c => c.type === 'audio' || c.embeddedAudio !== false).map(c => String(c.track)));
-      const childMix = {};
-      for (const [k, v] of Object.entries(project.trackMix)) if (usedAudioTracks.has(k)) childMix[k] = structuredClone(v);
-      if (Object.keys(childMix).length) childProject.trackMix = childMix;
-    }
+    // A solo on a track outside the selection can silence the whole selection.
+    if (project.trackMix) childProject.trackMix = structuredClone(project.trackMix);
 
     const hasVideo = selected.some(c => c.type === 'video' || c.type === 'title');
     const hasAudio = sequenceHasAudio(childProject);
@@ -196,9 +192,16 @@ window.SpliceNested = (() => {
     const isLocked = (t, k) => editor.isTrackLocked?.(t, k);
 
     const videoTrack = hasVideo ? freeTrack(remaining, 'video', Math.max(1, prefVideo || 1), minStart, minStart + span, isLocked) : null;
-    const audioTrack = hasAudio ? freeTrack(remaining, 'audio', Math.min(-1, prefAudio || -1), minStart, minStart + span, isLocked) : null;
+    // The child renders the source tracks' mix. Route that sound through a unity parent track.
+    const solo = Object.values(project.trackMix || {}).some(m => m.solo);
+    const unavailableAudio = t => {
+      const mix = project.trackMix?.[t] || {};
+      if (isLocked(t, 'audio') || mix.mute || (mix.gain ?? 100) !== 100 || (mix.pan ?? 0) !== 0) return true;
+      return solo && !mix.solo && project.clips.some(c => c.track === t);
+    };
+    const audioTrack = hasAudio ? freeTrack(remaining, 'audio', Math.min(-1, prefAudio || -1), minStart, minStart + span, unavailableAudio) : null;
     if (hasVideo && videoTrack === null) throw new Error('No free unlocked video track for the nested sequence.');
-    if (!hasVideo && hasAudio && audioTrack === null) throw new Error('No free unlocked audio track for the nested sequence.');
+    if (hasAudio && audioTrack === null) throw new Error('The nested mix needs a free, unlocked audio track with unity gain and centered pan.');
 
     const createdClips = [];
     const linkGroup = hasVideo && hasAudio && audioTrack !== null ? uid() : undefined;
@@ -237,6 +240,8 @@ window.SpliceNested = (() => {
     }
 
     editor.editProject(next => {
+      if (hasAudio && solo && !next.trackMix[audioTrack]?.solo)
+        next.trackMix[audioTrack] = {...next.trackMix[audioTrack], solo:true};
       next.media.push(nestedItem);
       next.clips = next.clips.filter(c => !idSet.has(c.id));
       next.clips.push(...createdClips);
@@ -510,7 +515,8 @@ window.SpliceNested = (() => {
       const trimHead = ovStart - cc.start;
       const newDuration = snapToFps((ovEnd - ovStart) / speed, fps);
       if (newDuration < 1 / fps - 1e-6) continue;
-      const newStart = snapToFps(primary.start + (ovStart - winStart) / speed, fps);
+      const offset = primary.reverse ? winEnd - ovEnd : ovStart - winStart;
+      const newStart = snapToFps(primary.start + offset / speed, fps);
       const out = structuredClone(cc);
       out.id = uid();
       if (out.mediaId && mediaRemap.has(out.mediaId)) out.mediaId = mediaRemap.get(out.mediaId);
@@ -518,6 +524,7 @@ window.SpliceNested = (() => {
       out.duration = newDuration;
       if (!out.reverse) out.in = (Number(out.in) || 0) + trimHead * cSpeed;
       else out.in = (Number(out.in) || 0) + (cc.start + cc.duration - ovEnd) * cSpeed;
+      if (primary.reverse) out.reverse = !cc.reverse;
       if (speed !== 1) out.speed = cSpeed * speed;
       if (primary.enabled === false) out.enabled = false;
       delete out.premiereIndex;

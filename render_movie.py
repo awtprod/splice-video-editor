@@ -1816,22 +1816,23 @@ def _expand_editorial_clips(project):
             after_mc.append(clip)
 
     # Step 2: resolve subclips to their parent media + subclipIn offset.
-    for clip in after_mc:
-        if not isinstance(clip, dict) or clip.get('type') == 'title':
-            continue
-        mid = clip.get('mediaId')
-        item = media_by_id.get(mid)
-        if isinstance(item, dict) and item.get('parentMediaId'):
-            root_id, offset = _resolve_subclip(mid, media_by_id)
-            clip['mediaId'] = root_id
-            clip['in'] = _number(clip.get('in', 0), 'source in', 0, MAX_SOURCE_SECONDS) + offset
-
-    prepared['clips'] = after_mc
+    prepared['clips'] = [resolve_subclip_source(clip, media_by_id) for clip in after_mc]
     return prepared
 
 
+def resolve_subclip_source(clip, media_by_id):
+    """Translate a subclip's local In to the original media for file delivery."""
+    if not isinstance(clip, dict) or clip.get('type') == 'title':
+        return clip
+    mid = clip.get('mediaId')
+    if not (media_by_id.get(mid) or {}).get('parentMediaId'):
+        return clip
+    root, offset = _resolve_subclip(mid, media_by_id)
+    return {**clip, 'mediaId': root, 'in': _number(clip.get('in', 0), 'source in') + offset}
+
+
 def render_to_file(project, output_path, *, options=None, progress=None, cancelled=None, heartbeat=None,
-                   work_directory=None, report=None, _nested_depth=0, _seen_sequences=frozenset()):
+                   work_directory=None, report=None, _nested_depth=0, _seen_sequences=frozenset(), _minimum_duration=0):
     """Resolve multicam clips, subclips, and nested sequences, then render the parent timeline.
 
     ``heartbeat`` is called whenever FFmpeg makes progress, so a supervisor
@@ -1852,7 +1853,7 @@ def render_to_file(project, output_path, *, options=None, progress=None, cancell
     enabled_media = {clip.get('mediaId') for clip in project.get('clips') or [] if isinstance(clip, dict) and clip_enabled(clip)}
     if not any(isinstance(item,dict) and item.get('nestedProject') for item in project['media']):
         return _render_prepared(project,output_path,options=options,progress=progress,cancelled=cancelled,heartbeat=heartbeat,
-                                work_directory=work_directory,report=report)
+                                work_directory=work_directory,report=report,minimum_duration=_minimum_duration)
     MEDIA_ROOT.mkdir(parents=True,exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='splice-nested-',dir=MEDIA_ROOT) as directory:
         prepared=copy.deepcopy(project)
@@ -1868,16 +1869,17 @@ def render_to_file(project, output_path, *, options=None, progress=None, cancell
             target=Path(directory)/f'nested-{index}{suffix}'
             child_options={**options,'codec':'prores' if suffix=='.mov' else 'h264'}
             child_options.pop('range',None)
+            span = _number(item.get('duration', 0), 'nested media duration', 0, MAX_TIMELINE_SECONDS) if isinstance(seq_id, str) else 0
             render_to_file(child,target,options=child_options,cancelled=cancelled,heartbeat=heartbeat,work_directory=work_directory,
-                           _nested_depth=_nested_depth+1,_seen_sequences=next_seen)
+                           _nested_depth=_nested_depth+1,_seen_sequences=next_seen,_minimum_duration=span)
             item['src']='/media/'+str(target.relative_to(MEDIA_ROOT))
-            item['duration']=max((float(c['start'])+float(c['duration']) for c in child['clips']),default=0)
+            item['duration']=max(span, max((float(c['start'])+float(c['duration']) for c in child['clips']),default=0))
             item.pop('nestedSequence',None)
             item.pop('nestedProject',None)
             for clip in prepared['clips']:
                 if clip.get('mediaId')==item['id']: clip.pop('nestedSequence',None)
         return _render_prepared(prepared,output_path,options=options,progress=progress,cancelled=cancelled,heartbeat=heartbeat,
-                                work_directory=work_directory,report=report)
+                                work_directory=work_directory,report=report,minimum_duration=_minimum_duration)
 
 
 def _track_hidden(track_state, kind, track):
@@ -1907,7 +1909,7 @@ def _export_settings(options):
     return codec, color_space, (ceiling if enabled else None), language, peak_safe
 
 
-def _validate_timeline(project):
+def _validate_timeline(project, minimum_duration=0):
     """Shape and size checks over the whole project; cheap, no media access."""
     clips, media = project.get('clips'), project.get('media')
     if not isinstance(clips, list) or not isinstance(media, list):
@@ -1923,7 +1925,7 @@ def _validate_timeline(project):
     used = {clip.get('mediaId') for clip in clips if clip.get('type') != 'title'}
     if len(used) > MAX_MEDIA:
         raise ValueError(f'The timeline uses {len(used):,} media files; export supports at most {MAX_MEDIA:,}')
-    total = 0.0
+    total = _number(minimum_duration, 'nested media duration', 0, MAX_TIMELINE_SECONDS)
     for clip in clips:
         if clip.get('type') not in ('video', 'audio', 'title'):
             raise ValueError('Unsupported timeline item')
@@ -1950,14 +1952,14 @@ def _estimated_bytes(width, height, fps, seconds, codec):
 
 
 def _render_prepared(project, output_path, *, options=None, progress=None, cancelled=None, heartbeat=None, work_directory=None,
-                     report=None):
+                     report=None, minimum_duration=0):
     """Render bounded picture windows and audio chunks, then mux them in one pass."""
     import copy
     options = dict(options or {})
     codec, color_space, limiter, language, peak_safe = _export_settings(options)
     # One private copy: probe results are cached on its media items.
     project = copy.deepcopy(project)
-    total = _validate_timeline(project)
+    total = _validate_timeline(project, minimum_duration)
     width, height = _frame_size(project) if codec != 'wav' else (16, 16)
     fps_fraction = _sequence_fps(project)
     fps = float(fps_fraction)

@@ -216,15 +216,15 @@
     const now=performance.now();
     if(now-meterSampleAt<100)return meterValues;
     meterSampleAt=now; meterValues={};
-    const active = new Map([...audioElements,...layerVideos]);
-    if(activeVideoId && video)active.set(activeVideoId,video);
-    for(const clip of project.clips) {
-      const route=audioNodes.get(active.get(clip.id));
+    const active = [...audioElements.values(), ...layerVideos.values()];
+    if(activeVideoId && video)active.push(video);
+    for(const element of active) {
+      const route=audioNodes.get(element);
       if(!route)continue;
       route.analyser.getFloatTimeDomainData(route.samples);
       let peak=0;
       for(const sample of route.samples)peak=Math.max(peak,Math.abs(sample));
-      meterValues[clip.track]=Math.max(meterValues[clip.track]||0,peak);
+      meterValues[route.track]=Math.max(meterValues[route.track]||0,peak);
     }
     return meterValues;
   }
@@ -237,6 +237,7 @@
   function setAudio(element,clip) {
     if (!element || !clip) return;
     const route=routeAudio(element);
+    route.track=clip.track;
     const mix=trackSettings(clip.track);
     const gain=clip.type==='video' && clip.embeddedAudio===false ? 0 : audibility(clip);
     const pan=clamp(((Number(clip.pan)||0)+(Number(mix.pan)||0))/100,-1,1);
@@ -263,6 +264,7 @@
       return;
     }
     if (stream!==(item?.audioStream??null) && element.getAttribute('src')===item?.src) audible=false;
+    if (clip.type === 'video' && mediaOf(clip)?.multicam?.audioMode === 'all') audible=false;
     element.playbackRate=rate;
     setMediaPlaying(element,playing && playbackRate>0 && !clip.reverse && rate>=.25);
     element.muted=!audible || clip.reverse || rate<.25;
@@ -616,8 +618,7 @@
     const speed=clamp(Number(clip.speed)||1,.1,16), local=atTime-clip.start;
     return Number(clip.in||0)+(clip.reverse ? clip.duration-local : local)*speed-(clip.reverse?1e-6:0);
   };
-  const multicamAngleActive = (clip, atTime) => {
-    const resolved = resolveClipMedia(clip);
+  const multicamAngleActive = (clip, atTime, resolved = resolveClipMedia(clip)) => {
     if (!resolved.angle) return true;
     const t = rawSourceTime(clip, atTime);
     return t >= resolved.minTime - 1e-6 && t < resolved.maxTime - 1e-6;
@@ -992,9 +993,26 @@
         setMediaPlaying(element,false);
       } else syncClipPlayback(element,layer,target,forceSeek);
     }
-    const currentIds = new Set(audioClips.map((c) => c.id));
+    for (const layer of layers.values()) {
+      if (!preloading.has(layer.id) && layer.embeddedAudio !== false && mediaOf(layer)?.multicam?.audioMode === 'all')
+        audioClips.push({...layer, type:'audio', track:-64});
+    }
+    const voices = new Map();
+    for (const clip of audioClips) {
+      const mc = mediaOf(clip)?.multicam;
+      if (mc?.audioMode === 'all') {
+        for (let angle = 0; angle < mc.angles.length; angle++) {
+          if (Number.isInteger(clip.multicamAudioAngle) && angle !== clip.multicamAudioAngle) continue;
+          const voice = {...clip, multicamAudioAngle:angle};
+          const resolved = resolveClipMedia(voice), source = resolved.item;
+          if (source?.src && !source.still && (source.type === 'audio' || source.audioChannels !== 0) &&
+              multicamAngleActive(voice, time, resolved))
+            voices.set(JSON.stringify([clip.id, angle]), voice);
+        }
+      } else voices.set(JSON.stringify([clip.id]), clip);
+    }
     for (const [id, element] of audioElements)
-      if (!currentIds.has(id)) {
+      if (!voices.has(id)) {
         element.pause();
         disconnectAudio(element);
         element.removeAttribute("src");
@@ -1002,18 +1020,20 @@
         element.remove();
         audioElements.delete(id);
       }
-    for (const audioClip of audioClips) {
+    audio = null;
+    for (const [key, audioClip] of voices) {
       const source=programSource(audioClip);
       if (!source) continue;
-      let element = audioElements.get(audioClip.id);
+      let element = audioElements.get(key);
       if (!element) {
         element = document.createElement("audio");
         element.src = source;
         element.preload = "auto";
         element.style.display = "none";
         document.body.append(element);
-        audioElements.set(audioClip.id, element);
+        audioElements.set(key, element);
       }
+      if (!audio) audio = element;
       if (element.getAttribute("src") !== source) element.src = source;
       const target = sourceTime(audioClip,time);
       if (forceSeek || Math.abs(element.currentTime - target) > seekTolerance(audioClip))
@@ -1024,7 +1044,6 @@
         }
       syncClipPlayback(element,audioClip,target,forceSeek);
     }
-    audio = audioClips.length ? audioElements.get(audioClips[0].id) : null;
     for(const [element,state] of auditions) if (!state.active) {
       stopAudition(state);
       auditions.delete(element);

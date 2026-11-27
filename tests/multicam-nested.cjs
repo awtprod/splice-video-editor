@@ -228,6 +228,37 @@ async function testNestedSequences(page, files) {
   await settle(page);
   assert.ok(await page.evaluate(() => Editor.get().project.clips.length === 2 && Editor.get().project.clips.every(c => c.nestedSequence == null)), 'Ctrl+Shift+Z redoes unnest back to plain clips');
 
+  const reversed = await page.evaluate(clipId => {
+    Editor.undo();
+    Editor.editProject(p => {
+      const outer = p.clips.find(c => c.type === 'video');
+      for (const clip of p.clips) Object.assign(clip, {reverse:true, in:.4, duration:3});
+      const child = p.media.find(m => m.id === outer.mediaId).nestedProject;
+      child.clips.find(c => c.start === 2).reverse = true;
+    });
+    return SpliceNested.unnestClip(clipId).sort((a,b) => a.start-b.start)
+      .map(c => [c.start, c.duration, c.reverse, Number(c.in.toFixed(2))]);
+  }, reopenedClipId);
+  assert.deepEqual(reversed, [[0, 1.4, false, .6], [1.4, 1.6, true, .4]]);
+  await page.evaluate(async id => {
+    Editor.undo();
+    await SpliceNested.enter(id);
+    Editor.editProject(p => { p.clips = []; });
+    SpliceNested.exit();
+  }, nestedInfo.mediaId);
+  await waitForNestedPreview(page, nestedInfo.mediaId);
+  const proxyDuration = await page.evaluate(async id => {
+    const media = Editor.get().project.media.find(m => m.id === id);
+    const decoder = document.createElement('video');
+    try {
+      const ready = new Promise((ok, fail) => { decoder.onloadedmetadata = ok; decoder.onerror = fail; });
+      decoder.src = media.src;
+      await ready;
+      return decoder.duration;
+    } finally { decoder.removeAttribute('src'); decoder.load(); }
+  }, nestedInfo.mediaId);
+  assert.ok(proxyDuration >= 3.4, 'empty child proxy covers the full trimmed parent source range');
+
   console.log('Nested sequences: nest, step-in, depth-2, edit, parent preview refresh, recovery/reopen, unnest, undo/redo passed.');
 }
 
@@ -702,6 +733,81 @@ async function testViewportLayout(splice, viewport, files) {
   }
 }
 
+async function testAudioParity(page, files) {
+  await freshProjectWithMedia(page, [files.red, files.green, files.blue], 'Audio parity');
+  // Measure the actual preview mix at the Web Audio destination.
+  await page.evaluate(() => {
+    const connect = AudioNode.prototype.connect;
+    let spectrum;
+    AudioNode.prototype.connect = function (node, ...args) {
+      if (node === this.context.destination) {
+        spectrum ||= this.context.createAnalyser();
+        spectrum.fftSize = 4096;
+        spectrum.smoothingTimeConstant = 0;
+        connect.call(this, spectrum);
+      }
+      return connect.call(this, node, ...args);
+    };
+    window.previewTones = () => {
+      if (!spectrum) return [];
+      const bins = new Float32Array(spectrum.frequencyBinCount);
+      spectrum.getFloatFrequencyData(bins);
+      return [300,500,700].filter(hz => bins[Math.round(hz*spectrum.fftSize/spectrum.context.sampleRate)] > -46);
+    };
+    window.restoreAudioProbe = () => { AudioNode.prototype.connect = connect; };
+    const ids = [...Editor.get().project.media].sort((a,b) => a.name.localeCompare(b.name)).map(m => m.id);
+    const mc = SpliceMulticam.createMulticam({name:'All cameras', angleMediaIds:ids, audioMode:'all'});
+    Editor.editProject(p => {
+      Object.assign(p.media.find(m => m.id === mc.id).multicam.angles[2], {offset:.4, duration:1.6});
+      p.clips = [{id:'sound', mediaId:mc.id, type:'audio', track:-1, start:0, duration:3, in:0}];
+    });
+    Editor.seek(.25);
+    Editor.togglePlay();
+  });
+  try {
+    await page.waitForFunction(() => previewTones().length === 3);
+    await page.evaluate(() => Editor.updateClip('sound', {multicamAudioAngle:1}));
+    await page.waitForFunction(() => String(previewTones()) === '500');
+    await page.evaluate(() => {
+      if (Editor.get().playing) Editor.togglePlay();
+      Editor.editProject(p => {
+        Object.assign(p.clips[0], {type:'video', track:1, embeddedAudio:true});
+        delete p.clips[0].multicamAudioAngle;
+      });
+      Editor.seek(.25);
+      Editor.togglePlay();
+    });
+    await page.waitForFunction(() => previewTones().length === 3 && Editor.get().video.muted);
+    await page.evaluate(() => Editor.seek(2.2));
+    await page.waitForFunction(() => String(previewTones()) === '300,500');
+  } finally {
+    await page.evaluate(() => { if (Editor.get().playing) Editor.togglePlay(); restoreAudioProbe(); });
+  }
+  // Compare the stereo WAV both before and after nesting part of a mixed track.
+  const mix = await page.evaluate(async () => {
+    const measure = async () => {
+      const job = await Editor.exportVideo({codec:'wav', limiter:false}, undefined, AbortSignal.timeout(60000));
+      const bytes = await (await fetch(job.downloadURL)).arrayBuffer();
+      const decoder = new OfflineAudioContext(2, 1, 48000);
+      const pcm = await decoder.decodeAudioData(bytes);
+      return [0,1].flatMap(ch => [.25,1.25].map(t => {
+        const samples = pcm.getChannelData(ch).subarray(t*48000,(t+.25)*48000);
+        return Math.sqrt(samples.reduce((sum,v) => sum+v*v,0)/samples.length);
+      }));
+    };
+    Editor.editProject(p => {
+      const mediaId = p.media.find(m => m.name.includes('CamA_Red')).id;
+      p.clips = [0,1].map(start => ({id:'a'+start, type:'audio', track:-1, mediaId, start, duration:1, in:0}));
+      p.trackMix = {'-1':{gain:50, pan:35}};
+    });
+    const before = await measure();
+    SpliceNested.nestSelection(['a0']);
+    return {before, after:await measure()};
+  });
+  console.log('WAV channel RMS before and after nesting:', mix);
+  mix.before.forEach((v,i) => assert.ok(v > .005 && Math.abs(mix.after[i]/v - 1) < .03));
+}
+
 async function main() {
   const splice = await startSplice('splice-mn-');
   try {
@@ -721,6 +827,7 @@ async function main() {
     try {
       await testNestedSequences(page, files);
       await testMulticam(page, files);
+      await testAudioParity(page, files);
       await testSubclips(page, files);
       await testBinsAndMetadata(page, files);
       assert.deepEqual(errors, [], '1440x900: zero page errors');

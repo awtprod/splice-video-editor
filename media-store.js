@@ -176,8 +176,9 @@ window.SpliceMedia = (() => {
       try {
         item.proxyState='preparing';
         const project=await forPremiere(item.nestedProject);
+        const minimumDuration = typeof item.nestedSequence === 'string' ? item.duration : 0;
         const response=await fetch('/api/media/nested-preview',{method:'POST',headers:{'Content-Type':'application/json'},
-                                 body:JSON.stringify({project}),signal:AbortSignal.timeout(3600000)});
+                                 body:JSON.stringify({project,minimumDuration}),signal:AbortSignal.timeout(3600000)});
         const body=await response.json();
         if(!response.ok||!localMedia(body.src))throw Error(body.error||'Nested preview failed');
         item.src=body.src;item.proxyState='ready';item.offline=false;

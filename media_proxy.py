@@ -471,15 +471,16 @@ def premiere_audio(src, audio_stream=None):
         _encoders.release()
 
 
-def nested_preview(project):
+def nested_preview(project, minimum_duration=0):
     """Cache a review-size render by timeline content and original file timestamps."""
-    from render_movie import render_to_file
+    from render_movie import MAX_TIMELINE_SECONDS, _number, render_to_file
 
     if not isinstance(project, dict) or not isinstance(project.get('clips'),list) or not isinstance(project.get('media'),list):
         raise ValueError('Invalid nested sequence')
-    if not project['clips']:
+    minimum_duration = _number(minimum_duration, 'nested media duration', 0, MAX_TIMELINE_SECONDS)
+    if not project['clips'] and not minimum_duration:
         raise ValueError('The nested sequence has no playable clips')
-    fingerprint = hashlib.sha256(b'nested-preview-v2')
+    fingerprint = hashlib.sha256(f'nested-preview-v3:{minimum_duration}'.encode())
     def add_sources(sequence,depth=0,seen=frozenset()):
         if depth>4:
             raise ValueError('Nested sequence exceeds four levels')
@@ -531,7 +532,7 @@ def nested_preview(project):
             mark(directory, 'derived')
             with tempfile.TemporaryDirectory(dir=directory,prefix='.nested-') as staging:
                 output = Path(staging) / target.name
-                render_to_file(prepared,output,options={'codec':'h264','crf':19})
+                render_to_file(prepared,output,options={'codec':'h264','crf':19},_minimum_duration=minimum_duration)
                 os.link(output,target)
             return _playback_url(target)
     finally:

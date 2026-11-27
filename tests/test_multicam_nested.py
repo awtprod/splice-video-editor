@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / 'tests'))
 
 from interchange import cut as interchange_cut  # noqa: E402
-from premiere import MEDIA_ROOT  # noqa: E402
+from premiere import MEDIA_ROOT, open_project, save_project  # noqa: E402
 from render_movie import render_to_file  # noqa: E402
 from test_render_audio_mix import AMPLITUDE, left_channel, tone_level  # noqa: E402
 
@@ -162,6 +162,22 @@ class MulticamNestedExportTests(unittest.TestCase):
         edited_sound = left_channel(edited_movie)
         self.assertAlmostEqual(tone_level(edited_sound, 875, 0.65, 1.55), AMPLITUDE, delta=0.01)
         self.assertLess(tone_level(edited_sound, 625, 0.65, 1.55), 0.005)
+
+    def test_shortened_nest_keeps_black_and_silence_through_parent_out(self):
+        child = dict(name='Short', width=W, height=H, fps=FPS, media=self.media,
+                     clips=[self._vclip('inside', 'red', 0, 1)])
+        nest = dict(id='nest', name='Short', type='video', duration=2, nestedSequence='s', nestedProject=child)
+        parent = dict(name='Main', width=W, height=H, fps=FPS, media=[nest],
+                      clips=[self._vclip('outside', 'nest', 0, 2)])
+        for has_picture in (True, False):
+            if not has_picture:
+                child['clips'] = []
+            movie = self._render(parent, f'shortened-{has_picture}')
+            frames = frames_rgb(movie)
+            self.assertEqual(len(frames), 2 * FPS)
+            self.assertEqual(dominant_channel(frames[5]), 'red' if has_picture else 'black')
+            self.assertEqual(dominant_channel(frames[-1]), 'black')
+            self.assertLess(max(abs(x) for x in left_channel(movie)[60_000:85_000]), .001)
 
     def test_depth_two_nesting_and_depth_limit_and_cycle_guard(self):
         # Depth 2: root -> level1 -> level2 (green 1.0s).
@@ -373,6 +389,13 @@ class MulticamNestedExportTests(unittest.TestCase):
         self.assertAlmostEqual(tone_level(pcm, 625, 0.1, 1.1), AMPLITUDE, delta=0.01)
         self.assertLess(tone_level(pcm, 375, 0.1, 1.1), 0.005)
         self.assertLess(tone_level(pcm, 875, 0.1, 1.1), 0.005)
+
+        # A second generation of subclip adds its own source offset on native save.
+        proj['media'].append(dict(sub, id='sub-2', parentMediaId='sub-1', subclipIn=.2, subclipOut=1.8))
+        proj['clips'][0]['mediaId'] = 'sub-2'
+        reopened = open_project(save_project(proj))
+        self.assertAlmostEqual(next(c['in'] for c in reopened['clips'] if c['type'] == 'video'), 2.6)
+        self.assertAlmostEqual(proj['clips'][0]['in'], .4)
 
         # Circular subclip reference is refused cleanly.
         cyc = dict(

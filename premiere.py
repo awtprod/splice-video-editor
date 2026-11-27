@@ -556,6 +556,10 @@ def _merged_track_states(states):
 def save_project(data):
     if not isinstance(data, dict):
         raise ValueError('Invalid project')
+    media_by_id = {item.get('id'): item for item in data.get('media', [])}
+    if any(item.get('parentMediaId') for item in media_by_id.values()):
+        from render_movie import resolve_subclip_source
+        data = {**data, 'clips': [resolve_subclip_source(clip, media_by_id) for clip in data['clips']]}
     lanes = {}
     for item in data.get('clips', []):
         lane = ('audio' if item.get('type') == 'audio' else 'video', int(item.get('track', 1)))
@@ -805,7 +809,6 @@ def save_project(data):
         available[item['id']] = project.import_files([path])[0]
         if item.get('bin'):
             available[item['id']].move_to(_ensure_bin(project, item['bin'], bin_cache))
-    media_by_id = {item.get('id'): item for item in data.get('media',[])}
     generated_audio = {}
 
     def source_audio(clip):
