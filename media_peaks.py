@@ -73,6 +73,14 @@ def waveform(src, stream=0):
     if type(stream) is not int or not 0 <= stream < 16:
         raise ValueError('The selected source audio stream is unavailable')
     path = _media_path(src)
+    import raw_decode
+    if raw_decode.is_raw_extension(path.name):
+        # Camera RAW sound is a sidecar WAV (CinemaDNG/ARRIRAW sequences) or the container's own track.
+        info = raw_decode.probe_raw(path)
+        if info.get('rawAudioPath'):
+            path = type(path)(info['rawAudioPath'])
+        elif not info.get('audioStreams'):
+            return []
     stat = path.stat()
     key = (str(path),stat.st_size,stat.st_mtime_ns,stream)
     with _lock:

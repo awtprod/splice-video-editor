@@ -347,6 +347,25 @@ def _event(cut: Cut, clip: dict) -> Event | None:
         report.note(f'{label}: the input LUT of its source ({source.input_lut}) is not carried.')
     if source is not None and source.color_matrix:
         report.note(f'{label}: the untagged color matrix override of its source ({source.color_matrix}) is not carried.')
+    raw_settings = clip.get('rawSettings')
+    if isinstance(raw_settings, dict) and raw_settings.get('decodeUsing') == 'clip':
+        details = []
+        if raw_settings.get('iso') is not None:
+            details.append(f"ISO {raw_settings['iso']}")
+        if raw_settings.get('exposure') not in (None, 0, 0.0):
+            details.append(f"exposure {float(raw_settings['exposure']):+g} EV")
+        if raw_settings.get('kelvin') is not None:
+            details.append(f"{int(round(float(raw_settings['kelvin'])))}K")
+        if raw_settings.get('tint') not in (None, 0, 0.0):
+            details.append(f"tint {float(raw_settings['tint']):+g}")
+        if raw_settings.get('colorSpace'):
+            details.append(str(raw_settings['colorSpace']))
+        if raw_settings.get('gamma'):
+            details.append(str(raw_settings['gamma']))
+        if raw_settings.get('highlightRecovery'):
+            details.append('highlight recovery')
+        summary = f" ({', '.join(details)})" if details else ''
+        report.note(f'{label}: its Splice Camera RAW decode overrides{summary} are not carried; receiving apps decode the original RAW using camera metadata.')
     if clip.get('pan') not in (None, 0):
         report.note(f'{label}: clip pan is not carried by timeline interchange.')
     effects = _effects_named(clip.get('audioFx'))

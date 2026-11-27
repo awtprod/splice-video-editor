@@ -2292,6 +2292,115 @@ def _concat_list(directory, name, paths):
     return manifest
 
 
+def _is_raw_media_item(item):
+    if not isinstance(item, dict) or item.get('nestedProject') or item.get('nativeGenerator') is not None:
+        return False
+    if item.get('raw') is True:
+        return True
+    src = item.get('src')
+    if not isinstance(src, str) or not src:
+        return False
+    import raw_decode
+    if raw_decode.is_raw_extension(src):
+        return True
+    if Path(src).suffix.lower() in ('.mov', '.mxf'):
+        try:
+            return raw_decode.detect_raw_format(_render_source(item)) is not None
+        except (OSError, ValueError):
+            return False
+    return False
+
+
+def _raw_source_window(clips, info, transition_seconds=0.0):
+    """The source frames ``clips`` read, with handles for the longest transition on the
+    timeline (a dissolve reads past either cut): ``(first_frame, frame_count)``."""
+    fps = Fraction(info.get('rate') or '24/1')
+    total = max(1, round(float(info.get('duration') or 0) * fps))
+    low, high = None, 0.0
+    for clip in clips:
+        speed = abs(float(clip.get('speed', 1) or 1))
+        handle = float(transition_seconds) * speed + 2 / fps
+        start = float(clip.get('in', 0) or 0)
+        low = start - handle if low is None else min(low, start - handle)
+        high = max(high, start + float(clip.get('duration', 0) or 0) * speed + handle)
+    if info.get('still'):
+        return 0, max(1, math.ceil(high * fps))
+    first = max(0, math.floor((low or 0) * fps))
+    return first, max(1, min(total, math.ceil(high * fps)) - first)
+
+
+def _materialize_raw_clips(project, directory, *, options=None, cancelled=None, heartbeat=None):
+    """Develop every enabled camera RAW clip at full resolution in 16-bit RGB with its own
+    rawSettings (lossless FFV1 QuickTime intermediate) before grading, LUTs and delivery. Only the source
+    frames the cut reads are decoded; each clip's ``in`` is shifted to the intermediate."""
+    import copy
+    import raw_decode
+    media_by_id = {m.get('id'): m for m in project.get('media') or [] if isinstance(m, dict) and m.get('id')}
+    uses = {}
+    for index, clip in enumerate(project.get('clips') or []):
+        if not isinstance(clip, dict) or not clip_enabled(clip) or clip.get('type') not in ('video', 'audio'):
+            continue
+        item = media_by_id.get(clip.get('mediaId'))
+        if item is not None and _is_raw_media_item(item):
+            uses.setdefault(clip['mediaId'], []).append(index)
+    if not uses:
+        return project
+    prepared = copy.deepcopy(project)
+    audio_only_export = (options or {}).get('codec') in AUDIO_ONLY_CODECS
+    transitions = max((float(c.get('transitionDuration', .5) or 0) + float(c.get('transitionBefore', 0) or 0)
+                       for c in prepared['clips'] if isinstance(c, dict) and c.get('transition') in ('dissolve', 'wipe', 'fade')),
+                      default=0.0)
+    serial = 0
+    for media_id, indexes in uses.items():
+        item = next(m for m in prepared['media'] if isinstance(m, dict) and m.get('id') == media_id)
+        info = raw_decode.probe_raw(_render_source(item))
+        groups = {}
+        for index in indexes:
+            clip = prepared['clips'][index]
+            if clip.get('type') == 'audio' or audio_only_export:
+                key = 'sound'
+            else:
+                settings = raw_decode.normalize_raw_settings(clip.get('rawSettings'), info['rawFormat'], info.get('rawDefaults'))
+                key = raw_decode.raw_settings_key(settings)
+            groups.setdefault(key, []).append(clip)
+        for key, clips in groups.items():
+            if cancelled is not None and cancelled.is_set():
+                raise InterruptedError('Export cancelled')
+            serial += 1
+            clone = copy.deepcopy(item)
+            clone.update(id=f'{media_id}__raw{serial}', raw=False)
+            if key == 'sound':
+                # Sound needs no picture decode: the sidecar WAV, or the container's own sound track.
+                sound = Path(info['rawAudioPath']) if info.get('rawAudioPath') else _render_source(item)
+                target = Path(directory) / f'raw-sound-{serial}{sound.suffix.lower()}'
+                try:
+                    os.link(sound, target)
+                except OSError:
+                    shutil.copy2(sound, target)
+                clone.update(src='/media/' + str(target.relative_to(MEDIA_ROOT)), type='audio')
+            elif not info.get('rawDecoderAvailable') and isinstance(item.get('rawAttachedProxy'), str) and item['rawAttachedProxy']:
+                # No decoder here: the proxy the editor attached stands in for the picture.
+                clone.update(src=item['rawAttachedProxy'], still=False)
+            elif not info.get('rawDecoderAvailable'):
+                raise ValueError(info.get('rawDecoderMessage') or f"{item.get('name') or 'A camera RAW clip'} has no decoder")
+            else:
+                first, count = _raw_source_window(clips, info, transitions)
+                target = Path(directory) / f'raw-{serial}.mov'
+                raw_decode.decode_to_intermediate(
+                    _render_source(item), target, clips[0].get('rawSettings') if key != 'sound' else None, info=info,
+                    audio_stream=clips[0].get('audioStream'), start_frame=first, frame_count=count,
+                    cancelled=cancelled, heartbeat=heartbeat)
+                offset = float(Fraction(first) / Fraction(info.get('rate') or '24/1'))
+                for clip in clips:
+                    clip['in'] = max(0.0, float(clip.get('in', 0) or 0) - offset)
+                clone.update(src='/media/' + str(target.relative_to(MEDIA_ROOT)), still=False,
+                             duration=float(Fraction(count) / Fraction(info.get('rate') or '24/1')))
+            for clip in clips:
+                clip['mediaId'] = clone['id']
+            prepared['media'].append(clone)
+    return prepared
+
+
 def render_to_file(project, output_path, *, options=None, progress=None, cancelled=None, heartbeat=None,
                    work_directory=None, report=None, _nested_depth=0, _lossless_intermediate=False):
     """Resolve imported nested Premiere sequences, then render the parent timeline.
@@ -2316,7 +2425,9 @@ def render_to_file(project, output_path, *, options=None, progress=None, cancell
     if _nested_depth>4: raise ValueError('Nested Premiere sequences exceed four levels')
     # Nested material used only by disabled clips is not rendered (it would contribute nothing).
     enabled_media = {clip.get('mediaId') for clip in project.get('clips') or [] if isinstance(clip, dict) and clip_enabled(clip)}
-    if not any(isinstance(item,dict) and item.get('nestedProject') for item in project['media']):
+    has_nested = any(isinstance(item,dict) and item.get('nestedProject') for item in project['media'])
+    has_raw = any(isinstance(item, dict) and item.get('id') in enabled_media and _is_raw_media_item(item) for item in project['media'])
+    if not has_nested and not has_raw:
         return _render_prepared(project,output_path,options=options,progress=progress,cancelled=cancelled,heartbeat=heartbeat,
                                 work_directory=work_directory,report=report)
     MEDIA_ROOT.mkdir(parents=True,exist_ok=True)
@@ -2348,6 +2459,7 @@ def render_to_file(project, output_path, *, options=None, progress=None, cancell
             item.pop('nestedProject',None)
             for clip in prepared['clips']:
                 if clip.get('mediaId')==item['id']: clip.pop('nestedSequence',None)
+        prepared = _materialize_raw_clips(prepared, directory, options=options, cancelled=cancelled, heartbeat=heartbeat)
         return _render_prepared(prepared,output_path,options=options,progress=progress,cancelled=cancelled,heartbeat=heartbeat,
                                 work_directory=work_directory,report=report)
 

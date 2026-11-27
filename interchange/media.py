@@ -192,9 +192,41 @@ class ProbeBudget:
 
 
 def probe_file(path: Path, timeout: float = PROBE_TIMEOUT) -> Probe:
-    """ffprobe one local regular file. Raises ``ValueError`` when it is unreadable."""
+    """ffprobe or RAW-probe one local regular file. Raises ``ValueError`` when it is unreadable."""
     if not path.is_file():
         raise ValueError(f'{path.name} is not a readable file')
+    try:
+        import raw_decode
+    except ImportError:
+        raw_decode = None
+    if raw_decode is not None and raw_decode.is_raw_candidate(path, path.name):
+        try:
+            info = raw_decode.probe_raw(path)
+        except (OSError, ValueError) as error:
+            raise ValueError(f'Could not probe RAW {path.name}: {error}') from None
+        fps_val = info.get('fps')
+        rate = snap_rate(parse_rate(fps_val)) if fps_val else None
+        dur_val = info.get('duration')
+        duration = Fraction(repr(float(dur_val))) if isinstance(dur_val, (int, float)) and dur_val > 0 else None
+        audio_streams = []
+        for idx, s in enumerate(info.get('audioStreamDetails') or []):
+            if isinstance(s, dict):
+                audio_streams.append({'index': s.get('index', idx), 'channels': int(s.get('channels') or 2),
+                                      'layout': s.get('layout') or 'stereo', 'codec': s.get('codec') or 'pcm'})
+        return Probe(
+            rate=rate,
+            raw_rate=str(fps_val) if fps_val else None,
+            vfr=False,
+            timecode=info.get('timecode') or None,
+            duration=duration,
+            width=info.get('width') or None,
+            height=info.get('height') or None,
+            has_video=True,
+            has_audio=bool(audio_streams),
+            audio_streams=audio_streams,
+            audio_rate=(info.get('audioSampleRate') or 48000) if audio_streams else None,
+            reel=info.get('reel') or None,
+        )
     try:
         result = subprocess.run(['ffprobe', '-v', 'error', '-protocol_whitelist', 'file',
                                  '-show_streams', '-show_format', '-of', 'json', 'file:' + str(path)],
@@ -386,6 +418,14 @@ def resolve_source(item: dict, sequence_rate: Fraction, budget: ProbeBudget) -> 
         source.input_lut = clean(str(item['inputLut'].get('title') or 'LUT'))[:120]
     if item.get('colorMatrix') in ('bt709', 'bt601'):
         source.color_matrix = item['colorMatrix']
+    if item.get('raw') is True:
+        guessed = [f for f in item.get('rawEstimated') or () if f in ('timecode', 'fps', 'duration', 'width', 'height')]
+        if guessed:
+            source.notes.append(f"camera RAW {', '.join(guessed)} could not be read from the file; Splice's placeholder was written")
+        if isinstance(item.get('rawMetadata'), dict) and item['rawMetadata'].get('isSequence'):
+            source.notes.append('camera RAW frame sequence: the timeline references its first frame')
+            if item['rawMetadata'].get('missingFrames'):
+                source.notes.append(f"camera RAW frame sequence has {item['rawMetadata']['missingFrames']} missing frame numbers")
     reference = media_reference(item)
     local = reference.local
     source.local, source.path, source.location = local, reference.path, reference.kind

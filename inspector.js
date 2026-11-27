@@ -54,6 +54,7 @@
       field('Speed (%)','speedPercent',Math.round(number(clip.speed,1)*10000)/100,10,800,.01) +
       `<label class="splice-safe-toggle"><input aria-label="Reverse clip" type="checkbox" data-field="reverse" ${clip.reverse?'checked':''}> Reverse clip</label>`);
     if (clip.type === 'video') {
+      if (window.SpliceRawUI && source?.raw === true) html += window.SpliceRawUI.markup(clip, source);
       const previous = state.project.clips.find(item => item.type==='video' && item.track===clip.track && item.id!==clip.id &&
         Math.round((item.start+item.duration)*fps)===Math.round(clip.start*fps));
       const previousMedia = previous && state.project.media.find(item=>item.id===previous.mediaId);
@@ -267,7 +268,10 @@
       editor.seek(clip.start+Number(button.dataset.keyTime));
       render(editor.get(),element,editor);
     });
-    if (clip.type === 'video') window.SpliceColorUI?.bind(element, clip, editor, () => render(editor.get(), element, editor));
+    if (clip.type === 'video') {
+      if (source?.raw === true) window.SpliceRawUI?.bind(element, clip, editor, () => render(editor.get(), element, editor));
+      window.SpliceColorUI?.bind(element, clip, editor, () => render(editor.get(), element, editor));
+    }
     if (clip.type === 'audio' || clip.type === 'video' && clip.embeddedAudio !== false) mountAudioFx(element, clip, editor, locked, previousFx);
     window.SpliceScopes.bind(element);
     // Never forced here: the scopes' own throttle and unchanged-frame check decide (the preview

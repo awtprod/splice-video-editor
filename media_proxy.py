@@ -14,7 +14,8 @@ import threading
 
 from premiere import MEDIA_ROOT, STILL_IMAGES, _playback_url
 from media_exec import run_bounded
-from media_links import camera_raw_error, mark, resolve_media as _media_path
+from media_links import mark, resolve_media as _media_path
+import raw_decode
 
 _encoders = threading.BoundedSemaphore(2)
 _locks = tuple(threading.Lock() for _ in range(32))
@@ -85,6 +86,8 @@ def audition_audio(src, index, rate=1, reverse=False, stream=0):
         raise ValueError('Invalid audio preview position')
     path = _media_path(src)
     info = describe(src)
+    if info.get('rawAudioPath'):
+        path = Path(info['rawAudioPath'])
     streams = info['audioStreams']
     if type(stream) is not int or not 0 <= stream < max(1, streams):
         raise ValueError('The selected source audio stream is unavailable')
@@ -331,8 +334,14 @@ def _describe_file(path, size, modified):
 
 def describe_path(path):
     path = Path(path)
+    raw_format = raw_decode.detect_raw_format(path)
+    if raw_format and raw_format != 'prores_raw':
+        return {**raw_decode.probe_raw(path), 'sourcePath': str(path)}
     stat = path.stat()
-    return {**_describe_file(str(path), stat.st_size, stat.st_mtime_ns), 'sourcePath': str(path)}
+    described = _describe_file(str(path), stat.st_size, stat.st_mtime_ns)
+    if raw_format == 'prores_raw':
+        described = raw_decode.enrich_prores_raw(path, described)
+    return {**described, 'sourcePath': str(path)}
 
 
 def describe(src):
@@ -354,13 +363,13 @@ def _text_art(fmt, streams):
 
 
 def decodable(path, name):
-    """Whether the installed FFmpeg can edit this file. The probe decides,
-    not the filename extension, except for camera RAW it never decodes and
-    text files FFmpeg would draw as a picture. A probe that times out is
-    reported as a timeout."""
-    message = camera_raw_error(name)
-    if message:
-        raise ValueError(message)
+    """Whether Splice can edit this file. The probe decides, not the filename extension, except
+    for text files FFmpeg would draw as a picture. Camera RAW is read by raw_decode, which
+    imports it even without a decoder for its picture (sound, timecode and reel still edit).
+    A probe that times out is reported as a timeout."""
+    if raw_decode.is_raw_candidate(path, name):
+        raw_decode.probe_raw(path)
+        return
     try:
         data = _ffprobe(path, '-show_entries', 'stream=codec_type,codec_name:format=format_name',
                         timeout=25, limit=SCAN_LIMIT)
@@ -388,7 +397,7 @@ def _source_audio_map(channels, selection, duration):
     return ['-map',f'0:a:{chosen[0]}' if chosen else '0:a:0?']
 
 
-def proxy(src, seek_optimized=False, audio_stream=None, grading_data=False):
+def proxy(src, seek_optimized=False, audio_stream=None, grading_data=False, raw_settings=None):
     original = _media_path(src)
     info = describe(src)
     if grading_data and not info['hdr']:
@@ -396,8 +405,16 @@ def proxy(src, seek_optimized=False, audio_stream=None, grading_data=False):
     if seek_optimized and (info['type']!='video' or info['still']):
         raise ValueError('A seek proxy requires moving video')
     stat = original.stat()
+    is_raw = bool(info.get('raw'))
     profile = 'proxy-seek-v1' if seek_optimized else 'proxy-v3'
-    alpha = info['still'] and original.suffix.lower() in ('.png','.bmp')
+    raw_effective = None
+    if is_raw:
+        raw_effective = raw_decode.normalize_raw_settings(raw_settings, fmt=info.get('rawFormat'),
+                                                          defaults=info.get('rawDefaults'))
+        salt = raw_decode.decoder_cache_salt(info['rawFormat'])
+        fp = raw_decode.sequence_fingerprint(original)
+        profile += f":raw-v1:{raw_decode.raw_settings_key(raw_effective)}:{salt}:{fp}"
+    alpha = not is_raw and info['still'] and original.suffix.lower() in ('.png','.bmp')
     if alpha:
         profile += f':still-alpha-v{STILL_PREVIEW_VERSION}'
     if info['hdr']:
@@ -423,6 +440,11 @@ def proxy(src, seek_optimized=False, audio_stream=None, grading_data=False):
                 raise ValueError('Insufficient free space for an edit proxy')
             with tempfile.TemporaryDirectory(dir=directory,prefix='.proxy-') as staging:
                 out = Path(staging) / target.name
+                if is_raw:
+                    raw_decode.decode_to_proxy(original, out, raw_effective, info=info,
+                                               seek_optimized=seek_optimized, audio_stream=audio_stream)
+                    os.link(out, target)
+                    return _playback_url(target)
                 cmd = ['ffmpeg','-nostdin','-v','error','-y','-threads','2','-filter_threads','1','-filter_complex_threads','2','-protocol_whitelist','file']
                 if info['still']:
                     cmd += ['-f','image2','-loop','1','-framerate','25']

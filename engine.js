@@ -712,6 +712,13 @@
     const item=clip && mediaOf(clip);
     if (!item?.src) return;
     const stream=clipAudioStream(clip,item);
+    if (item.raw) {
+      if (item.rawAttachedProxy && item.rawDecoderAvailable === false) return item.rawAttachedPreview || item.rawAttachedProxy;
+      if (clip.rawSettings && typeof clip.rawSettings === 'object') {
+        const rawSrc=window.SpliceMedia?.prepareRawPreview?.(item,clip.rawSettings,stream)?.src;
+        if (rawSrc) return rawSrc;
+      }
+    }
     if (item.hdr && hasHdrGrade(clip)) {
       const graded=window.SpliceMedia?.preparePreview(item,stream,true)?.src;
       if (graded) return graded;
@@ -1529,6 +1536,7 @@
             points.some(point => !point || !Number.isFinite(point.time) || !Number.isFinite(point.value)))))
         throw new Error("This project file has invalid keyframes.");
       if (clip.keyframes) window.SpliceGrade.keyTimes(clip);
+      if (clip.rawSettings != null) window.SpliceRawUI?.validateRawSettings?.(clip.rawSettings);
       if (clip.color?.grade !== undefined) window.SpliceGrade.validateGrade(clip.color.grade);
       if (clip.color?.lut) {
         const intensity = clip.color.lutIntensity ?? 100;

@@ -190,9 +190,6 @@ def upload_media(handler, length, query):
     name = Path(query.get('name', ['media'])[0]).name
     if not name or name in ('.', '..') or len(name) > 255:
         raise ValueError('Invalid file name')
-    message = media_links.camera_raw_error(name)
-    if message:
-        raise ValueError(message)
     MEDIA_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
     if shutil.disk_usage(MEDIA_ROOT).free < length + 512 * 1024 ** 2:
         raise ValueError('There is insufficient local space to import this file')
@@ -230,7 +227,41 @@ def media_proxy_route(handler, body):
     payload = _json_body(body)
     handler._json(200, {'src': proxy(payload['src'], seek_optimized=payload.get('seekOptimized') is True,
                                      audio_stream=payload.get('audioStream'),
-                                     grading_data=payload.get('gradingData') is True)})
+                                     grading_data=payload.get('gradingData') is True,
+                                     raw_settings=payload.get('rawSettings'))})
+
+
+@get('/api/raw/decoders')
+def raw_decoders_route(handler, query):
+    import raw_decode
+    handler._json(200, raw_decode.decoder_status())
+
+
+@post('/api/raw/settings', limit=MAX_SMALL_BODY)
+def raw_settings_route(handler, body):
+    """Save decoder paths (validated: absolute, existing, executable or a shared library, no
+    shell metacharacters) to raw-decoders.json in Splice's user data folder."""
+    import raw_decode
+    payload = _json_body(body)
+    if not isinstance(payload.get('paths'), dict):
+        raise ValueError('Expected a paths object mapping decoder ids to executable or library paths')
+    raw_decode.save_decoder_config(payload['paths'])
+    handler._json(200, raw_decode.decoder_status())
+
+
+@post('/api/raw/preview', limit=MAX_SMALL_BODY)
+def raw_preview_route(handler, body):
+    """Re-decode a camera RAW source's playback proxy with new RAW settings (cached per setting)."""
+    import raw_decode
+    payload = _json_body(body)
+    info = describe(payload.get('src'))
+    if not info.get('raw'):
+        raise ValueError('This source is not camera RAW')
+    settings = raw_decode.normalize_raw_settings(payload.get('rawSettings'), fmt=info['rawFormat'],
+                                                 defaults=info.get('rawDefaults'))
+    src = proxy(payload['src'], seek_optimized=payload.get('seekOptimized') is True,
+                audio_stream=payload.get('audioStream'), raw_settings=settings)
+    handler._json(200, {'src': src, 'rawSettings': settings})
 
 
 @post('/api/audio/sync', limit=MAX_SMALL_BODY)
