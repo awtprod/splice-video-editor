@@ -469,12 +469,33 @@
   background: transparent;
   white-space: nowrap;
 }
-/* The compact viewer header (studio.css) sets gaps and the Scopes toggle; size Multicam with it. */
-@container viewer (max-width: 640px) {
-  .multicam-toggle { padding: 1px 5px; font-size: 10px; }
+/* The program monitor header holds the title, the monitor colour controls (quality, view, guides,
+   Bypass, Split), Multicam, Scopes and fullscreen. Keep them on one row at every supported window
+   size, tightening step by step as the panel narrows, so the picture keeps the height a second
+   header row would take. Wrapping stays as the fallback for the narrowest docked layouts. */
+@container viewer (max-width: 900px) {
+  .viewer > .panel-top { gap: 4px 8px; padding-left: 10px; padding-right: 10px; }
+  .viewer-actions { gap: 4px 6px; }
+  .monitor-color-controls { gap: 4px 5px; }
+  .monitor-select { max-width: 92px; }
+  .monitor-color-controls button, .scope-dock-toggle, .multicam-toggle { padding: 3px 6px; }
 }
-@container viewer (max-width: 480px) {
+@container viewer (max-width: 720px) {
+  .viewer > .panel-top { min-height: 32px; padding: 2px 6px; gap: 2px 4px; }
+  .viewer-actions, .monitor-color-controls { gap: 2px 4px; }
+  .monitor-subtitle { display: none; }
+  .monitor-select { max-width: 74px; padding: 1px 2px; font-size: 10px; }
+  .monitor-color-controls button, .scope-dock-toggle, .multicam-toggle { padding: 1px 5px; font-size: 10px; }
+}
+@container viewer (max-width: 600px) {
+  /* "Fit" repeats the monitor scale; the quality menu says how the picture is processed. */
   #monitor-resolution { display: none; }
+  .viewer > .panel-top, .viewer-actions, .monitor-color-controls { column-gap: 3px; }
+  /* Sized so the defaults (Auto, Normal, No guides) read in full. */
+  .monitor-select[data-monitor-quality] { max-width: 50px; }
+  .monitor-select[data-monitor-view] { max-width: 62px; }
+  .monitor-select[data-monitor-guides] { max-width: 72px; }
+  .monitor-color-controls button, .scope-dock-toggle, .multicam-toggle { padding: 1px 4px; }
 }
 
 /* Keep bin browser strictly inside narrow Media Pool panels */

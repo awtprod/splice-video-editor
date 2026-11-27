@@ -10,21 +10,36 @@ const root = path.resolve(__dirname, '..');
 
 async function startSplice(prefix) {
   const temp = fs.mkdtempSync(path.join(process.env.SPLICE_TEST_SCRATCH || os.tmpdir(), prefix));
-  const server = await startSpliceServer({root, env: {HOME: temp, XDG_DATA_HOME: temp}});
-  const executablePath = [process.env.SPLICE_CHROME, '/opt/google/chrome/chrome', '/usr/bin/chromium',
-    '/usr/bin/google-chrome', chromium.executablePath()].find(file => file && fs.existsSync(file));
-  if (!executablePath) {
-    await server.stop();
-    throw Error('Install Chromium or set SPLICE_CHROME');
+  let server, browser;
+  try {
+    server = await startSpliceServer({root, env: {HOME: temp, XDG_DATA_HOME: temp}});
+    const executablePath = [process.env.SPLICE_CHROME, '/opt/google/chrome/chrome', '/usr/bin/chromium',
+      '/usr/bin/google-chrome', chromium.executablePath()].find(file => file && fs.existsSync(file));
+    if (!executablePath) throw Error('Install Chromium or set SPLICE_CHROME');
+    browser = await chromium.launch({executablePath,
+      args: ['--no-sandbox', '--autoplay-policy=no-user-gesture-required', '--js-flags=--expose-gc']});
+  } catch (error) {
+    // Never leave the server.py this call started running: stop exactly that child (by PID).
+    await stopServer(server);
+    fs.rmSync(temp, {recursive: true, force: true});
+    throw error;
   }
-  const browser = await chromium.launch({executablePath,
-    args: ['--no-sandbox', '--autoplay-policy=no-user-gesture-required', '--js-flags=--expose-gc']});
   async function stop() {
     await browser.close().catch(() => {});
-    await server.stop();
+    await stopServer(server);
     fs.rmSync(temp, {recursive: true, force: true});
   }
   return {url: server.url, server, browser, temp, stop};
+}
+
+async function stopServer(server) {
+  if (!server) return;
+  const pid = server.process.pid;
+  await server.stop().catch(() => {});
+  // Fall back to a SIGKILL of that exact PID if the graceful stop did not end it.
+  if (server.process.exitCode === null && !server.process.signalCode) {
+    try { process.kill(pid, 'SIGKILL'); } catch {}
+  }
 }
 
 async function openPage(splice, viewport = {width: 1440, height: 900}) {

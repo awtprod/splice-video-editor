@@ -180,26 +180,27 @@ class LongGop(DeliveryCase):
                     self.assertEqual(self.video(info).get('level'), 31 if profile else None)
 
     def test_h264_bitrate_single_and_two_pass_hit_the_target(self):
-        # Grain the encoder cannot predict, so a bitrate target is what decides the size. Tagged
-        # Rec. 709 so it reaches the encoder as is (an untagged source is first conformed from Rec. 601).
-        noisy = self.media / 'noise.mp4'
+        # Grain the encoder cannot predict, so a bitrate target is what decides the size. The source is
+        # untagged, like most camera and screen recordings, so it is conformed from Rec. 601 on the way.
+        # Eight seconds: x264's frame-threaded rate control (the encoder runs with -threads 6) cannot
+        # converge on a two-second clip, so a short clip measures threading, not the two-pass target.
+        seconds = 8
+        noisy = self.media / 'noise-untagged.mp4'
         if not noisy.exists():
-            ffmpeg('-f', 'lavfi', '-i', f'testsrc2=s={W}x{H}:r={FPS}:d={SECONDS + 0.2},noise=alls=60:allf=t', '-f', 'lavfi',
-                   '-i', f'sine=d={SECONDS + 0.2}', '-c:v', 'libx264', '-qp', '0', '-colorspace', 'bt709',
-                   '-color_primaries', 'bt709', '-color_trc', 'bt709', '-c:a', 'aac', '-shortest', str(noisy))
+            ffmpeg('-f', 'lavfi', '-i', f'testsrc2=s={W}x{H}:r={FPS}:d={seconds + 0.2},noise=alls=60:allf=t', '-f', 'lavfi',
+                   '-i', f'sine=d={seconds + 0.2}', '-c:v', 'libx264', '-qp', '0', '-c:a', 'aac', '-shortest', str(noisy))
+        self.assertNotIn('color_space', self.video(probe(noisy)), 'the grain source stays untagged')
         project = self.project()
-        project['media'].append(dict(id='n', name='noise.mp4', src=self.src(noisy)))
+        project['media'].append(dict(id='n', name='noise-untagged.mp4', src=self.src(noisy)))
         for clip in project['clips']:
-            clip['mediaId'] = 'n'
-        for mode in ('bitrate', 'twopass'):
+            clip.update(mediaId='n', duration=seconds)
+        for mode, tolerance in (('bitrate', .3), ('twopass', .05)):
             with self.subTest(mode=mode):
                 path, _ = self.render(project, dict(codec='h264', rateControl=mode, videoBitrate=800))
                 info = probe(path)
-                self.check_common(path, info, codec='h264', pix='yuv420p', profile='High', depth=8)
+                self.check_common(path, info, codec='h264', pix='yuv420p', profile='High', depth=8, frames=FPS * seconds)
                 rate = int(self.video(info)['bit_rate'])
-                # Two seconds of pure grain is the hardest case for one pass; two passes land close.
-                self.assertLess(abs(rate - 800_000) / 800_000, .3 if mode == 'bitrate' else .15,
-                                f'{mode}: {rate} bit/s for an 800 kbit/s target')
+                self.assertLess(abs(rate - 800_000) / 800_000, tolerance, f'{mode}: {rate} bit/s for an 800 kbit/s target')
 
     def test_web_mp4_is_faststart(self):
         path, _ = self.render(self.project(), dict(codec='h264'))

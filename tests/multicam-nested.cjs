@@ -921,6 +921,14 @@ async function testViewportLayout(splice, viewport, files) {
         grid: check('#multicam-grid'),
         binBrowser: check('#bin-browser'),
         tiles: document.querySelectorAll('#multicam-grid .multicam-tile').length,
+        // The monitor header (title, colour controls, Multicam, Scopes, fullscreen) stays on one row.
+        headerRows: (() => {
+          const top = document.querySelector('.viewer > .panel-top');
+          const items = [top.querySelector('.panel-title'), ...top.querySelectorAll('.viewer-actions > *, .monitor-color-controls > *')]
+            .filter(el => !el.classList.contains('monitor-color-controls') && el.getClientRects().length);
+          const middles = items.map(el => { const r = el.getBoundingClientRect(); return r.top + r.height / 2; });
+          return {spread: Math.round(Math.max(...middles) - Math.min(...middles)), height: Math.round(top.getBoundingClientRect().height)};
+        })(),
       };
     });
     assert.equal(metrics.tiles, 3, `${label}: 3 multicam tiles visible`);
@@ -928,6 +936,7 @@ async function testViewportLayout(splice, viewport, files) {
     assert.ok(metrics.scopeBtn.inside && metrics.scopeBtn.w > 20, `${label}: Scopes button fits inside viewport (${JSON.stringify(metrics.scopeBtn)})`);
     assert.ok(metrics.grid.inside && metrics.grid.w >= 260 && metrics.grid.h >= 140, `${label}: Multicam grid usable (${JSON.stringify(metrics.grid)})`);
     assert.ok(metrics.binBrowser.inside, `${label}: Bin browser stays inside Media Pool (${JSON.stringify(metrics.binBrowser)})`);
+    assert.ok(metrics.headerRows.spread < 8, `${label}: program monitor header fits on one row (${JSON.stringify(metrics.headerRows)})`);
 
     // Live angle switch works at this viewport too!
     await page.locator('#multicam-grid .multicam-tile[data-angle="1"]').click();
@@ -1084,7 +1093,10 @@ async function testNestAudioFinishing(page, files) {
   assert.equal(restored.start, 1);
   assert.deepEqual(restored.keys, [[1, 80], [2, 60], [3, 40]], 'unnest brings child automation back onto the parent clock');
   for (const [label, patch] of [['clip audio effects', c => { c.audioFx = {comp:{enabled:true, threshold:-20}}; }],
+                                // A bypassed stage still holds the editor's settings: it must keep the nest too.
+                                ['clip audio effects', c => { c.audioFx = {comp:{enabled:false, threshold:-20}}; }],
                                 ['track audio effects', (c, p) => { p.trackMix[c.track] = {fx:{gate:{enabled:true}}}; }],
+                                ['track audio effects', (c, p) => { p.trackMix[c.track] = {fx:{gate:{enabled:false, threshold:-40}}}; }],
                                 ['track automation', (c, p) => { p.trackMix[c.track] = {keyframes:{volume:[{time:0, value:50}]}}; }],
                                 ['surround track routing', (c, p) => { p.trackMix[c.track] = {route:'surround'}; }]]) {
     const outer = await page.evaluate(() => {
@@ -1096,10 +1108,62 @@ async function testNestAudioFinishing(page, files) {
       p.trackMix ||= {};
       (0, eval)(source)(clip, p);
     }), {outer, source:patch.toString()});
+    const before = await page.evaluate(() => JSON.stringify(Editor.get().project));
     await assert.rejects(page.evaluate(id => SpliceNested.unnestClip(id), outer), new RegExp('unnest losslessly: outer ' + label), label);
+    assert.equal(await page.evaluate(() => JSON.stringify(Editor.get().project)), before, label + ': refusal leaves the project unchanged');
     await page.evaluate(() => { Editor.undo(); Editor.undo(); });
   }
   console.log('Nested audio finishing: automation clock and lossless-unnest guard passed.');
+}
+
+// A bypassed outer grade renders nothing but is still the editor's grade. Unnesting must carry it
+// intact onto plain children, refuse over graded children, and never silently drop it.
+async function testNestBypassedGrade(page, files) {
+  await freshProjectWithMedia(page, [files.red], 'Nest bypassed grade');
+  // A 2×2×2 LUT that warms the picture slightly.
+  const lut = {size:2, data:[0,0,0, .9,0,0, 0,1,0, .9,1,0, 0,0,1, .9,0,1, 0,1,1, .9,1,1]};
+  const outerColor = {brightness:60, lut, lutName:'Warm.cube', lutIntensity:80, grade:{gain:[1.2, 1, 1, 1], bypass:true}};
+  const run = (childColor, outer) => page.evaluate(({childColor, outer}) => {
+    const mediaId = Editor.get().project.media[0].id;
+    Editor.editProject(p => {
+      p.trackMix = {};
+      p.clips = [{id:'v', type:'video', track:1, mediaId, start:0, duration:2, in:0, embeddedAudio:false, color:childColor}];
+    });
+    const id = SpliceNested.nestSelection(['v']).clipIds[0];
+    Editor.editProject(p => { p.clips.find(c => c.id === id).color = structuredClone(outer); });
+    const before = JSON.stringify(Editor.get().project);
+    let error = null;
+    try { SpliceNested.unnestClip(id); } catch (e) { error = e.message; }
+    const {project} = Editor.get();
+    return {error, unchanged:JSON.stringify(project) === before,
+      clips:project.clips.map(c => ({nested:!!project.media.find(m => m.id === c.mediaId)?.nestedProject, color:c.color}))};
+  }, {childColor, outer});
+
+  const plain = await run({}, outerColor);
+  assert.equal(plain.error, null, 'a bypassed outer grade over plain children unnests');
+  assert.equal(plain.clips.length, 1);
+  assert.equal(plain.clips[0].nested, false);
+  assert.deepEqual(plain.clips[0].color, outerColor, 'the bypassed grade, LUT and brightness are carried intact with the bypass flag');
+
+  for (const [label, outer] of [['grade', outerColor], ['brightness only', {brightness:60, grade:{bypass:true}}],
+                                ['LUT only', {lut, lutName:'Warm.cube', grade:{bypass:true}}]]) {
+    const graded = await run({saturation:50}, outer);
+    assert.match(graded.error || '', /unnest losslessly: outer .*bypassed grade must remain on the nested composite/, label);
+    assert.ok(graded.unchanged, label + ': refusal leaves the project unchanged');
+    assert.equal(graded.clips[0].nested, true);
+    assert.deepEqual(graded.clips[0].color, outer, label + ': the outer bypassed grade stays on the nest');
+  }
+
+  // A child holding its own bypassed grade is not neutral either: the outer grade cannot overwrite it.
+  const bypassedChild = await run({grade:{lift:[0, 0, 0, .1], bypass:true}}, {saturation:120});
+  assert.match(bypassedChild.error || '', /unnest losslessly: outer saturation must remain/);
+  assert.ok(bypassedChild.unchanged);
+
+  // A bypass flag with nothing behind it holds no settings and unnests like a plain clip.
+  const empty = await run({}, {grade:{bypass:true}});
+  assert.equal(empty.error, null);
+  assert.equal(empty.clips[0].nested, false);
+  console.log('Nested bypassed grade: carried over plain children, refused over graded children.');
 }
 
 async function testUnnestMix(page, files) {
@@ -1366,6 +1430,7 @@ async function main() {
       await testAudioParity(page, files);
       await testUnnestMix(page, files);
       await testNestAudioFinishing(page, files);
+      await testNestBypassedGrade(page, files);
       await testFlattenRouting(page, files);
       await testNestVisibility(page, files);
       await testUnnestComponents(page, files);
@@ -1378,7 +1443,8 @@ async function main() {
       await page.context().close();
     }
 
-    // Responsive verification at 1180x780 and 1024x640
+    // Responsive verification at 1440x900, 1180x780 and 1024x640
+    await testViewportLayout(splice, {width: 1440, height: 900}, files);
     await testViewportLayout(splice, {width: 1180, height: 780}, files);
     await testViewportLayout(splice, {width: 1024, height: 640}, files);
 

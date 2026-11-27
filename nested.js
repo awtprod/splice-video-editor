@@ -463,7 +463,14 @@ window.SpliceNested = (() => {
       if (value !== (key === 'scale' ? 100 : 0)) names.push(key);
     const color = clip.color || {};
     const gradeBypass = !!color.grade?.bypass;
-    if (!gradeBypass) {
+    if (gradeBypass) {
+      // A bypassed grade renders nothing but is still the editor's grade: carry it, never drop it.
+      const {grade, ...rest} = color;
+      if (Object.keys(grade).some(key => key !== 'bypass') || Object.entries(rest).some(([key, value]) =>
+          !(key === 'lutIntensity' || key === 'lutName' || (key === 'lut' && !value)) &&
+          value !== (['brightness','contrast','saturation'].includes(key) ? 100 : 0)))
+        names.push('bypassed grade');
+    } else {
       for (const [key, value] of Object.entries(color)) {
         if (key === 'lutIntensity' || key === 'lutName' || (key === 'lut' && !value)) continue;
         if (key === 'grade') {
@@ -506,7 +513,8 @@ window.SpliceNested = (() => {
     // Outer audio finishing (clip effects and channel mapping, the parent track's effects,
     // automation, channel mode and surround routing) acts on the nested mix as a whole and has
     // no per-child equivalent on the unnested tracks. Keep it on the nested clip.
-    const enabledFx = fx => !!fx && Object.values(fx).some(stage => stage && stage.enabled !== false &&
+    // A bypassed (disabled) stage still holds the editor's settings: it stays on the nest too.
+    const enabledFx = fx => !!fx && Object.values(fx).some(stage => stage &&
       (!Array.isArray(stage.bands) || stage.bands.length));
     const finishing = new Set();
     for (const c of outerClips) {
