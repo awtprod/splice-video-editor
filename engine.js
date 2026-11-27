@@ -618,9 +618,11 @@
   const decode709 = value => Math.sign(value)*Math.abs(value)**2.4;
   const encode709 = value => Math.sign(value)*Math.abs(value)**(1/2.4);
   const decodePixels709 = Array.from({length:256},(_,level)=>decode709(level/255));
-  const decodePixelsPQ = Array.from({length:256},(_,level)=>{
-    const value=(level/255)**(32/2523);
-    return (10000/203)*(Math.max(0,value-3424/4096)/(2413/128-(2392/128)*value))**(16384/2610);
+  // Inverse of the signed linear Rec.709 grading-proxy packing in media_proxy.py.
+  const decodeGradePixels = Array.from({length:256},(_,level)=>{
+    if (level<32) return -Math.expm1((32-level)/3.45)/256;
+    if (level>206) return Math.exp((level-206)/11);
+    return ((level-32)/174)**2.4;
   });
   const primaryColorKeys = ['brightness','contrast','saturation','exposure','temperature','tint'];
   function hdrStaticColor(clip) {
@@ -661,16 +663,12 @@
   function gradeHdrPreview(pixels, color, gains, gradingData) {
     const brightness=(color.brightness??100)/100, contrast=(color.contrast??100)/100, saturation=(color.saturation??100)/100;
     const displayGrade=brightness!==1 || contrast!==1 || saturation!==1;
-    const decode=gradingData?decodePixelsPQ:decodePixels709;
+    const decode=gradingData?decodeGradePixels:decodePixels709;
     for(let i=0;i<pixels.length;i+=4) {
       if (!pixels[i+3]) continue;
       let r=decode[pixels[i]],g=decode[pixels[i+1]],b=decode[pixels[i+2]];
       const before=Math.max(r,g,b);
-      if (gradingData) {
-        // Unpack the proxy's linear BT.2020 primaries into the working gamut.
-        const red=1.66049*r-.58764*g-.07285*b, green=-.12455*r+1.13290*g-.00835*b;
-        b=-.01815*r-.10058*g+1.11873*b;r=red;g=green;
-      } else if (before>hdrShoulder) {
+      if (!gradingData && before>hdrShoulder) {
         const inverse=(before*shoulderB-shoulderScale*shoulderA)/(shoulderScale-before);
         const ratio=Math.min(hdrPeak,inverse)/before;
         r*=ratio;g*=ratio;b*=ratio;
@@ -953,7 +951,7 @@
       } else syncClipPlayback(element,layer,target,forceSeek);
     }
     // Bypass and split show the ordinary tone-mapped proxy. Decoding the 8-bit
-    // PQ grading proxy back to a neutral image can change saturated colours.
+    // grading proxy back to a neutral image can change saturated colours.
     const references=new Set();
     if ((monitor.bypass || monitor.split!=null) && !mutedTracks.video) {
       if (previous) layers.set(previous.id,previous);
@@ -1090,8 +1088,8 @@
   blackGenerator.getContext('2d').fillRect(0,0,16,9);
   // An HDR clip graded with static brightness/contrast/exposure controls is graded in linear light
   // on the CPU (as the export grades it before the tone map) at the monitor's size; the result is a
-  // layer the picture pipeline composites like any other. When bypassed while showing PQ grading
-  // data, it still runs the neutral BT.2020->BT.709 Mobius tone map so bypass preserves tone mapping.
+  // layer the picture pipeline composites like any other. When bypassed while showing HDR grading
+  // data, it still runs the neutral Rec.709 Mobius tone map so bypass preserves tone mapping.
   function hdrLayer(element,clip,canvas,bypass=false) {
     const color=bypass ? {} : hdrStaticColor(clip), gains=bypass ? [1,1,1] : gradeGains(color), item=mediaOf(clip);
     const gradingSource=window.SpliceMedia?.hdrPreviewStatus(item,clipAudioStream(clip,item))?.src;

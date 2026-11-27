@@ -29,10 +29,17 @@ STILL_PREVIEW_VERSION = 1
 HDR_LINEAR_REC709 = 'zscale=t=linear:npl={peak:.9f},format=gbrpf32le,zscale=p=bt709'
 HDR_TONE_MAP = 'tonemap=mobius:param=0.78:desat=0:peak=4.926108,zscale=t=bt709:m=bt709:r=limited,format=yuv444p10le'
 HDR_TO_REC709 = HDR_LINEAR_REC709.format(peak=203) + ',' + HDR_TONE_MAP
-# Pack wide-gamut PQ channel values into a browser-decodable proxy. Its
-# Rec.709 tags prevent the browser from tone-mapping these data samples.
-HDR_GRADE_DATA = ('zscale=t=linear:npl=203,format=gbrpf32le,zscale=p=bt2020,'
-                  'zscale=t=smpte2084:m=bt709:r=limited:npl=203,format=yuv420p')
+# Compand signed linear Rec.709 before reducing to proxy precision. Quantizing
+# PQ BT.2020 first magnifies errors when saturated channels cancel in the
+# gamut matrix. Reserve most codes for displayable values, with log tails
+# for out-of-gamut negatives and specular highlights (linear white = 1).
+# Codes 32..206 carry SDR, the endpoints cover roughly -42..86 times white.
+_HDR_PACK = ("st(0,{c}(X,Y));if(lt(ld(0),0),32-3.45*log(1-256*ld(0)),"
+             "if(lte(ld(0),1),32+174*pow(ld(0),1/2.4),206+11*log(ld(0))))/255")
+HDR_GRADE_DATA = (HDR_LINEAR_REC709.format(peak=203) + ',format=gbrpf32le,geq=' +
+                  ':'.join(f"{c}='{_HDR_PACK.format(c=c)}'" for c in 'rgb') +
+                  ':interpolation=nearest,setparams=color_primaries=bt709:color_trc=bt709:range=pc,'
+                  'format=gbrp')
 AUDITION_SECONDS = 4
 _audition_decoders = threading.BoundedSemaphore(4)
 
@@ -376,7 +383,7 @@ def proxy(src, seek_optimized=False, audio_stream=None, grading_data=False):
     if alpha:
         profile += f':still-alpha-v{STILL_PREVIEW_VERSION}'
     if info['hdr']:
-        profile += ':hdr-grading-v1' if grading_data else f':hdr-rec709-v{HDR_PREVIEW_VERSION}'
+        profile += ':hdr-grading-v2' if grading_data else f':hdr-rec709-v{HDR_PREVIEW_VERSION}'
     audio_map = _source_audio_map(info['audioStreamChannels'],audio_stream,info['duration'])
     if info['audioStreams']>1:
         profile += f':audio-v2:{audio_stream}'
@@ -405,18 +412,24 @@ def proxy(src, seek_optimized=False, audio_stream=None, grading_data=False):
                 if video:
                     width,height = (960,540) if seek_optimized else (1280,720)
                     fit = f"scale=w='min({width},iw)':h='min({height},ih)':force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1"
-                    picture = (HDR_GRADE_DATA if grading_data else HDR_TO_REC709)+','+fit if info['hdr'] else fit
+                    picture = fit
                     if grading_data:
-                        picture += ',setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv'
+                        picture += ','+HDR_GRADE_DATA
+                    elif info['hdr']:
+                        picture = HDR_TO_REC709+','+fit
                     cmd += ['-map','0:V:0','-vf',picture]
                     if alpha:
                         cmd += ['-c:v','libvpx-vp9','-threads','2','-deadline','realtime','-cpu-used','5',
                                 '-b:v','0','-crf','18','-auto-alt-ref','0','-pix_fmt','yuva420p']
+                    elif grading_data:
+                        cmd += ['-c:v','libx264rgb','-threads','2','-preset','veryfast','-crf','10','-maxrate','4M','-bufsize','8M',
+                                '-g','1' if seek_optimized else '24','-pix_fmt','rgb24',
+                                '-colorspace','rgb','-color_range','pc','-color_primaries','bt709','-color_trc','bt709']
                     else:
                         cmd += ['-c:v','libx264','-threads','2','-preset','veryfast',
                                 '-crf','22' if seek_optimized else '19','-maxrate','4M','-bufsize','8M',
                                 '-g','1' if seek_optimized else '24','-pix_fmt','yuv420p']
-                    if info['hdr']:
+                    if info['hdr'] and not grading_data:
                         cmd += ['-bsf:v',AVC_REC709,'-color_primaries','bt709','-color_trc','bt709','-colorspace','bt709']
                 else:
                     cmd += ['-vn']

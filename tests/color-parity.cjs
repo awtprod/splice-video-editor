@@ -127,6 +127,7 @@ async function main() {
     }
     for (const source of ['hlg', 'pq']) {
       one(`${source} source`, {}, source, {kind:'hdr'});
+      one(`${source} static +1 stop`, {exposure:1}, source, {gradingProxy:true});
       one(`${source} source with wheels`, {grade:{gain:[1.1, 1, .9, 1]}}, source, {kind:'hdr'});
       one(`${source} source bypassed`, {exposure:1, contrast:140, grade:{bypass:true, gain:[1.2, 1, .8, 1]}}, source, {kind:'hdr'});
       cases.push({name:`${source} source animated exposure`, source, length:1, clips:[{track:1, color:{exposure:.5},
@@ -223,18 +224,23 @@ async function main() {
         // A source change can leave the old canvas visible until loadeddata. Its
         // stale count is also zero. Wait for a new paint and the active decoder.
         const layers = sample.item.transition ? 1 : sample.item.clips.filter(clip => !clip.adjustment).length;
-        await page.waitForFunction(({before, layers}) => {
+        await page.waitForFunction(({before, layers, gradingProxy}) => {
           const {project, activeClip, video} = Editor.get();
           const source = project.media.find(m => m.id === activeClip?.mediaId);
           const ready = !source?.src || (video.readyState >= 2 && !video.seeking && video.currentSrc === video.src);
+          if (gradingProxy) {
+            const src = SpliceMedia.hdrPreviewStatus(source)?.src;
+            if (!src || video.currentSrc !== new URL(src, location.href).href) return false;
+          }
           const canvas = document.querySelector('#preview-canvas');
           const videos = Editor.framePlan(canvas).ops.flatMap(op => [op, op.outgoing, op.incoming])
             .filter(op => op?.element instanceof HTMLVideoElement);
-          if (videos.length < layers || videos.some(op => op.element.readyState < 2 || op.element.seeking)) return false;
+          // Static HDR primaries paint their decoded video into a graded canvas.
+          if ((!gradingProxy && videos.length < layers) || videos.some(op => op.element.readyState < 2 || op.element.seeking)) return false;
           const stats = SplicePicture.stats;
           return ready && stats.frames > before && stats.exactDecode && stats.stale === 0 &&
             document.querySelector('#preview-canvas').width === 640;
-        }, {before:previous, layers});
+        }, {before:previous, layers, gradingProxy:!!sample.item.clips[0]?.gradingProxy});
         // Sample after the workspace has presented the newly ready composition.
         await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
         await page.waitForFunction(() => SplicePicture.stats.exactDecode && SplicePicture.stats.stale === 0);
@@ -291,7 +297,7 @@ async function main() {
     const render = (name, clips, options) => {
       const projectFile = path.join(splice.temp, name+'.json'), movie = path.join(splice.temp, name+(options.codec === 'prores' ? '.mov' : '.mp4'));
       fs.writeFileSync(projectFile, JSON.stringify({...project, clips}));
-      execFileSync('python3', ['-c', `import json,sys; sys.path.insert(0, ${JSON.stringify(root)}); from render_movie import render_to_file; render_to_file(json.load(open(sys.argv[1])), sys.argv[2], options=json.loads(sys.argv[3]))`,
+      execFileSync('python3', ['-c', `import json,sys; from pathlib import Path; sys.path.insert(0, ${JSON.stringify(root)}); from render_movie import render_to_file; render_to_file(json.loads(Path(sys.argv[1]).read_text()), sys.argv[2], options=json.loads(sys.argv[3]))`,
         projectFile, movie, JSON.stringify({crf:14, limiter:false, ...options})], {cwd:root, env:{...process.env, TMPDIR:splice.temp, HOME:splice.temp, XDG_DATA_HOME:splice.temp}, stdio:['ignore', 'inherit', 'inherit'], timeout:900000});
       return movie;
     };
@@ -363,25 +369,20 @@ async function main() {
     assert.deepEqual(failures, [], failures.join('\n'));
     if (!process.env.SPLICE_PARITY_ONLY) for (const source of ['hlg', 'pq']) {
       const index = sampleTimes.findIndex(s => s.item.name === source+' source');
-      await page.evaluate(async time => {
-        Editor.seek(time);
-        const {activeClip,project} = Editor.get(), item = project.media.find(m => m.id===activeClip.mediaId);
-        await SpliceMedia.preparePreview(item, item.audioStream ?? null, true).done;
-        Editor.updateClip(activeClip.id,{color:{exposure:1}});
-      }, sampleTimes[index].time);
+      const active = sampleTimes.findIndex(s => s.item.name === source+' static +1 stop');
+      await page.evaluate(time => Editor.seek(time), sampleTimes[active].time);
       for (const mode of ['bypass', 'split']) {
         const toggle = page.locator('[data-monitor-'+mode+']');
         await toggle.click();
-        await page.waitForFunction(({centers, reference, split}) => {
+        await page.waitForFunction(({centers, reference, graded, split}) => {
           const canvas = document.querySelector('#preview-canvas'), ctx = canvas.getContext('2d');
           const delta = centers.map(([x,y], i) => {
             const rgb = ctx.getImageData(x,y,1,1).data;
-            return Math.max(...reference[i].map((v,c) => Math.abs(rgb[c]-v)));
+            const expected = split && x < canvas.width/2 ? graded[i] : reference[i];
+            return Math.max(...expected.map((v,c) => Math.abs(rgb[c]-v)));
           });
-          const right = delta.filter((v,i) => centers[i][0] > canvas.width/2);
-          const left = delta.filter((v,i) => centers[i][0] < canvas.width/2);
-          return split ? Math.max(...right)<=4 && Math.max(...left)>20 : Math.max(...delta)<=4;
-        }, {centers, reference:gl[index], split:mode==='split'});
+          return Math.max(...delta)<=2;
+        }, {centers, reference:gl[index], graded:gl[active], split:mode==='split'});
         await toggle.click();
       }
     }
