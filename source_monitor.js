@@ -3,7 +3,8 @@
   // include the frame they are set on; `out` is stored as the end of that frame (see Editor.setMark).
   let dialog, media, player, marks = {}, fps = 25, shuttleTimer, shuttleRate = 0;
   let unsubscribe = null, committedMarks = '{}', frameRequest = 0;
-  let isSubclip = false, subclipOffset = 0;
+  let isSubclip = false, sourceOffset = 0;
+  let angleWindow = null, gapTime = null, gapSince = 0;
   const markIn = () => Number.isFinite(marks.in) ? marks.in : 0;
   const markOut = () => Number.isFinite(marks.out) ? marks.out : media.duration;
   // The last frame the range includes, for display.
@@ -12,18 +13,35 @@
   const snap = value => Math.round(value * fps) / fps;
   const format = seconds => Editor.formatTimecode(seconds,fps);
   const show = (message,error=true) => {const node=dialog.querySelector('.source-status');node.textContent=message;node.classList.toggle('error',!!message&&error);};
-  const current = () => Math.max(0,Math.min(media.duration,(player?.currentTime || 0) - subclipOffset));
+  const current = () => Math.max(0,Math.min(media.duration,gapTime ?? ((player?.currentTime || 0) - sourceOffset)));
   const seekLocal = value => {
     if (!player || !media) return;
-    player.currentTime = subclipOffset + Math.max(0, Math.min(media.duration, value));
+    const local = Math.max(0, Math.min(media.duration, value));
+    if (angleWindow) {
+      const unavailable = local < angleWindow.minTime || local >= angleWindow.maxTime;
+      player.style.visibility = unavailable ? 'hidden' : '';
+      gapTime = unavailable ? local : null;
+      gapSince = performance.now();
+      if (unavailable) { player.pause(); return; }
+    }
+    player.currentTime = sourceOffset + local;
   };
   function update() {
     if (!dialog?.open) return;
+    if (angleWindow && player.readyState >= 1) {
+      if (gapTime !== null && shuttleRate > 0) {
+        seekLocal(gapTime + (performance.now() - gapSince) * shuttleRate / 1000);
+        if (gapTime === null) player.play().catch(error=>show(error.message));
+      } else if (gapTime === null && current() >= angleWindow.maxTime) {
+        seekLocal(current());
+      }
+      if (current() >= media.duration && shuttleRate > 0) stopShuttle();
+    }
     if (isSubclip && player && player.readyState >= 1) {
-      if (player.currentTime < subclipOffset - 1e-3) player.currentTime = subclipOffset;
-      else if (player.currentTime >= subclipOffset + media.duration - 1e-3 && !player.paused) {
+      if (player.currentTime < sourceOffset - 1e-3) player.currentTime = sourceOffset;
+      else if (player.currentTime >= sourceOffset + media.duration - 1e-3 && !player.paused) {
         stopShuttle();
-        player.currentTime = subclipOffset + media.duration;
+        player.currentTime = sourceOffset + media.duration;
       }
     }
     dialog.querySelector('.source-time').textContent = format(current())+' / '+format(media.duration);
@@ -93,7 +111,7 @@
     player.pause();player.removeAttribute('src');player.load();
     document.removeEventListener('keydown',onKey,true);
     dialog.close();dialog.remove();dialog=null;player=null;media=null;
-    isSubclip = false; subclipOffset = 0;
+    isSubclip = false; sourceOffset = 0; angleWindow = null; gapTime = null;
     document.querySelector('.workspace')?.classList.remove('source-open');
   }
   // Follow the project: undo can change the saved marks, and a new project can drop the source.
@@ -118,8 +136,11 @@
     const rate=Math.sign(shuttleRate)===direction?Math.min(4,Math.abs(shuttleRate)*2):1;
     stopShuttle();shuttleRate=direction*rate;
     if(direction>0){
-      if(isSubclip && current()>=media.duration-1e-3) seekLocal(0);
-      player.playbackRate=rate;player.play().catch(error=>show(error.message));return;
+      if((isSubclip || angleWindow) && current()>=media.duration-1e-3) seekLocal(0);
+      gapSince=performance.now();
+      player.playbackRate=rate;
+      if(gapTime !== null)return;
+      player.play().catch(error=>show(error.message));return;
     }
     shuttleTimer=setInterval(()=>{
       if(!dialog?.open || current()<=0){stopShuttle();return;}
@@ -197,10 +218,11 @@
     const item=state.media.find(entry=>entry.id===id);
     if(!item){window.alert('Media is unavailable.');return;}
     const resolved = Editor.resolveClipMedia ? Editor.resolveClipMedia({ mediaId: item.id, type: item.type }, state) : { item, inShift: 0 };
-    const playSrc = item.src || resolved.item?.src || '';
+    const playSrc = (item.multicam ? resolved.item?.src : item.src || resolved.item?.src) || '';
     if(!playSrc || item.offline){window.alert('Relink '+item.name+' before opening it.');return;}
     isSubclip = !!item.parentMediaId;
-    subclipOffset = isSubclip ? (Number(resolved.inShift) || 0) : 0;
+    angleWindow = resolved.angle ? resolved : null;
+    sourceOffset = (resolved.inShift || 0) - (angleWindow?.minTime || 0);
     media={...item,src:playSrc,duration:Number.isFinite(Number(item.duration)) && Number(item.duration)>0 ? Number(item.duration) : 0};
     fps=Number.isFinite(media.fps) && media.fps>0 ? media.fps : state.fps;
     const trackCount=Math.min(64,Math.max(state.trackCounts?.[media.type] || 3,
@@ -228,14 +250,14 @@
     const subclipBar = !media.multicam ? (
       `<div class="source-subclip-row">` +
       `<button type="button" class="source-subclip-btn" data-action="make-subclip" title="Create reusable subclip from In/Out marks (Ctrl+U / Cmd+U)">Make Subclip…</button>` +
-      (isSubclip ? `<span class="source-subclip-badge">Subclip · ${format(subclipOffset)}–${format(subclipOffset + media.duration)}${media.timecode ? ' · TC ' + esc(media.timecode) : ''}</span>` +
+      (isSubclip ? `<span class="source-subclip-badge">Subclip · ${format(sourceOffset)}–${format(sourceOffset + media.duration)}${media.timecode ? ' · TC ' + esc(media.timecode) : ''}</span>` +
         `<button type="button" class="bin-mini-btn" data-action="toggle-subclip-limits">${media.subclipLimits === false ? 'Restore subclip limits' : 'Remove subclip limits'}</button>` : '') +
       `</div>`
     ) : '';
     // Head, picture, settings (they scroll when the window is short) and a footer whose transport,
     // mark and edit buttons are always in view.
     dialog.innerHTML=`<div class="source-head"><div><small>SOURCE</small><strong>${esc(media.name)}</strong></div><button class="source-close" aria-label="Close source monitor">×</button></div>`+
-      `<div class="source-stage"><${tag} controls playsinline preload="auto"></${tag}></div>`+
+      `<div class="source-stage"><${tag} ${angleWindow ? '' : 'controls'} playsinline preload="auto"></${tag}></div>`+
       `<div class="source-controls"><input class="source-scrub" type="range" min="0" max="${media.duration}" step="${1/fps}" value="0" aria-label="Source playhead">`+
       `<div class="source-readout"><span class="source-time"></span><span class="source-range"></span></div>`+
       `<small class="source-shortcuts">I · O mark (both frames included) · J K L shuttle · , insert · . overwrite · Ctrl+U subclip</small>`+
@@ -252,16 +274,20 @@
     else document.body.append(dialog);
     // Drag the picture (or the sound's stage) onto a timeline track: overwrite there, Ctrl or ⌘ inserts.
     const stage=dialog.querySelector('.source-stage');
+    if (angleWindow) stage.style.background = 'black';
     stage.draggable=true;stage.title='Drag onto a timeline track to overwrite there (hold Ctrl or ⌘ to insert)';
     stage.addEventListener('dragstart',event=>{
       if(!media){event.preventDefault();return;}
       event.dataTransfer.setData('application/x-splice-source',media.id);
       event.dataTransfer.effectAllowed='copy';
     });
-    player=dialog.querySelector('video,audio');player.src=media.src;player.onerror=()=>show('The source file could not be decoded.');player.onended=stopShuttle;
+    player=dialog.querySelector('video,audio');player.src=media.src;player.onerror=()=>show('The source file could not be decoded.');player.onended=()=>{
+      if (angleWindow && angleWindow.maxTime < media.duration && shuttleRate > 0) seekLocal(angleWindow.maxTime);
+      else stopShuttle();
+    };
     player.onloadedmetadata=()=>{
       if(!dialog?.open)return;
-      if (isSubclip) {
+      if (isSubclip || angleWindow) {
         seekLocal(0);
       } else if (!media.multicam && Number.isFinite(player.duration) && player.duration>0) {
         media.duration=player.duration;
@@ -354,7 +380,7 @@
     };
     picturePicker.onchange=()=>{syncTargets();show('');};
     if(soundPicker)soundPicker.onchange=()=>show('');
-    dialog.querySelector('.source-scrub').oninput=event=>{player.pause();seekLocal(Number(event.target.value));};
+    dialog.querySelector('.source-scrub').oninput=event=>{stopShuttle();seekLocal(Number(event.target.value));};
     dialog.querySelector('.source-bin input').onchange=event=>{
       const value=event.target.value.trim().replace(/\s*\/\s*/g,'/').replace(/^\/+|\/+$/g,'');
       if (window.SpliceBins?.updateMediaMetadata) window.SpliceBins.updateMediaMetadata(id, { bin: value });

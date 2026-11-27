@@ -326,6 +326,45 @@ async function testNestedSequences(page, files, directory) {
     }
     return hashes;
   }
+  await page.evaluate(() => Editor.editProject(p => {
+    const outer = p.clips.find(c => c.type === 'video');
+    const child = p.media.find(m => m.id === outer.mediaId).nestedProject;
+    for (const c of p.clips) c.duration = 2;
+    Object.assign(outer, {transform:{scale:50}});
+    const c = child.clips.find(c => c.type === 'video');
+    Object.assign(c, {transition:'none', transform:{scale:80}});
+  }));
+  const beforeRefusal = await page.evaluate(() => JSON.stringify(Editor.get().project));
+  await assert.rejects(page.evaluate(id => SpliceNested.unnestClip(id), reopenedClipId), /unnest losslessly.*scale/i);
+  assert.equal(await page.evaluate(() => JSON.stringify(Editor.get().project)), beforeRefusal);
+  await page.evaluate(() => Editor.editProject(p => {
+    const child = p.media.find(m => m.id === p.clips[0].mediaId).nestedProject;
+    delete child.clips.find(c => c.type === 'video').transform;
+  }));
+  const scaled = await decoded('scaled-nest', ['prores']);
+  await page.evaluate(id => SpliceNested.unnestClip(id), reopenedClipId);
+  assert.deepEqual(await decoded('scaled-flat', ['prores']), scaled, 'decoded 50% scale survives unnest');
+  const frame = ffmpeg(['-ss','0.5','-i',path.join(directory,'scaled-flat.mov'),'-frames:v','1',
+    '-pix_fmt','rgb24','-f','rawvideo','-']);
+  let bluePixels = 0;
+  for (let i = 2; i < frame.length; i += 3) if (frame[i] > 200) bluePixels++;
+  assert.equal(bluePixels, 160 * 90, '50% scale fills one quarter of the 320×180 frame');
+  const curves = await page.evaluate(id => {
+    Editor.undo();
+    Editor.editProject(p => {
+      const outer = p.clips.find(c => c.type === 'video');
+      outer.color = {saturation:75};
+      outer.keyframes = {opacity:[{time:0,value:100},{time:2,value:40}]};
+      const child = p.media.find(m => m.id === outer.mediaId).nestedProject;
+      const first = child.clips.find(c => c.type === 'video');
+      first.duration = 1;
+      child.clips.push({...first, id:'second-picture', start:1});
+    });
+    return SpliceNested.unnestClip(id).filter(c => c.type === 'video')
+      .map(c => [c.color.saturation, c.keyframes.opacity.map(p => [p.time,p.value])]);
+  }, reopenedClipId);
+  assert.deepEqual(curves, [[75,[[0,100],[1,70]]],[75,[[0,70],[1,40]]]]);
+  await page.evaluate(() => { Editor.undo(); Editor.undo(); Editor.undo(); Editor.undo(); });
   const padded = await decoded('padded-nest');
   await page.evaluate(id => SpliceNested.unnestClip(id), reopenedClipId);
   assert.deepEqual(await decoded('padded-flat'), padded);
@@ -529,6 +568,38 @@ async function testMulticam(page, files) {
 // ---------------------------------------------------------------------------
 // 3. Subclips (Source Monitor -> Media Pool -> Timeline -> Persistence)
 // ---------------------------------------------------------------------------
+async function testMulticamSource(page, files) {
+  await freshProjectWithMedia(page, [files.multi, files.red], 'Camera source clock');
+  await page.evaluate(() => {
+    const cameras = Editor.get().project.media;
+    const first = cameras.find(m => m.name.includes('MultiSeg'));
+    Editor.setSourceSettings(first.id, {sourceMarks:{in:3,out:4}});
+    const mc = SpliceMulticam.createMulticam({angleMediaIds:[first.id, cameras.find(m => m.id !== first.id).id]});
+    SpliceSource.open(mc.id);
+  });
+  const video = page.locator('.source-stage video');
+  await page.waitForFunction(() => {
+    const v = document.querySelector('.source-stage video');
+    return v.readyState >= 2 && !v.seeking && Math.abs(v.currentTime-3) < .001;
+  });
+  const preview = await video.evaluate(v => {
+    const ctx = document.createElement('canvas').getContext('2d');
+    ctx.drawImage(v,0,0,1,1);
+    return [...ctx.getImageData(0,0,1,1).data].slice(0,3);
+  });
+  assert.equal(dominantColor(preview), 'yellow');
+  for (const action of ['in','out','insert']) await page.locator('.source-dialog [data-action="'+action+'"]').click();
+  assert.equal(await page.evaluate(() => Editor.get().project.clips.find(c => c.type === 'video').in), 0);
+  assert.equal(dominantColor(await programColor(page,0)), dominantColor(preview));
+  await capture(page, 'multicam-source-in.png');
+  await page.locator('.source-scrub').evaluate(input => {
+    input.value = '2';
+    input.dispatchEvent(new Event('input'));
+  });
+  assert.equal(await video.evaluate(v => getComputedStyle(v).visibility), 'hidden');
+  await page.locator('.source-close').click();
+}
+
 async function testSubclips(page, files) {
   await freshProjectWithMedia(page, [files.multi], 'Subclip Test');
   await page.evaluate(() => SpliceBins.createBin('Selects'));
@@ -1205,6 +1276,7 @@ async function main() {
       await testFlattenRouting(page, files);
       await testNestVisibility(page, files);
       await testUnnestComponents(page, files);
+      await testMulticamSource(page, files);
       await testSubclips(page, files);
       await testBinsAndMetadata(page, files);
       assert.deepEqual(errors, [], '1440x900: zero page errors');

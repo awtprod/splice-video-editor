@@ -440,6 +440,22 @@ window.SpliceNested = (() => {
     renderBreadcrumb();
   }
 
+  function pictureAdjustments(clip) {
+    const names = [];
+    for (const [key, value] of Object.entries(clip.transform || {}))
+      if (value !== (key === 'scale' ? 100 : 0)) names.push(key);
+    for (const [key, value] of Object.entries(clip.color || {})) {
+      if (key === 'lutIntensity' || (key === 'lut' && !value)) continue;
+      if (value !== (['brightness','contrast','saturation'].includes(key) ? 100 : 0)) names.push(key);
+    }
+    if ((clip.opacity ?? 100) !== 100) names.push('opacity');
+    if (clip.transition && clip.transition !== 'none') names.push(clip.transition);
+    if (clip.pictureDip) names.push('picture dip');
+    for (const [key, points] of Object.entries(clip.keyframes || {}))
+      if (key !== 'volume' && points.length) names.push('animated ' + key);
+    return names;
+  }
+
   function unnestClip(clipId) {
     const editor = window.Editor;
     const state = editor.get();
@@ -599,10 +615,13 @@ window.SpliceNested = (() => {
         placeSound(out, cc.type === 'audio' ? cc.track : -1, occupied, childMix(soundTrack, sound));
       } else {
         out.track = childLane(cc.track);
-        const opacity = (outer.opacity ?? 100) / 100;
-        if (opacity !== 1) {
-          out.opacity = (out.opacity ?? 100) * opacity;
-          for (const point of out.keyframes?.opacity || []) point.value *= opacity;
+        if (pictureAdjustments(outer).length) {
+          for (const field of ['transform','color','opacity'])
+            if (outer[field] != null) out[field] = structuredClone(outer[field]);
+          const keys = Object.fromEntries(Object.entries(outer.keyframes || {}).filter(([key]) => key !== 'volume'));
+          const from = newStart - outer.start;
+          if (Object.keys(keys).length) out.keyframes = {...out.keyframes,
+            ...editor.clipKeyframeWindow(keys, from, from + newDuration)};
         }
         if (out.type === 'video' && !sound) out.embeddedAudio = false;
         if (sound) {
@@ -624,6 +643,27 @@ window.SpliceNested = (() => {
     }
     const childMedia = new Map(child.media.map(m => [m.id,m]));
     function expandWindow(picture, sound) {
+      const adjustments = picture ? pictureAdjustments(picture) : [];
+      if (adjustments.length) {
+        const start = picture.in || 0, end = start + picture.duration * (picture.speed || 1);
+        const pictures = child.clips.filter(c => c.type !== 'audio' && c.start < end && c.start+c.duration > start)
+          .sort((a,b) => a.start-b.start);
+        // Only distribute a composite effect over an uninterrupted run of neutral pictures.
+        let cursor = start;
+        const neutral = pictures.every(c => {
+          const media = childMedia.get(c.mediaId);
+          const contiguous = Math.abs(Math.max(start,c.start)-cursor) < 1e-6;
+          cursor = Math.min(end,c.start+c.duration);
+          return contiguous && c.type === 'video' && c.enabled !== false && !c.disabled &&
+            !editor.isTrackHidden(c.track,'video',child) && !pictureAdjustments(c).length &&
+            media && !media.hdr && !media.multicam && !media.nativeGenerator &&
+            media.width * child.height === media.height * child.width;
+        });
+        if (!neutral || cursor < end-1e-6 || child.width !== project.width || child.height !== project.height ||
+            picture.pictureDip || (picture.transition && picture.transition !== 'none'))
+          throw new Error('Cannot unnest losslessly: outer ' + adjustments.join(', ') +
+            ' must remain on the nested composite.');
+      }
       for (const cc of child.clips || []) {
         const showPicture = picture && cc.type !== 'audio';
         const playSound = sound && (cc.type === 'audio' || (cc.type === 'video' && cc.embeddedAudio !== false &&
