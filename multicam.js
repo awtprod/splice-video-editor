@@ -519,11 +519,6 @@ window.SpliceMulticam = (() => {
     return { clipId: nextSelectedId, angleIndex, cut: shouldCut };
   }
 
-  function sameTrackMix(a = {}, b = {}) {
-    return (a.gain ?? 100) === (b.gain ?? 100) && (a.pan ?? 0) === (b.pan ?? 0) &&
-      !!a.mute === !!b.mute && !!a.solo === !!b.solo;
-  }
-
   function flattenClips(clipIds) {
     const editor = window.Editor;
     const state = editor.get();
@@ -585,26 +580,11 @@ window.SpliceMulticam = (() => {
       const sound = makeAngleClip(base, angle, 'audio', preferred);
       if (!sound) return;
       const mix = project.trackMix?.[sourceTrack];
-      // A lane with other clips must retain its mix even outside this edit.
-      // A64 also carries embedded multicam voices with no timeline audio clip.
-      const candidates = [preferred, ...Array.from({length:64}, (_, i) => -1-i)];
-      for (const track of candidates) {
-        if (editor.isTrackLocked(track, 'audio')) continue;
-        const lane = audioLanes.filter(c => c.track === track);
-        if (lane.some(c => c !== base && c.start < sound.start + sound.duration - 1e-6 &&
-            c.start + c.duration > sound.start + 1e-6)) continue;
-        const destinationMix = addedMixes[track] ?? project.trackMix?.[track];
-        if (!sameTrackMix(mix, destinationMix)) {
-          if (lane.length || destinationMix || track === -64) continue;
-          addedMixes[track] = structuredClone(mix);
-        }
-        sound.track = track;
-        delete sound.linkGroup;
-        audioLanes.push(sound);
-        produced.push(sound);
-        return;
-      }
-      throw new Error('Flattening needs a free, unlocked audio track that preserves the camera mix.');
+      sound.track = editor.audioTrackForMix(sound, preferred, audioLanes, mix, addedMixes, base);
+      if (sound.track === null) throw new Error('Flattening needs a free, unlocked audio track that preserves the camera mix.');
+      delete sound.linkGroup;
+      audioLanes.push(sound);
+      produced.push(sound);
     };
     const linkRemap = new Map();
     for (const clip of targets) {
@@ -640,7 +620,7 @@ window.SpliceMulticam = (() => {
 
       // Video clip
       const hasEmbedded = clip.embeddedAudio !== false;
-      const sameAudio = aIdx === vIdx && audioMode !== 'all';
+      const sameAudio = !editor.separateMulticamSound(clip);
       const vc = makeAngleClip(clip, angles[vIdx], 'video', clip.track, hasEmbedded ? sameAudio : false);
       if (vc) {
         if (clip.linkGroup && aIdx === vIdx && audioMode !== 'all') {

@@ -510,6 +510,21 @@ window.SpliceNested = (() => {
     const expanded = [];
     const workingClips = project.clips.filter(c => !outerIds.has(c.id));
     const isLocked = (t, k) => editor.isTrackLocked?.(t, k);
+    const addedMixes = {};
+    const childSolo = Object.values(child.trackMix || {}).some(m => m.solo);
+    const parentSolo = Object.values(project.trackMix || {}).some(m => m.solo);
+    const outerSound = outerClips.find(c => c.type === 'audio') || outerClips.find(c => c.type === 'video' && c.embeddedAudio !== false);
+    const outerMix = project.trackMix?.[outerSound?.track];
+    function childMix(track) {
+      const mix = child.trackMix?.[track] || {};
+      // Solo is local to the child sequence. Carry its audible result onto the parent's buses.
+      return {...mix, mute:!!(mix.mute || (childSolo && !mix.solo) || !outerSound || outerSound.enabled === false ||
+        outerMix?.mute || (parentSolo && !outerMix?.solo)), solo:!!outerMix?.solo};
+    }
+    function placeSound(sound, preferred, clips, mix) {
+      sound.track = editor.audioTrackForMix(sound, preferred, clips, mix, addedMixes);
+      if (sound.track === null) throw new Error('Unnesting needs a free, unlocked audio track that preserves the child mix.');
+    }
 
     for (const cc of child.clips || []) {
       const ovStart = Math.max(cc.start, winStart);
@@ -537,16 +552,33 @@ window.SpliceNested = (() => {
         if (!linkRemap.has(out.linkGroup)) linkRemap.set(out.linkGroup, uid());
         out.linkGroup = linkRemap.get(out.linkGroup);
       }
-      const laneKind = out.type === 'audio' ? 'audio' : 'video';
-      const chosenTrack = freeTrack([...workingClips, ...expanded], laneKind, out.track, out.start, out.start + out.duration, isLocked);
-      if (chosenTrack === null) throw new Error(`No free unlocked ${laneKind} track to unnest into.`);
-      out.track = chosenTrack;
+      const occupied = [...workingClips, ...expanded];
+      if (out.type === 'audio') {
+        placeSound(out, cc.track, occupied, childMix(cc.track));
+      } else {
+        out.track = freeTrack(occupied, 'video', cc.track, out.start, out.start + out.duration, isLocked);
+        if (out.track === null) throw new Error('No free unlocked video track to unnest into.');
+        if (out.type === 'video' && out.embeddedAudio !== false && editor.hasSound(child.media.find(m => m.id === cc.mediaId), child)) {
+          const separate = editor.separateMulticamSound(cc, child);
+          const mix = childMix(separate ? -64 : cc.track);
+          if (!editor.reserveTrackMix(separate ? -64 : out.track, mix, occupied, addedMixes)) {
+            // Keep the picture in place and give its sound a compatible audio lane.
+            out.linkGroup ||= uid();
+            const sound = {...out, type:'audio', id:uid()};
+            placeSound(sound, -1, occupied, mix);
+            out.embeddedAudio = false;
+            expanded.push(out, sound);
+            continue;
+          }
+        }
+      }
       expanded.push(out);
     }
 
     if (!expanded.length) throw new Error('This nested clip has no content within its trimmed range.');
 
     editor.editProject(next => {
+      if (Object.keys(addedMixes).length) next.trackMix = {...next.trackMix, ...addedMixes};
       if (addedMedia.length) next.media.push(...addedMedia);
       next.clips = next.clips.filter(c => !outerIds.has(c.id));
       next.clips.push(...expanded);

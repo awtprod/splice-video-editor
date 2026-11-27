@@ -264,7 +264,7 @@
       return;
     }
     if (stream!==(item?.audioStream??null) && element.getAttribute('src')===item?.src) audible=false;
-    if (clip.type === 'video' && mediaOf(clip)?.multicam?.audioMode === 'all') audible=false;
+    if (separateMulticamSound(clip)) audible=false;
     element.playbackRate=rate;
     setMediaPlaying(element,playing && playbackRate>0 && !clip.reverse && rate>=.25);
     element.muted=!audible || clip.reverse || rate<.25;
@@ -373,6 +373,10 @@
     }
   }
   const mediaOf = (clip, source = project) => source.media.find((m) => m.id === clip.mediaId);
+  function separateMulticamSound(clip, source = project) {
+    const mc = clip.type === 'video' && mediaOf(clip, source)?.multicam;
+    return !!mc && (mc.audioMode !== 'follow' || Number.isInteger(clip.multicamAudioAngle));
+  }
   function resolveSubclipItem(item, source = project) {
     let cur = item, inShift = 0;
     const seen = new Set();
@@ -394,7 +398,7 @@
       let idx = Number.isInteger(clip.multicamAngle) ? clip.multicamAngle : 0;
       if (clip.type === "audio") {
         if (Number.isInteger(clip.multicamAudioAngle)) idx = clip.multicamAudioAngle;
-        else if (mc.audioMode === "camera1") idx = 0;
+        else if (!mc.audioMode || mc.audioMode === "camera1") idx = 0;
         else if (mc.audioMode === "fixed") idx = Number.isInteger(mc.audioAngle) ? mc.audioAngle : 0;
       }
       idx = clamp(idx, 0, angles.length - 1);
@@ -993,8 +997,10 @@
         setMediaPlaying(element,false);
       } else syncClipPlayback(element,layer,target,forceSeek);
     }
+    // The outgoing transition decoder is managed separately from the other layers.
+    if (previous) layers.set(previous.id, previous);
     for (const layer of layers.values()) {
-      if (!preloading.has(layer.id) && layer.embeddedAudio !== false && mediaOf(layer)?.multicam?.audioMode === 'all')
+      if (!preloading.has(layer.id) && layer.embeddedAudio !== false && separateMulticamSound(layer))
         audioClips.push({...layer, type:'audio', track:-64});
     }
     const voices = new Map();
@@ -1561,12 +1567,27 @@
     return item.type === "video" && !item.still && item.audioChannels > 0;
   };
   const startOfLane = (lane) => ({kind: lane.startsWith("audio") ? "audio" : "video", track: Number(lane.split(":")[1])});
-  function freeAudioTrack(source, from, to) {
-    for (let track = -1; track >= -64; track--) {
+  function reserveTrackMix(track, mix = {}, clips, addedMixes) {
+    const current = addedMixes[track] ?? project.trackMix?.[track];
+    if ((mix.gain ?? 100) === (current?.gain ?? 100) && (mix.pan ?? 0) === (current?.pan ?? 0) &&
+        !!mix.mute === !!current?.mute && !!mix.solo === !!current?.solo) return true;
+    // A64 can carry embedded multicam sound even when it has no timeline audio clips.
+    if (current || track === -64 || clips.some(c => c.track === track)) return false;
+    addedMixes[track] = {...mix};
+    return true;
+  }
+  function audioTrackForMix(clip, preferred, clips, mix, addedMixes, ignore) {
+    return freeAudioTrack(project, clip.start, clip.start + clip.duration, {
+      preferred, clips, ignore, canUse:track => reserveTrackMix(track, mix, clips, addedMixes),
+    });
+  }
+  function freeAudioTrack(source, from, to, {preferred = -1, clips = source.clips, ignore, canUse} = {}) {
+    const candidates = new Set([preferred, ...Array.from({length:64}, (_, i) => -1-i)]);
+    for (const track of candidates) {
       if (trackLocked("audio", track, source)) continue;
-      const busy = source.clips.some((clip) => clip.type === "audio" && clip.track === track &&
+      const busy = clips.some((clip) => clip !== ignore && clip.type === "audio" && clip.track === track &&
         clip.start < to - 1e-6 && clip.start + clip.duration > from + 1e-6);
-      if (!busy) return track;
+      if (!busy && (!canUse || canUse(track))) return track;
     }
     return null;
   }
@@ -1886,6 +1907,7 @@
   }
   const defaultStartTimecode = (fps, dropFrame) => timecodeToFrames("01:00:00:00", fps, dropFrame);
   const Editor = {
+    separateMulticamSound, hasSound, reserveTrackMix, audioTrackForMix,
     formatTimecode(seconds, fps = 30, dropFrame = isDropFrameRate(fps)) {
       return framesToTimecode((seconds || 0) * fps, fps, dropFrame);
     },
