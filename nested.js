@@ -360,18 +360,15 @@ window.SpliceNested = (() => {
     if (window.SpliceMedia?.restore) await window.SpliceMedia.restore(child);
     transitioning = true;
     try {
-      const previous = editor.swapSequence(child, { time: 0, selectedId: child.clips[0]?.id || null });
-      stack.push({
-        parentProject: previous.project,
-        history: previous.history,
-        future: previous.future,
-        time: previous.time,
-        selectedId: previous.selectedId,
-        mediaId,
-        seqId: item.nestedSequence,
-        name: item.name,
-        dirty: false,
-        childRevision: editor.get().revision,
+      editor.swapSequence(child, {
+        time: 0, selectedId: child.clips[0]?.id || null,
+        beforeNotify(previous, revision) {
+          stack.push({
+            parentProject: previous.project, history: previous.history, future: previous.future,
+            time: previous.time, selectedId: previous.selectedId, mediaId,
+            seqId: item.nestedSequence, name: item.name, dirty: false, childRevision: revision,
+          });
+        },
       });
     } finally {
       transitioning = false;

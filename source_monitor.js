@@ -217,7 +217,7 @@
     const state=Editor.get().project;
     const item=state.media.find(entry=>entry.id===id);
     if(!item){window.alert('Media is unavailable.');return;}
-    const resolved = Editor.resolveClipMedia ? Editor.resolveClipMedia({ mediaId: item.id, type: item.type }, state) : { item, inShift: 0 };
+    const resolved = Editor.resolveClipMedia ? Editor.resolveClipMedia({ mediaId: item.id, type: item.type, multicamAngle: Editor.defaultPictureAngle(item, state) }, state) : { item, inShift: 0 };
     const playSrc = (item.multicam ? resolved.item?.src : item.src || resolved.item?.src) || '';
     if(!playSrc || item.offline){window.alert('Relink '+item.name+' before opening it.');return;}
     isSubclip = !!item.parentMediaId;

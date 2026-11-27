@@ -408,6 +408,10 @@
     }
     return { item: cur, inShift };
   }
+  function defaultPictureAngle(item, source = project) {
+    const angles = item.multicam?.angles || [];
+    return Math.max(0, angles.findIndex(angle => source.media.some(m => m.id === angle.mediaId && m.type === "video")));
+  }
   function resolveClipMedia(clip, source = project) {
     const media = clip && mediaOf(clip, source);
     if (!media) return { item: null, media: null, inShift: 0, angle: null, angleIndex: null, minTime: 0, maxTime: Infinity };
@@ -1659,7 +1663,7 @@
     const group = clip.linkGroup || uid();
     const sound = {id: uid(), mediaId: clip.mediaId, type: "audio", track, start: clip.start,
       duration: clip.duration, in: clip.in, title: "", volume: clip.volume ?? 100, transition: "none", linkGroup: group};
-    for (const key of ["speed", "reverse", "pan", "fadeIn", "fadeOut", "audioStream", "fadeClock"])
+    for (const key of ["speed", "reverse", "pan", "fadeIn", "fadeOut", "audioStream", "fadeClock", "multicamAngle", "multicamAudioAngle"])
       if (key in clip) sound[key] = clip[key];
     if (clip.pictureDip) {
       sound.pictureDip = cloneState(clip.pictureDip);
@@ -1685,7 +1689,7 @@
   // without a picture track only the sound is placed.
   function sourceClips(item, selection, start, videoTrack, audioTrack) {
     const extra = {};
-    if (item.multicam) extra.multicamAngle = 0;
+    if (item.multicam) extra.multicamAngle = defaultPictureAngle(item);
     if (item.nestedSequence != null) extra.nestedSequence = item.nestedSequence;
     const base = {mediaId: item.id, start, title: "", volume: 100, transition: "none", ...extra, ...selection};
     if (item.type === "audio" || videoTrack == null) return [{id: uid(), type: "audio", track: audioTrack, ...base}];
@@ -2905,6 +2909,7 @@
       syncMedia(true);
       notify();
     },
+    defaultPictureAngle,
     resolveClipMedia(clip, source = project) {
       return resolveClipMedia(clip, source);
     },
@@ -2921,6 +2926,7 @@
       time = clamp(Number.isFinite(opts.time) ? opts.time : 0, 0, project.duration);
       playing = false;
       revision += 1;
+      opts.beforeNotify?.(previous, revision);
       syncMedia(true);
       notify();
       return previous;

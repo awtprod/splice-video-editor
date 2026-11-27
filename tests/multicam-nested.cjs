@@ -133,6 +133,11 @@ async function testNestedSequences(page, files, directory) {
   assert.match(crumbText, /Intro Nest/, 'breadcrumb shows nested sequence');
   assert.match(crumbText, /Depth 1\/4/, 'breadcrumb shows Depth 1/4');
   await capture(page, 'nested-breadcrumb-1440x900.png');
+  await page.waitForFunction(() => document.getElementById('session-status')?.textContent.includes('Draft saved'));
+  await page.reload();
+  await page.evaluate(() => SpliceSession.ready);
+  assert.equal(await page.evaluate(() => Editor.get().project.name), 'Nest Main');
+  await page.evaluate(id => SpliceNested.enter(id), nestedInfo.mediaId);
 
   // Edit inside the nested sequence: swap first inner clip (Red) to Blue!
   const blueMediaId = await page.evaluate(() => {
@@ -568,6 +573,35 @@ async function testMulticam(page, files) {
 // ---------------------------------------------------------------------------
 // 3. Subclips (Source Monitor -> Media Pool -> Timeline -> Persistence)
 // ---------------------------------------------------------------------------
+async function testRecorderFirst(page, files) {
+  const recorder = path.join(path.dirname(files.red), 'recorder.wav');
+  ffmpeg(['-f', 'lavfi', '-i', 'sine=frequency=900:duration=4', recorder]);
+  await freshProjectWithMedia(page, [recorder, files.green], 'Recorder and camera');
+  const selection = await page.evaluate(() => {
+    const items = Editor.get().project.media;
+    const recorder = items.find(m => m.type === 'audio'), camera = items.find(m => m.type === 'video');
+    const mc = SpliceMulticam.createMulticam({angleMediaIds:[recorder.id, camera.id], audioMode:'follow'});
+    Editor.addToTimeline(mc.id);
+    return Editor.get().project.clips.map(c => c.multicamAngle);
+  });
+  assert.deepEqual(selection, [1, 1]);
+  assert.equal(dominantColor(await programColor(page, .5)), 'green');
+  for (const override of [null, 0]) {
+    const result = await page.evaluate(override => {
+      Editor.editProject(p => {
+        p.clips = p.clips.filter(c => c.type === 'video');
+        p.clips[0].embeddedAudio = true;
+        delete p.clips[0].linkGroup;
+        if (override !== null) p.clips[0].multicamAudioAngle = override;
+      });
+      const id = Editor.detachAudio(Editor.get().project.clips[0].id);
+      const clip = Editor.get().project.clips.find(c => c.id === id);
+      return [clip.multicamAngle, clip.multicamAudioAngle ?? null, Editor.resolveClipMedia(clip).item.type];
+    }, override);
+    assert.deepEqual(result, [1, override, override === null ? 'video' : 'audio']);
+  }
+}
+
 async function testMulticamSource(page, files) {
   await freshProjectWithMedia(page, [files.multi, files.red], 'Camera source clock');
   await page.evaluate(() => {
@@ -1276,6 +1310,7 @@ async function main() {
       await testFlattenRouting(page, files);
       await testNestVisibility(page, files);
       await testUnnestComponents(page, files);
+      await testRecorderFirst(page, files);
       await testMulticamSource(page, files);
       await testSubclips(page, files);
       await testBinsAndMetadata(page, files);
