@@ -5,7 +5,7 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const {startSplice, openPage, ffmpeg, makeCamera, nearestSegment} = require('./browser-harness.cjs');
+const {startSplice, openPage, ffmpeg, makeCamera, nearestSegment, colorAt} = require('./browser-harness.cjs');
 
 const evidenceDir = process.env.SPLICE_EVIDENCE_DIR || '';
 const settle = page => page.evaluate(() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))));
@@ -733,6 +733,17 @@ async function testViewportLayout(splice, viewport, files) {
   }
 }
 
+// Runs in the page, through the same WAV export used by the editor.
+async function stereoWavLevels() {
+  const job = await Editor.exportVideo({codec:'wav', limiter:false}, undefined, AbortSignal.timeout(60000));
+  const bytes = await (await fetch(job.downloadURL)).arrayBuffer();
+  const pcm = await new OfflineAudioContext(2, 1, 48000).decodeAudioData(bytes);
+  return [0,1].flatMap(ch => [.25,1.25].map(t => {
+    const samples = pcm.getChannelData(ch).subarray(t * 48000, (t + .25) * 48000);
+    return Math.sqrt(samples.reduce((sum,v) => sum + v*v, 0) / samples.length);
+  }));
+}
+
 async function testAudioParity(page, files) {
   await freshProjectWithMedia(page, [files.red, files.green, files.blue], 'Audio parity');
   // Measure the actual preview mix at the Web Audio destination.
@@ -784,28 +795,94 @@ async function testAudioParity(page, files) {
     await page.evaluate(() => { if (Editor.get().playing) Editor.togglePlay(); restoreAudioProbe(); });
   }
   // Compare the stereo WAV both before and after nesting part of a mixed track.
-  const mix = await page.evaluate(async () => {
-    const measure = async () => {
-      const job = await Editor.exportVideo({codec:'wav', limiter:false}, undefined, AbortSignal.timeout(60000));
-      const bytes = await (await fetch(job.downloadURL)).arrayBuffer();
-      const decoder = new OfflineAudioContext(2, 1, 48000);
-      const pcm = await decoder.decodeAudioData(bytes);
-      return [0,1].flatMap(ch => [.25,1.25].map(t => {
-        const samples = pcm.getChannelData(ch).subarray(t*48000,(t+.25)*48000);
-        return Math.sqrt(samples.reduce((sum,v) => sum+v*v,0)/samples.length);
-      }));
-    };
-    Editor.editProject(p => {
-      const mediaId = p.media.find(m => m.name.includes('CamA_Red')).id;
-      p.clips = [0,1].map(start => ({id:'a'+start, type:'audio', track:-1, mediaId, start, duration:1, in:0}));
-      p.trackMix = {'-1':{gain:50, pan:35}};
-    });
-    const before = await measure();
-    SpliceNested.nestSelection(['a0']);
-    return {before, after:await measure()};
+  await page.evaluate(() => Editor.editProject(p => {
+    const mediaId = p.media.find(m => m.name.includes('CamA_Red')).id;
+    p.clips = [0,1].map(start => ({id:'a'+start, type:'audio', track:-1, mediaId, start, duration:1, in:0}));
+    p.trackMix = {'-1':{gain:50, pan:35}};
+  }));
+  const before = await page.evaluate(stereoWavLevels);
+  await page.evaluate(() => SpliceNested.nestSelection(['a0']));
+  const after = await page.evaluate(stereoWavLevels);
+  console.log('WAV channel RMS before and after nesting:', {before, after});
+  before.forEach((v,i) => assert.ok(v > .005 && Math.abs(after[i]/v - 1) < .03));
+}
+
+async function testFlattenRouting(page, files) {
+  await freshProjectWithMedia(page, [files.red, files.green, files.blue], 'Flatten routing');
+  const {mcId, cameras} = await page.evaluate(() => {
+    const cameras = [...Editor.get().project.media].sort((a,b) => a.name.localeCompare(b.name)).map(m => m.id);
+    const mc = SpliceMulticam.createMulticam({name:'Cameras', angleMediaIds:cameras.slice(0,2), audioMode:'all'});
+    return {mcId:mc.id, cameras};
   });
-  console.log('WAV channel RMS before and after nesting:', mix);
-  mix.before.forEach((v,i) => assert.ok(v > .005 && Math.abs(mix.after[i]/v - 1) < .03));
+  for (const mode of ['mixed','muted','override','embedded mix','embedded override']) {
+    const embedded = mode.startsWith('embedded');
+    const override = mode.endsWith('override');
+    await page.evaluate(({embedded, override, mode, mcId, cameras}) => Editor.editProject(p => {
+      p.trackMix = {
+        [embedded ? -64 : -1]:{gain:45, pan:60, mute:mode === 'muted', solo:true},
+        '-2':{gain:75, pan:-35, solo:true},
+      };
+      p.clips = [
+        {id:'mc', type:embedded ? 'video' : 'audio', mediaId:mcId, track:embedded ? 1 : -1,
+          start:0, duration:1, in:0, ...(override ? {multicamAudioAngle:1} : {})},
+        {id:'other', type:'audio', mediaId:cameras[2], track:-2, start:1, duration:1, in:0},
+      ];
+    }), {embedded, override, mode, mcId, cameras});
+    const before = await page.evaluate(stereoWavLevels);
+    const angles = await page.evaluate(cameras => SpliceMulticam.flattenClips(['mc'])
+      .filter(c => c.type === 'audio').map(c => cameras.indexOf(c.mediaId)), cameras);
+    const after = await page.evaluate(stereoWavLevels);
+    console.log('Flattened stereo WAV:', {mode, angles, before, after});
+    assert.deepEqual(angles, override ? [1] : [0,1], mode);
+    assert.ok(before[1] > .005 && before[3] > .005, 'unrelated clip is audible');
+    assert.ok(mode === 'muted' ? before[0] === 0 : before[0] > .001, mode);
+    before.forEach((v,i) => assert.ok(Math.abs(after[i] - v) < .0001, mode + ' changes stereo output'));
+  }
+  const exhausted = await page.evaluate(mcId => {
+    Editor.editProject(p => {
+      p.clips = [{id:'mc', type:'audio', mediaId:mcId, track:-1, start:0, duration:1, in:0}];
+      p.trackState = {};
+      for (let i = 2; i <= 64; i++) p.trackState['audio:' + -i] = {locked:true};
+    });
+    const before = JSON.stringify(Editor.get().project);
+    let message;
+    try { SpliceMulticam.flattenClips(['mc']); } catch (error) { message = error.message; }
+    return {message, intact:before === JSON.stringify(Editor.get().project)};
+  }, mcId);
+  assert.match(exhausted.message, /free, unlocked audio track/);
+  assert.ok(exhausted.intact, 'a full timeline retains every angle and mixer setting');
+}
+
+async function testNestVisibility(page, files) {
+  await freshProjectWithMedia(page, [files.red, files.green], 'Nest track visibility');
+  await page.evaluate(() => {
+    const media = [...Editor.get().project.media].sort((a,b) => a.name.localeCompare(b.name));
+    Editor.editProject(p => {
+      p.clips = media.map((m,i) => ({id:'v'+i, type:'video', mediaId:m.id, track:i+1,
+        start:i, duration:1, in:0, embeddedAudio:false}));
+    });
+    Editor.setTrackState(1, 'video', {hidden:true});
+  });
+  const before = [await programColor(page,.5), await programColor(page,1.5)];
+  assert.ok(Math.max(...before[0]) < 25);
+  assert.equal(dominantColor(before[1]), 'green');
+  const nest = await page.evaluate(() => SpliceNested.nestSelection(['v0','v1']));
+  await waitForNestedPreview(page, nest.mediaId);
+  const after = [await programColor(page,.5), await programColor(page,1.5)];
+  console.log('Program RGB before and after nesting hidden V1 and visible V2:', {before, after});
+  assert.ok(Math.max(...after[0]) < 25);
+  assert.equal(dominantColor(after[1]), 'green');
+  await capture(page, 'nested-visible-v2.png');
+  const url = await page.evaluate(async () =>
+    (await Editor.exportVideo({codec:'h264'}, undefined, AbortSignal.timeout(60000))).downloadURL);
+  const response = await page.request.get(new URL(url, page.url()).href);
+  assert.ok(response.ok());
+  const file = path.join(path.dirname(files.red), 'visible-v2.mp4');
+  fs.writeFileSync(file, await response.body());
+  const colors = [.5, 1.5].map(t => colorAt(file, t));
+  console.log('Nested H.264 export RGB:', colors);
+  assert.ok(Math.max(...colors[0]) < 25);
+  assert.equal(dominantColor(colors[1]), 'green');
 }
 
 async function main() {
@@ -828,6 +905,8 @@ async function main() {
       await testNestedSequences(page, files);
       await testMulticam(page, files);
       await testAudioParity(page, files);
+      await testFlattenRouting(page, files);
+      await testNestVisibility(page, files);
       await testSubclips(page, files);
       await testBinsAndMetadata(page, files);
       assert.deepEqual(errors, [], '1440x900: zero page errors');

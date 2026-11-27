@@ -166,6 +166,7 @@ window.SpliceNested = (() => {
     };
     // A solo on a track outside the selection can silence the whole selection.
     if (project.trackMix) childProject.trackMix = structuredClone(project.trackMix);
+    if (project.trackState) childProject.trackState = structuredClone(project.trackState);
 
     const hasVideo = selected.some(c => c.type === 'video' || c.type === 'title');
     const hasAudio = sequenceHasAudio(childProject);
@@ -187,11 +188,14 @@ window.SpliceNested = (() => {
     };
 
     const remaining = project.clips.filter(c => !idSet.has(c.id));
-    const prefVideo = hasVideo ? Math.min(...selected.filter(c => c.type !== 'audio').map(c => c.track)) : null;
+    const pictures = selected.filter(c => c.type !== 'audio');
+    const visiblePictures = pictures.filter(c => !editor.isTrackHidden(c.track, c.type));
+    const prefVideo = Math.min(...(visiblePictures.length ? visiblePictures : pictures).map(c => c.track));
     const prefAudio = hasAudio ? Math.max(...selected.filter(c => c.type === 'audio').map(c => c.track), -1) : null;
     const isLocked = (t, k) => editor.isTrackLocked?.(t, k);
 
-    const videoTrack = hasVideo ? freeTrack(remaining, 'video', Math.max(1, prefVideo || 1), minStart, minStart + span, isLocked) : null;
+    const unavailableVideo = t => isLocked(t, 'video') || (visiblePictures.length > 0 && editor.isTrackHidden(t, 'video'));
+    const videoTrack = hasVideo ? freeTrack(remaining, 'video', Math.max(1, prefVideo), minStart, minStart + span, unavailableVideo) : null;
     // The child renders the source tracks' mix. Route that sound through a unity parent track.
     const solo = Object.values(project.trackMix || {}).some(m => m.solo);
     const unavailableAudio = t => {

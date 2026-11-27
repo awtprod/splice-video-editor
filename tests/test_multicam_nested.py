@@ -238,6 +238,25 @@ class MulticamNestedExportTests(unittest.TestCase):
 
     # -- 2. Multicam Export Parity ---------------------------------------------------------------
 
+    def test_multicam_outlasts_selected_angle(self):
+        angles = [dict(mediaId='red', offset=0, duration=2), dict(mediaId='blue', offset=0, duration=8)]
+        multicam = dict(id='mc', type='video', duration=8, multicam=dict(angles=angles, audioMode='follow'))
+        for source_in in (0, 2):
+            with self.subTest(source_in=source_in):
+                project = dict(width=W, height=H, fps=FPS, media=[*self.media, multicam],
+                               clips=[self._vclip('cut', 'mc', 0, 4, src_in=source_in)])
+                movie = self._render(project, f'short-angle-{source_in}')
+                frames = frames_rgb(movie)
+                sound = left_channel(movie)
+                self.assertEqual(len(frames), 4 * FPS)
+                self.assertEqual(len(sound), 4 * 48000)
+                self.assertEqual(dominant_channel(frames[0]), 'red' if source_in == 0 else 'black')
+                if source_in == 0:
+                    self.assertAlmostEqual(tone_level(sound, 375, .1, 1.9), AMPLITUDE, delta=.01)
+                silent_from = 2 if source_in == 0 else 0
+                self.assertEqual({dominant_channel(f) for f in frames[silent_from * FPS:]}, {'black'})
+                self.assertLess(max(abs(s) for s in sound[silent_from * 48000:]), .001)
+
     def test_multicam_follow_vs_camera1_and_parity_with_flattened(self):
         angles = [
             dict(mediaId='red', name='Cam A', offset=0.0, duration=8.0),

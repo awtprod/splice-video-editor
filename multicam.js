@@ -519,15 +519,9 @@ window.SpliceMulticam = (() => {
     return { clipId: nextSelectedId, angleIndex, cut: shouldCut };
   }
 
-  function freeAudioTrack(clips, preferred, from, to, isLocked) {
-    const candidates = [preferred];
-    for (let i = 1; i <= 64; i++) if (-i !== preferred) candidates.push(-i);
-    for (const track of candidates) {
-      if (isLocked && isLocked(track, 'audio')) continue;
-      const busy = clips.some(c => c.type === 'audio' && c.track === track && c.start < to - 1e-6 && c.start + c.duration > from + 1e-6);
-      if (!busy) return track;
-    }
-    return null;
+  function sameTrackMix(a = {}, b = {}) {
+    return (a.gain ?? 100) === (b.gain ?? 100) && (a.pan ?? 0) === (b.pan ?? 0) &&
+      !!a.mute === !!b.mute && !!a.solo === !!b.solo;
   }
 
   function flattenClips(clipIds) {
@@ -552,8 +546,6 @@ window.SpliceMulticam = (() => {
     const fps = project.fps || 25;
     const mediaById = new Map(project.media.map(m => [m.id, m]));
     const targetIds = new Set(targets.map(c => c.id));
-    const remaining = project.clips.filter(c => !targetIds.has(c.id));
-    const isLocked = (t, k) => editor.isTrackLocked?.(t, k);
 
     const makeAngleClip = (base, angle, kind, track, embeddedAudio) => {
       const angMedia = mediaById.get(angle.mediaId);
@@ -585,12 +577,42 @@ window.SpliceMulticam = (() => {
     };
 
     const produced = [];
+    const audioLanes = project.clips.filter(c => c.type === 'audio');
+    const addedMixes = {};
+    const addAngleAudio = (base, angle, sourceTrack, preferred) => {
+      const media = mediaById.get(angle.mediaId);
+      if (!media || (media.type !== 'audio' && (media.still || !media.audioChannels))) return;
+      const sound = makeAngleClip(base, angle, 'audio', preferred);
+      if (!sound) return;
+      const mix = project.trackMix?.[sourceTrack];
+      // A lane with other clips must retain its mix even outside this edit.
+      // A64 also carries embedded multicam voices with no timeline audio clip.
+      const candidates = [preferred, ...Array.from({length:64}, (_, i) => -1-i)];
+      for (const track of candidates) {
+        if (editor.isTrackLocked(track, 'audio')) continue;
+        const lane = audioLanes.filter(c => c.track === track);
+        if (lane.some(c => c !== base && c.start < sound.start + sound.duration - 1e-6 &&
+            c.start + c.duration > sound.start + 1e-6)) continue;
+        const destinationMix = addedMixes[track] ?? project.trackMix?.[track];
+        if (!sameTrackMix(mix, destinationMix)) {
+          if (lane.length || destinationMix || track === -64) continue;
+          addedMixes[track] = structuredClone(mix);
+        }
+        sound.track = track;
+        delete sound.linkGroup;
+        audioLanes.push(sound);
+        produced.push(sound);
+        return;
+      }
+      throw new Error('Flattening needs a free, unlocked audio track that preserves the camera mix.');
+    };
     const linkRemap = new Map();
     for (const clip of targets) {
       const item = mediaById.get(clip.mediaId);
       const mc = item.multicam;
       const angles = mc.angles;
       const audioMode = mc.audioMode || 'camera1';
+      const allAngles = audioMode === 'all' && !Number.isInteger(clip.multicamAudioAngle);
       const vIdx = clamp(Number.isInteger(clip.multicamAngle) ? clip.multicamAngle : 0, 0, angles.length - 1);
       const aIdx = clamp(
         Number.isInteger(clip.multicamAudioAngle)
@@ -601,19 +623,12 @@ window.SpliceMulticam = (() => {
       );
 
       if (clip.type === 'audio') {
-        if (audioMode === 'all') {
-          angles.forEach((ang, idx) => {
-            const angMedia = mediaById.get(ang.mediaId);
-            if (!angMedia || (angMedia.type !== 'audio' && (angMedia.still || !angMedia.audioChannels))) return;
-            const trk = idx === 0 ? clip.track : freeAudioTrack([...remaining, ...produced], clip.track - idx, clip.start, clip.start + clip.duration, isLocked);
-            if (trk === null) return;
-            const ac = makeAngleClip(clip, ang, 'audio', trk);
-            if (ac) { delete ac.linkGroup; produced.push(ac); }
-          });
+        if (allAngles) {
+          for (const angle of angles) addAngleAudio(clip, angle, clip.track, clip.track);
         } else {
           const ac = makeAngleClip(clip, angles[aIdx], 'audio', clip.track);
           if (ac) {
-            if (clip.linkGroup && aIdx === vIdx) {
+            if (clip.linkGroup && aIdx === vIdx && audioMode !== 'all') {
               if (!linkRemap.has(clip.linkGroup)) linkRemap.set(clip.linkGroup, uid());
               ac.linkGroup = linkRemap.get(clip.linkGroup);
             } else delete ac.linkGroup;
@@ -635,22 +650,14 @@ window.SpliceMulticam = (() => {
         produced.push(vc);
       }
       if (hasEmbedded && !sameAudio) {
-        const audioIndices = audioMode === 'all' ? angles.map((_, i) => i) : [aIdx];
-        for (const idx of audioIndices) {
-          const ang = angles[idx];
-          const angMedia = mediaById.get(ang.mediaId);
-          if (!angMedia || (angMedia.type !== 'audio' && (angMedia.still || !angMedia.audioChannels))) continue;
-          const trk = freeAudioTrack([...remaining, ...produced], -1 - idx, clip.start, clip.start + clip.duration, isLocked);
-          if (trk === null) continue;
-          const ac = makeAngleClip(clip, ang, 'audio', trk);
-          if (ac) { delete ac.linkGroup; produced.push(ac); }
-        }
+        for (const angle of (allAngles ? angles : [angles[aIdx]])) addAngleAudio(clip, angle, -64, -1);
       }
     }
 
     if (!produced.length) throw new Error('No angle footage overlapped the selected multicam clip(s).');
 
     editor.editProject(next => {
+      if (Object.keys(addedMixes).length) next.trackMix = {...next.trackMix, ...addedMixes};
       next.clips = next.clips.filter(c => !targetIds.has(c.id));
       next.clips.push(...produced);
     });

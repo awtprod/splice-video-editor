@@ -1848,7 +1848,11 @@ def render_to_file(project, output_path, *, options=None, progress=None, cancell
     # Keys with a leading underscore are internal to the renderer.
     options = {key: value for key, value in (options or {}).items() if isinstance(key, str) and not key.startswith('_')}
     if _nested_depth>4: raise ValueError('Nested sequences exceed four levels')
-    project = _expand_editorial_clips(project)
+    expanded = _expand_editorial_clips(project)
+    if expanded is not project:
+        # Missing angle footage contributes black and silence through the original edit's Out.
+        _minimum_duration = _validate_timeline(project, _minimum_duration)
+        project = expanded
     # Nested material used only by disabled clips is not rendered (it would contribute nothing).
     enabled_media = {clip.get('mediaId') for clip in project.get('clips') or [] if isinstance(clip, dict) and clip_enabled(clip)}
     if not any(isinstance(item,dict) and item.get('nestedProject') for item in project['media']):
