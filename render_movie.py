@@ -807,9 +807,8 @@ def _lut_filter(color, destination, *, preserve_headroom=False):
         if domain_min == [0,0,0] and min(domain_max) >= .5:
             normalize += _linear_gain(tuple(1/maximum for maximum in domain_max))
         else:
-            channels = ':'.join(f"{channel}='clip(({channel}(X,Y)-({low!r}))/({high-low!r}),0,1)'"
-                                for channel, low, high in zip('rgb',domain_min,domain_max))
-            normalize += ',geq='+channels
+            from color_grade import float_lut_domain
+            normalize += float_lut_domain(domain_min, domain_max)
     else:
         working_format = 'gbrapf32le'
         channels = ':'.join(f"{channel}='clip((val-maxval*({low!r}))/({high-low!r}),0,maxval)'"

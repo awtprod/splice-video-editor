@@ -365,10 +365,15 @@ def _mixers(matrix):
     return ','+text(half)+','+text(half)
 
 
+def float_lut_domain(domain_min, domain_max):
+    """Map each float RGB plane to the LUT domain before the lookup clamps its coordinates."""
+    channels = ':'.join(f"{channel}='(p(X,Y)-({low!r}))/({high-low!r})'"
+                        for channel, low, high in zip('rgb', domain_min, domain_max))
+    return f",geq={channels}:a='p(X,Y)':interpolation=nearest"
+
+
 def look_filter(lut, intensity, directory, name):
-    """A creative (or technical) LUT on float RGB, exactly as the monitor applies it: the domain is
-    mapped onto 0..1 by an exact two-entry lut1d, then the 3D lattice (lut3d trilinear) or the full
-    1D curve (lut1d linear), then mixed with the input at the intensity."""
+    """Normalize float RGB to the LUT domain, apply its lattice or curve, then mix with the input."""
     from lut import cube_text, cube1d_text
     if not lut:
         return ''
@@ -380,19 +385,11 @@ def look_filter(lut, intensity, directory, name):
     domain_min = lut.get('domainMin', [0, 0, 0])
     domain_max = lut.get('domainMax', [1, 1, 1])
     custom = domain_min != [0, 0, 0] or domain_max != [1, 1, 1]
-    chain = ''
-    if custom:
-        # Validate through the serializer first (it checks the domain), then write the affine map.
-        (cube1d_text if lut.get('curve') else cube_text)(lut, 100)
-        columns = [[-domain_min[c]/(domain_max[c]-domain_min[c]), (1-domain_min[c])/(domain_max[c]-domain_min[c])] for c in range(3)]
-        _write_1d(directory/f'{name}-domain.cube', columns)
-        chain += f',lut1d=file={_filter_path(directory/f"{name}-domain.cube")}:interp=linear'
-    if lut.get('curve'):
-        (directory/f'{name}.cube').write_text(cube1d_text(lut, 100, normalized_domain=custom))
-        chain += f',lut1d=file={_filter_path(directory/f"{name}.cube")}:interp=linear'
-    else:
-        (directory/f'{name}.cube').write_text(cube_text(lut, 100, normalized_domain=custom))
-        chain += f',lut3d=file={_filter_path(directory/f"{name}.cube")}:interp=trilinear'
+    serialize, lookup, interp = (cube1d_text, 'lut1d', 'linear') if lut.get('curve') else (cube_text, 'lut3d', 'trilinear')
+    path = directory/f'{name}.cube'
+    path.write_text(serialize(lut, 100, normalized_domain=custom))
+    chain = float_lut_domain(domain_min, domain_max) if custom else ''
+    chain += f',{lookup}=file={_filter_path(path)}:interp={interp}'
     if intensity == 100:
         return chain
     # Only the lookup is domain-limited. Its dry signal retains the incoming headroom.

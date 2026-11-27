@@ -50,8 +50,8 @@ function patchSource(file, {matrix = 'bt709', range = 'tv', tags = true, transfe
     '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo', '-t', '4', '-vf', graph, ...codec, '-g', '1', '-c:a', 'aac', '-shortest', file]);
   fs.rmSync(raw);
 }
-function cube3D(size, fn) {
-  const rows = [`LUT_3D_SIZE ${size}`];
+function cube3D(size, fn, header = '') {
+  const rows = [`LUT_3D_SIZE ${size}`+header];
   for (let b = 0; b < size; b++) for (let g = 0; g < size; g++) for (let r = 0; r < size; r++)
     rows.push(fn(r/(size-1), g/(size-1), b/(size-1)).map(v => v.toFixed(6)).join(' '));
   return rows.join('\n')+'\n';
@@ -80,8 +80,10 @@ async function main() {
     await page.locator('#media-input').setInputFiles(Object.values(files));
     await page.waitForFunction(count => Editor.get().project.media.length === count && Editor.get().project.media.every(item => item.src), Object.keys(files).length);
     await page.evaluate(() => SpliceMonitor.setQuality('full'));
+    const extendedDomain = '\nDOMAIN_MIN -1 0.25 0\nDOMAIN_MAX 1 0.75 2';
     const luts = await page.evaluate(texts => Object.fromEntries(Object.entries(texts).map(([name, text]) => [name, SpliceLUT.parseCube(text, name)])), {
       lut33:cube3D(33, warm), lut65:cube3D(65, warm), short1D:cube1D(17, film), long1D:cube1D(4096, film),
+      extended1D:cube1D(2, t => [t,t,t], extendedDomain), extended3D:cube3D(2, (r,g,b) => [r,g,b], extendedDomain),
       domain1D:cube1D(1024, film, '\nDOMAIN_MIN 0 0.05 0\nDOMAIN_MAX 1 0.95 0.9'), input:cube1D(256, logToVideo)});
     // ---- The cases. Each: clips (relative to its second), sample times (relative), tolerance kind.
     const cases = [];
@@ -126,6 +128,8 @@ async function main() {
     one('extended input LUT before desaturation', {saturation:0}, 'headroom');
     for (const [name, lut] of [['1D', luts.short1D], ['3D', luts.lut33]])
       one('extended input with partial '+name+' look', {lut, lutIntensity:50}, 'headroom');
+    for (const lut of ['extended1D', 'extended3D']) for (const intensity of [75, 100])
+      one(`${lut} domain at ${intensity}%`, {lut:luts[lut], lutIntensity:intensity}, 'headroom');
     for (const edit of ['uncut', 'split', 'trimmed']) {
       cases.push({name:edit+' grade ramp', edit, source:'tag709', length:2, times:[.48, 1, 1.48],
         clips:[{track:1, color:{}, keyframes:{exposure:[{time:0,value:-1}, {time:2,value:1}],
