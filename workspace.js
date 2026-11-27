@@ -882,6 +882,7 @@
   $("save-project").onclick = () =>
     busy(() => window.SpliceSession?.save?.("prproj") ?? editor.saveProject("prproj"), "Project saved");
   $("export-video").onclick=()=>SpliceDialogs.exportVideo();
+  $("render-queue").onclick=()=>SpliceDelivery.queuePanel();
   // A large scope docked beside the program monitor, for grading. It takes the media pool's
   // column while open; the inspector's small scope steps aside so only one scope is painted.
   // Below 1100 px wide the dock, the source monitor and a usable program monitor do not fit side
