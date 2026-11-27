@@ -3196,7 +3196,12 @@ class _Window:
 def _encoder_command(spec, fps, profile, size, target, *, light_levels=None, pass_number=None, passlog=None, sink=None):
     pix = spec['pix_fmt']
     command = ['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y', *delivery.hardware_input_args(spec),
-               '-f', 'rawvideo', '-pix_fmt', pix, '-s', f'{size["width"]}x{size["height"]}', '-r', str(fps), '-i', 'pipe:0']
+               '-f', 'rawvideo', '-pix_fmt', pix, '-s', f'{size["width"]}x{size["height"]}', '-r', str(fps)]
+    # Raw frames lose the composite's color tags in the pipe. An unspecified input matrix
+    # can make FFmpeg convert already-correct YUV samples again when tagging the output.
+    if spec['kind'] != 'images':
+        command += ['-color_primaries', profile[0], '-color_trc', profile[1], '-colorspace', profile[2], '-color_range', 'tv']
+    command += ['-i', 'pipe:0']
     if sink == 'measure':
         return command + light_level_filter_args(profile, target)
     hw_filter = delivery.hardware_filter(spec)
