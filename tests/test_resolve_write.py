@@ -1373,10 +1373,11 @@ class EveryFeatureTests(SaveCase):
         carrier.update(transitionDuration=8 * fr, transitionBefore=4 * fr)
         # Reported.
         v[0]['keyframes'] = {k: [{'time': 0, 'value': 1}, {'time': 0.1, 'value': 2}]
-                             for k in ('opacity', 'x', 'y', 'scale', 'rotation')}
+                             for k in ('opacity', 'x', 'y', 'scale', 'rotation', 'exposure')}
         others[1]['keyframes'] = {'volume': [{'time': 0, 'value': 50}]}
         v[1]['color'] = {'brightness': 110, 'contrast': 90, 'saturation': 80, 'exposure': 0.5, 'temperature': 10,
-                         'tint': -5, 'lut': {'size': 2, 'name': 'x.cube'}, 'lutIntensity': 50}
+                         'tint': -5, 'grade': {'gain': [1.1, 1, 0.9, 1]}, 'lut': {'size': 2, 'name': 'x.cube'},
+                         'lutIntensity': 50}
         v[1]['opacity'] = 50
         v[1]['fadeIn'] = 0.2
         others[1]['fadeOut'] = 0.2
@@ -1399,6 +1400,10 @@ class EveryFeatureTests(SaveCase):
         project['trackCounts'] = {'video': project['trackCounts']['video'] + 1,
                                   'audio': project['trackCounts']['audio'] + 1}
         project['media'][0]['name'] = 'Renamed media'
+        project['media'][0]['colorMatrix'] = 'bt709'
+        project['media'][0]['inputLut'] = {'size': 2, 'title': 'LogTo709'}
+        project['media'].append({'id': 'adj-media', 'type': 'video', 'name': 'Adjustment clip', 'src': '',
+                                 'duration': 3600, 'nativeGenerator': 1414680150, 'adjustment': True})
         end = max(c['start'] + c['duration'] for c in project['clips'])
         project['clips'] += [
             {'id': 'title', 'type': 'title', 'track': 1, 'start': end, 'duration': 1.0, 'title': 'Hi',
@@ -1421,9 +1426,12 @@ class EveryFeatureTests(SaveCase):
             self.assertEqual({line['status'] for line in found}, {status}, prefix)
             for place in places:
                 self.assertTrue(any(place in p for line in found for p in line['all']), (prefix, place))
-        has('Keyframes', writer.NOT_WRITTEN, 'opacity', 'x', 'y', 'scale', 'rotation', 'volume')
+        has('Keyframes', writer.NOT_WRITTEN, 'opacity', 'x', 'y', 'scale', 'rotation', 'volume', 'exposure')
         has('Splice color adjustments', writer.NOT_WRITTEN, 'brightness', 'contrast', 'saturation', 'exposure',
-            'temperature', 'tint')
+            'temperature', 'tint', 'grade')
+        has('Adjustment clips')
+        has('Source color matrix overrides')
+        has('Source input LUTs')
         has('Splice LUTs')
         has('Zoom, vertical position and rotation', writer.NOT_WRITTEN, 'y', 'scale', 'rotation')
         has('Opacity changes')

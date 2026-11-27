@@ -663,16 +663,20 @@
   let lastPaint = "", lastScope = -Infinity, monitorState;
   for (const event of ['loadeddata','seeked','canplay','emptied'])
     document.addEventListener(event,()=>{lastPaint="";},true);
+  // A decoded frame's exact planes arrive after the paint that asked for them: paint again.
+  window.SplicePicture?.onReady(()=>{lastPaint="";});
   function paintPreview(now) {
     const canvas = $("preview-canvas"), state = monitorState;
     if (!state) { requestAnimationFrame(paintPreview); return; }
     const video = state.video;
     const frame=Math.floor(state.time*state.project.fps);
     const paintKey = [state.revision, frame, state.selectedId, video?.currentSrc,video?.readyState,
-      state.playing?'rolling':video?.currentTime, video?.seeking,canvas.width,canvas.height].join(':');
+      state.playing?'rolling':video?.currentTime, video?.seeking,canvas.width,canvas.height,JSON.stringify(editor.monitor)].join(':');
     if (paintKey !== lastPaint) {
       editor.drawFrame(canvas);
       lastPaint = paintKey;
+      if (window.SpliceMonitor?.measure(window.SplicePicture?.stats.frameMs||0,state.project.fps||25,state.playing))
+        sizePreviewCanvas(state.project);
     }
     if (now-lastScope >= 100) {
       window.SpliceInspector?.paintScope?.();
@@ -755,8 +759,7 @@
     }
     $('size-label').textContent=state.project.width+' × '+state.project.height;
     const aspect=state.project.width/state.project.height;
-    const canvas=$('preview-canvas'), height=Math.min(2048,Math.max(1,Math.round(960/aspect)));
-    if(canvas.width!==960 || canvas.height!==height){canvas.width=960; canvas.height=height; lastPaint='';}
+    sizePreviewCanvas(state.project);
     // Re-measure only when the frame shape changes; the ResizeObserver covers window resizes.
     // Measuring on every edit forces a synchronous layout of the whole page.
     if(aspect!==lastAspect){lastAspect=aspect;sizeMonitor();}
@@ -797,6 +800,15 @@
       svg(path) + (label ? ` <span>${label.textContent}</span>` : "");
   }
   $("play-toggle").dataset.icon = "play";
+  // The program monitor's processing size follows the monitor quality setting (color-monitor.js).
+  let monitorWidth = 0;
+  function sizePreviewCanvas(project) {
+    const canvas=$('preview-canvas');
+    const display=Math.round(monitorWidth*(window.devicePixelRatio||1));
+    const size=window.SpliceMonitor?.size(project,display) || {width:960,height:Math.min(2048,Math.max(1,Math.round(960*project.height/project.width)))};
+    if(canvas.width!==size.width || canvas.height!==size.height){canvas.width=size.width; canvas.height=size.height; lastPaint='';}
+  }
+  document.addEventListener('splice-monitor-change',()=>{sizePreviewCanvas(editor.get().project);lastPaint='';});
   function sizeMonitor() {
     const area = document.querySelector(".monitor-area");
     const frame = $("monitor-frame");
@@ -805,8 +817,10 @@
       1,
       Math.min(area.clientWidth - 24, (area.clientHeight - 24) * ratio),
     );
+    monitorWidth = width;
     frame.style.width = `${width}px`;
     frame.style.height = `${width / ratio}px`;
+    sizePreviewCanvas(editor.get().project);
   }
   new ResizeObserver(sizeMonitor).observe(
     document.querySelector(".monitor-area"),

@@ -268,6 +268,9 @@ def _event(cut: Cut, clip: dict) -> Event | None:
     if kind != 'title' and source is None:
         report.note(f'{label}: not exported because its source is missing from the project.')
         return None
+    if source is not None and source.adjustment:
+        report.note(f'{label}: adjustment clip: its grade of the tracks beneath is not carried; export that grade as a .cube LUT from the Color section to rebuild it.')
+        return None
     if source is not None and (source.nested or source.generator):
         what = 'a nested sequence' if source.nested else 'a Premiere-native generator'
         report.note(f'{label}: not exported because it is {what}; export that sequence or replace the item.')
@@ -329,6 +332,21 @@ def _event(cut: Cut, clip: dict) -> Event | None:
         any(color.get(k) for k in ('exposure', 'temperature', 'tint', 'lift', 'gamma', 'gain', 'curves'))
     if graded or color.get('lut'):
         report.note(f'{label}: its Splice grade{" and LUT" if color.get("lut") else ""} is not carried; grade from the source media.')
+    grade = color.get('grade') if isinstance(color.get('grade'), dict) else {}
+    tools = [name for name, present in (('colour wheels', any(grade.get(key) for key in ('lift', 'gamma', 'gain', 'offset'))),
+                                        ('curves', bool(grade.get('curves'))), ('hue vs saturation curve', bool(grade.get('hueSat'))),
+                                        ('contrast pivot', 'pivot' in grade)) if present]
+    if tools:
+        report.note(f'{label}: its {", ".join(tools)} are not carried; Export .cube in the Color section takes the whole grade as a LUT.')
+    keyed = [key for key in ('exposure', 'temperature', 'tint', 'brightness', 'contrast', 'saturation') if (clip.get('keyframes') or {}).get(key)]
+    if keyed:
+        report.note(f'{label}: its grade keyframes ({", ".join(keyed)}) are not carried.')
+    if grade.get('bypass'):
+        report.note(f'{label}: its grade is bypassed in Splice; receiving apps get the ungraded clip and none of its grade.')
+    if source is not None and source.input_lut:
+        report.note(f'{label}: the input LUT of its source ({source.input_lut}) is not carried.')
+    if source is not None and source.color_matrix:
+        report.note(f'{label}: the untagged color matrix override of its source ({source.color_matrix}) is not carried.')
     if clip.get('pan') not in (None, 0):
         report.note(f'{label}: clip pan is not carried by timeline interchange.')
     effects = _effects_named(clip.get('audioFx'))

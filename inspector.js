@@ -7,15 +7,16 @@
   const field = (title, key, value, min, max, step = .04, group = '') =>
     `<label class="splice-number"><span>${title}</span><input aria-label="${title}" type="number" data-field="${key}" data-group="${group}" min="${min}" max="${max}" step="${step}" value="${value}"></label>`;
   const section = (title, body) => `<section class="splice-section"><h3>${title}</h3>${body}</section>`;
-  // A 1D LUT longer than the 65-point lattice is applied as that lattice in preview and export alike.
-  const lutNote = lut => {
-    const error = lut?.curve ? window.SpliceLUT.curveError(lut) : 0;
-    return error >= .5 ? `<p class="splice-lut-note" role="note">This 1D LUT has ${lut.curve.size} entries. Preview and export apply it as a ${lut.size}-point table, up to ${error.toFixed(1)} code values (8-bit) away from the file.</p>` : '';
-  };
+  // 1D LUTs are applied at full length in preview and export (lut1d); only a missing file needs a note.
+  const lutNote = lut => lut && !lut.data?.length ? '<p class="splice-lut-note" role="note">This LUT\'s table is missing. Import the .cube file again.</p>' : '';
   const option = (key, title, selected) => `<option value="${escape(key)}" ${key === selected ? 'selected' : ''}>${escape(title)}</option>`;
   let automationProperty = 'opacity';
   let showSafeArea = false;
-  const automation = {opacity:['Opacity',0,100,1],x:['Horizontal',-100,100,1],y:['Vertical',-100,100,1],scale:['Scale',10,400,1],rotation:['Rotation',-180,180,1],volume:['Audio gain',0,200,1]};
+  const automation = {opacity:['Opacity',0,100,1],x:['Horizontal',-100,100,1],y:['Vertical',-100,100,1],scale:['Scale',10,400,1],rotation:['Rotation',-180,180,1],volume:['Audio gain',0,200,1],
+    // Grade keyframes (color-grade.js ANIMATED): the grade at each keyframe is mixed over time.
+    exposure:['Exposure (EV)',-4,4,.1],temperature:['Temperature',-100,100,1],tint:['Tint',-100,100,1],
+    brightness:['Brightness',0,200,1],contrast:['Contrast',0,200,1],saturation:['Saturation',0,200,1]};
+  const gradeKeys = ['exposure','temperature','tint','brightness','contrast','saturation'];
   function atKeyframe(points,time,base) {
     if(!points.length)return base;
     if(time<=points[0].time)return points[0].value;
@@ -26,11 +27,11 @@
     }
     return points.at(-1).value;
   }
-  let previousView;
+  const renderedInspectors = new WeakMap();
   function render(state, element, editor, reuse = false) {
     const clip = state.selected;
     if (!clip) {
-      previousView = null;
+      renderedInspectors.delete(element);
       element.innerHTML = '<div class="inspector-empty">Select a clip to edit its settings.</div>';
       return;
     }
@@ -79,6 +80,7 @@
         lutNote(color.lut) +
         (color.lut ? label('LUT intensity', 'lutIntensity', number(color.lutIntensity, 100), 0, 100, 1, '%', 'color') : '') +
         '<input type="file" class="splice-lut-input" accept=".cube" hidden>' +
+        (window.SpliceColorUI ? window.SpliceColorUI.markup(clip, source) : '') +
         window.SpliceScopes.markup());
       html += section('Incoming transition',
         `<label class="splice-number"><span>Style</span><select aria-label="Transition style" data-field="transition">${clip.transition==='native'?option('native','Imported: '+(clip.transitionMatchName||'Premiere effect'),'native'):''}${option('none','Cut',clip.transition || 'none')}${option('dissolve','Cross dissolve',clip.transition || 'none')}${option('fade','Fade through black',clip.transition || 'none')}${option('wipe','Wipe left to right',clip.transition || 'none')}</select></label>` +
@@ -122,16 +124,23 @@
     }
     if (['video','audio','title'].includes(clip.type)) {
       const available=clip.type==='audio' ? ['volume'] : clip.type==='title' ? ['opacity'] :
-        ['opacity','x','y','scale','rotation',...(clip.embeddedAudio===false?[]:['volume'])];
+        ['opacity','x','y','scale','rotation',...(clip.embeddedAudio===false?[]:['volume']),...gradeKeys];
       if(!available.includes(automationProperty))automationProperty=available[0];
       const spec=automation[automationProperty], local=Math.max(0,Math.min(clip.duration,number(state.time,clip.start)-clip.start));
       const points=(clip.keyframes?.[automationProperty] || []).slice().sort((a,b)=>a.time-b.time);
-      const base=automationProperty==='opacity' ? number(clip.opacity,100) : automationProperty==='volume' ? number(clip.volume,100) : number(transform[automationProperty],automationProperty==='scale'?100:0);
+      const base=automationProperty==='opacity' ? number(clip.opacity,100) : automationProperty==='volume' ? number(clip.volume,100) :
+        gradeKeys.includes(automationProperty) ? number(color[automationProperty],['brightness','contrast','saturation'].includes(automationProperty)?100:0) :
+        number(transform[automationProperty],automationProperty==='scale'?100:0);
       const current=atKeyframe(points,local,base);
+      const keyButtons=points.map(point=>{
+        const outside=point.time < -1e-6 || point.time > clip.duration+1e-6;
+        const when=point.time.toFixed(2);
+        return `<button type="button" data-key-time="${point.time}" ${outside?'disabled':''} title="${outside?'Keyframe outside this trim':'Go to keyframe at '+when+' seconds'}">${when}s · ${point.value}</button>`;
+      }).join('');
       html += section('Keyframes',
         `<label class="splice-number"><span>Property</span><select aria-label="Keyframe property" data-key-property>${available.map(key=>option(key,automation[key][0],automationProperty)).join('')}</select></label>` +
         `<div class="splice-key-edit"><label><span class="splice-key-time">Value at ${local.toFixed(2)} s</span><input aria-label="Keyframe value" type="number" class="splice-key-value" min="${spec[1]}" max="${spec[2]}" step="${spec[3]}" value="${current}"></label><button type="button" data-key-add>Add / update</button></div>` +
-        (points.length ? `<div class="splice-key-list">${points.map(point=>`<button type="button" data-key-time="${point.time}" title="Go to keyframe at ${point.time.toFixed(2)} seconds">${point.time.toFixed(2)}s · ${point.value}</button>`).join('')}</div><button type="button" class="splice-key-delete" data-key-delete>Delete keyframe at playhead</button>` : '<p class="splice-handle">No keyframes. Add one at the playhead to animate this property.</p>'));
+        (points.length ? `<div class="splice-key-list">${keyButtons}</div><button type="button" class="splice-key-delete" data-key-delete>Delete keyframe at playhead</button>` : '<p class="splice-handle">No keyframes. Add one at the playhead to animate this property.</p>'));
     }
     if (clip.type === 'audio' || clip.type === 'video' && clip.embeddedAudio !== false) {
       const track = clip.track;
@@ -153,25 +162,25 @@
       `<p class="splice-compat">${escape(nativeLimits.join(', '))} will not save to Premiere. Save a Splice working copy to keep this edit.</p>`);
     if(clip.transition==='native') html += section('Render compatibility',
       `<p class="splice-compat">This imported Premiere transition (${escape(clip.transitionMatchName||'unknown effect')}) stays in the native project. MP4 export cannot render it yet. Choose a supported transition to export video.</p>`);
-    // The scope canvas survives the re-render: it keeps its picture and the scopes' record of
-    // the frame it shows, so an edit does not repaint (or blank) the scope.
-    // An unrelated timeline edit can leave the selected clip, all displayed values,
-    // and their event bindings intact. Explicit refreshes still reset edited fields.
-    if (reuse && previousView?.root === element.firstElementChild && previousView.clip === clip &&
-        previousView.source === source && previousView.html === html) return;
+    // Edits elsewhere on the timeline often leave this inspector identical.
+    // Preserve its canvases and listeners when their captured inputs still match.
+    const prior = renderedInspectors.get(element);
+    if (reuse && prior?.root === element.firstElementChild && prior.clip === clip &&
+        prior.source === source && prior.locked === locked && prior.html === html && prior.fps === fps) return;
+    // The scope canvas and Audio FX mount survive re-renders when their inputs still match.
     const previousScope = element.querySelector('.splice-scope');
     const previousFx = element.querySelector('.audio-fx-mount');
     element.innerHTML = html;
-    previousView = {root: element.firstElementChild, clip, source, html};
+    renderedInspectors.set(element, {root: element.firstElementChild, clip, source, locked, html, fps});
     const freshScope = element.querySelector('.splice-scope');
     if (previousScope && freshScope) {
       previousScope.style.height = freshScope.style.height;
       freshScope.replaceWith(previousScope);
     }
-    for(const key of ['scale','x','y','rotation','opacity','volume'])
+    for(const key of ['scale','x','y','rotation','opacity','volume',...gradeKeys])
       if(clip.keyframes?.[key]?.length) element.querySelector(`[data-field="${key}"]:not([data-group="trackMix"])`)?.setAttribute('disabled','');
     if(clip.transition==='native') element.querySelector('[data-field="transitionDuration"]')?.setAttribute('disabled','');
-    if(locked) for(const input of element.querySelectorAll('[data-field]:not([data-group="trackMix"]),[data-key-add],[data-key-delete],[data-key-property],.splice-key-value,[data-action="import-lut"],[data-action="remove-lut"]')) input.disabled=true;
+    if(locked) for(const input of element.querySelectorAll('[data-field]:not([data-group="trackMix"]),[data-key-add],[data-key-delete],[data-key-property],.splice-key-value,[data-action="import-lut"],[data-action="remove-lut"],[data-grade-tools] input,[data-grade-tools] select,[data-grade-tools] button:not([data-grade-action="copy"]):not([data-grade-action="cube"]):not([data-curve-tab])')) input.disabled=true;
     document.querySelector('#monitor-frame')?.classList.toggle('show-safe-area', showSafeArea);
     element.querySelector('[data-safe-area]')?.addEventListener('change',event=>{
       showSafeArea=event.target.checked;
@@ -240,7 +249,10 @@
       const time=Math.round(Math.max(0,Math.min(active.duration,editor.get().time-active.start))*fps)/fps;
       const points=(active.keyframes?.[automationProperty]||[]).filter(point=>Math.abs(point.time-time)>=.5/fps);
       points.push({time,value});points.sort((a,b)=>a.time-b.time);
-      editor.updateClip(active.id,{keyframes:{...(active.keyframes||{}),[automationProperty]:points}});
+      const keyframes={...(active.keyframes||{}),[automationProperty]:points};
+      try { window.SpliceGrade.keyTimes({keyframes}); }
+      catch (error) { return window.alert(error.message); }
+      editor.updateClip(active.id,{keyframes});
       render(editor.get(),element,editor);
     });
     element.querySelector('[data-key-delete]')?.addEventListener('click',()=>{
@@ -255,6 +267,7 @@
       editor.seek(clip.start+Number(button.dataset.keyTime));
       render(editor.get(),element,editor);
     });
+    if (clip.type === 'video') window.SpliceColorUI?.bind(element, clip, editor, () => render(editor.get(), element, editor));
     if (clip.type === 'audio' || clip.type === 'video' && clip.embeddedAudio !== false) mountAudioFx(element, clip, editor, locked, previousFx);
     window.SpliceScopes.bind(element);
     // Never forced here: the scopes' own throttle and unchanged-frame check decide (the preview
@@ -274,7 +287,9 @@
     if(input && clip && document.activeElement!==input){
       const local=Math.max(0,Math.min(clip.duration,number(state.time,clip.start)-clip.start));
       const points=(clip.keyframes?.[automationProperty]||[]).slice().sort((a,b)=>a.time-b.time);
-      const base=automationProperty==='opacity'?number(clip.opacity,100):automationProperty==='volume'?number(clip.volume,100):number(clip.transform?.[automationProperty],automationProperty==='scale'?100:0);
+      const base=automationProperty==='opacity'?number(clip.opacity,100):automationProperty==='volume'?number(clip.volume,100):
+        gradeKeys.includes(automationProperty)?number(clip.color?.[automationProperty],['brightness','contrast','saturation'].includes(automationProperty)?100:0):
+        number(clip.transform?.[automationProperty],automationProperty==='scale'?100:0);
       input.value=String(atKeyframe(points,local,base));
       const label=document.querySelector('.splice-key-time');
       if(label)label.textContent=`Value at ${local.toFixed(2)} s`;

@@ -87,6 +87,8 @@ try {
       lut.data = warm; lut.domainMin = [0,0,0]; lut.domainMax = [1,1,1];
     }
     reply.totals = totals;
+  } else if (request.op === 'error') {
+    reply.curveError = LUT.curveError(request.lut);
   } else if (request.op === 'limits') {
     reply.limits = LUT.limits; reply.exportApplies1D = LUT.exportApplies1D;
   } else throw new Error('unknown op');

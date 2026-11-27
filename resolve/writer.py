@@ -67,9 +67,10 @@ CLIP_FIELDS = {
     'premiereIndex': 'meta', 'premiereId': 'meta', 'nativeId': 'meta', 'locked': 'meta', 'selected': 'meta'}
 #: Sub-fields of a clip's ``color``, ``transform`` and ``keyframes`` with their neutral values.
 COLOR_FIELDS = {'brightness': 100, 'contrast': 100, 'saturation': 100, 'exposure': 0, 'temperature': 0, 'tint': 0,
-                'lut': None, 'lutName': None, 'lutIntensity': 100}
+                'lut': None, 'lutName': None, 'lutIntensity': 100, 'grade': None}
 TRANSFORM_FIELDS = {'x': 0, 'y': 0, 'scale': 100, 'rotation': 0}
-KEYFRAME_FIELDS = ('opacity', 'x', 'y', 'scale', 'rotation', 'volume')
+KEYFRAME_FIELDS = ('opacity', 'x', 'y', 'scale', 'rotation', 'volume',
+                   'exposure', 'temperature', 'tint', 'brightness', 'contrast', 'saturation')
 TRACK_STATE_FIELDS = {'locked': 'written', 'hidden': 'written', 'syncLocked': 'reported'}
 TRACK_MIX_FIELDS = {'mute': 'written', 'gain': 'reported', 'pan': 'reported', 'solo': 'reported',
                     'channels': 'reported', 'fx': 'reported', 'keyframes': 'reported', 'route': 'reported', 'stem': 'reported'}
@@ -81,7 +82,8 @@ MEDIA_FIELDS = {
     'nativeUnsupported': 'written', 'nestedSequence': 'reported', 'nestedProject': 'reported', 'audioChannels': 'meta',
     'still': 'meta', 'width': 'meta', 'height': 'meta', 'fps': 'meta', 'size': 'meta', 'codec': 'meta',
     'audioStreams': 'meta', 'timecode': 'meta', 'proxy': 'meta', 'premiereId': 'meta', 'mediaKey': 'meta',
-    'linked': 'meta', 'missing': 'meta', 'local': 'meta', 'file': 'meta', 'audio': 'meta', 'video': 'meta'}
+    'linked': 'meta', 'missing': 'meta', 'local': 'meta', 'file': 'meta', 'audio': 'meta', 'video': 'meta',
+    'adjustment': 'reported', 'colorMatrix': 'reported', 'inputLut': 'reported'}
 _DEFAULTS = {'speed': 1, 'reverse': False, 'opacity': 100, 'fadeIn': 0, 'fadeOut': 0, 'pan': 0, 'title': '',
              'markers': [], 'keyframes': {}, 'color': {}, 'audioStream': 0, 'nativeTimeRemap': None,
              'titleStyle': None, 'text': None, 'embeddedAudio': None}
@@ -971,6 +973,15 @@ class Writer:
             if old is not None and media.get('name') != old.get('name'):
                 report.add(NOT_WRITTEN, 'Media renamed in Splice (Resolve keeps its media-pool names)',
                            f'{old.get("name")} → {media.get("name")}')
+            if media.get('adjustment') and not (old and old.get('adjustment')):
+                report.add(NOT_WRITTEN, 'Adjustment clips (Resolve adjustment clips are not written)',
+                           media.get('name') or 'Adjustment clip')
+            if media.get('colorMatrix') and not _same(media.get('colorMatrix'), old.get('colorMatrix') if old else None):
+                report.add(NOT_WRITTEN, 'Source color matrix overrides (Resolve keeps its clip attributes)',
+                           f'{media.get("name") or "Media"} ({media.get("colorMatrix")})')
+            if media.get('inputLut') and not _same(media.get('inputLut'), old.get('inputLut') if old else None):
+                report.add(NOT_WRITTEN, 'Source input LUTs (Resolve clip LUTs are not written)',
+                           media.get('name') or 'Media')
             # Other media fields are what Splice measured or linked (path, fingerprint, rate, HDR
             # and the like): facts of the file, not edits; the file itself is what is written.
         if not _same(project.get('masterFx') or {}, base.get('masterFx') or {}):

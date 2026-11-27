@@ -123,9 +123,9 @@
     }
     return {low, high, weight};
   }
-  // Until render_movie.py applies `curve` with FFmpeg's lut1d filter, the export applies the
-  // 3D lattice, so the preview does too and the two agree. Turn this on in that same change.
-  const EXPORT_APPLIES_1D = false;
+  // The export applies a 1D file's full `curve` with FFmpeg's lut1d (color_grade.look_filter, the
+  // domain mapped onto 0..1 first), so the preview does too. (HDR masters still use the lattice.)
+  const EXPORT_APPLIES_1D = true;
   function applyImageData(imageData,lut,intensity=100,options={}) {
     validateShape(lut);
     if (lut.curve && (EXPORT_APPLIES_1D || options.exact1D)) return applyCurve(imageData,lut,intensity);

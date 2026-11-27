@@ -360,7 +360,7 @@ def _run_ffmpeg(command, cancelled=None, heartbeat=None):
 def _probe(path):
     from media_proxy import MAX_AUDIO_STREAMS
     result = subprocess.run(['ffprobe', '-v', 'error', '-protocol_whitelist', 'file', '-show_entries',
-                            'stream=codec_type,channels,sample_rate,width,height,color_primaries,color_transfer,color_space,time_base'
+                            'stream=codec_type,channels,sample_rate,width,height,color_primaries,color_transfer,color_space,color_range,time_base'
                             ':format=duration,start_time,format_name', '-of', 'json', str(path)],
                             capture_output=True, text=True, timeout=30, check=True)
     data = json.loads(result.stdout)
@@ -394,6 +394,7 @@ def _probe(path):
     return {'kinds': {stream.get('codec_type') for stream in streams}, 'duration': duration, 'audio': audio,
             'width': int(video.get('width') or 0), 'height': int(video.get('height') or 0),
             'profile': tuple(video.get(key) for key in ('color_primaries', 'color_transfer', 'color_space')),
+            'range': 'pc' if video.get('color_range') in ('pc', 'jpeg') else 'tv',
             'start': start, 'time_base': time_base, 'rates': rates,
             'format': str(data.get('format', {}).get('format_name') or '')}
 
@@ -504,7 +505,22 @@ def _brightness_contrast(brightness, contrast, pivot=.5):
     return _linear_gain((slope,)*3)+f',exposure=exposure={-math.log2(1-offset):.12f}:black={-offset:.12f}'
 
 
+PRIMARY_COLOR_KEYS = ('brightness', 'contrast', 'saturation', 'exposure', 'temperature', 'tint')
+ALLOWED_SOURCE_RANGES = ('tv', 'pc')
+
+
+def _hdr_static_color(clip):
+    color = clip.get('color') or {}
+    if not isinstance(color, dict) or (color.get('grade') or {}).get('bypass'):
+        return {}
+    keyframes = clip.get('keyframes') or {}
+    return {key: value for key, value in color.items()
+            if key not in PRIMARY_COLOR_KEYS or not keyframes.get(key)}
+
+
 def _hdr_grade(color, lut, high_depth, profile, target=None, depth=10):
+    if isinstance(color, dict) and (color.get('grade') or {}).get('bypass'):
+        color, lut = {}, ''
     yuv = f'format=yuv444p{max(10,depth)}le'
     tone_map = HDR_TONE_MAP + ',' + yuv
     brightness,contrast,saturation,gains=_grade_values(color)
@@ -569,16 +585,26 @@ def _hdr_still_filter(profile, depth):
 
 
 def _fit_picture(width, height, color, lut, alpha_format, depth, profile=None, rec709=False,
-                 *, still_frames=0, hdr_profile=None, conform_pq=False):
+                 *, still_frames=0, hdr_profile=None, conform_pq=False, high_depth=None,
+                 graded=None, animate_still=False):
+    """``graded``: the table-based grade (color_grade) for this clip, which replaces the CSS-style
+    filters and the LUT."""
     wide_yuv = f'format=yuv444p{max(10,depth)}le'
+    if high_depth is None:
+        high_depth = depth > 8
     if profile and profile[1] in HDR_TRANSFERS:
-        keep_hdr = depth > 8 and not rec709 and (depth <= 10 or hdr_profile is not None)
+        keep_hdr = bool(high_depth) and not rec709 and (depth <= 10 or hdr_profile is not None)
         grade = _hdr_grade(color,lut,keep_hdr,profile,PQ if conform_pq else None,depth)
+        if graded:
+            grade += graded
+    elif graded is not None:
+        grade = graded
     else:
         convert = (',zscale=p=bt709:t=bt709:m=bt709:r=limited,'+wide_yuv
                    if rec709 and profile and profile!=REC709
                    and all(value not in (None,'unknown','unspecified') for value in profile) else '')
-        grade = convert+_css_color_filter(color,depth,bool(still_frames))+lut
+        primary = '' if (color.get('grade') or {}).get('bypass') else _css_color_filter(color,depth,bool(still_frames))
+        grade = convert+primary+lut
         if still_frames and hdr_profile:
             grade += _hdr_still_filter(hdr_profile,depth)
         elif conform_pq and profile:
@@ -587,9 +613,162 @@ def _fit_picture(width, height, color, lut, alpha_format, depth, profile=None, r
             grade += (f',zscale=pin={primaries}:tin={transfer}:min={matrix}:p=bt2020:t=linear,format=gbrpf32le,'
                       'zscale=t=smpte2084:m=bt2020nc:r=limited:npl=203,'+wide_yuv)
     repeat = f',loop=loop={still_frames-1}:size=1:start=0,setpts=N' if still_frames>1 else ''
+    if animate_still:
+        # The grade and its alpha branch need a frame at each sequence timestamp.
+        grade = repeat + grade
+        repeat = ''
     return (f'scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2'
             f'{grade},format={alpha_format},'
             f'pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black@0{repeat}')
+
+
+def _grade_clock(clip, fps, zero, frames, reverse):
+    """Clip-local keyframe time of the frame a grade sees, as an expression of the filter time T.
+    zero is the clip start relative to the first displayed frame, which can fall between keys.
+    The grade runs before a reversed clip is flipped, so its frame k is shown at frames-1-k."""
+    rate = float(fps)
+    constant = _frames(float(clip.get('_keyframeShift', 0) or 0), rate) - _frames(zero, rate)
+    index = f'({frames-1}-round(T*{rate!r}))' if reverse else f'round(T*{rate!r})'
+    return f'(({index}+({constant!r}))/{rate!r})'
+
+
+def _picture_grade(clip, item, directory, name, profile, *, fps, zero, frames, reverse, hdr_master):
+    """The table-based grade of a picture clip (see color_grade), or None when the clip has no
+    color work and its picture passes through untouched."""
+    from color_grade import (SETPARAMS_MATRIX, WORKING_FORMAT, ZSCALE_MATRIX, grade_active, grade_filter,
+                             key_times, output_matrix, source_matrix, validate_grade)
+    color = clip.get('color') or {}
+    if not isinstance(color, dict):
+        raise ValueError('Invalid clip color')
+    grade = validate_grade(color.get('grade'))
+    input_lut = item.get('inputLut')
+    if input_lut is not None:
+        _validate_project_lut(input_lut, 'input LUT')
+    if color.get('lut') is not None:
+        _validate_project_lut(color['lut'], 'LUT')
+    source_profile = item.get('_sourceProfile')
+    hdr_source = bool(source_profile and source_profile[1] in HDR_TRANSFERS)
+    bypass = bool(grade and grade.get('bypass'))
+    times = key_times(clip)
+    if hdr_source:
+        # HDR sources keep static primary grading in linear light; animated primaries, wheels,
+        # curves, input LUTs and look LUTs run after the tone map, in the same SDR working space
+        # as the monitor. Bypass suppresses all grade controls while preserving tone mapping.
+        if hdr_master:
+            if input_lut or (not bypass and (grade_active(grade) or times)):
+                raise ValueError('Wheels, curves, input LUTs and grade keyframes are graded in Rec. 709 SDR. Export this timeline as Rec. 709.')
+            return None
+        if bypass:
+            if not input_lut:
+                return None
+            sdr_clip = {**clip, 'color': {'grade': {'bypass': True}}, 'keyframes': {}}
+        else:
+            if not grade_active(grade) and not times and not input_lut:
+                return None
+            # Strip static primary keys (applied in _hdr_grade); keep keyframes so animated
+            # primaries evaluate cleanly after the tone map, matching the monitor.
+            sdr = {key: value for key, value in color.items() if key not in PRIMARY_COLOR_KEYS}
+            sdr_clip = {**clip, 'color': sdr}
+        chain = grade_filter(sdr_clip, directory, name, input_lut=input_lut,
+                             clock=_grade_clock(clip, fps, zero, frames, reverse))
+        return (f',setparams=colorspace=bt709:range=tv,zscale,format={WORKING_FORMAT}{chain},'
+                f'zscale=m={ZSCALE_MATRIX[output_matrix(profile)]}:r=limited')
+    if not _has_color_work(clip, item) and not item.get('colorMatrix'):
+        return None
+    if hdr_master:
+        if bypass and not input_lut and not item.get('colorMatrix'):
+            return None
+        raise ValueError('Color grading of SDR clips in an HDR master is not supported. Export this timeline as Rec. 709.')
+    still = bool(item.get('_renderStill'))
+    # zscale converts exactly; swscale's 8-bit to float conversion reads white as 254.02/255.
+    chain = grade_filter(clip, directory, name, input_lut=input_lut, clock=_grade_clock(clip, fps, zero, frames, reverse))
+    out = f',zscale=m={ZSCALE_MATRIX[output_matrix(profile)]}:r=limited'
+    if not still:
+        source_range = item.get('_sourceRange', 'tv')
+        if source_range not in ALLOWED_SOURCE_RANGES:
+            raise ValueError('Invalid source color range')
+        matrix = SETPARAMS_MATRIX[source_matrix(source_profile, item.get('colorMatrix'))]
+        return f',setparams=colorspace={matrix}:range={source_range},zscale,format={WORKING_FORMAT}{chain}{out}'
+    # A still keeps its alpha: graded colour and the original alpha are merged after the grade.
+    label = '_still_'+name.replace('-', '_')
+    return (f',format=gbrap16le,split[{label}_c][{label}_a];[{label}_a]alphaextract[{label}_alpha];'
+            f'[{label}_c]zscale=rin=full:r=full,format={WORKING_FORMAT}{chain}{out},format=yuva444p16le[{label}_g];'
+            f'[{label}_g][{label}_alpha]alphamerge')
+
+
+def _adjustment_layer(filters, active, number, clip, item, directory, profile, fps, alpha_format, full_alpha, overlay,
+                      *, hdr_master, base_format=None):
+    """An adjustment clip grades the composite beneath it for its duration, mixed in by its
+    opacity (and opacity keyframes), as the monitor's adjust pass does. Returns the new label."""
+    from color_grade import SETPARAMS_MATRIX, WORKING_FORMAT, ZSCALE_MATRIX, grade_filter, output_matrix
+    input_lut = item.get('inputLut') if isinstance(item, dict) else None
+    if input_lut is not None:
+        _validate_project_lut(input_lut, 'input LUT')
+    color = clip.get('color') or {}
+    if isinstance(color, dict) and color.get('lut') is not None:
+        _validate_project_lut(color['lut'], 'LUT')
+    if not _has_color_work(clip, item):
+        return active
+    if isinstance(color, dict) and (color.get('grade') or {}).get('bypass') and not input_lut:
+        return active
+    if hdr_master:
+        raise ValueError('Adjustment clips are graded in Rec. 709 SDR. Export this timeline as Rec. 709.')
+    matrix = output_matrix(profile)
+    start = float(clip['start'])
+    end = start+float(clip['duration'])
+    chain = grade_filter(clip, directory, f'adjust-{number}', input_lut=input_lut, clock=_grade_clock(clip, fps, start, 1, False))
+    if not chain:
+        return active
+    opacity = _number(clip.get('opacity', 100), 'opacity', 0, 100)/100
+    opacity_keys = (clip.get('keyframes') or {}).get('opacity')
+    mask = ''
+    if opacity_keys:
+        mask = _mask_alpha(f"({_keyframe_expr(clip,'opacity',opacity*100,0,100,_keyframe_clock(clip,fps,'T',start))})/100", alpha_format, full_alpha)
+    elif opacity != 1:
+        mask = _mask_alpha(f'{opacity:.6f}', alpha_format, full_alpha)
+    filters.append(f'[{active}]split[adjust{number}_under][adjust{number}_in]')
+    filters.append(f'[adjust{number}_in]setparams=colorspace={SETPARAMS_MATRIX[matrix]}:range=tv,zscale,format={WORKING_FORMAT}{chain},'
+                   f'zscale=m={ZSCALE_MATRIX[matrix]}:r=limited,format={alpha_format}{mask}[adjust{number}_graded]')
+    # The frames from the clip's first to its last, with 1 us of slack as the wipe mask uses.
+    enable = f'gte(t,{start-1e-6:.9f})*lt(t,{end-1e-6:.9f})'
+    if overlay and not (base_format and base_format.startswith('yuva')):
+        filters.append(f"[adjust{number}_under][adjust{number}_graded]overlay=x=0:y=0:{overlay}:enable='{enable}'[base{number+1}]")
+    else:
+        target_format = base_format or alpha_format
+        filters.append(f'[adjust{number}_graded]split[adjust{number}_fg][adjust{number}_a]')
+        filters.append(f'[adjust{number}_a]extractplanes=a,mergeplanes=0:format={target_format}[adjust{number}_mask]')
+        filters.append(f'[adjust{number}_fg]format={target_format}[adjust{number}_color]')
+        filters.append(f"[adjust{number}_under][adjust{number}_color][adjust{number}_mask]maskedmerge=planes=7:enable='{enable}'[base{number+1}]")
+    return f'base{number+1}'
+
+
+def _grade_key_times(clip):
+    from color_grade import key_times
+    return key_times(clip)
+
+
+def _has_color_work(clip, item):
+    """Whether a clip's picture is graded at all (else it passes through untouched)."""
+    from color_grade import grade_active, key_times, validate_grade
+    color = clip.get('color') or {}
+    if not isinstance(color, dict):
+        raise ValueError('Invalid clip color')
+    grade = validate_grade(color.get('grade'))
+    legacy = any(color.get(key) not in (None, default) for key, default in
+                 (('brightness',100),('contrast',100),('saturation',100),('exposure',0),('temperature',0),('tint',0)))
+    look = color.get('lut') and color.get('lutIntensity', 100) not in (0, None)
+    return bool(legacy or look or grade_active(grade) or key_times(clip) or (grade and grade.get('bypass'))
+                or (item and item.get('inputLut')))
+
+
+def _validate_project_lut(lut, label):
+    from lut import cube_text, cube1d_text
+    if not isinstance(lut, dict):
+        raise ValueError(f'Invalid {label}')
+    cube_text(lut, 100)
+    if lut.get('curve') is not None:
+        cube1d_text(lut, 100)
+
 
 
 def _picture_input(index, source, length, speed, width, height, fps, reverse, still_frames, *, frames=None, origin=0.0):
@@ -633,9 +812,18 @@ def _lut_filter(color, destination, *, preserve_headroom=False):
     domain_min = lut.get('domainMin', [0,0,0]) if isinstance(lut, dict) else [0,0,0]
     domain_max = lut.get('domainMax', [1,1,1]) if isinstance(lut, dict) else [1,1,1]
     custom_domain = domain_min != [0,0,0] or domain_max != [1,1,1]
+    if not preserve_headroom and isinstance(lut, dict) and lut.get('curve'):
+        # A 1D file's full curve, and any domain, exactly as the monitor applies them (float RGB).
+        from color_grade import look_filter
+        return (',zscale,format=gbrapf32le'+look_filter(lut, intensity, destination.parent, destination.stem))
     mix_after_lookup = custom_domain or preserve_headroom
-    destination.write_text(cube_text(lut,100 if mix_after_lookup else intensity,normalized_domain=custom_domain))
-    apply_lut = f'lut3d=file={_filter_path(destination)}:interp=trilinear'
+    if lut.get('curve'):
+        from lut import cube1d_text
+        destination.write_text(cube1d_text(lut, 100 if mix_after_lookup else intensity, normalized_domain=custom_domain))
+        apply_lut = f'lut1d=file={_filter_path(destination)}:interp=linear'
+    else:
+        destination.write_text(cube_text(lut,100 if mix_after_lookup else intensity,normalized_domain=custom_domain))
+        apply_lut = f'lut3d=file={_filter_path(destination)}:interp=trilinear'
     if not mix_after_lookup:
         return ','+apply_lut
     # Apply the input offset and scale explicitly. FFmpeg's .cube reader
@@ -648,9 +836,8 @@ def _lut_filter(color, destination, *, preserve_headroom=False):
         if domain_min == [0,0,0] and min(domain_max) >= .5:
             normalize += _linear_gain(tuple(1/maximum for maximum in domain_max))
         else:
-            channels = ':'.join(f"{channel}='clip(({channel}(X,Y)-({low!r}))/({high-low!r}),0,1)'"
-                                for channel, low, high in zip('rgb',domain_min,domain_max))
-            normalize += ',geq='+channels
+            from color_grade import float_lut_domain
+            normalize += float_lut_domain(domain_min, domain_max)
     else:
         working_format = 'gbrapf32le'
         channels = ':'.join(f"{channel}='clip((val-maxval*({low!r}))/({high-low!r}),0,maxval)'"
@@ -817,15 +1004,18 @@ def _keyframe_expr(clip, key, base, low, high, clock):
 
 def _slice_keyframes(keyframes, offset, length):
     if not keyframes: return keyframes
-    if not isinstance(keyframes,dict) or len(keyframes)>6: raise ValueError('Invalid keyframes')
+    if not isinstance(keyframes,dict) or len(keyframes)>12: raise ValueError('Invalid keyframes')
     result={}
     for key,points in keyframes.items():
-        bounds={'opacity':(0,100),'x':(-100,100),'y':(-100,100),'scale':(10,400),'rotation':(-180,180),'volume':(0,200)}
+        bounds={'opacity':(0,100),'x':(-100,100),'y':(-100,100),'scale':(10,400),'rotation':(-180,180),'volume':(0,200),
+                # Grade keyframes (color_grade.ANIMATED).
+                'exposure':(-4,4),'temperature':(-100,100),'tint':(-100,100),'brightness':(0,200),'contrast':(0,200),'saturation':(0,200)}
         if key not in bounds or not isinstance(points,list): raise ValueError('Invalid keyframes')
         if len(points)>MAX_KEYFRAMES: raise ValueError(f'A clip has more than {MAX_KEYFRAMES} {key} keyframes, the export limit')
         if not points: continue
         if any(not isinstance(point,dict) for point in points): raise ValueError('Invalid keyframes')
-        ordered=sorted(({'time':_number(point.get('time'),'keyframe time',0,MAX_SOURCE_SECONDS),
+        earliest = -MAX_SOURCE_SECONDS if key in PRIMARY_COLOR_KEYS else 0
+        ordered=sorted(({'time':_number(point.get('time'),'keyframe time',earliest,MAX_SOURCE_SECONDS),
                          'value':_number(point.get('value'),'keyframe value',*bounds[key])} for point in points),key=lambda point:point['time'])
         if any(right['time']<=left['time'] for left,right in zip(ordered,ordered[1:])): raise ValueError('Duplicate keyframes')
         def value_at(at):
@@ -999,7 +1189,7 @@ def _media_info(item, probes, heartbeat=None):
         raise ValueError('Nested Premiere sequences are not yet supported for export')
     if generator is not None:
         _number(item.get('duration'),'generator duration',0,MAX_SOURCE_SECONDS)
-        item.update(_kinds={'video'}, _actualDuration=float(MAX_SOURCE_SECONDS), _audioStreams=[])
+        item.update(_kinds={'video'}, _actualDuration=float(MAX_SOURCE_SECONDS), _audioStreams=[], _sourceRange='tv')
         return item
     path = _render_source(item)
     item['_path'] = path
@@ -1010,8 +1200,10 @@ def _media_info(item, probes, heartbeat=None):
     if probe is None:
         probe = probes[path] = _probe(path)
         if heartbeat: heartbeat()
+    probed_range = probe.get('range', 'tv')
     item.update(_kinds=probe['kinds'], _actualDuration=probe['duration'], _audioStreams=probe['audio'], _audioRates=probe['rates'],
                 _sourceProfile=probe['profile'], _startTime=probe['start'], _videoTimeBase=probe['time_base'],
+                _sourceRange=probed_range if probed_range in ALLOWED_SOURCE_RANGES else 'tv',
                 _seekMargin=SEEK_MARGIN_STREAM_SECONDS if set(probe['format'].split(',')) & STREAM_FORMATS else SEEK_MARGIN_SECONDS)
     return item
 
@@ -1087,9 +1279,7 @@ def _sample_origin(render_start, render_length, first, frames, fps, reverse):
 
 
 def _alpha_bytes_per_pixel(spec):
-    if spec['chroma'] == '444':
-        return 8 if spec['high_depth'] else 4
-    return 6 if spec['high_depth'] else 3 if spec['chroma'] == '422' else 2.5
+    return 8 if spec['chroma'] == '444' else 6
 
 
 def _composite_layer(filters, base, layer, output, position, overlay, first, frames, window_frames, base_format):
@@ -1144,20 +1334,16 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
     high_depth = spec['high_depth']
     rec709 = options.get('colorSpace')=='rec709'
     conform_pq = options.get('colorSpace')=='pq'
+    # Composite at mastering precision (at least 10-bit 4:2:2); quantize and subsample once on delivery.
     # Composite in 4:4:4 for 4:4:4 and RGB deliveries, with an alpha base when alpha is delivered.
-    # High-depth paths work in at least 4:2:2 even when the final encoder uses 4:2:0.
-    chroma = spec['chroma']
-    if high_depth and chroma == '420':
-        chroma = '422'
+    chroma = '444' if spec['chroma'] == '444' else '422'
     wide = spec['depth'] > 10
-    depth = 16 if wide else 10 if high_depth else 8
-    depth_suffix = f'p{depth}le' if high_depth else 'p'
+    depth = 16 if wide else 10
+    depth_suffix = f'p{depth}le'
     alpha_format = f'yuva{chroma}{depth_suffix}'
     base_format = alpha_format if spec['alpha'] else f'yuv{chroma}{depth_suffix}'
     full_alpha = 'yuva444' + depth_suffix
-    dip_rgb = 'gbra' + depth_suffix
-    overlay_format = f'yuv{chroma}p10' if high_depth else f'yuv{chroma}'
-    overlay = None if wide else 'eof_action=pass:shortest=0:format=' + overlay_format
+    overlay = None if wide else f'eof_action=pass:shortest=0:format=yuv{chroma}p10'
     window_frames = math.ceil(duration*fps-1e-6)
     if not isinstance(render_options, dict) or not isinstance(render_options.get('mutedTracks', {}), dict):
         raise ValueError('Invalid render options')
@@ -1265,6 +1451,10 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
             active = _draw_title(filters,active,number,clip,height,fps,directory,hdr_profile)
             continue
         item = media_by_id[clip['mediaId']]
+        if item.get('adjustment') and item.get('nativeGenerator')==1414680150:
+            active = _adjustment_layer(filters, active, number, clip, item, directory, profile, fps, alpha_format, full_alpha,
+                                       overlay, hdr_master=bool(hdr_profile) or conform_pq, base_format=base_format)
+            continue
         if item.get('nativeGenerator')==1414680150: continue
         plan = plans[number]
         start, length, speed, before = plan['start'], plan['length'], plan['speed'], plan['before']
@@ -1274,11 +1464,18 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
         index, render_source = source_input(item['id'], ('main', number), plan['render_source'])
         color = clip.get('color') or {}
         transform,position=_transform(clip,width,height,before,fps,place_on_canvas=wide)
-        lut_filter=_lut_filter(color,Path(directory)/f'clip-{number}.cube',preserve_headroom=bool(
-            hdr_profile and (item.get('_sourceProfile') or REC709)[1] in HDR_TRANSFERS))
         opacity=_number(clip.get('opacity',100),'opacity',0,100)/100
         opacity_keys=(clip.get('keyframes') or {}).get('opacity')
         first_frame, frames = _frame_span(render_start, render_length, fps)
+        graded = None if item.get('_disabled') else _picture_grade(
+            clip, item, directory, f'clip-{number}', profile, fps=fps, zero=start-first_frame/fps, frames=frames,
+            reverse=reverse and not item.get('_renderStill'),
+            hdr_master=bool(hdr_profile) or conform_pq)
+        hdr_source = (item.get('_sourceProfile') or REC709)[1] in HDR_TRANSFERS
+        clip_bypass = bool(isinstance(color, dict) and (color.get('grade') or {}).get('bypass'))
+        fit_color = _hdr_static_color(clip) if hdr_source else color
+        lut_filter = '' if (graded is not None or clip_bypass) else _lut_filter(
+            color, Path(directory)/f'clip-{number}.cube', preserve_headroom=bool(hdr_profile and hdr_source))
         still_frames = frames if item.get('_renderStill') else 0
         origin = _sample_origin(render_start, render_length, first_frame, frames, fps, reverse)
         disabled = bool(item.get('_disabled'))
@@ -1291,8 +1488,10 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
         else:
             prefix = _picture_input(index,render_source,render_length,speed,width,height,fps,reverse,still_frames,
                                     frames=frames,origin=origin)
-            fit = _fit_picture(width,height,color,lut_filter,alpha_format,depth,item.get('_sourceProfile'),rec709,
-                               still_frames=still_frames,hdr_profile=hdr_profile,conform_pq=conform_pq)
+            fit = _fit_picture(width,height,fit_color,lut_filter,alpha_format,depth,item.get('_sourceProfile'),rec709,
+                               still_frames=still_frames,hdr_profile=hdr_profile,conform_pq=conform_pq,
+                               high_depth=high_depth, graded=graded,
+                               animate_still=still_frames>1 and not clip_bypass and len(_grade_key_times(clip))>1)
             # Reverse after scaling so the buffered window holds sequence-size frames.
             flip = ',reverse' if reverse and not still_frames and index is not None else ''
             chain = f'{prefix},{fit}{flip}{transform}'
@@ -1313,21 +1512,22 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
             # a wipe to a disabled clip, which wipes this clip off).
             filters.append(f'[{active}]split[with{number}][without{next_number}]')
             active = f'with{number}'
-        dipped = False
-        if disabled:
-            pass
-        elif dip_head>0:
-            chain += f',format={dip_rgb},fade=t=in:st=0:d={dip_head:.6f}'
-            dipped = True
-        if following and following.get('transition') == 'fade' and not disabled:
-            dip_tail = float(following.get('transitionBefore',0) or 0)
-            if dip_tail>0:
-                chain += f',format={dip_rgb},fade=t=out:st={max(0,render_length-dip_tail):.6f}:d={dip_tail:.6f}'
-                dipped = True
-        if clip.get('_dipFormat') and not dipped and not disabled:
-            # The rest of a clip that dips elsewhere: take the same RGB round
-            # trip so its pixels match the window that holds the dip.
-            chain += f',format={dip_rgb}'
+        # Fade legal-range YUV toward black, preserving alpha. Use the sequence
+        # timestamp directly so fractional cuts do not round to a whole frame.
+        clock = f'(T+({first_frame/float(fps)-render_start:.12f}))'
+        gains = []
+        if dip_head > 0:
+            gains.append(f'clip({clock}/{dip_head:.9f},0,1)')
+        if following and following.get('transition') == 'fade':
+            tail = float(following.get('transitionBefore', 0) or 0)
+            if tail > 0:
+                gains.append(f'clip(({render_length:.9f}-{clock})/{tail:.9f},0,1)')
+        if gains and not disabled:
+            gain = '*'.join(gains)
+            scale = 1 << (depth - 8)
+            black_y, mid_c = 16 * scale, 128 * scale
+            chain += (f",geq=lum='{black_y}+(p(X,Y)-{black_y})*{gain}':cb='{mid_c}+(p(X,Y)-{mid_c})*{gain}':"
+                      f"cr='{mid_c}+(p(X,Y)-{mid_c})*{gain}':a='alpha(X,Y)'")
         overlap_transition = previous is not None and clip.get('transition') in ('dissolve','wipe')
         if overlap_transition:
             prior_item = media_by_id[previous['mediaId']]
@@ -1349,19 +1549,30 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
                     else: prior_tail['transform'][key]=terminal
             prior_transform,prior_position=_transform(prior_tail,width,height,fps=fps,place_on_canvas=wide)
             prior_color=previous.get('color') or {}
-            prior_lut=_lut_filter(prior_color,Path(directory)/f'tail-{number}.cube',preserve_headroom=bool(
-                hdr_profile and (prior_item.get('_sourceProfile') or REC709)[1] in HDR_TRANSFERS))
+            prior_tail['keyframes'] = {key: points for key, points in (previous.get('keyframes') or {}).items()
+                                       if key in PRIMARY_COLOR_KEYS}
+            cut_frame, tail_frames = _frame_span(start, tail, fps)
+            still_tail = tail_frames if prior_item.get('_renderStill') else 0
+            prior_graded=None if prior_item.get('_disabled') else _picture_grade(
+                prior_tail, prior_item, directory, f'tail-{number}', profile, fps=fps,
+                zero=float(previous['start'])-cut_frame/fps, frames=tail_frames,
+                reverse=prior_reverse and not prior_item.get('_renderStill'),
+                hdr_master=bool(hdr_profile) or conform_pq)
+            prior_hdr=(prior_item.get('_sourceProfile') or REC709)[1] in HDR_TRANSFERS
+            prior_bypass = bool(isinstance(prior_color, dict) and (prior_color.get('grade') or {}).get('bypass'))
+            prior_fit_color = _hdr_static_color(prior_tail) if prior_hdr else prior_color
+            prior_lut = '' if (prior_graded is not None or prior_bypass) else _lut_filter(
+                prior_color, Path(directory)/f'tail-{number}.cube', preserve_headroom=bool(hdr_profile and prior_hdr))
             prior_opacity=_number(prior_tail.get('opacity',100),'opacity',0,100)/100
             # A disabled outgoing clip has no tail: the incoming clip dissolves or wipes in over what lies beneath.
             if tail + 1e-6 >= frame_duration and not prior_item.get('_disabled'):
-                cut_frame, tail_frames = _frame_span(start, tail, fps)
-                still_tail = tail_frames if prior_item.get('_renderStill') else 0
                 tail_origin = _sample_origin(start, tail, cut_frame, tail_frames, fps, prior_reverse)
                 prior_prefix = _picture_input(prior_index,prior_source,tail,prior_speed,width,height,fps,prior_reverse,
                                               still_tail,frames=tail_frames,origin=tail_origin)
-                prior_fit = _fit_picture(width,height,prior_color,prior_lut,alpha_format,depth,
+                prior_fit = _fit_picture(width,height,prior_fit_color,prior_lut,alpha_format,depth,
                                          prior_item.get('_sourceProfile'),rec709,still_frames=still_tail,
-                                         hdr_profile=hdr_profile,conform_pq=conform_pq)
+                                         hdr_profile=hdr_profile,conform_pq=conform_pq,high_depth=high_depth,
+                                         graded=prior_graded, animate_still=still_tail>1 and not prior_bypass and len(_grade_key_times(prior_tail))>1)
                 prior_flip = ',reverse' if prior_reverse and not still_tail and prior_index is not None else ''
                 prior_alpha = _mask_alpha(f'{prior_opacity:.6f}',alpha_format,full_alpha) if prior_opacity!=1 else ''
                 filters.append(f'{prior_prefix},{prior_fit}{prior_flip}{prior_transform}{prior_alpha},setpts=PTS+{cut_frame}[tail{number}]')
@@ -2279,7 +2490,16 @@ def _render_delivery(project, output_path, *, options, progress, cancelled, hear
     codec = spec['codec']
     audio_only = spec['kind'] == 'audio'
     # One private copy: probe results are cached on its media items.
+    # Strip any leading-underscore internal keys from caller-supplied entries.
     project = copy.deepcopy(project)
+    if isinstance(project, dict):
+        for section in ('media', 'clips'):
+            entries = project.get(section)
+            if isinstance(entries, list):
+                for entry in entries:
+                    if isinstance(entry, dict):
+                        for key in [k for k in entry if isinstance(k, str) and k.startswith('_')]:
+                            del entry[key]
     total = _validate_timeline(project)
     width, height = _frame_size(project) if not audio_only else (16, 16)
     fps_fraction = _sequence_fps(project)
@@ -2735,25 +2955,8 @@ def _picture_windows(project, picture, first, stop, total_frames, fps, width, he
         frames.append(min(total_frames, proposed))
     windows = [(a,b) for a,b in zip(frames,frames[1:]) if b>first and a<stop]
     media_by_id = {item['id']: item for item in project['media']}
-    # A clip's chain takes the same pixel-format round trips in every window
-    # (dips go through RGB, wipes through 4:4:4), or its pixels would change
-    # at a window seam. Record which clips have them in the whole timeline.
-    video = sorted((clip for clip in picture if clip.get('type') == 'video'),
-                   key=lambda clip: (clip.get('track', 0), float(clip['start'])))
-    fps_value = float(fps)
-    _, followers = _picture_transitions(video, media_by_id, fps_value)
-    dip_format, wipe_mask = set(), set()
-    for number, clip in enumerate(video):
-        before = float(clip.get('transitionBefore', 0) or 0)
-        if clip.get('transition') == 'fade':
-            duration = min(float(clip.get('transitionDuration', .5)), float(clip['duration'])+before)
-            if duration-before > 0:
-                dip_format.add(id(clip))
-        if clip.get('transition') == 'wipe':
-            wipe_mask.add(id(clip))
-        following = video[followers[number]] if number in followers else None
-        if following is not None and following.get('transition') == 'fade' and float(following.get('transitionBefore', 0) or 0) > 0:
-            dip_format.add(id(clip))
+    # A wipe passes through 4:4:4 in every window to avoid a visible seam.
+    wipe_mask = {id(clip) for clip in picture if clip.get('type') == 'video' and clip.get('transition') == 'wipe'}
     # Sweep the clips once: each window sees only the clips that overlap it.
     ordered = sorted(picture, key=lambda clip: float(clip['start'])-float(clip.get('transitionBefore',0) or 0))
     active, pointer = [], 0
@@ -2790,7 +2993,6 @@ def _picture_windows(project, picture, first, stop, total_frames, fps, width, he
                 clip['transitionBefore']=0
                 if overlap_start > cut+.5/fps: clip['transition']='none'
                 clip['_keyframeShift']=overlap_start-cut
-            if id(original) in dip_format: clip['_dipFormat'] = True
             if id(original) in wipe_mask: clip['_wipeMask'] = True
             clips.append(clip)
         # Gaps still need a black base track to keep exact segment duration.
@@ -2997,7 +3199,12 @@ class _Window:
 def _encoder_command(spec, fps, profile, size, target, *, light_levels=None, pass_number=None, passlog=None, sink=None):
     pix = spec['pix_fmt']
     command = ['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y', *delivery.hardware_input_args(spec),
-               '-f', 'rawvideo', '-pix_fmt', pix, '-s', f'{size["width"]}x{size["height"]}', '-r', str(fps), '-i', 'pipe:0']
+               '-f', 'rawvideo', '-pix_fmt', pix, '-s', f'{size["width"]}x{size["height"]}', '-r', str(fps)]
+    # Raw frames lose the composite's color tags in the pipe. An unspecified input matrix
+    # can make FFmpeg convert already-correct YUV samples again when tagging the output.
+    if spec['kind'] != 'images':
+        command += ['-color_primaries', profile[0], '-color_trc', profile[1], '-colorspace', profile[2], '-color_range', 'tv']
+    command += ['-i', 'pipe:0']
     if sink == 'measure':
         return command + light_level_filter_args(profile, target)
     hw_filter = delivery.hardware_filter(spec)
