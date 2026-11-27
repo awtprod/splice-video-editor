@@ -2880,16 +2880,22 @@
           `${safe}.splice.json`,
         );
     },
+    // The timeline as an export request sends it (also used by the render queue).
+    async prepareExport() {
+      if (!duration()) throw new Error("Add clips to the timeline before exporting.");
+      const prepared = window.SpliceMedia?.forPremiere
+        ? await window.SpliceMedia.forPremiere(project)
+        : structuredClone(project);
+      delete prepared.premiereOriginal; delete prepared.premiereManaged;
+      prepared.renderOptions = { mutedTracks: structuredClone(mutedTracks) };
+      return prepared;
+    },
     // `download: false` (Analyze program) keeps the result in the job report instead of saving a file.
     async exportVideo(options = {}, onProgress = () => {}, signal, {download = true} = {}) {
       if (!duration()) throw new Error("Add clips to the timeline before exporting.");
       if (signal?.aborted) throw signal.reason || new DOMException("Export cancelled", "AbortError");
-      const prepared = window.SpliceMedia?.forPremiere
-        ? await window.SpliceMedia.forPremiere(project)
-        : structuredClone(project);
+      const prepared = await this.prepareExport();
       if (signal?.aborted) throw signal.reason || new DOMException("Export cancelled", "AbortError");
-      delete prepared.premiereOriginal; delete prepared.premiereManaged;
-      prepared.renderOptions = { mutedTracks };
       const response = await fetch("/api/exports", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -2924,7 +2930,7 @@
           if (job.state === "cancelled") throw new Error("Export cancelled.");
           if (job.state === "complete") {
             const safe = (project.name || "Untitled").replace(/[^a-z0-9_-]+/gi, "-").replace(/^-+|-+$/g, "") || "Untitled";
-            const extension = ["mp4","mov","wav","zip","json"].includes(job.extension) ? job.extension : "mp4";
+            const extension = ["mp4","mov","mxf","wav","zip","json"].includes(job.extension) ? job.extension : "mp4";
             const downloadURL = endpoint + "/file?name=" + encodeURIComponent(safe + "." + extension);
             if (download) {
               const anchor = document.createElement("a");

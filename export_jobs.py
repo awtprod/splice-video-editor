@@ -14,6 +14,7 @@ user cancels it.
 import multiprocessing
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import threading
@@ -26,15 +27,37 @@ import warnings
 # declared stuck (covers time spent outside FFmpeg, such as probing media).
 JOB_STALL_GRACE = 120
 
-FORMATS = {'h264':('mp4','video/mp4',True), 'prores':('mov','video/quicktime',False),
-           'wav':('wav','audio/wav',True), 'stems':('zip','application/zip',False),
-           'loudness':('json','application/json',False)}
+# Outputs a browser can play back in the export dialog.
+PREVIEWABLE = {('h264', 'mp4'), ('wav', 'wav')}
+IMAGE_FOLDER = re.compile(r'[A-Za-z0-9][A-Za-z0-9 _.\-]{0,79}')
+
+
+def _orphan_guard():
+    """End this worker and everything it started if the server process dies (killed, crashed).
+
+    The worker runs in its own session, so nothing else would stop its FFmpeg children; the
+    parent's sentinel becomes ready when the parent is gone. The job's scratch folder is unlocked
+    by the exit and removed by reap_stale_work on the next start."""
+    parent = multiprocessing.parent_process()
+    if parent is None:
+        return
+
+    def watch():
+        from multiprocessing.connection import wait
+        wait([parent.sentinel])
+        if os.name == 'nt':
+            taskkill = Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32' / 'taskkill.exe'
+            subprocess.run([str(taskkill), '/PID', str(os.getpid()), '/T', '/F'], capture_output=True, timeout=10)
+        else:
+            os.killpg(0, signal.SIGKILL)
+    threading.Thread(target=watch, daemon=True, name='splice-orphan-guard').start()
 
 
 def _worker(project, options, output, progress, beat, cancelled, connection):
     # A cancelled render must stop its FFmpeg children as well as Python.
     if os.name != 'nt':
         os.setsid()
+    _orphan_guard()
     connection.send(('ready', os.name != 'nt'))
     try:
         from render_movie import render_to_file
@@ -71,6 +94,7 @@ def _kill_group(group):
 class ExportJobs:
     def __init__(self):
         self.jobs = {}
+        self.closed = False
         self.lock = threading.RLock()
         self.context = multiprocessing.get_context('spawn')
         from render_movie import reap_stale_work
@@ -79,14 +103,23 @@ class ExportJobs:
         except OSError as error:
             warnings.warn(f'Could not clean up old export files: {error}', stacklevel=2)
 
-    def start(self, project, options):
+    def start(self, project, options, *, folder_name='frames'):
+        """Start a render; ``folder_name`` names an image sequence's folder and files."""
         if not isinstance(project, dict) or not isinstance(options, dict):
             raise ValueError('Invalid export settings')
-        codec = options.get('codec','h264')
-        if codec not in FORMATS:
-            raise ValueError('Unknown export format')
-        extension, mime, previewable = FORMATS[codec]
+        import delivery
+        spec = delivery.normalize({key: value for key, value in options.items() if not str(key).startswith('_')})
+        reason = delivery.unavailable_reason({key: value for key, value in options.items() if not str(key).startswith('_')})
+        if reason:
+            raise ValueError(f'{spec["profile_label"] or spec["label"]} is not available on this machine: {reason}')
+        if not IMAGE_FOLDER.fullmatch(folder_name or '') or folder_name.strip(' .') != folder_name:
+            raise ValueError('Invalid image sequence name')
+        extension, mime = spec['extension'], spec['mime']
+        previewable = (spec['codec'], spec['container']) in PREVIEWABLE
+        images = spec['kind'] == 'images'
         with self.lock:
+            if self.closed:
+                raise ValueError('The server is shutting down')
             self.reap()
             if any(job['state'] == 'rendering' for job in self.jobs.values()):
                 raise ValueError('An export is already running')
@@ -94,7 +127,7 @@ class ExportJobs:
             from render_movie import WorkDirectory, _stall_seconds
             stall = _stall_seconds() + JOB_STALL_GRACE
             temp = WorkDirectory('splice-export-')
-            out = Path(temp.name) / ('output.'+extension)
+            out = Path(temp.name) / (folder_name if images else 'output.'+extension)
             progress = self.context.Value('d', 0)
             beat = self.context.Value('q', 0)
             cancelled = self.context.Event()
@@ -109,7 +142,8 @@ class ExportJobs:
                 raise
             finally:
                 writer.close()
-            job = dict(state='rendering', directory=temp, output=out, process=process, extension=extension, mime=mime, previewable=previewable,
+            job = dict(state='rendering', directory=temp, output=out, process=process, extension=extension or 'folder', mime=mime,
+                       previewable=previewable, images=images, started=time.monotonic(),
                        progress=progress, beat=beat, stall=stall, cancelled=cancelled, error='', warnings=[], report={}, finished=0,
                        group=None, settled=threading.Event())
             self.jobs[identifier] = job
@@ -216,10 +250,37 @@ class ExportJobs:
             job = self.jobs[identifier]
             if job['state'] != 'complete':
                 raise ValueError('Export is not ready')
+            if job['images']:
+                raise ValueError('An image sequence is a folder: find it in the render queue')
             return job['output'].open('rb')
+
+    def outputs(self, identifier):
+        """The finished output (file or image folder) and its sidecar files, for the render queue to move."""
+        with self.lock:
+            job = self.jobs[identifier]
+            if job['state'] != 'complete':
+                raise ValueError('Export is not ready')
+            output = job['output']
+            sidecars = [] if job['images'] else [output.with_suffix('.' + Path(name).suffix.lstrip('.'))
+                                                  for name in job['report'].get('sidecars', [])]
+            return output, [path for path in sidecars if path.is_file()]
+
+    def release(self, identifier):
+        """Forget a settled job and remove its scratch folder now."""
+        with self.lock:
+            job = self.jobs.get(identifier)
+            if job is None or not job['settled'].is_set():
+                return
+            del self.jobs[identifier]
+        job['directory'].cleanup()
+
+    def running(self):
+        with self.lock:
+            return any(job['state'] == 'rendering' for job in self.jobs.values())
 
     def shutdown(self):
         with self.lock:
+            self.closed = True
             jobs = list(self.jobs.values())
             for job in jobs:
                 if job['state'] == 'rendering':

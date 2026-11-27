@@ -214,7 +214,9 @@
     if (form.elements.audioDeliver?.value === 'stems') {
       options.codec = 'stems';
       if (form.elements.isoTracks.checked) options.isoTracks = true;
-      delete options.colorSpace; delete options.aacPeakSafe;
+      for (const key of ['colorSpace', 'aacPeakSafe', 'subtitleLanguage', 'profile', 'container', 'rateControl',
+        'videoBitrate', 'speed', 'encoder', 'alpha', 'audioCodec', 'hdr', 'timecode', 'reel', 'title', 'comment',
+        'faststart', 'startNumber', 'padding', 'burnIns', 'outputSize', 'fit', 'captionFiles']) delete options[key];
     }
     return options;
   }
