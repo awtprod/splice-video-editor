@@ -349,7 +349,9 @@ window.SpliceMulticam = (() => {
         tile.type = 'button';
         tile.className = 'multicam-tile';
         tile.dataset.angle = String(idx);
+        tile.disabled = !window.Editor.isPictureAngle(angle, state.project);
         tile.title = `Angle ${idx + 1}: ${angle.name || angleMedia?.name || 'Angle'} (click or press ${idx + 1} to cut; Shift+click to switch without cutting)`;
+        if (tile.disabled) tile.title = 'Audio-only angle';
         const vid = document.createElement('video');
         vid.muted = true;
         vid.playsInline = true;
@@ -441,6 +443,7 @@ window.SpliceMulticam = (() => {
     if (!Number.isInteger(angleIndex) || angleIndex < 0 || angleIndex >= angles.length) {
       throw new Error(`Angle ${angleIndex + 1} does not exist (this multicam has ${angles.length} angles).`);
     }
+    if (!editor.isPictureAngle(angles[angleIndex], project)) throw new Error('Select a video angle to switch picture.');
     if (editor.isTrackLocked?.(clip.track, clip.type)) {
       throw new Error(`Unlock video track ${clip.track} before switching angles.`);
     }
@@ -614,6 +617,8 @@ window.SpliceMulticam = (() => {
         if (allAngles) {
           for (const angle of angles) addAngleAudio(clip, angle, clip.track, clip.track);
         } else {
+          const selectedMedia = mediaById.get(angles[aIdx].mediaId);
+          if (selectedMedia?.type === 'video' && (selectedMedia.still || selectedMedia.audioChannels === 0)) continue;
           const ac = makeAngleClip(clip, angles[aIdx], 'audio', clip.track);
           if (ac) {
             if (clip.linkGroup && aIdx === vIdx && audioMode !== 'all') {

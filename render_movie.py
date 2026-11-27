@@ -1773,7 +1773,7 @@ def _expand_editorial_clips(project):
     prepared = copy.deepcopy(project)
     media_by_id = {m['id']: m for m in prepared['media'] if isinstance(m, dict) and isinstance(m.get('id'), str)}
 
-    def angle_clip(base_clip, angle, kind, track, *, embedded_audio=None, optional_audio=False, suffix=''):
+    def angle_clip(base_clip, angle, kind, track, *, embedded_audio=None, suffix=''):
         ang_media_id = angle.get('mediaId')
         if not isinstance(ang_media_id, str) or ang_media_id not in media_by_id:
             raise ValueError('Multicam angle references missing media')
@@ -1839,7 +1839,7 @@ def _expand_editorial_clips(project):
         out.pop('multicamAudioAngle', None)
         if embedded_audio is not None:
             out['embeddedAudio'] = embedded_audio
-        if optional_audio:
+        if kind == 'audio':
             out['_optionalAudio'] = True
         return out
 
@@ -1896,13 +1896,12 @@ def _expand_editorial_clips(project):
                 if v_clip:
                     after_mc.append(v_clip)
                 for idx in audio_indices:
-                    a_clip = angle_clip(clip, angles[idx], 'audio', -64, optional_audio=True, suffix=f'-mca{idx}')
+                    a_clip = angle_clip(clip, angles[idx], 'audio', -64, suffix=f'-mca{idx}')
                     if a_clip:
                         after_mc.append(a_clip)
         elif clip.get('type') == 'audio':
             for idx in audio_indices:
                 a_clip = angle_clip(clip, angles[idx], 'audio', clip['track'],
-                                    optional_audio=(len(audio_indices) > 1),
                                     suffix=(f'-mca{idx}' if len(audio_indices) > 1 else ''))
                 if a_clip:
                     after_mc.append(a_clip)

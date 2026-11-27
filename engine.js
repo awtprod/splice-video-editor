@@ -408,9 +408,10 @@
     }
     return { item: cur, inShift };
   }
+  const isPictureAngle = (angle, source = project) => source.media.some(m => m.id === angle?.mediaId && m.type === "video");
   function defaultPictureAngle(item, source = project) {
     const angles = item.multicam?.angles || [];
-    return Math.max(0, angles.findIndex(angle => source.media.some(m => m.id === angle.mediaId && m.type === "video")));
+    return Math.max(0, angles.findIndex(angle => isPictureAngle(angle, source)));
   }
   function resolveClipMedia(clip, source = project) {
     const media = clip && mediaOf(clip, source);
@@ -2909,7 +2910,7 @@
       syncMedia(true);
       notify();
     },
-    defaultPictureAngle,
+    defaultPictureAngle, isPictureAngle,
     resolveClipMedia(clip, source = project) {
       return resolveClipMedia(clip, source);
     },

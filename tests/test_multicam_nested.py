@@ -368,6 +368,27 @@ class MulticamNestedExportTests(unittest.TestCase):
         self.assertEqual(expanded['keyframes']['x'], [dict(time=0, value=-20), dict(time=2, value=20)])
         self.assertEqual(expanded['fadeOut'], 3)
 
+    def test_linked_multicam_audio_can_select_a_silent_angle(self):
+        silent = self.directory / 'silent.mov'
+        ffmpeg('-i', str(self.directory / 'red.mov'), '-an', '-c:v', 'copy', str(silent))
+        camera = dict(self.media[0], id='silent', audioChannels=0, src='/media/' + str(silent.relative_to(MEDIA_ROOT)))
+        angles = [dict(mediaId=m, duration=1) for m in ('silent', 'green')]
+        for mode, selected, override in [('camera1', 1, None), ('follow', 0, None), ('fixed', 1, 0)]:
+            mc = dict(id='mc', type='video', duration=1, multicam=dict(angles=angles, audioMode=mode, audioAngle=1))
+            pic = self._vclip('v', 'mc', 0, 1, multicamAngle=selected, embeddedAudio=False, linkGroup='pair')
+            sound = dict(pic, id='a', type='audio', track=-1)
+            if override is not None:
+                sound['multicamAudioAngle'] = override
+            project = dict(width=W, height=H, fps=FPS, media=[camera, self.media[1], mc], clips=[pic, sound])
+            for codec in ('prores', 'wav'):
+                with self.subTest(mode=mode, codec=codec):
+                    movie = self._render(project, mode, codec)
+                    samples = left_channel(movie)
+                    self.assertEqual(len(samples), 48000)
+                    self.assertLess(max(map(abs, samples)), .001)
+                    if codec == 'prores':
+                        self.assertEqual(dominant_channel(frames_rgb(movie)[0]), 'green' if selected else 'red')
+
     def test_multicam_outlasts_selected_angle(self):
         angles = [dict(mediaId='red', offset=0, duration=2), dict(mediaId='blue', offset=0, duration=8)]
         multicam = dict(id='mc', type='video', duration=8, multicam=dict(angles=angles, audioMode='follow'))

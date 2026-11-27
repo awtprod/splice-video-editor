@@ -51,8 +51,8 @@
     }
     if (window.SpliceMulticam?.isMulticamItem?.(source)) {
       const angles = source.multicam.angles;
-      const curAngle = Number.isInteger(clip.multicamAngle) ? clip.multicamAngle : 0;
-      const opts = angles.map((a, i) => option(String(i), `${i + 1}: ${a.name || 'Angle ' + (i + 1)}`, String(curAngle))).join('');
+      const curAngle = (clip.type === 'audio' ? clip.multicamAudioAngle : undefined) ?? clip.multicamAngle ?? 0;
+      const opts = angles.map((a, i) => clip.type === 'video' && !editor.isPictureAngle(a, state.project) ? '' : option(String(i), `${i + 1}: ${a.name || 'Angle ' + (i + 1)}`, String(curAngle))).join('');
       html += section('Multicam',
         `<label class="splice-number"><span>Active angle</span><select aria-label="Multicam angle" data-action="mc-angle">${opts}</select></label>` +
         '<div class="inspector-editorial-actions">' +
@@ -246,9 +246,16 @@
         editor.editProject(next => {
           const target = next.clips.find(c => c.id === clip.id);
           if (!target) return;
-          target.multicamAngle = idx;
           const mc = next.media.find(m => m.id === target.mediaId)?.multicam;
-          if (target.linkGroup && mc?.audioMode === 'follow') {
+          if (!mc?.angles[idx]) return;
+          const picture = editor.isPictureAngle(mc.angles[idx], next);
+          if (target.type === 'audio' && (!picture || Number.isInteger(target.multicamAudioAngle))) {
+            target.multicamAudioAngle = idx;
+            return;
+          }
+          if (!picture) return;
+          target.multicamAngle = idx;
+          if (target.linkGroup && mc.audioMode === 'follow') {
             for (const other of next.clips) {
               if (other.id !== target.id && other.linkGroup === target.linkGroup && other.mediaId === target.mediaId) other.multicamAngle = idx;
             }

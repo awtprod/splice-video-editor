@@ -585,6 +585,23 @@ async function testRecorderFirst(page, files) {
     return Editor.get().project.clips.map(c => c.multicamAngle);
   });
   assert.deepEqual(selection, [1, 1]);
+  await page.evaluate(() => {
+    Editor.seek(.5);
+    SpliceMulticam.setMulticamView(true);
+  });
+  assert.ok(await page.locator('.multicam-tile[data-angle="0"]').isDisabled());
+  await assert.rejects(page.evaluate(() => SpliceMulticam.switchAngle(0)), /video angle/);
+  await blur(page);
+  await page.keyboard.press('1');
+  assert.equal(await page.evaluate(() => Editor.get().project.clips.length), 2);
+  assert.equal(await page.locator('[data-action="mc-angle"]').inputValue(), '1');
+  assert.equal(await page.locator('[data-action="mc-angle"] option[value="0"]').count(), 0);
+  await page.evaluate(() => Editor.select(Editor.get().project.clips.find(c => c.type === 'audio').id));
+  await page.locator('[data-action="mc-angle"]').selectOption('0');
+  const routing = await page.evaluate(() => Editor.get().project.clips.map(c => Editor.resolveClipMedia(c).item.type));
+  assert.deepEqual(routing, ['video', 'audio']);
+  await capture(page, 'recorder-first-grid.png');
+  await page.evaluate(() => SpliceMulticam.setMulticamView(false));
   assert.equal(dominantColor(await programColor(page, .5)), 'green');
   for (const override of [null, 0]) {
     const result = await page.evaluate(override => {
