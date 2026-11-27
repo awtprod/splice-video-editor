@@ -181,6 +181,27 @@ class ColorRenderParityTests(unittest.TestCase):
                 self.assertGreater(sample(24, 16)-sample(12, 16), 15)
                 self.assertGreater(min(sample(frame, 48) for frame in range(25)), 245)
 
+    def test_bypassed_sdr_grade_in_pq_master(self):
+        media = [{'id': 'm', 'src': '/media/sdr_tv.mp4', 'type': 'video', 'duration': 2}]
+        clip = {'id': 'c', 'type': 'video', 'mediaId': 'm', 'track': 1, 'in': 0, 'start': 0, 'duration': .4}
+        options = {'codec': 'prores', 'colorSpace': 'pq'}
+        bypass = {'exposure': 1.5, 'lut': self.warm_lut, 'grade': {'bypass': True}}
+        reference = None
+        for name, color in [('neutral', {}), ('bypass', {'grade': {'bypass': True}}), ('graded-bypass', bypass)]:
+            output = Path(self.temp.name) / (name + '.mov')
+            render_to_file(self._project(media, [{**clip, 'color': color}]), output, options=options.copy())
+            frames = subprocess.check_output(['ffmpeg', '-v', 'error', '-i', str(output), '-map', '0:v:0',
+                                              '-pix_fmt', 'yuv422p10le', '-f', 'rawvideo', '-'], timeout=30)
+            self.assertTrue(frames)
+            if reference is None:
+                reference = frames
+            else:
+                self.assertEqual(frames, reference)
+        for item, color in [(media[0], {'exposure': 1}), ({**media[0], 'inputLut': self.warm_lut}, bypass),
+                            ({**media[0], 'colorMatrix': 'bt601'}, bypass)]:
+            with self.assertRaisesRegex(ValueError, 'HDR master'):
+                render_to_file(self._project([item], [{**clip, 'color': color}]), output, options=options.copy())
+
     def test_hdr_bypass_preserves_tone_mapping(self):
         for name in ('hlg.mov', 'pq.mov'):
             with self.subTest(source=name):

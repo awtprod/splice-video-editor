@@ -603,7 +603,8 @@ def _fit_picture(width, height, color, lut, alpha_format, depth, profile=None, r
         convert = (',zscale=p=bt709:t=bt709:m=bt709:r=limited,'+wide_yuv
                    if rec709 and profile and profile!=REC709
                    and all(value not in (None,'unknown','unspecified') for value in profile) else '')
-        grade = convert+_css_color_filter(color,depth,bool(still_frames))+lut
+        primary = '' if (color.get('grade') or {}).get('bypass') else _css_color_filter(color,depth,bool(still_frames))
+        grade = convert+primary+lut
         if still_frames and hdr_profile:
             grade += _hdr_still_filter(hdr_profile,depth)
         elif conform_pq and profile:
@@ -675,6 +676,8 @@ def _picture_grade(clip, item, directory, name, profile, *, fps, zero, frames, r
     if not _has_color_work(clip, item) and not item.get('colorMatrix'):
         return None
     if hdr_master:
+        if bypass and not input_lut and not item.get('colorMatrix'):
+            return None
         raise ValueError('Color grading of SDR clips in an HDR master is not supported. Export this timeline as Rec. 709.')
     still = bool(item.get('_renderStill'))
     # zscale converts exactly; swscale's 8-bit to float conversion reads white as 254.02/255.
