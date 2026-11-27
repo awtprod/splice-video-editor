@@ -202,7 +202,7 @@ def probe_file(path: Path, timeout: float = PROBE_TIMEOUT) -> Probe:
     if raw_decode is not None and raw_decode.is_raw_candidate(path, path.name):
         try:
             info = raw_decode.probe_raw(path)
-        except (OSError, ValueError) as error:
+        except (OSError, ValueError, TypeError, IndexError, KeyError, ArithmeticError) as error:
             raise ValueError(f'Could not probe RAW {path.name}: {error}') from None
         fps_val = info.get('fps')
         rate = snap_rate(parse_rate(fps_val)) if fps_val else None
@@ -275,6 +275,7 @@ class Source:
     adjustment: bool = False    # a Splice adjustment clip (a generator that grades the tracks beneath)
     input_lut: str | None = None  # title of the source's technical input LUT, for the loss report
     color_matrix: str | None = None  # untagged source matrix override ('bt709' or 'bt601'), for the loss report
+    raw_capabilities: dict | None = None  # camera RAW: the settings its decoder applies (raw_decode.decoder_capabilities)
     location: str = 'none'      # see Reference.kind
     original_path: str | None = None   # path on this machine, when export path mapping rewrote it
     path_rule: int | None = None        # index of the mapping rule that applied
@@ -422,6 +423,13 @@ def resolve_source(item: dict, sequence_rate: Fraction, budget: ProbeBudget) -> 
         guessed = [f for f in item.get('rawEstimated') or () if f in ('timecode', 'fps', 'duration', 'width', 'height')]
         if guessed:
             source.notes.append(f"camera RAW {', '.join(guessed)} could not be read from the file; Splice's placeholder was written")
+        look_names = {'iso': 'ISO', 'kelvin': 'white balance (Kelvin)', 'tint': 'tint', 'camera': 'camera model'}
+        look = [look_names[f] for f in look_names if f in (item.get('rawEstimated') or ())]
+        if look:
+            source.notes.append(f"camera RAW {', '.join(look)} not recorded in the file or a sidecar; "
+                                "Splice's decode used a placeholder (ISO 800, 5600 K, tint 0), not camera metadata")
+        if isinstance(item.get('rawCapabilities'), dict):
+            source.raw_capabilities = item['rawCapabilities']
         if isinstance(item.get('rawMetadata'), dict) and item['rawMetadata'].get('isSequence'):
             source.notes.append('camera RAW frame sequence: the timeline references its first frame')
             if item['rawMetadata'].get('missingFrames'):

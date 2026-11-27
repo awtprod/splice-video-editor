@@ -49,6 +49,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import xml.etree.ElementTree as ET
 
 import raw_bayer
@@ -235,7 +236,16 @@ FORMAT_DEFAULTS = {
     'xocn': {'colorSpace': 'rec709', 'gamma': 'rec709'},
 }
 
-_SHELL_META = re.compile(r'[;&|$`<>\(\)\{\}\[\]\*\?~\r\n\x00]')
+# Decoders run from an argv list, never a shell; these are refused anyway so a pasted command line
+# fails loudly. Parentheses are allowed: Windows installs under "C:\Program Files (x86)\...".
+_SHELL_META = re.compile(r'[;&|$`<>\{\}\[\]\*\?~\r\n\x00]')
+# A RAW decoder is a vendor tool or a bridge program, never a general interpreter or shell (which
+# would run anything) and never a kernel pseudo-file such as /proc/self/exe.
+_INTERPRETER = re.compile(
+    r'^(?:python[\d.]*w?|pypy[\d.]*|perl[\d.]*|ruby[\d.]*|node(?:js)?|deno|bun|php[\d.]*|lua[\d.]*|luajit|'
+    r'tclsh[\d.]*|wish[\d.]*|java|javaw|osascript|ba?sh|dash|zsh|ksh|mksh|csh|tcsh|fish|sh|busybox|env|'
+    r'cmd|powershell|pwsh|wscript|cscript|mshta|rundll32|gawk|mawk|awk|sed)(?:\.exe)?$', re.IGNORECASE)
+_PSEUDO_ROOTS = ('/proc/', '/sys/', '/dev/')
 _LIB_SUFFIX = re.compile(r'\.(?:so(?:\.\d+)*|dylib|dll)$', re.IGNORECASE)
 _TIMECODE_RE = re.compile(r'(\d{2}):(\d{2}):(\d{2})([:;.,])(\d{2,3})')
 # DNG compressions FFmpeg's tiff decoder unpacks to a linearized Bayer plane (7 = lossless JPEG).
@@ -278,6 +288,8 @@ def validate_decoder_path(decoder_id: str, raw_path) -> str | None:
     if '..' in Path(value).parts:
         raise ValueError('Decoder path cannot contain parent directory traversal (..)')
     resolved = Path(value).resolve(strict=False)
+    if _not_a_decoder(value, resolved):
+        raise ValueError(f'{Path(value).name} is a system program or interpreter, not a RAW decoder: {value}')
     if not resolved.is_file():
         raise ValueError(f'Decoder path does not point to a regular file: {value}')
     is_lib = bool(_LIB_SUFFIX.search(resolved.name))
@@ -288,6 +300,14 @@ def validate_decoder_path(decoder_id: str, raw_path) -> str | None:
         if os.name != 'nt' and not os.access(resolved, os.X_OK):
             raise ValueError(f'Decoder executable does not have execute permission: {value}')
     return str(resolved)
+
+
+def _not_a_decoder(value: str, resolved: Path) -> bool:
+    """True for kernel pseudo-files and for general interpreters or shells (by the resolved name)."""
+    for candidate in (str(value), str(resolved)):
+        if any(candidate.startswith(root) for root in _PSEUDO_ROOTS):
+            return True
+    return bool(_INTERPRETER.match(resolved.name) or _INTERPRETER.match(Path(value).name))
 
 
 def load_decoder_config() -> dict[str, str]:
@@ -384,7 +404,7 @@ def _is_usable_candidate(candidate: str) -> tuple[bool, str | None]:
         if '..' in Path(candidate).parts:
             return False, None
         p = Path(candidate).resolve(strict=False)
-        if not p.is_file():
+        if _not_a_decoder(candidate, p) or not p.is_file():
             return False, None
         if _LIB_SUFFIX.search(p.name) or '.framework/' in str(p):
             return os.access(p, os.R_OK), 'sdk'
@@ -392,9 +412,15 @@ def _is_usable_candidate(candidate: str) -> tuple[bool, str | None]:
             return True, 'cli'
         return False, None
     found = shutil.which(candidate)
-    if found:
+    if found and not _not_a_decoder(found, Path(found).resolve(strict=False)):
         return True, 'cli'
     return False, None
+
+
+@lru_cache(maxsize=32)
+def _find_library(name: str) -> str | None:
+    """``ctypes.util.find_library`` runs ldconfig / gcc each call: look each SDK name up once per process."""
+    return ctypes.util.find_library(name)
 
 
 def _resolve_backend(backend_id: str, cfg: dict | None = None, env_map: dict | None = None) -> dict:
@@ -433,7 +459,7 @@ def _resolve_backend(backend_id: str, cfg: dict | None = None, env_map: dict | N
         elif kind == 'sdk' and sdk_path is None:
             sdk_path = resolved
     if sdk_path is None and spec['libNames']:
-        sdk_path = next((found for found in map(ctypes.util.find_library, spec['libNames']) if found), None)
+        sdk_path = next((found for found in map(_find_library, spec['libNames']) if found), None)
     guidance = None
     if not cli_path:
         guidance = (f'{Path(sdk_path).name} is installed, but Splice decodes through a command-line bridge. '
@@ -1034,7 +1060,8 @@ def detect_raw_format(path) -> str | None:
         # camera RAW. Every MXF FFmpeg can decode (XDCAM, DNxHD, AVC-Intra, ...) stays ordinary media.
         data = _ffprobe_optional(path)
         video = _ffprobe_streams(data, 'video')
-        if data and (not video or str(video[0].get('codec_name') or 'none') in ('none', 'unknown')):
+        # A picture stream must exist: a sound-only MXF whose tags name a RAW camera is just sound.
+        if data and video and str(video[0].get('codec_name') or 'none') in ('none', 'unknown'):
             tags = ' '.join(f'{k} {v}' for k, v in _ffprobe_tags(data).items()).lower()
             descriptor = ' '.join(str(v) for s in video for k, v in s.items() if k in ('codec_tag_string', 'codec_long_name')).lower()
             blob = tags + ' ' + descriptor
@@ -1131,13 +1158,21 @@ def _seconds(value) -> float | None:
     return seconds if math.isfinite(seconds) and 0 < seconds < 10 * 24 * 3600 else None
 
 
+# Look metadata a camera records; a placeholder stands in (and is flagged) when the file has none.
+LOOK_METADATA = ('iso', 'kelvin', 'tint')
+
+
 def _record(path: Path, fmt: str, *, width=None, height=None, fps=None, duration=None, frame_count=None,
             timecode=None, drop_frame=False, reel=None, camera=None, defaults=None, audio=(), audio_rate=None,
-            audio_path=None, still=False, label=None, decoder=None, metadata=None, video_codec=None) -> dict:
+            audio_path=None, still=False, label=None, decoder=None, metadata=None, video_codec=None,
+            decoder_kind=None, camera_placeholder=None) -> dict:
     """One Splice ``describe()`` record for a camera RAW source.
 
     Nothing is invented: a value the file does not carry falls back to an editable placeholder
-    and is named in ``rawEstimated`` so the Inspector and interchange reports can say so."""
+    and is named in ``rawEstimated`` so the Inspector and interchange reports can say so. That
+    covers the picture (size, rate, duration, timecode) and the look the camera recorded: ISO,
+    white balance (``kelvin``, ``tint``) and the ``camera`` model, when neither the file nor its
+    sidecar holds them (``defaults`` carries only what was read)."""
     estimated = []
     if not (isinstance(width, int) and isinstance(height, int) and width > 0 and height > 0):
         width, height = 1920, 1080
@@ -1154,11 +1189,17 @@ def _record(path: Path, fmt: str, *, width=None, height=None, fps=None, duration
                 estimated.append('duration')
     if timecode is None:
         estimated.append('timecode')
+    read = {k for k, v in (defaults or {}).items() if v is not None}
+    estimated += [key for key in LOOK_METADATA if key not in read]
+    if not camera:
+        estimated.append('camera')
+        camera = camera_placeholder
     if decoder is None:
         backend = _resolve_backend('libraw' if fmt == 'still_raw' else fmt)
         available = backend['available']
         decoder = (available, f"{backend['version']} ({backend['activeBackend']})" if available else None,
                    None if available else _missing_decoder_message(fmt, path.name))
+        decoder_kind = _decoder_kind(fmt, backend)
     available, decoder_name, decoder_message = decoder
     audio = list(audio)
     meta = {'camera': camera or None, 'isSequence': False}
@@ -1171,6 +1212,7 @@ def _record(path: Path, fmt: str, *, width=None, height=None, fps=None, duration
         'rawDecoderMessage': decoder_message,
         'rawDefaults': normalize_raw_settings(defaults or {}, fmt=fmt),
         'rawAudioPath': audio_path, 'rawMetadata': meta, 'rawEstimated': estimated,
+        'rawCapabilities': decoder_capabilities(decoder_kind) if available else None,
         'duration': float(duration), 'width': int(width), 'height': int(height),
         'hdr': False, 'hdrPreviewVersion': None, 'fps': float(fps), 'rate': _rational_str(fps), 'vfr': False,
         'timecode': timecode, 'dropFrame': bool(timecode and drop_frame), 'reel': reel or None,
@@ -1190,6 +1232,7 @@ def _record(path: Path, fmt: str, *, width=None, height=None, fps=None, duration
 def _probe_cinemadng(path: Path) -> dict:
     seq = raw_bayer.detect_dng_sequence(path)
     meta = raw_bayer.parse_dng(seq['firstFrame'])
+    kind = 'builtin'
     if meta['builtinDecodable']:
         decoder = (True, f"Built-in CinemaDNG ({meta['bitsPerSample']}-bit {meta['cfaName']})", None)
     elif meta['compression'] in FFMPEG_DNG_COMPRESSIONS and shutil.which('ffmpeg'):
@@ -1198,13 +1241,18 @@ def _probe_cinemadng(path: Path) -> dict:
         libraw = _resolve_backend('libraw')
         decoder = (libraw['available'], f"LibRaw ({libraw['version']})" if libraw['available'] else None,
                    None if libraw['available'] else _missing_decoder_message('libraw', path.name))
+        kind = _decoder_kind('libraw', libraw)
+    look = {'iso': meta.get('iso')}
+    if meta.get('whiteBalanceKnown'):
+        look.update(kelvin=meta['kelvin'], tint=meta['tint'])
     audio, rate = _audio_details(_ffprobe_streams(_ffprobe_optional(Path(seq['audioPath'])), 'audio')) \
         if seq['audioPath'] else ([], None)
     return _record(
         path, 'cinemadng', width=meta['width'], height=meta['height'], fps=meta['fps'],
         frame_count=seq['frameCount'] if seq['isSequence'] else None, timecode=meta['timecode'],
         drop_frame=meta['dropFrame'], reel=meta['reel'] or seq['prefix'][:16] or None,
-        camera=meta['camera'], defaults={'kelvin': meta['kelvin'], 'tint': meta['tint']},
+        camera=meta['camera'] if meta.get('cameraKnown') else None, camera_placeholder=meta['camera'],
+        defaults=look, decoder_kind=kind,
         audio=audio, audio_rate=rate, audio_path=seq['audioPath'], still=not seq['isSequence'],
         label=f"CinemaDNG {meta['bitsPerSample']}-bit", decoder=decoder, video_codec='cinemadng',
         metadata={'bitDepth': meta['bitsPerSample'], 'bayerPattern': meta['cfaName'],
@@ -1250,7 +1298,7 @@ def _probe_ari(path: Path) -> dict:
     return _record(
         path, 'arriraw', width=ari['width'], height=ari['height'],
         frame_count=ari['frameCount'] if ari['isSequence'] else None, reel=ari['prefix'][:16] or None,
-        camera=ari['camera'] or 'ARRI', audio=audio, audio_rate=rate, audio_path=ari['audioPath'],
+        camera=ari['camera'], camera_placeholder='ARRI', audio=audio, audio_rate=rate, audio_path=ari['audioPath'],
         still=not ari['isSequence'], label='ARRIRAW', video_codec='arriraw',
         metadata={'isSequence': ari['isSequence']})
 
@@ -1280,8 +1328,8 @@ def _probe_still(path: Path) -> dict:
         raise RawError(_missing_decoder_message('still_raw', path.name).split(' Its metadata')[0] +
                        ' Install LibRaw (dcraw_emu) and set its path in File > RAW Decoders….')
     return _record(path, 'still_raw', still=True, label=f'Camera RAW ({path.suffix.upper().lstrip(".")})',
-                   camera=path.suffix.upper().lstrip('.'), video_codec='still_raw',
-                   decoder=(True, f"LibRaw ({backend['version']})", None))
+                   camera=None, camera_placeholder=path.suffix.upper().lstrip('.') + ' camera', video_codec='still_raw',
+                   decoder=(True, f"LibRaw ({backend['version']})", None), decoder_kind=_decoder_kind('libraw', backend))
 
 
 _PROBERS = {
@@ -1332,7 +1380,7 @@ def probe_raw(path) -> dict:
         message = str(error)
         raise RawError(message if FORMAT_LABELS[fmt] in message else
                        f'{path.name} is named like {FORMAT_LABELS[fmt]} (camera RAW) but cannot be read: {message}') from None
-    except (OSError, struct.error, ValueError, OverflowError) as error:
+    except (OSError, ValueError, *raw_bayer.MALFORMED_ERRORS) as error:
         raise RawError(f'{path.name} is {FORMAT_LABELS[fmt]} (camera RAW) but its header is damaged '
                        f'({type(error).__name__})') from None
     with _probe_lock:
@@ -1352,7 +1400,10 @@ def enrich_prores_raw(path, described: dict) -> dict:
         'rawDecoderName': f"FFmpeg prores_raw ({backend['version']})" if backend['available'] else None,
         'rawDecoderMessage': None if backend['available'] else _missing_decoder_message('prores_raw', Path(path).name),
         'rawDefaults': normalize_raw_settings({}, fmt='prores_raw'), 'rawAudioPath': None,
-        'rawMetadata': {'camera': out.get('camera') or None, 'isSequence': False}, 'rawEstimated': [],
+        'rawMetadata': {'camera': out.get('camera') or None, 'isSequence': False},
+        # FFmpeg's prores_raw decoder exposes no ISO or white balance: the look starts from placeholders.
+        'rawEstimated': list(LOOK_METADATA) + ([] if out.get('camera') else ['camera']),
+        'rawCapabilities': decoder_capabilities('prores_raw') if backend['available'] else None,
         'pixelFormat': 'rgb48le', 'colorPrimaries': 'bt709', 'colorTransfer': 'bt709', 'colorSpace': 'bt709',
         'proxyRecommended': True,
     })
@@ -1501,7 +1552,10 @@ def decode_dng(path: Path, settings: dict, scale: int, via_ffmpeg: bool = False)
         return raw_bayer.decode_dng_frame(path, settings=settings, scale=scale)
     meta = raw_bayer.parse_dng(path)
     plane, linear = _ffmpeg_bayer_plane(path, meta)
-    return raw_bayer.decode_plane(plane, linear, settings, scale=scale, name=path.name)
+    try:
+        return raw_bayer.decode_plane(plane, linear, settings, scale=scale, name=path.name)
+    except raw_bayer.MALFORMED_ERRORS as error:
+        raise raw_bayer.malformed(path.name, error) from None
 
 
 def _frame_window(total: int, start: int, count: int | None) -> tuple[int, int]:
@@ -1523,7 +1577,9 @@ def _decode_cinemadng(path: Path, out_path: Path, settings: dict, info: dict, *,
             if not libraw['available']:
                 raise RawError(_missing_decoder_message('libraw', path.name))
             return _decode_via_cli(path, out_path, settings, backend=libraw, info=info, is_intermediate=is_intermediate,
-                                   seek_optimized=seek_optimized, audio_stream=audio_stream, job=job)
+                                   seek_optimized=seek_optimized, audio_stream=audio_stream, start_frame=start_frame,
+                                   frame_count=frame_count, job=job,
+                                   frame_paths=seq['frames'] if seq['isSequence'] else None)
     scale = 1 if is_intermediate else DEBAYER_SCALES.get(settings.get('debayerQuality', 'half'), 2)
     fps = Fraction(info.get('rate') or '24/1')
     if seq['isSequence']:
@@ -1669,8 +1725,163 @@ def _vendor_kind(exe: str) -> str:
     return {'redline': 'redline', 'art-cmd': 'art-cmd', 'dcraw_emu': 'dcraw'}.get(stem, 'splice')
 
 
+# Option values from each tool's published documentation:
+#   REDline: REDCINE-X PRO Operation Guide, "REDline arguments" (--colorSpace, --gammaCurve,
+#            --start/--frameCount, --res, --format 1 = TIFF, --iso/--kelvin/--tint/--exposure).
+#   art-cmd: ARRI Reference Tool command line user manual (process --start/--duration,
+#            --target-colorspace, --output-width/--output-height, --parameters JSON overrides).
+#   dcraw_emu: LibRaw samples/dcraw_emu.cpp usage (-o [0-8], -g pow ts, -H, -b, -h, -w, -W, -6 -T -Z).
+_REDLINE_COLOR_SPACES = {'red_wide_gamut': '25', 'rec709': '1', 'linear': '1', 'rec2020': '24'}
+_REDLINE_GAMMAS = {'log3g10': '34', 'rec709': '1', 'linear': '-1'}
+_REDLINE_RES = {'full': '1', 'half': '2', 'quarter': '4', 'eighth': '8'}
+_ARTCMD_TARGETS = {
+    ('arri_wide_gamut_4', 'arri_logc4'): 'AWG4/D65/LogC4',
+    ('arri_wide_gamut_3', 'arri_logc3'): 'AWG3/D65/LogC3',
+    ('rec709', 'rec709'): 'Rec.709/D65/BT.1886',
+    ('linear', 'rec709'): 'Rec.709/D65/BT.1886',
+    ('rec2020', 'rec709'): 'Rec.2020/D65/BT.1886',
+}
+_DCRAW_COLOR_SPACES = {'rec709': '1', 'linear': '1', 'rec2020': '8'}
+_DCRAW_GAMMAS = {'rec709': ('2.222', '4.5'), 'linear': ('1', '1')}
+RAW_SETTING_KEYS = ('iso', 'exposure', 'kelvin', 'tint', 'colorSpace', 'gamma', 'highlightRecovery', 'debayer')
+_PRORES_RAW_GAMMAS = ('rec709', 'linear', 'cinemadng_log')
+_TOOL_NAMES = {'redline': 'REDline', 'art-cmd': 'art-cmd', 'dcraw': 'dcraw_emu', 'prores_raw': 'FFmpeg prores_raw'}
+
+
+def decoder_capabilities(kind: str | None) -> dict | None:
+    """Which RAW settings the decode route ``kind`` applies: ``settings`` (keys of
+    ``RAW_SETTING_KEYS``), and where only some values work, ``colorSpaces`` / ``gammas`` and
+    ``pairs`` (colour space + gamma combinations). ``None``: every setting (Splice's own CinemaDNG
+    developer, or a bridge speaking the Splice RAW decoder contract) or no decoder yet."""
+    if kind in (None, 'builtin', 'splice'):
+        return None
+    if kind == 'redline':
+        return {'tool': 'REDline', 'settings': ['iso', 'exposure', 'kelvin', 'tint', 'colorSpace', 'gamma', 'debayer'],
+                'colorSpaces': sorted(_REDLINE_COLOR_SPACES), 'gammas': sorted(_REDLINE_GAMMAS), 'pairs': None}
+    if kind == 'art-cmd':
+        return {'tool': 'art-cmd', 'settings': ['iso', 'kelvin', 'tint', 'colorSpace', 'gamma', 'debayer'],
+                'colorSpaces': sorted({cs for cs, _ in _ARTCMD_TARGETS}),
+                'gammas': sorted({gamma for _, gamma in _ARTCMD_TARGETS}),
+                'pairs': [list(pair) for pair in _ARTCMD_TARGETS]}
+    if kind == 'dcraw':
+        return {'tool': 'dcraw_emu', 'settings': ['iso', 'exposure', 'colorSpace', 'gamma', 'highlightRecovery', 'debayer'],
+                'colorSpaces': sorted(_DCRAW_COLOR_SPACES), 'gammas': sorted(_DCRAW_GAMMAS), 'pairs': None}
+    if kind == 'prores_raw':
+        return {'tool': 'FFmpeg prores_raw', 'settings': ['iso', 'exposure', 'kelvin', 'tint', 'gamma', 'debayer'],
+                'colorSpaces': None, 'gammas': list(_PRORES_RAW_GAMMAS), 'pairs': None}
+    return None
+
+
+def unapplied_settings(settings: dict, capabilities: dict | None) -> list[str]:
+    """The keys of ``settings`` (a clip's ``rawSettings``) its decoder cannot apply."""
+    if not capabilities or not isinstance(settings, dict):
+        return []
+    allowed = set(capabilities.get('settings') or ())
+    out = []
+    for key in RAW_SETTING_KEYS:
+        value = settings.get('debayerQuality' if key == 'debayer' and 'debayer' not in settings else key)
+        if value is None:
+            continue
+        if key not in allowed:
+            out.append(key)
+        elif key == 'colorSpace' and capabilities.get('colorSpaces') and value not in capabilities['colorSpaces']:
+            out.append(key)
+        elif key == 'gamma' and capabilities.get('gammas') and value not in capabilities['gammas']:
+            out.append(key)
+    pairs = capabilities.get('pairs')
+    if pairs and 'colorSpace' not in out and 'gamma' not in out and \
+            [settings.get('colorSpace'), settings.get('gamma')] not in pairs:
+        out += ['colorSpace', 'gamma']
+    return out
+
+
+def _decoder_kind(fmt: str, backend: dict | None) -> str | None:
+    if fmt == 'prores_raw':
+        return 'prores_raw'
+    if not backend or not backend.get('available'):
+        return None
+    if backend.get('activeBackend') == 'builtin':
+        return 'builtin'
+    return _vendor_kind(backend['path']) if backend.get('path') else None
+
+
+def _require_free_space(directory: Path, needed: int, what: str):
+    """Fail before writing ``what`` (about ``needed`` bytes) to ``directory`` if it cannot fit."""
+    try:
+        free = shutil.disk_usage(directory).free
+    except OSError:
+        return
+    margin = 512 * 1024 ** 2
+    if free < needed + margin:
+        gib = 1024 ** 3
+        raise RawError(f'Not enough free disk space for {what}: it needs about {(needed + margin) / gib:.1f} GB in '
+                       f'{directory}, and {free / gib:.1f} GB is free. Free some space, or shorten the export range.')
+
+
+def intermediate_bytes(width: int, height: int, frames: int) -> int:
+    """A cautious size for a lossless FFV1 16-bit 4:4:4 intermediate (camera pictures compress to
+    roughly 50-70% of their 6 bytes per pixel)."""
+    return int(max(2, width) * max(2, height) * 6 * max(1, frames) * 0.7)
+
+
+def _kill_tree(proc):
+    if proc.poll() is not None:
+        return
+    try:
+        if os.name != 'nt':
+            os.killpg(proc.pid, 9)
+        else:
+            proc.kill()
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def _run_tool(argv: list[str], job: _Job, label: str, timeout: float):
+    """Run a decoder or encoder to completion while polling ``job``: a cancelled export kills the
+    tool and everything it started within about 0.1 s, and leaves no process behind."""
+    errors = tempfile.TemporaryFile()
+    try:
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=errors,
+                                start_new_session=os.name != 'nt')
+    except OSError as error:
+        errors.close()
+        raise RawError(f'Could not start {label}: {error.strerror or error}') from None
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            try:
+                proc.wait(timeout=0.05)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            job.tick()
+            if time.monotonic() > deadline:
+                raise RawError(f'{label} did not finish within {int(timeout)} s')
+    finally:
+        if proc.poll() is None:
+            _kill_tree(proc)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        if os.name != 'nt':  # Anything the tool left running in its session goes too.
+            try:
+                os.killpg(proc.pid, 9)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        errors.seek(0)
+        detail = errors.read()[-400:].decode('utf-8', 'replace').strip()
+        errors.close()
+    if proc.returncode:
+        raise RawError(f'{label} failed (exit {proc.returncode}): {detail}')
+
+
 def _decode_via_cli(path: Path, out_path: Path, settings: dict, *, backend: dict, info: dict, is_intermediate: bool,
-                    seek_optimized=False, audio_stream=None, start_frame=0, frame_count=None, job=None):
+                    seek_optimized=False, audio_stream=None, start_frame=0, frame_count=None, job=None,
+                    frame_paths: list[Path] | None = None):
     """Run a detected decoder executable with an argv list (never a shell).
 
     Executables named ``REDline``, ``art-cmd`` or ``dcraw_emu`` get their own documented options
@@ -1692,12 +1903,20 @@ def _decode_via_cli(path: Path, out_path: Path, settings: dict, *, backend: dict
     out_h = max(2, (src_h // scale) & ~1) if scale > 1 else src_h
     fps = Fraction(info.get('rate') or '24/1')
     total = max(1, round(float(info.get('duration') or 0) * fps))
-    start, count = _frame_window(total, start_frame, frame_count)
+    if frame_paths:
+        total = len(frame_paths)
+    if info.get('still') and not frame_paths:
+        # A still is held for as long as the caller asks (the longest clip using it).
+        start, count = 0, max(1, int(frame_count) if frame_count else total)
+    else:
+        start, count = _frame_window(total, start_frame, frame_count)
     source = str(path.resolve())
     kind = _vendor_kind(exe)
     if kind != 'splice':
         return _decode_vendor_tiffs(kind, exe, source, path, out_path, settings, clip, quality, fps, info,
-                                    is_intermediate=is_intermediate, seek_optimized=seek_optimized, job=job)
+                                    start=start, count=count, total=total, out_size=(out_w, out_h),
+                                    is_intermediate=is_intermediate, seek_optimized=seek_optimized, job=job,
+                                    frame_paths=frame_paths, audio_stream=audio_stream)
     argv = [exe, '--input', source, '--pix-fmt', 'rgb48le', '--width', str(out_w), '--height', str(out_h),
             '--start-frame', str(start), '--frames', str(count), '--decode-using', 'clip' if clip else 'camera',
             '--iso', str(int(settings.get('iso', 800))), '--exposure', f"{float(settings.get('exposure', 0.0)):.4f}",
@@ -1717,37 +1936,122 @@ def _decode_via_cli(path: Path, out_path: Path, settings: dict, *, backend: dict
         _reap(decoder)
 
 
-def _decode_vendor_tiffs(kind, exe, source, path, out_path, settings, clip, quality, fps, info, *,
-                         is_intermediate, seek_optimized, job):
-    """REDline / ARRI Reference Tool / dcraw_emu: decode the whole clip to 16-bit TIFFs, then encode.
-    Their option names come from each tool's published command-line help."""
+def _artcmd_input(path: Path, info: dict) -> str:
+    """art-cmd reads a legacy ``.ari``/``.arx`` sequence from a printf pattern; a clip file as is."""
+    meta = info.get('rawMetadata') or {}
+    pattern = raw_bayer.sequence_pattern(path.name) if path.suffix.lower() in ('.ari', '.arx') else None
+    if pattern and meta.get('isSequence'):
+        prefix, digits, _ = pattern
+        return str(path.resolve().parent / f'{prefix}%0{len(digits)}d{path.suffix}')
+    return str(path.resolve())
+
+
+def vendor_argv(kind: str, exe: str, source: str, staging: Path, settings: dict, *, quality: str, start: int,
+                count: int, out_size: tuple[int, int], path: Path | None = None, info: dict | None = None) -> list[str]:
+    """The documented command line that makes ``kind`` (``redline``, ``art-cmd`` or ``dcraw``) write
+    frames ``start .. start+count-1`` of ``source`` as 16-bit TIFFs into ``staging``, with every RAW
+    setting that tool accepts. Settings it cannot take are left out (``decoder_capabilities``)."""
+    clip = settings.get('decodeUsing') == 'clip'
+    color_space = str(settings.get('colorSpace') or 'rec709')
+    gamma = str(settings.get('gamma') or 'rec709')
+    if kind == 'redline':
+        argv = [exe, '--i', source, '--outDir', str(staging), '--o', 'frame', '--format', '1',
+                '--res', _REDLINE_RES.get(quality, '2'), '--start', str(start), '--frameCount', str(count)]
+        if color_space in _REDLINE_COLOR_SPACES:
+            argv += ['--colorSpace', _REDLINE_COLOR_SPACES[color_space]]
+        if gamma in _REDLINE_GAMMAS:
+            argv += ['--gammaCurve', _REDLINE_GAMMAS[gamma]]
+        if clip:
+            argv += ['--iso', str(int(settings.get('iso', 800))), '--kelvin', str(int(settings.get('kelvin', 5600))),
+                     '--tint', f"{float(settings.get('tint', 0.0)):.2f}",
+                     '--exposure', f"{float(settings.get('exposure', 0.0)):.3f}"]
+        return argv
+    if kind == 'art-cmd':
+        argv = [exe, 'process', '--input', _artcmd_input(path or Path(source), info or {}),
+                '--output', str(staging / 'frame.%07d.tif'), '--start', str(start), '--duration', str(count)]
+        target = _ARTCMD_TARGETS.get((color_space, gamma))
+        if target:
+            argv += ['--target-colorspace', target]
+        if quality != 'full':
+            argv += ['--output-width', str(out_size[0]), '--output-height', str(out_size[1])]
+        if clip:
+            overrides = {'exposureIndexOverride': int(settings.get('iso', 800)),
+                         'colorTemperatureOverride': int(settings.get('kelvin', 5600)),
+                         'tintOverride': float(settings.get('tint', 0.0))}
+            parameters = staging / 'splice-parameters.json'
+            parameters.write_text(json.dumps(overrides), encoding='utf-8')
+            argv += ['--parameters', str(parameters)]
+        return argv
+    # dcraw_emu develops one still. -W keeps it from auto-brightening, so exposure and ISO are exact
+    # brightness gains (-b); white balance is the camera's (-w): it takes no Kelvin or tint.
+    gain = 1.0
+    if clip:
+        gain = (2.0 ** float(settings.get('exposure', 0.0))) * (max(50.0, float(settings.get('iso', 800))) / 800.0)
+    argv = [exe, '-6', '-T', '-W', '-w', '-b', f'{gain:.6f}', '-o', _DCRAW_COLOR_SPACES.get(color_space, '1'),
+            '-g', *_DCRAW_GAMMAS.get(gamma, _DCRAW_GAMMAS['rec709']), '-H', '2' if settings.get('highlightRecovery') else '0']
+    if quality != 'full':
+        argv.append('-h')
+    return argv + ['-Z', str(staging / 'frame.tiff'), source]
+
+
+def _decode_vendor_tiffs(kind, exe, source, path, out_path, settings, clip, quality, fps, info, *, start, count,
+                         total, out_size, is_intermediate, seek_optimized, job, frame_paths=None, audio_stream=None):
+    """REDline / ARRI Reference Tool / dcraw_emu: decode the window's frames to 16-bit TIFFs in a
+    private staging folder, then encode them. A tool that writes the whole clip instead of the
+    window is trimmed to it, so the cut always gets the frames it reads. dcraw_emu develops one
+    still per run: once for a still, once per frame of a (compressed) DNG sequence's window."""
     timeout = max(600, int(float(info.get('duration') or 0) * 60))
+    out_w, out_h = out_size
+    dcraw_sources = [Path(f) for f in frame_paths[start:start + count]] if kind == 'dcraw' and frame_paths else None
+    # A still (one ARRIRAW frame, a camera RAW photo) is developed once and held for ``count`` frames.
+    hold = kind == 'dcraw' and not dcraw_sources or (bool(info.get('still')) and not frame_paths)
+    tool_start, tool_count = (0, 1) if hold else (start, count)
+    frames_written = len(dcraw_sources) if dcraw_sources else tool_count
+    _require_free_space(out_path.parent, out_w * out_h * 6 * frames_written + 1024 ** 2 * frames_written,
+                        f"{_TOOL_NAMES[kind]}'s 16-bit TIFF frames")
     with tempfile.TemporaryDirectory(prefix='.splice-raw-', dir=out_path.parent) as staging:
-        if kind == 'redline':
-            argv = [exe, '--i', source, '--outDir', staging, '--o', 'frame', '--format', '1',
-                    '--res', {'full': '1', 'half': '2', 'quarter': '4', 'eighth': '8'}.get(quality, '2')]
-            if clip:
-                argv += ['--ISO', str(int(settings.get('iso', 800))), '--kelvin', str(int(settings.get('kelvin', 5600))),
-                         '--tint', f"{float(settings.get('tint', 0.0)):.2f}",
-                         '--exposureAdjust', f"{float(settings.get('exposure', 0.0)):.3f}"]
-        elif kind == 'art-cmd':
-            argv = [exe, 'process', '--input', source, '--output', str(Path(staging) / 'frame.#######.tif')]
+        staging = Path(staging)
+        if dcraw_sources:
+            for index, frame in enumerate(dcraw_sources):
+                job.tick()
+                argv = vendor_argv(kind, exe, str(frame.resolve()), staging, settings, quality=quality, start=0,
+                                   count=1, out_size=out_size)
+                argv[argv.index('-Z') + 1] = str(staging / f'frame.{index:07d}.tiff')
+                _run_tool(argv, job, Path(exe).name, timeout)
         else:
-            argv = [exe, '-6', '-T', '-W' if clip else '-w', '-Z', str(Path(staging) / 'frame.tiff'), source]
+            argv = vendor_argv(kind, exe, source, staging, settings, quality=quality, start=tool_start,
+                               count=tool_count, out_size=out_size, path=path, info=info)
+            job.tick()
+            _run_tool(argv, job, Path(exe).name, timeout)
         job.tick()
-        result = subprocess.run(argv, capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
-        job.tick()
-        if result.returncode:
-            raise RawError(f'{Path(exe).name} failed (exit {result.returncode}): '
-                           + result.stderr.decode('utf-8', 'replace')[-400:])
-        _encode_decoded_stills(Path(staging), out_path, fps, is_intermediate=is_intermediate,
-                               seek_optimized=seek_optimized,
-                               duration=float(info.get('duration') or 5.0) if kind == 'dcraw' else None)
+        files = _staged_frames(staging)
+        if dcraw_sources and len(files) != len(dcraw_sources):
+            raise RawError(f'{Path(exe).name} developed {len(files)} of {len(dcraw_sources)} frames')
+        if hold:
+            files = files[:1]
+        elif not dcraw_sources:
+            if len(files) == count:
+                pass
+            elif len(files) >= total and start + count <= len(files):
+                files = files[start:start + count]
+            else:
+                raise RawError(f'{Path(exe).name} wrote {len(files)} frames; the export needs source frames '
+                               f'{start}-{start + count - 1} of {total}')
+        audio = Path(info['rawAudioPath']) if info.get('rawAudioPath') else (path if info.get('audioStreams') else None)
+        _encode_decoded_stills(staging, files, out_path, fps, is_intermediate=is_intermediate,
+                               seek_optimized=seek_optimized, frames=count, job=job, audio_path=audio,
+                               audio_stream=audio_stream, audio_start=float(start / fps))
 
 
-def _encode_decoded_stills(staging: Path, out_path: Path, fps: Fraction, *, is_intermediate: bool,
-                           seek_optimized=False, duration: float | None = None):
-    files = sorted(p for p in staging.rglob('*') if p.is_file() and p.suffix.lower() in ('.tif', '.tiff', '.dpx', '.png'))
+def _staged_frames(staging: Path) -> list[Path]:
+    return sorted(p for p in staging.rglob('*') if p.is_file() and p.suffix.lower() in ('.tif', '.tiff', '.dpx', '.png'))
+
+
+def _encode_decoded_stills(staging: Path, files: list[Path], out_path: Path, fps: Fraction, *, is_intermediate: bool,
+                           seek_optimized=False, frames: int = 1, job: _Job | None = None, audio_path=None,
+                           audio_stream=None, audio_start: float = 0.0):
+    job = job or _Job()
+    audio_in, audio_map = _audio_input(audio_path, audio_stream, audio_start)
     if not files:
         raise RawError('The RAW decoder produced no frames')
     if len(files) > 1:
@@ -1759,13 +2063,16 @@ def _encode_decoded_stills(staging: Path, out_path: Path, fps: Fraction, *, is_i
         source = ['-f', 'image2', '-framerate', _rational_str(fps), '-start_number', '0',
                   '-i', str(listing / f'%07d{files[0].suffix.lower()}')]
     else:
-        source = ['-loop', '1', '-framerate', _rational_str(fps), '-i', str(files[0]),
-                  '-t', f'{float(duration or 5.0):.6f}']
+        source = ['-loop', '1', '-framerate', _rational_str(fps), '-i', str(files[0])]
     cmd = ['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y', '-protocol_whitelist', 'file', *source,
-           *_output_args(is_intermediate, seek_optimized, False, '', fps), str(out_path)]
-    result = subprocess.run(cmd, capture_output=True, timeout=3600, stdin=subprocess.DEVNULL)
-    if result.returncode:
-        raise RawError('Encoding the decoded RAW frames failed: ' + result.stderr.decode('utf-8', 'replace')[-400:])
+           *audio_in, *_output_args(is_intermediate, seek_optimized, audio_map is not None, audio_map or '', fps),
+           '-frames:v', str(max(1, frames)), '-t', f'{float(max(1, frames) / fps):.6f}', str(out_path)]
+    try:
+        _run_tool(cmd, job, 'FFmpeg', 3600)
+    except RawError as error:
+        if 'FFmpeg failed' in str(error):
+            raise RawError('Encoding the decoded RAW frames failed: ' + str(error).split(': ', 1)[-1]) from None
+        raise
 
 
 def _generate_missing_decoder_proxy(path: Path, out_path: Path, info: dict, audio_stream: int | None = None):
@@ -1836,6 +2143,10 @@ def decode_to_intermediate(path, out_path, raw_settings: dict | None = None, *, 
     decoder = _decoder_for(info['rawFormat']) if info.get('rawDecoderAvailable') else None
     if decoder is None:
         raise RawError(info.get('rawDecoderMessage') or _missing_decoder_message(info['rawFormat'], path.name))
+    fps = Fraction(info.get('rate') or '24/1')
+    frames = int(frame_count) if frame_count else max(1, round(float(info.get('duration') or 0) * fps))
+    _require_free_space(out_path.parent, intermediate_bytes(int(info.get('width') or 0), int(info.get('height') or 0), frames),
+                        f'the full-resolution 16-bit intermediate of {path.name}')
     decoder(path, out_path, settings, info, is_intermediate=True, audio_stream=audio_stream,
             start_frame=start_frame, frame_count=frame_count, job=_Job(cancelled, heartbeat))
 

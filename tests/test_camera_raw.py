@@ -656,8 +656,14 @@ class TestRawDecodePipeline(_IsolatedDataDirMixin, unittest.TestCase):
         self.assertEqual(info['rawMetadata']['reelSource'], 'file name')
         self.assertNotIn('fps', info['rawEstimated'])
         self.assertNotIn('duration', info['rawEstimated'])
+        # No .sidecar and no .RMD: ISO / white balance are placeholders, and say so.
+        self.assertTrue({'iso', 'kelvin', 'tint'} <= set(info['rawEstimated']), info['rawEstimated'])
         braw = raw_fixtures.write_synthetic_braw(self.tmp / 'B004_C001.braw', with_sidecar=False)
-        self.assertEqual(raw_decode.probe_raw(braw)['rawEstimated'], [])
+        self.assertEqual(raw_decode.probe_raw(braw)['rawEstimated'], ['iso', 'kelvin', 'tint'])
+        with_sidecar = raw_fixtures.write_synthetic_braw(self.tmp / 'B004_C002.braw', with_sidecar=True)
+        self.assertEqual(raw_decode.probe_raw(with_sidecar)['rawEstimated'], [])
+        with_rmd = raw_fixtures.write_synthetic_r3d(self.tmp / 'A004_C003_0101AB_001.R3D', with_rmd=True)
+        self.assertEqual(raw_decode.probe_raw(with_rmd)['rawEstimated'], [])
         ffprobe = raw_decode._ffprobe_optional(r3d)
         if ffprobe and raw_decode._ffprobe_streams(ffprobe, 'video'):
             video = raw_decode._ffprobe_streams(ffprobe, 'video')[0]
@@ -860,12 +866,12 @@ class TestRawInterchangeAndResolveDisclosure(_IsolatedDataDirMixin, unittest.Tes
             'clips': [
                 {
                     'id': 'c1', 'type': 'video', 'track': 1, 'mediaId': 'm1',
-                    'start': 0.0, 'in': 0.0, 'duration': 0.5,
+                    'start': 0.0, 'in': 0.25, 'duration': 0.25,
                     'rawSettings': {'decodeUsing': 'clip', 'iso': 1600, 'exposure': 1.0, 'kelvin': 7200},
                 },
                 {
                     'id': 'c2', 'type': 'video', 'track': 1, 'mediaId': 'm2',
-                    'start': 0.5, 'in': 0.0, 'duration': 0.5,
+                    'start': 0.25, 'in': 0.0, 'duration': 0.5,
                     'rawSettings': {'decodeUsing': 'camera'},
                 },
             ],
@@ -883,18 +889,28 @@ class TestRawInterchangeAndResolveDisclosure(_IsolatedDataDirMixin, unittest.Tes
         self.assertIn('ISO 1600', raw_notes[0])
         self.assertIn('7200K', raw_notes[0])
 
-        # Export all 4 interchange formats cleanly
-        for fmt in ('fcpxml', 'xmeml', 'edl', 'otio'):
-            exported = interchange_handle('export', {'project': project, 'format': fmt})
-            self.assertTrue(exported['files'], f'No files returned for {fmt}')
+        # Each interchange format on its own: the original RAW path, the reel and the source timecode
+        # (c1 starts 6 frames into a roll whose TC is 01:02:03:04, i.e. frame 89356 at 24 fps).
+        dng_uri, braw_uri = first.resolve().as_uri(), braw.resolve().as_uri()
+        expected = {
+            'fcpxml': ('.fcpxml', [f'src="{dng_uri}"', f'src="{braw_uri}"', 'value="A001"', 'value="B002"',
+                                   'start="89356/24s"', 'start="7200s"']),
+            'xmeml': ('.xml', [dng_uri.replace('file://', 'file://localhost', 1), '<name>A001</name>', '<name>B002</name>',
+                               '<string>01:02:03:04</string>', '<frame>89356</frame>', '<string>02:00:00:00</string>']),
+            'edl': ('.edl', [f'* SOURCE FILE: {first.resolve()}', f'* SOURCE FILE: {braw.resolve()}',
+                             '001  A001     V     C        01:02:03:10 01:02:03:16',
+                             '002  B002     V     C        02:00:00:00 02:00:00:12']),
+            'otio': ('.otio', [f'"target_url": "{dng_uri}"', f'"target_url": "{braw_uri}"', '"reel": "A001"',
+                               '"reel": "B002"', '"timecode": "01:02:03:04"', '"value": 89356.0']),
+        }
+        for fmt, (suffix, needles) in expected.items():
+            exported = interchange_handle('export', {'project': project, 'options': {'formats': [fmt]}})
+            names = [f['name'] for f in exported['files']]
+            self.assertTrue(names and all(name.endswith(suffix) for name in names), f'{fmt} wrote {names}')
             text = '\n'.join(f['content'] for f in exported['files'])
-            self.assertTrue(len(text) > 50)
-            if fmt != 'edl':
-                self.assertIn(first.name, text)
-                self.assertIn(braw.name, text)
-            else:
-                self.assertIn('A001', text)
-                self.assertIn('B002', text)
+            for needle in needles:
+                self.assertIn(needle, text, f'{fmt} is missing {needle!r}')
+            self.assertIn('Camera RAW decode overrides (ISO 1600, exposure +1 EV, 7200K)', exported['report'])
 
     def test_resolve_writer_reports_raw_decode_overrides(self):
         from resolve import writer as rw

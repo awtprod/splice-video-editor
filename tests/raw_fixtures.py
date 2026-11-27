@@ -95,8 +95,10 @@ def write_synthetic_dng(
     baseline_exposure: float = 0.0,
     frame_index: int = 0,
     big_endian: bool = False,
+    iso: int | None = 800,
 ) -> Path:
-    """Write a genuine, uncompressed 12-bit or 16-bit Bayer CFA CinemaDNG (.dng) file."""
+    """Write a genuine, uncompressed 12-bit or 16-bit Bayer CFA CinemaDNG (.dng) file. ``iso``
+    goes in the TIFF/EP ISOSpeedRatings tag (``None`` leaves it out, as some cameras do)."""
     path = Path(path)
     if width % 2 or height % 2:
         raise ValueError('Bayer DNG dimensions must be even')
@@ -169,6 +171,7 @@ def write_synthetic_dng(
         (279, 4, 1, struct.pack(f'{endian}I', len(pixel_bytes))),        # StripByteCounts
         (33421, 3, 2, struct.pack(f'{endian}HH', 2, 2)),                 # CFARepeatPatternDim
         (33422, 1, 4, bytes(cfa_pattern)),                               # CFAPattern
+        *([(34855, 3, 1, struct.pack(f'{endian}H', iso))] if iso else []),  # ISOSpeedRatings
         (50706, 1, 4, bytes([1, 4, 0, 0])),                              # DNGVersion 1.4.0.0
         (50708, 2, len(make_str(camera)), make_str(camera)),             # UniqueCameraModel
         (50714, 4, 1, struct.pack(f'{endian}I', black_level)),           # BlackLevel

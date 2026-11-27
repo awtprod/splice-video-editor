@@ -173,11 +173,46 @@
     }
   }
 
-  function optionList(entries, selected) {
+  function optionList(entries, selected, allowed = null) {
     const has = entries.some(([value]) => value === selected);
     const list = has ? entries : [[selected, selected], ...entries];
-    return list.map(([value, title]) =>
-      `<option value="${esc(value)}" ${value === selected ? 'selected' : ''}>${esc(title)}</option>`).join('');
+    return list.map(([value, title]) => {
+      const off = allowed && !allowed(value) && value !== selected;
+      return `<option value="${esc(value)}" ${value === selected ? 'selected' : ''}${off ? ' disabled' : ''}>${esc(title)}</option>`;
+    }).join('');
+  }
+
+  const SETTING_NAMES = {
+    iso: 'ISO', exposure: 'exposure', kelvin: 'white balance', tint: 'tint', colorSpace: 'color space',
+    gamma: 'gamma', highlightRecovery: 'highlight recovery', debayer: 'debayer quality',
+  };
+
+  // What the clip's decoder applies (source.rawCapabilities from the probe). No capabilities: the
+  // decoder applies every setting (Splice's own CinemaDNG developer or a Splice-contract bridge).
+  function capabilitiesOf(source) {
+    const caps = source?.rawCapabilities;
+    if (!caps || typeof caps !== 'object' || !Array.isArray(caps.settings)) return null;
+    return caps;
+  }
+
+  function takes(caps, key) {
+    return !caps || caps.settings.includes(key);
+  }
+
+  function colorSpaceAllowed(caps, value) {
+    return !caps || (takes(caps, 'colorSpace') && (!Array.isArray(caps.colorSpaces) || caps.colorSpaces.includes(value)));
+  }
+
+  function gammaAllowed(caps, value, colorSpace) {
+    if (!caps) return true;
+    if (!takes(caps, 'gamma') || (Array.isArray(caps.gammas) && !caps.gammas.includes(value))) return false;
+    return !Array.isArray(caps.pairs) || caps.pairs.some(([cs, gamma]) => cs === colorSpace && gamma === value);
+  }
+
+  // Look values the file did not record: the Inspector shows the placeholder and says so.
+  function estimatedLook(source) {
+    const list = Array.isArray(source?.rawEstimated) ? source.rawEstimated : [];
+    return new Set(['iso', 'kelvin', 'tint', 'camera'].filter(key => list.includes(key)));
   }
 
   function markup(clip, source) {
@@ -191,19 +226,27 @@
     const decoderBadge = decoderAvailable
       ? `<span class="raw-badge raw-badge-decoder" title="Active RAW decoder">${esc(source.rawDecoderName || 'Native decoder')}</span>`
       : `<span class="raw-badge raw-badge-warn" title="Install vendor SDK or attach proxy">Decoder missing</span>`;
+    const caps = capabilitiesOf(source);
+    const estimated = estimatedLook(source);
+    // In Camera Metadata mode the look IS the file's metadata, so a placeholder is flagged on its control.
+    const flag = key => estimated.has(key) && settings.decodeUsing === 'camera'
+      ? `<em class="raw-est" data-raw-est="${key}" title="Not recorded in the file: Splice placeholder">estimated</em>` : '';
     const metaParts = [];
-    if (meta.camera) metaParts.push(meta.camera);
+    if (meta.camera) metaParts.push(estimated.has('camera') ? `${meta.camera} (model not in the file)` : meta.camera);
     if (source.reel) metaParts.push('Reel ' + source.reel);
     if (source.timecode) metaParts.push('TC ' + source.timecode);
     if (meta.frameCount > 1) metaParts.push(`${meta.frameCount} frames`);
     if (meta.missingFrames > 0) metaParts.push(`${meta.missingFrames} frame numbers missing: later frames play early`);
-    const names = {timecode: 'timecode', fps: 'frame rate', duration: 'duration', width: 'frame size'};
+    const names = {timecode: 'timecode', fps: 'frame rate', duration: 'duration', width: 'frame size',
+      iso: 'ISO', kelvin: 'white balance', tint: 'tint', camera: 'camera model'};
     const guessed = [...new Set((source.rawEstimated || []).filter(key => key !== 'height').map(key => names[key]).filter(Boolean))];
     const job = window.SpliceMedia?.rawPreviewStatus?.(source, clip.rawSettings);
     const statusText = job?.pending ? 'Decoding Camera RAW preview…' : (job?.error ? job.error : '');
     const statusClass = job?.error ? 'raw-pending raw-error' : 'raw-pending';
     const csList = COLOR_SPACES[fmt] || COLOR_SPACES.default;
     const gmList = GAMMAS[fmt] || GAMMAS.default;
+    const off = key => takes(caps, key) ? '' : ` disabled data-raw-unsupported title="${esc(caps.tool)} cannot take ${SETTING_NAMES[key]}"`;
+    const ignored = caps ? Object.keys(SETTING_NAMES).filter(key => !takes(caps, key)).map(key => SETTING_NAMES[key]) : [];
     return `<section class="splice-section splice-raw-section" data-raw-panel>` +
       `<h3>Camera RAW</h3>` +
       `<div class="splice-raw">` +
@@ -213,7 +256,9 @@
         `</div>` +
         (metaParts.length ? `<p class="raw-camera-meta">${esc(metaParts.join(' · '))}</p>` : '') +
         (guessed.length ? `<p class="raw-camera-meta raw-estimated" data-raw-estimated>Not in the file: ${esc(guessed.join(', '))}. ` +
-          `Splice shows a placeholder; interchange reports say so.</p>` : '') +
+          `Splice shows a placeholder, marked “estimated”; interchange reports say so.</p>` : '') +
+        (ignored.length ? `<p class="raw-camera-meta raw-unsupported" data-raw-unsupported-note>${esc(caps.tool)} cannot take ` +
+          `${esc(ignored.join(', '))}: ${ignored.length === 1 ? 'that control is' : 'those controls are'} off for this clip.</p>` : '') +
         (!decoderAvailable ? `<div class="raw-status-banner" role="status">` +
           `<p>${esc(source.rawDecoderMessage || 'Native vendor RAW decoder is not installed yet. Container metadata and audio were imported.')}</p>` +
           `<div class="raw-banner-actions">` +
@@ -229,22 +274,22 @@
             `<option value="camera" ${settings.decodeUsing === 'camera' ? 'selected' : ''}>Camera Metadata</option>` +
             `<option value="clip" ${settings.decodeUsing === 'clip' ? 'selected' : ''}>Clip</option>` +
           `</select></label>` +
-        `<label class="splice-number"><span>ISO</span>` +
-          `<input aria-label="RAW ISO" type="number" data-raw-field="iso" min="50" max="102400" step="50" value="${settings.iso}"></label>` +
+        `<label class="splice-number"><span>ISO ${flag('iso')}</span>` +
+          `<input aria-label="RAW ISO" type="number" data-raw-field="iso" min="50" max="102400" step="50" value="${settings.iso}"${off('iso')}></label>` +
         `<label class="splice-control"><span>Exposure<output data-raw-out="exposure">${settings.exposure >= 0 ? '+' : ''}${settings.exposure.toFixed(1)} EV</output></span>` +
-          `<input aria-label="RAW Exposure" type="range" data-raw-field="exposure" min="-4" max="4" step="0.1" value="${settings.exposure}"></label>` +
-        `<label class="splice-control"><span>White Balance<output data-raw-out="kelvin">${settings.kelvin}K</output></span>` +
-          `<input aria-label="RAW White Balance Kelvin" type="range" data-raw-field="kelvin" min="2000" max="15000" step="50" value="${settings.kelvin}"></label>` +
-        `<label class="splice-control"><span>Tint<output data-raw-out="tint">${settings.tint >= 0 ? '+' : ''}${settings.tint}</output></span>` +
-          `<input aria-label="RAW Tint" type="range" data-raw-field="tint" min="-100" max="100" step="1" value="${settings.tint}"></label>` +
+          `<input aria-label="RAW Exposure" type="range" data-raw-field="exposure" min="-4" max="4" step="0.1" value="${settings.exposure}"${off('exposure')}></label>` +
+        `<label class="splice-control"><span>White Balance ${flag('kelvin')}<output data-raw-out="kelvin">${settings.kelvin}K</output></span>` +
+          `<input aria-label="RAW White Balance Kelvin" type="range" data-raw-field="kelvin" min="2000" max="15000" step="50" value="${settings.kelvin}"${off('kelvin')}></label>` +
+        `<label class="splice-control"><span>Tint ${flag('tint')}<output data-raw-out="tint">${settings.tint >= 0 ? '+' : ''}${settings.tint}</output></span>` +
+          `<input aria-label="RAW Tint" type="range" data-raw-field="tint" min="-100" max="100" step="1" value="${settings.tint}"${off('tint')}></label>` +
         `<label class="splice-number"><span>Color space</span>` +
-          `<select aria-label="RAW Color Space" data-raw-field="colorSpace">${optionList(csList, settings.colorSpace)}</select></label>` +
+          `<select aria-label="RAW Color Space" data-raw-field="colorSpace"${off('colorSpace')}>${optionList(csList, settings.colorSpace, value => colorSpaceAllowed(caps, value))}</select></label>` +
         `<label class="splice-number"><span>Gamma</span>` +
-          `<select aria-label="RAW Gamma" data-raw-field="gamma">${optionList(gmList, settings.gamma)}</select></label>` +
+          `<select aria-label="RAW Gamma" data-raw-field="gamma"${off('gamma')}>${optionList(gmList, settings.gamma, value => gammaAllowed(caps, value, settings.colorSpace))}</select></label>` +
         `<label class="splice-safe-toggle">` +
-          `<input aria-label="RAW Highlight Recovery" type="checkbox" data-raw-field="highlightRecovery" ${settings.highlightRecovery ? 'checked' : ''}> Highlight recovery</label>` +
+          `<input aria-label="RAW Highlight Recovery" type="checkbox" data-raw-field="highlightRecovery" ${settings.highlightRecovery ? 'checked' : ''}${off('highlightRecovery')}> Highlight recovery</label>` +
         `<label class="splice-number"><span>Preview debayer</span>` +
-          `<select aria-label="RAW Preview Debayer Quality" data-raw-field="debayer">` +
+          `<select aria-label="RAW Preview Debayer Quality" data-raw-field="debayer"${off('debayer')}>` +
             `<option value="full" ${settings.debayer === 'full' ? 'selected' : ''}>Full</option>` +
             `<option value="half" ${settings.debayer === 'half' ? 'selected' : ''}>Half</option>` +
             `<option value="quarter" ${settings.debayer === 'quarter' ? 'selected' : ''}>Quarter</option>` +
@@ -274,6 +319,9 @@
         node.disabled = true;
       }
     }
+    // Controls the clip's decoder cannot take were rendered disabled: keep them so even if a
+    // shared helper re-enables Inspector inputs.
+    for (const node of panel.querySelectorAll('[data-raw-unsupported]')) node.disabled = true;
 
     const formatOutput = (field, raw) => {
       const v = Number(raw);
@@ -323,6 +371,14 @@
         }
         const next = {...base, [key]: value};
         if (key !== 'debayer') next.decodeUsing = 'clip';
+        // A decoder that only renders some colour space + gamma pairs: follow the colour space
+        // with the first gamma it pairs with, instead of exporting a combination it cannot render.
+        const caps = capabilitiesOf(source);
+        if (key === 'colorSpace' && !gammaAllowed(caps, next.gamma, next.colorSpace)) {
+          const gamma = (GAMMAS[source.rawFormat] || GAMMAS.default).map(([g]) => g)
+            .find(g => gammaAllowed(caps, g, next.colorSpace));
+          if (gamma) next.gamma = gamma;
+        }
         commit(next);
       });
     }
@@ -382,5 +438,6 @@
     validateRawSettings,
     defaultsFor,
     effectiveSettings,
+    capabilitiesOf,
   };
 })();

@@ -404,6 +404,9 @@ def link_many(values, validate=None):
             prepared.append(_prepare(value, validate))
         except (ValueError, OSError) as error:
             prepared.append(error)
+        except Exception as error:  # One unreadable file must not fail the rest of the batch.
+            name = Path(str(value)).name if isinstance(value, (str, os.PathLike)) else 'This file'
+            prepared.append(ValueError(f'{name} could not be read ({type(error).__name__})'))
 
     def change(links):
         by_path = {entry['path']: key for key, entry in links.items()}

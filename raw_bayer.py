@@ -24,7 +24,15 @@ MAX_HEIGHT = 16384
 MAX_PIXELS = 64_000_000
 MAX_IFD_ENTRIES = 1024
 MAX_IFD_DEPTH = 4
+MAX_IFDS = 64
 MAX_SEQUENCE_FRAMES = 500_000
+# Header decoding limits. Only the tags Splice reads are decoded at all; each has a count cap, and a
+# file may decode at most MAX_DECODED_VALUES tag values in total across every IFD it chains.
+MAX_DECODED_VALUES = 1_000_000
+MAX_METADATA_VALUES = 64
+MAX_STRING_BYTES = 4096
+MAX_LAYOUT_VALUES = 65536
+MAX_BASELINE_EXPOSURE = 16.0
 
 # TIFF / DNG tag IDs
 TAG_NEW_SUBFILE_TYPE = 254
@@ -63,6 +71,22 @@ TAG_CALIBRATION_ILLUMINANT_2 = 50779
 TAG_TIMECODES = 51043
 TAG_FRAME_RATE = 51044
 TAG_REEL_NAME = 51081
+TAG_EXIF_IFD = 34665
+TAG_ISO_SPEED = 34855
+
+# Tags whose values may hold one entry per strip / tile.
+_LAYOUT_TAGS = frozenset({TAG_STRIP_OFFSETS, TAG_STRIP_BYTE_COUNTS, TAG_TILE_OFFSETS, TAG_TILE_BYTE_COUNTS})
+_STRING_TAGS = frozenset({TAG_MAKE, TAG_MODEL, TAG_UNIQUE_CAMERA_MODEL, TAG_REEL_NAME})
+# DNG allows up to ten 8-byte SMPTE time codes.
+_TAG_COUNT_LIMITS = {TAG_TIMECODES: 80}
+# Every tag parse_dng_bytes reads. Anything else in an IFD is skipped without decoding its values.
+_PARSED_TAGS = frozenset({
+    TAG_NEW_SUBFILE_TYPE, TAG_IMAGE_WIDTH, TAG_IMAGE_LENGTH, TAG_BITS_PER_SAMPLE, TAG_COMPRESSION,
+    TAG_PHOTOMETRIC, TAG_SAMPLES_PER_PIXEL, TAG_ROWS_PER_STRIP, TAG_TILE_WIDTH, TAG_TILE_LENGTH,
+    TAG_SUB_IFDS, TAG_CFA_PATTERN, TAG_BLACK_LEVEL, TAG_WHITE_LEVEL, TAG_COLOR_MATRIX_1, TAG_COLOR_MATRIX_2,
+    TAG_AS_SHOT_NEUTRAL, TAG_BASELINE_EXPOSURE, TAG_CALIBRATION_ILLUMINANT_1, TAG_CALIBRATION_ILLUMINANT_2,
+    TAG_TIMECODES, TAG_FRAME_RATE, TAG_EXIF_IFD, TAG_ISO_SPEED,
+}) | _LAYOUT_TAGS | _STRING_TAGS
 
 # TIFF field type sizes & struct codes
 _TIFF_TYPES = {
@@ -78,6 +102,7 @@ _TIFF_TYPES = {
     10: (8, 'ii'), # SRATIONAL
     11: (4, 'f'),  # FLOAT
     12: (8, 'd'),  # DOUBLE
+    13: (4, 'I'),  # IFD (SubIFDs offsets)
 }
 
 # Standard EXIF / DNG CalibrationIlluminant Kelvin temperatures
@@ -172,6 +197,15 @@ _CFA_NAMES = {
 
 class RawError(ValueError):
     """Raised when a RAW file is malformed, unsupported, or cannot be decoded."""
+
+
+# Exceptions a hostile header can provoke deep in parsing arithmetic; callers see them as RawError.
+MALFORMED_ERRORS = (TypeError, IndexError, KeyError, ArithmeticError, struct.error)
+
+
+def malformed(name: str, exc: BaseException) -> RawError:
+    """A ``RawError`` describing ``exc`` raised while reading the malformed file ``name``."""
+    return RawError(f'{name} has a malformed RAW header ({type(exc).__name__}: {str(exc)[:120]})')
 
 
 # ---------------------------------------------------------------------------
@@ -438,11 +472,31 @@ def _oetf_lut16(gamma: str):
 # TIFF / DNG / DNG-EP IFD parser
 # ---------------------------------------------------------------------------
 
-def _read_ifd(data: memoryview, endian: str, offset: int, seen: set):
+def _tag_limit(tag: int) -> int:
+    if tag in _LAYOUT_TAGS:
+        return MAX_LAYOUT_VALUES
+    if tag in _STRING_TAGS:
+        return MAX_STRING_BYTES
+    return _TAG_COUNT_LIMITS.get(tag, MAX_METADATA_VALUES)
+
+
+def _read_ifd(data: memoryview, endian: str, offset: int, seen: set, budget: list | None = None):
+    """Read one IFD. Returns ``(tags, next_offset)``.
+
+    Only tags in ``_PARSED_TAGS`` are decoded; every other entry is skipped unread, however large
+    its declared count. A parsed tag over its count cap, or a file whose parsed tags together pass
+    ``MAX_DECODED_VALUES`` (``budget`` is a one-item list shared across a file's IFDs), raises
+    ``RawError``. RATIONAL values decode to ``Fraction`` (``None`` for a zero denominator); a tag
+    with more than one value decodes to a tuple.
+    """
+    if budget is None:
+        budget = [MAX_DECODED_VALUES]
     if offset <= 0 or offset + 2 > len(data):
         raise RawError('Truncated DNG IFD header')
     if offset in seen:
         raise RawError('Cyclic IFD chain in DNG file')
+    if len(seen) >= MAX_IFDS:
+        raise RawError(f'DNG file chains more than {MAX_IFDS} IFDs')
     seen.add(offset)
     count = struct.unpack_from(endian + 'H', data, offset)[0]
     if count > MAX_IFD_ENTRIES:
@@ -455,9 +509,17 @@ def _read_ifd(data: memoryview, endian: str, offset: int, seen: set):
     for _ in range(count):
         tag, typ, cnt, val_bytes = struct.unpack_from(endian + 'HHI4s', data, pos)
         pos += 12
-        spec = _TIFF_TYPES.get(typ)
-        if spec is None or cnt == 0 or cnt > 1_000_000:
+        if tag not in _PARSED_TAGS:
             continue
+        spec = _TIFF_TYPES.get(typ)
+        if spec is None or cnt == 0:
+            continue
+        limit = _tag_limit(tag)
+        if cnt > limit:
+            raise RawError(f'DNG tag {tag} declares {cnt} values (the limit is {limit})')
+        budget[0] -= cnt
+        if budget[0] < 0:
+            raise RawError(f'DNG header declares more than {MAX_DECODED_VALUES} tag values')
         unit_size, code = spec
         total = unit_size * cnt
         if total <= 4:
@@ -470,11 +532,8 @@ def _read_ifd(data: memoryview, endian: str, offset: int, seen: set):
         if typ == 2:  # ASCII
             tags[tag] = bytes(raw_slice).split(b'\x00', 1)[0].decode('utf-8', 'replace').strip()
         elif typ in (5, 10):  # RATIONAL / SRATIONAL
-            fmt = endian + code
-            vals = []
-            for idx in range(cnt):
-                num, den = struct.unpack_from(fmt, raw_slice, idx * 8)
-                vals.append((num, den))
+            flat = struct.unpack_from(endian + code[0] * (2 * cnt), raw_slice, 0)
+            vals = tuple(Fraction(flat[i], flat[i + 1]) if flat[i + 1] else None for i in range(0, 2 * cnt, 2))
             tags[tag] = vals[0] if cnt == 1 else vals
         else:
             vals = struct.unpack_from(endian + code * cnt, raw_slice, 0)
@@ -490,17 +549,62 @@ def _as_list(val):
 
 
 def _rat_float(val, default=0.0):
-    if isinstance(val, tuple) and len(val) == 2:
-        return val[0] / val[1] if val[1] else default
-    if isinstance(val, (int, float)):
-        return float(val)
-    return default
+    """A finite float from an integer, float, ``Fraction`` or legacy ``(num, den)`` pair, else ``default``."""
+    if isinstance(val, tuple) and len(val) == 2 and all(isinstance(v, int) for v in val):
+        val = Fraction(val[0], val[1]) if val[1] else None
+    if isinstance(val, bool) or not isinstance(val, (int, float, Fraction)):
+        return default
+    try:
+        out = float(val)
+    except (OverflowError, ValueError):
+        return default
+    return out if math.isfinite(out) else default
+
+
+def _tag_int(value, tag: int, name: str) -> int:
+    """Coerce one decoded TIFF value to an int, or raise ``RawError``."""
+    if isinstance(value, bool):
+        value = int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, Fraction) and value.denominator == 1:
+        return int(value)
+    if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        return int(value)
+    raise RawError(f'{name}: TIFF tag {tag} is not an integer ({type(value).__name__})')
+
+
+def _scalar_int(ifd: dict, tag: int, default, name: str, *, first_of_many: bool = False):
+    """Read a tag that must hold one integer. Tuples raise ``RawError`` unless ``first_of_many``
+    (BitsPerSample, which repeats per sample)."""
+    value = ifd.get(tag)
+    if value is None:
+        return default
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return default
+        if len(value) != 1 and not first_of_many:
+            raise RawError(f'{name}: TIFF tag {tag} holds {len(value)} values where one is expected')
+        value = value[0]
+    return _tag_int(value, tag, name)
+
+
+def _int_list(ifd: dict, tag: int, name: str) -> list[int]:
+    return [_tag_int(v, tag, name) for v in _as_list(ifd.get(tag))]
+
+
+def _area_or_zero(ifd: dict) -> int:
+    """Image area for choosing the primary IFD; a malformed size counts as empty."""
+    try:
+        return _scalar_int(ifd, TAG_IMAGE_WIDTH, 0, '') * _scalar_int(ifd, TAG_IMAGE_LENGTH, 0, '')
+    except RawError:
+        return 0
 
 
 def _parse_matrix(val):
     if not val:
         return None
-    items = val if isinstance(val, list) else [val]
+    items = list(val) if isinstance(val, (list, tuple)) else [val]
     if len(items) != 9:
         return None
     floats = [_rat_float(v, 0.0) for v in items]
@@ -515,7 +619,12 @@ def _parse_dng_timecode(val):
     """Decode DNG TimeCodes tag (8-byte SMPTE 12M BCD)."""
     if not val:
         return None, False
-    raw = bytes(val) if isinstance(val, (list, tuple, bytes, bytearray)) else b''
+    if isinstance(val, (list, tuple)) and all(isinstance(v, int) and 0 <= v <= 255 for v in val):
+        raw = bytes(val)
+    elif isinstance(val, (bytes, bytearray)):
+        raw = bytes(val)
+    else:
+        raw = b''
     if len(raw) < 4:
         return None, False
     b0, b1, b2, b3 = raw[0], raw[1], raw[2], raw[3]
@@ -544,7 +653,14 @@ def parse_dng(path) -> dict:
 
 
 def parse_dng_bytes(raw_bytes: bytes, name: str = 'frame.dng') -> dict:
-    """Parse DNG metadata from raw bytes."""
+    """Parse DNG metadata from raw bytes. Any malformed header raises ``RawError``."""
+    try:
+        return _parse_dng_bytes(raw_bytes, name)
+    except MALFORMED_ERRORS as exc:
+        raise malformed(name, exc) from None
+
+
+def _parse_dng_bytes(raw_bytes: bytes, name: str) -> dict:
     if len(raw_bytes) < 16:
         raise RawError(f'{name} is truncated (not a valid TIFF/DNG header)')
     view = memoryview(raw_bytes)
@@ -559,7 +675,8 @@ def parse_dng_bytes(raw_bytes: bytes, name: str = 'frame.dng') -> dict:
     if version != 42:
         raise RawError(f'{name} is not a standard TIFF/DNG file (version {version})')
     seen = set()
-    ifd0, next_ifd = _read_ifd(view, endian, first_ifd, seen)
+    budget = [MAX_DECODED_VALUES]
+    ifd0, next_ifd = _read_ifd(view, endian, first_ifd, seen, budget)
     candidates = [ifd0]
 
     def walk_sub(ifd, depth):
@@ -567,15 +684,22 @@ def parse_dng_bytes(raw_bytes: bytes, name: str = 'frame.dng') -> dict:
             return
         for sub_off in _as_list(ifd.get(TAG_SUB_IFDS)):
             if isinstance(sub_off, int) and sub_off > 0 and sub_off not in seen:
-                sub, _ = _read_ifd(view, endian, sub_off, seen)
+                sub, _ = _read_ifd(view, endian, sub_off, seen, budget)
                 candidates.append(sub)
                 walk_sub(sub, depth + 1)
 
     walk_sub(ifd0, 0)
+    exif = {}
+    exif_offset = ifd0.get(TAG_EXIF_IFD)
+    if isinstance(exif_offset, int) and exif_offset > 0 and exif_offset not in seen:
+        try:  # Only ISO is read from it: a damaged EXIF IFD leaves ISO unknown, not the frame unreadable.
+            exif, _ = _read_ifd(view, endian, exif_offset, seen, budget)
+        except RawError:
+            exif = {}
     while next_ifd and len(candidates) < 16:
         if next_ifd in seen:
             break
-        nxt, next_ifd = _read_ifd(view, endian, next_ifd, seen)
+        nxt, next_ifd = _read_ifd(view, endian, next_ifd, seen, budget)
         candidates.append(nxt)
         walk_sub(nxt, 0)
 
@@ -584,27 +708,25 @@ def parse_dng_bytes(raw_bytes: bytes, name: str = 'frame.dng') -> dict:
     if cfa_ifds:
         primary = max(
             cfa_ifds,
-            key=lambda i: (i.get(TAG_NEW_SUBFILE_TYPE, 0) == 0,
-                           int(i.get(TAG_IMAGE_WIDTH, 0)) * int(i.get(TAG_IMAGE_LENGTH, 0))),
+            key=lambda i: (i.get(TAG_NEW_SUBFILE_TYPE, 0) == 0, _area_or_zero(i)),
         )
     else:
-        primary = max(candidates, key=lambda i: int(i.get(TAG_IMAGE_WIDTH, 0)) * int(i.get(TAG_IMAGE_LENGTH, 0)))
+        primary = max(candidates, key=_area_or_zero)
 
     # Merge IFD0 metadata with primary image IFD
     merged = {**ifd0, **primary}
-    width = int(merged.get(TAG_IMAGE_WIDTH) or 0)
-    height = int(merged.get(TAG_IMAGE_LENGTH) or 0)
+    width = _scalar_int(merged, TAG_IMAGE_WIDTH, 0, name)
+    height = _scalar_int(merged, TAG_IMAGE_LENGTH, 0, name)
     if not (2 <= width <= MAX_WIDTH and 2 <= height <= MAX_HEIGHT and width * height <= MAX_PIXELS):
         raise RawError(f'{name} has unsupported dimensions ({width}x{height})')
-    bps_raw = merged.get(TAG_BITS_PER_SAMPLE, 12)
-    bps = int(bps_raw[0] if isinstance(bps_raw, (list, tuple)) else bps_raw)
-    compression = int(merged.get(TAG_COMPRESSION, 1))
-    photometric = int(merged.get(TAG_PHOTOMETRIC, 32803))
-    samples = int(merged.get(TAG_SAMPLES_PER_PIXEL, 1))
+    bps = _scalar_int(merged, TAG_BITS_PER_SAMPLE, 12, name, first_of_many=True)
+    compression = _scalar_int(merged, TAG_COMPRESSION, 1, name)
+    photometric = _scalar_int(merged, TAG_PHOTOMETRIC, 32803, name)
+    samples = _scalar_int(merged, TAG_SAMPLES_PER_PIXEL, 1, name)
 
-    cfa_raw = _as_list(merged.get(TAG_CFA_PATTERN))
+    cfa_raw = _int_list(merged, TAG_CFA_PATTERN, name)
     if len(cfa_raw) == 4:
-        cfa_tuple = tuple(int(v) for v in cfa_raw)
+        cfa_tuple = tuple(cfa_raw)
     else:
         cfa_tuple = (0, 1, 1, 2)  # Default RGGB
     cfa_name = _CFA_NAMES.get(cfa_tuple, 'RGGB')
@@ -633,8 +755,8 @@ def parse_dng_bytes(raw_bytes: bytes, name: str = 'frame.dng') -> dict:
 
     cm1 = _parse_matrix(merged.get(TAG_COLOR_MATRIX_1))
     cm2 = _parse_matrix(merged.get(TAG_COLOR_MATRIX_2))
-    illum1 = int(merged.get(TAG_CALIBRATION_ILLUMINANT_1, 17) or 17)
-    illum2 = int(merged.get(TAG_CALIBRATION_ILLUMINANT_2, 21) or 21)
+    illum1 = _scalar_int(merged, TAG_CALIBRATION_ILLUMINANT_1, 17, name) or 17
+    illum2 = _scalar_int(merged, TAG_CALIBRATION_ILLUMINANT_2, 21, name) or 21
 
     asn_raw = _as_list(merged.get(TAG_AS_SHOT_NEUTRAL))
     as_shot_neutral = None
@@ -644,28 +766,46 @@ def parse_dng_bytes(raw_bytes: bytes, name: str = 'frame.dng') -> dict:
             as_shot_neutral = vals
 
     baseline_exposure = _rat_float(merged.get(TAG_BASELINE_EXPOSURE), 0.0)
+    baseline_exposure = max(-MAX_BASELINE_EXPOSURE, min(MAX_BASELINE_EXPOSURE, baseline_exposure))
     fps_val = merged.get(TAG_FRAME_RATE)
     fps_fraction = None
-    if isinstance(fps_val, tuple) and len(fps_val) == 2 and fps_val[0] > 0 and fps_val[1] > 0:
-        fps_fraction = Fraction(fps_val[0], fps_val[1])
-    elif isinstance(fps_val, (int, float)) and 0 < fps_val <= 1000:
+    if isinstance(fps_val, Fraction) and 0 < fps_val <= 1000:
+        fps_fraction = fps_val
+    elif isinstance(fps_val, (int, float)) and not isinstance(fps_val, bool) and 0 < fps_val <= 1000:
         fps_fraction = Fraction(str(fps_val)).limit_denominator(1001)
 
     timecode, drop_frame = _parse_dng_timecode(merged.get(TAG_TIMECODES))
     reel = merged.get(TAG_REEL_NAME) if isinstance(merged.get(TAG_REEL_NAME), str) else None
-    camera = (
-        merged.get(TAG_UNIQUE_CAMERA_MODEL)
+    camera_model = (
+        (merged.get(TAG_UNIQUE_CAMERA_MODEL) if isinstance(merged.get(TAG_UNIQUE_CAMERA_MODEL), str) else '')
         or ' '.join(p for p in (merged.get(TAG_MAKE), merged.get(TAG_MODEL)) if isinstance(p, str) and p)
-        or 'CinemaDNG Camera'
-    )
+    ).strip()
+    camera = camera_model or 'CinemaDNG Camera'
+    iso = None
+    for source in (merged, exif):
+        try:
+            value = _scalar_int(source, TAG_ISO_SPEED, None, name, first_of_many=True)
+        except RawError:
+            value = None
+        if value and 0 < value <= 409600:
+            iso = value
+            break
 
-    strip_offsets = [int(v) for v in _as_list(primary.get(TAG_STRIP_OFFSETS))]
-    strip_counts = [int(v) for v in _as_list(primary.get(TAG_STRIP_BYTE_COUNTS))]
-    rows_per_strip = int(primary.get(TAG_ROWS_PER_STRIP) or height)
-    tile_width = int(primary.get(TAG_TILE_WIDTH) or 0)
-    tile_length = int(primary.get(TAG_TILE_LENGTH) or 0)
-    tile_offsets = [int(v) for v in _as_list(primary.get(TAG_TILE_OFFSETS))]
-    tile_counts = [int(v) for v in _as_list(primary.get(TAG_TILE_BYTE_COUNTS))]
+    strip_offsets = _int_list(primary, TAG_STRIP_OFFSETS, name)
+    strip_counts = _int_list(primary, TAG_STRIP_BYTE_COUNTS, name)
+    rows_per_strip = _scalar_int(primary, TAG_ROWS_PER_STRIP, 0, name) or height
+    tile_width = _scalar_int(primary, TAG_TILE_WIDTH, 0, name)
+    tile_length = _scalar_int(primary, TAG_TILE_LENGTH, 0, name)
+    tile_offsets = _int_list(primary, TAG_TILE_OFFSETS, name)
+    tile_counts = _int_list(primary, TAG_TILE_BYTE_COUNTS, name)
+    if len(strip_offsets) > height or len(strip_counts) > height:
+        raise RawError(f'{name} declares more strips than image rows')
+    if tile_width < 0 or tile_length < 0 or tile_width > MAX_WIDTH or tile_length > MAX_HEIGHT:
+        raise RawError(f'{name} has unsupported tile size ({tile_width}x{tile_length})')
+    if tile_width and tile_length:
+        tile_total = ((width + tile_width - 1) // tile_width) * ((height + tile_length - 1) // tile_length)
+        if len(tile_offsets) > tile_total or len(tile_counts) > tile_total:
+            raise RawError(f'{name} declares more tiles than its {tile_total}-tile layout')
 
     builtin_decodable = (
         compression == 1
@@ -701,6 +841,10 @@ def parse_dng_bytes(raw_bytes: bytes, name: str = 'frame.dng') -> dict:
         'dropFrame': drop_frame,
         'reel': reel or None,
         'camera': str(camera),
+        # What the file itself recorded; the rest above is a placeholder the probe flags as estimated.
+        'cameraKnown': bool(camera_model),
+        'whiteBalanceKnown': as_shot_neutral is not None,
+        'iso': iso,
         'builtinDecodable': builtin_decodable,
         'compressed': compression != 1,
         'stripOffsets': strip_offsets,
@@ -911,7 +1055,10 @@ def decode_dng_bytes(raw_bytes: bytes, settings: dict | None = None, *, scale: i
     meta = parse_dng_bytes(raw_bytes, name=name)
     if not meta['builtinDecodable']:
         raise RawError(f'{name} uses compressed DNG (compression={meta["compression"]}); requires LibRaw/dcraw_emu')
-    return decode_plane(_read_bayer_plane(raw_bytes, meta), meta, settings, scale=scale, name=name)
+    try:
+        return decode_plane(_read_bayer_plane(raw_bytes, meta), meta, settings, scale=scale, name=name)
+    except MALFORMED_ERRORS as exc:
+        raise malformed(name, exc) from None
 
 
 CFA_BY_PIX_FMT = {'rggb': (0, 1, 1, 2), 'bggr': (2, 1, 1, 0), 'grbg': (1, 0, 2, 1), 'gbrg': (1, 2, 0, 1)}
@@ -936,7 +1083,14 @@ def decode_plane(plane, meta: dict, settings: dict | None = None, *, scale: int 
     highlight_recovery = bool(settings.get('highlightRecovery', False)) if not use_as_shot else False
 
     wb, mat = compute_wb_and_matrix(meta, kelvin, tint, color_space=color_space, use_as_shot=use_as_shot)
-    exp_gain = (2.0 ** (exposure + meta['baselineExposure'])) * (max(1.0, iso) / base_iso)
+    # BaselineExposure is clamped at parse time; clamp the sum too so no header or setting overflows.
+    stops = exposure + _rat_float(meta.get('baselineExposure'), 0.0)
+    stops = max(-2.0 * MAX_BASELINE_EXPOSURE, min(2.0 * MAX_BASELINE_EXPOSURE, stops))
+    exp_gain = (2.0 ** stops) * (max(1.0, min(iso, 1_000_000.0)) / base_iso)
+    # A hostile colour matrix can invert to huge or non-finite gains; per-pixel maths would then
+    # overflow to inf and NaN. Real camera matrices and white balance gains are small numbers.
+    if not math.isfinite(exp_gain) or not all(math.isfinite(v) and abs(v) < 1e6 for v in (*wb, *mat[0], *mat[1], *mat[2])):
+        raise RawError(f'{name} has a colour matrix or white balance Splice cannot use')
 
     w, h = meta['width'], meta['height']
     cfa = meta['cfaPattern']  # (c00, c01, c10, c11) where 0=R, 1=G, 2=B
@@ -957,6 +1111,8 @@ def decode_plane(plane, meta: dict, settings: dict | None = None, *, scale: int 
     lut = _oetf_lut16(gamma)
 
     # Map CFA quad positions (00, 01, 10, 11) to R, G1, G2, B offsets
+    if tuple(cfa) not in _CFA_NAMES:
+        raise RawError(f'{name} has unsupported Bayer CFA pattern: {tuple(cfa)}')
     r_pos = cfa.index(0)
     b_pos = cfa.index(2)
     g_positions = [i for i, ch in enumerate(cfa) if ch == 1]

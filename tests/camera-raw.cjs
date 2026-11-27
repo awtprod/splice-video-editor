@@ -29,7 +29,11 @@ function fixtures(directory) {
       + ` bit_depth=12, width=${WIDTH}, height=${HEIGHT}, with_wav=True, reel='A001', timecode=(1, 0, 0, 0))`,
     "braw = raw_fixtures.write_synthetic_braw(base / 'B001_CARD' / 'B001_C001.braw', width=160, height=90, fps=24,"
       + " duration=0.5, reel='B001', timecode='02:00:00:00', with_audio=True, with_sidecar=True)",
-    "print(json.dumps({'first': str(first), 'card': str(first.parent), 'brawCard': str(braw.parent)}))",
+    // No .sidecar: ISO and white balance are not in the file, so they are placeholders.
+    "bare = raw_fixtures.write_synthetic_braw(base / 'B002_CARD' / 'B002_C001.braw', width=160, height=90, fps=24,"
+      + " duration=0.5, reel='B002', timecode='03:00:00:00', with_audio=True, with_sidecar=False)",
+    "print(json.dumps({'first': str(first), 'card': str(first.parent), 'brawCard': str(braw.parent),"
+      + " 'bareCard': str(bare.parent)}))",
   ].join('\n');
   return JSON.parse(execFileSync('python3', ['-c', script, directory], {cwd: root, encoding: 'utf8'}).trim());
 }
@@ -246,6 +250,70 @@ async function main() {
     if (proofDir) {
       await page.locator('.raw-status-banner').scrollIntoViewIfNeeded();
       await page.screenshot({path: path.join(proofDir, 'braw-missing-decoder.png')});
+    }
+
+    // Look metadata the file does not record is marked "estimated" on its control and named in
+    // the "Not in the file" line; a decoder that cannot take a setting has that control off.
+    await linkInPlace(page, media.bareCard, 'B002_C001.braw');
+    const bare = await page.waitForFunction(() => Editor.get().project.media.find(m => m.reel === 'B002')).then(h => h.jsonValue());
+    assert.deepEqual(bare.rawEstimated.filter(key => ['iso', 'kelvin', 'tint'].includes(key)), ['iso', 'kelvin', 'tint']);
+    await page.evaluate(id => {
+      Editor.editProject(project => project.clips.push({id: 'bare-1', mediaId: id, type: 'video', track: 1, start: 2,
+        duration: 0.5, in: 0, color: {}, volume: 100, transition: 'none', title: '', rawSettings: {decodeUsing: 'camera'}}));
+      Editor.select('bare-1');
+    }, bare.id);
+    await page.waitForSelector('[data-raw-panel] [data-raw-est="iso"]');
+    assert.deepEqual(await page.locator('[data-raw-est]').evaluateAll(nodes => nodes.map(n => n.dataset.rawEst)), ['iso', 'kelvin', 'tint']);
+    assert.match(await page.locator('[data-raw-estimated]').textContent(), /ISO, white balance, tint/);
+    for (const viewport of [{width: 1440, height: 900}, {width: 1180, height: 780}, {width: 1024, height: 640}]) {
+      await page.setViewportSize(viewport);
+      await page.waitForTimeout(150);
+      const marker = page.locator('[data-raw-est="kelvin"]');
+      await marker.scrollIntoViewIfNeeded();
+      const boxes = await page.locator('[data-raw-panel]').evaluate(panel => {
+        const box = el => el.getBoundingClientRect().toJSON();
+        return {panel: box(panel), overflow: panel.scrollWidth - panel.clientWidth,
+                markers: [...panel.querySelectorAll('[data-raw-est]')].map(box),
+                labels: [...panel.querySelectorAll('[data-raw-est]')].map(el => {
+                  const row = el.closest('label').getBoundingClientRect();
+                  return el.getBoundingClientRect().right <= row.right + 1;
+                })};
+      });
+      assert.ok(boxes.overflow <= 1, `estimated Inspector overflows at ${viewport.width}x${viewport.height}`);
+      assert.ok(boxes.markers.every(m => m.width > 0 && m.left >= boxes.panel.left - 1 && m.right <= boxes.panel.right + 1),
+        `estimated markers inside the panel at ${viewport.width}x${viewport.height}: ${JSON.stringify(boxes)}`);
+      assert.ok(boxes.labels.every(Boolean), 'markers stay inside their control rows');
+      if (proofDir) {
+        await page.locator('[data-raw-estimated]').evaluate(el => el.scrollIntoView({block: 'start'}));
+        await page.screenshot({path: path.join(proofDir, `raw-inspector-estimated-note-${viewport.width}x${viewport.height}.png`)});
+        await page.locator('[data-raw-est="kelvin"]').evaluate(el => el.scrollIntoView({block: 'center'}));
+        await page.screenshot({path: path.join(proofDir, `raw-inspector-estimated-${viewport.width}x${viewport.height}.png`)});
+      }
+    }
+    await page.setViewportSize({width: 1440, height: 900});
+    // Switching to Clip makes the values the editor's own: no longer flagged on the controls.
+    await page.locator('[data-raw-field="decodeUsing"]').selectOption('clip');
+    await page.waitForFunction(() => Editor.get().project.clips.find(c => c.id === 'bare-1').rawSettings.decodeUsing === 'clip');
+    assert.equal(await page.locator('[data-raw-est]').count(), 0);
+    assert.equal(await page.locator('[data-raw-estimated]').count(), 1, 'the "Not in the file" line stays');
+    await page.evaluate(() => Editor.undo());
+    // A decoder without Kelvin/tint options (dcraw_emu takes the camera's white balance only).
+    await page.evaluate(id => Editor.editProject(project => {
+      project.media.find(m => m.id === id).rawCapabilities = {tool: 'dcraw_emu',
+        settings: ['iso', 'exposure', 'colorSpace', 'gamma', 'highlightRecovery', 'debayer'],
+        colorSpaces: ['linear', 'rec2020', 'rec709'], gammas: ['linear', 'rec709'], pairs: null};
+    }), bare.id);
+    await page.evaluate(() => Editor.select('bare-1'));
+    await page.waitForSelector('[data-raw-unsupported-note]');
+    assert.equal(await page.locator('[data-raw-field="kelvin"]').isDisabled(), true);
+    assert.equal(await page.locator('[data-raw-field="tint"]').isDisabled(), true);
+    assert.equal(await page.locator('[data-raw-field="iso"]').isDisabled(), false);
+    assert.match(await page.locator('[data-raw-unsupported-note]').textContent(), /dcraw_emu cannot take white balance, tint/);
+    const offGammas = await page.locator('[data-raw-field="gamma"] option[disabled]').evaluateAll(nodes => nodes.map(n => n.value));
+    assert.deepEqual(offGammas.sort(), ['bmd_extended_video'], 'gammas dcraw_emu cannot render are off (the current one stays selectable)');
+    if (proofDir) {
+      await page.locator('[data-raw-field="kelvin"]').evaluate(el => el.scrollIntoView({block: 'center'}));
+      await page.screenshot({path: path.join(proofDir, 'raw-inspector-decoder-limits.png')});
     }
 
     // RAW Decoders dialog from the File menu at three window sizes; the Inspector fits as well.

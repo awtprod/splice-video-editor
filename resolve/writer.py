@@ -86,7 +86,8 @@ MEDIA_FIELDS = {
     'adjustment': 'reported', 'colorMatrix': 'reported', 'inputLut': 'reported',
     'raw': 'meta', 'rawFormat': 'meta', 'rawFormatLabel': 'meta', 'rawDecoderAvailable': 'meta',
     'rawDecoderName': 'meta', 'rawDecoderMessage': 'meta', 'rawDefaults': 'meta', 'rawMetadata': 'meta',
-    'rawAttachedProxy': 'reported', 'rawAttachedPreview': 'meta', 'rawAudioPath': 'meta', 'rawEstimated': 'meta'}
+    'rawAttachedProxy': 'reported', 'rawAttachedPreview': 'meta', 'rawAudioPath': 'meta', 'rawEstimated': 'meta',
+    'rawCapabilities': 'meta'}
 _DEFAULTS = {'speed': 1, 'reverse': False, 'opacity': 100, 'fadeIn': 0, 'fadeOut': 0, 'pan': 0, 'title': '',
              'markers': [], 'keyframes': {}, 'color': {}, 'audioStream': 0, 'nativeTimeRemap': None,
              'titleStyle': None, 'text': None, 'embeddedAudio': None, 'rawSettings': None}
