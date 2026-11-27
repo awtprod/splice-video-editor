@@ -162,6 +162,15 @@ class FcpxmlExport(InterchangeCase):
     def export(self, project=None, **options):
         return fcpxml.write(build_cut(project or self.project(), options))
 
+    def test_color_finishing_loss_report(self):
+        project = self.project()
+        clip = next(c for c in project['clips'] if c['type'] == 'video')
+        clip['color'] = {'grade': {'gain': [1.2, 1, 1, 1], 'pivot': .4, 'bypass': True}}
+        clip['keyframes'] = {'exposure': [{'time': 0, 'value': 1}]}
+        notes = ' '.join(build_cut(project, {}).report.general)
+        for phrase in ('colour wheels', 'contrast pivot', 'Export .cube', 'grade keyframes', 'bypassed'):
+            self.assertIn(phrase, notes)
+
     def test_structure_follows_the_dtd_rules_it_relies_on(self):
         text = self.export()
         self.assertTrue(text.startswith('<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE fcpxml>\n'))

@@ -351,7 +351,7 @@ async function main() {
     await page.waitForFunction(() => document.querySelector('#preview-canvas').getContext('2d').getImageData(10,200,1,1).data[0] > 180);
     assert.ok(Math.abs(await levelOf()-191) < 6, 'an inverting 65-point LUT moves 64 to 191 on the scope');
     console.log('Scopes follow the graded picture (exposure and a 65-point LUT).');
-    // A long 1D LUT is applied as its 65-point lattice in preview and export; the inspector says so.
+    // A long 1D LUT is applied at full length in preview and export (lut1d): no approximation note.
     const note = async entries => {
       await page.evaluate(count => {
         const rows = ['LUT_1D_SIZE '+count];
@@ -361,9 +361,9 @@ async function main() {
       }, entries);
       return page.evaluate(() => document.querySelector('.splice-lut-note')?.textContent ?? '');
     };
-    assert.match(await note(1024), /1024 entries.*65-point table, up to 14\.0 code values/);
+    assert.equal(await note(1024), '', 'a 1024-entry 1D LUT is applied exactly and has no note');
     assert.equal(await note(65), '', 'a 65-entry 1D LUT is exact and has no note');
-    console.log('A 1024-entry 1D LUT shows its measured 65-point error (14.0 codes); a 65-entry one does not.');
+    console.log('1D LUTs of 1024 and 65 entries are applied exactly; no approximation note.');
     await page.evaluate(() => Editor.updateClip('frame-gray', {color:{lut:null}}));
 
     // ---- Playback, pausing and scrubbing keep the scopes current; cost per repaint is measured.

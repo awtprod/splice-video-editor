@@ -1061,6 +1061,47 @@ async function testAudioParity(page, files) {
   before.forEach((v,i) => assert.ok(v > .005 && Math.abs(after[i]/v - 1) < .03));
 }
 
+// Track automation runs on the timeline clock: nesting moves it onto the child's clock and
+// unnesting moves it back. Outer audio finishing that acts on the nested mix as a whole keeps the nest.
+async function testNestAudioFinishing(page, files) {
+  await freshProjectWithMedia(page, [files.red], 'Nest audio finishing');
+  const nest = await page.evaluate(() => {
+    const mediaId = Editor.get().project.media[0].id;
+    Editor.editProject(p => {
+      p.clips = [{id:'a', type:'audio', track:-1, mediaId, start:1, duration:2, in:0}];
+      p.trackMix = {'-1':{keyframes:{volume:[{time:0, value:100}, {time:2, value:60, ease:true}, {time:4, value:20}]}}};
+    });
+    return SpliceNested.nestSelection(['a']);
+  });
+  const child = await page.evaluate(id => Editor.get().project.media.find(m => m.id === id).nestedProject.trackMix['-1'].keyframes.volume, nest.mediaId);
+  assert.deepEqual(child.map(p => [p.time, Number(p.value.toFixed(6)), !!p.ease]), [[0, 80, false], [1, 60, true], [2, 40, false]],
+    'track automation moves onto the child clock');
+  const restored = await page.evaluate(id => {
+    SpliceNested.unnestClip(id);
+    const {project} = Editor.get(), clip = project.clips[0];
+    return {start:clip.start, keys:project.trackMix[clip.track].keyframes.volume.map(p => [p.time, p.value])};
+  }, nest.clipIds[0]);
+  assert.equal(restored.start, 1);
+  assert.deepEqual(restored.keys, [[1, 80], [2, 60], [3, 40]], 'unnest brings child automation back onto the parent clock');
+  for (const [label, patch] of [['clip audio effects', c => { c.audioFx = {comp:{enabled:true, threshold:-20}}; }],
+                                ['track audio effects', (c, p) => { p.trackMix[c.track] = {fx:{gate:{enabled:true}}}; }],
+                                ['track automation', (c, p) => { p.trackMix[c.track] = {keyframes:{volume:[{time:0, value:50}]}}; }],
+                                ['surround track routing', (c, p) => { p.trackMix[c.track] = {route:'surround'}; }]]) {
+    const outer = await page.evaluate(() => {
+      Editor.editProject(p => { p.trackMix = {}; });
+      return SpliceNested.nestSelection([Editor.get().project.clips[0].id]).clipIds[0];
+    });
+    await page.evaluate(({outer, source}) => Editor.editProject(p => {
+      const clip = p.clips.find(c => c.id === outer);
+      p.trackMix ||= {};
+      (0, eval)(source)(clip, p);
+    }), {outer, source:patch.toString()});
+    await assert.rejects(page.evaluate(id => SpliceNested.unnestClip(id), outer), new RegExp('unnest losslessly: outer ' + label), label);
+    await page.evaluate(() => { Editor.undo(); Editor.undo(); });
+  }
+  console.log('Nested audio finishing: automation clock and lossless-unnest guard passed.');
+}
+
 async function testUnnestMix(page, files) {
   await freshProjectWithMedia(page, [files.red, files.green], 'Unnest mix');
   for (const scenario of ['zero volume','parent gain','parent pan','boost','gain and pan','muted','child solo','parent solo','relocated','embedded']) {
@@ -1324,6 +1365,7 @@ async function main() {
       await testMulticam(page, files);
       await testAudioParity(page, files);
       await testUnnestMix(page, files);
+      await testNestAudioFinishing(page, files);
       await testFlattenRouting(page, files);
       await testNestVisibility(page, files);
       await testUnnestComponents(page, files);

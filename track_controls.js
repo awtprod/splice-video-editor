@@ -55,6 +55,10 @@
         () => editor.updateTrackMix(lane.track, {mute: !mix.mute}));
       button('S', `${mix.solo ? 'Clear solo on' : 'Solo'} ${lane.name}`, !!mix.solo,
         () => editor.updateTrackMix(lane.track, {solo: !mix.solo}));
+      // Automation lane: volume and pan keyframes drawn over the track (audio-automation.js).
+      const automated = !!window.SpliceAutomation?.isShown(lane.track);
+      button('A', `${automated ? 'Hide' : 'Show'} automation for ${lane.name}`, automated,
+        () => window.SpliceAutomation?.toggle(lane.track));
     }
     head.replaceChildren(icon, name, controls);
   }

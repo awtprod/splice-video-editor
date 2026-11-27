@@ -257,7 +257,29 @@ def build_cut(project: dict, options: dict | None = None) -> Cut:
         if isinstance(mix, dict) and (mix.get('gain', 100) != 100 or mix.get('pan', 0) or mix.get('mute') or mix.get('solo') or mix.get('outputStages')):
             report.note(f'Audio track A{abs(int(key))} mixer settings (gain, pan, mute or solo) are not carried; '
                         'interchange formats have no track mixer.')
+        if isinstance(mix, dict):
+            lost = [*_effects_named(mix.get('fx')),
+                    *(['volume automation'] if (mix.get('keyframes') or {}).get('volume') else []),
+                    *(['pan automation'] if (mix.get('keyframes') or {}).get('pan') else []),
+                    *([f'stem "{mix["stem"]}"'] if mix.get('stem') else []),
+                    *([f'5.1 placement ({mix["route"]})'] if mix.get('route') not in (None, 'front') else []),
+                    *(['mono track'] if mix.get('channels') == 'mono' else [])]
+            if lost:
+                report.note(f'Audio track A{abs(int(key))}: {", ".join(lost)} not carried; interchange formats have no '
+                            'track effects, automation or stems. Export stems or iso WAVs for the mixer.')
+    master = _effects_named(project.get('masterFx'))
+    if master:
+        report.note(f'Master bus {" and ".join(master)} not carried; deliver a printed mix or stems.')
     return cut
+
+
+def _effects_named(fx) -> list:
+    """Names of the enabled audio effects in a clip, track or master setting."""
+    names = {'eq': 'EQ', 'comp': 'compressor', 'gate': 'gate', 'denoise': 'de-noise'}
+    if not isinstance(fx, dict):
+        return []
+    return [name for key, name in names.items() if isinstance(fx.get(key), dict) and fx[key].get('enabled', True) is not False
+            and (key != 'eq' or fx[key].get('bands'))]
 
 
 def _event(cut: Cut, clip: dict, subclips: dict | None = None) -> Event | None:
@@ -287,6 +309,9 @@ def _event(cut: Cut, clip: dict, subclips: dict | None = None) -> Event | None:
         return None
     if source is not None and source.multicam:
         report.note(f'{label}: not exported because it is an un-flattened multicam clip; flatten multicam before timeline interchange export.')
+        return None
+    if source is not None and source.adjustment:
+        report.note(f'{label}: adjustment clip: its grade of the tracks beneath is not carried; export that grade as a .cube LUT from the Color section to rebuild it.')
         return None
     if source is not None and (source.nested or source.generator):
         what = 'a nested sequence' if source.nested else 'a Premiere-native generator'
@@ -353,8 +378,33 @@ def _event(cut: Cut, clip: dict, subclips: dict | None = None) -> Event | None:
         any(color.get(k) for k in ('exposure', 'temperature', 'tint', 'lift', 'gamma', 'gain', 'curves'))
     if graded or color.get('lut'):
         report.note(f'{label}: its Splice grade{" and LUT" if color.get("lut") else ""} is not carried; grade from the source media.')
+    grade = color.get('grade') if isinstance(color.get('grade'), dict) else {}
+    tools = [name for name, present in (('colour wheels', any(grade.get(key) for key in ('lift', 'gamma', 'gain', 'offset'))),
+                                        ('curves', bool(grade.get('curves'))), ('hue vs saturation curve', bool(grade.get('hueSat'))),
+                                        ('contrast pivot', 'pivot' in grade)) if present]
+    if tools:
+        report.note(f'{label}: its {", ".join(tools)} are not carried; Export .cube in the Color section takes the whole grade as a LUT.')
+    keyed = [key for key in ('exposure', 'temperature', 'tint', 'brightness', 'contrast', 'saturation') if (clip.get('keyframes') or {}).get(key)]
+    if keyed:
+        report.note(f'{label}: its grade keyframes ({", ".join(keyed)}) are not carried.')
+    if grade.get('bypass'):
+        report.note(f'{label}: its grade is bypassed in Splice; receiving apps get the ungraded clip and none of its grade.')
+    if source is not None and source.input_lut:
+        report.note(f'{label}: the input LUT of its source ({source.input_lut}) is not carried.')
+    if source is not None and source.color_matrix:
+        report.note(f'{label}: the untagged color matrix override of its source ({source.color_matrix}) is not carried.')
     if clip.get('pan') not in (None, 0):
         report.note(f'{label}: clip pan is not carried by timeline interchange.')
+    effects = _effects_named(clip.get('audioFx'))
+    if effects:
+        report.note(f'{label}: its audio {", ".join(effects)} {"is" if len(effects) == 1 else "are"} not carried; '
+                    'receiving apps play the clip unprocessed.')
+    if clip.get('channelMap') not in (None, 'stereo'):
+        report.note(f'{label}: its channel mapping ({clip["channelMap"]}) is not carried.')
+    if clip.get('audioTransition') not in (None, 'auto'):
+        report.note(f'{label}: its sound transition override ({clip["audioTransition"]}) is not carried.')
+    if any(isinstance(point, dict) and point.get('ease') for point in (clip.get('keyframes') or {}).get('volume') or []):
+        report.note(f'{label}: eased volume keyframes are exported as linear ramps.')
     if clip.get('nativeVolumeOutsideTrim'):
         report.note(f'{label}: its Premiere volume keyframes outside the trimmed part of the clip are not carried.')
     if clip.get('nativeTimeRemap'):

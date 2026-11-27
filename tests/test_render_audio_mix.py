@@ -189,12 +189,11 @@ class SpeedChangedSound(ToneCase):
 
 
 class DipSound(ToneCase):
-    """Finding 7: a dip to black is a picture transition. Its sound follows the
-    clip that carries it (the monitor's rule, engine.js audibility): the incoming
-    clip fades in over the transition and the outgoing clip plays to its out
-    point. A linked sound clip carrying the same 'fade' transition renders the
-    same samples as the embedded sound; a linked sound clip carrying a
-    'dissolve' is a different edit (a crossfade) and sounds like one."""
+    """Finding 7 (audio finishing, item 8): a dip to black dips the sound the way
+    it dips the picture: the outgoing sound fades out over the part of the dip
+    before the cut, the incoming one fades in over the part after it. Embedded
+    sound and a linked sound clip render the same samples; a linked sound clip
+    carrying a 'dissolve' is a different edit (a crossfade) and sounds like one."""
 
     def test_embedded_and_linked_sound_of_a_dip_render_the_same_samples(self):
         camera = self.tone(375, video=True, later=625)
@@ -208,9 +207,9 @@ class DipSound(ToneCase):
         linked_sound = self.render(linked, media, name='linked')
         self.assertEqual(len(embedded_sound), len(linked_sound))
         self.assertEqual(max(abs(a-b) for a, b in zip(embedded_sound, linked_sound)), 0)
-        # The outgoing clip plays at full level to the cut; the incoming one fades in over 1.6..2.4 s.
-        self.assertLevels(embedded_sound, 375, inside((0, 2)))
-        self.assertLevels(embedded_sound, 625, lambda t: 0 if t < 1.6 else min(1, (t-1.6)/.8))
+        # The outgoing clip fades out over 1.6..2.0 s; the incoming one fades in over 2.0..2.4 s.
+        self.assertLevels(embedded_sound, 375, lambda t: 1 if t < 1.6 else max(0, (2-t)/.4))
+        self.assertLevels(embedded_sound, 625, lambda t: 0 if t < 2 else min(1, (t-2)/.4))
         crossfade = [dict(clip, transition='dissolve') if clip['type'] == 'audio' and clip.get('transition') else clip
                      for clip in linked]
         self.assertNotEqual(list(self.render(crossfade, media, name='crossfade')), list(linked_sound))

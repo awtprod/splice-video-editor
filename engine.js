@@ -77,6 +77,7 @@
   let audio = null;
   const audioElements = new Map();
   const layerVideos = new Map();
+  const comparisonVideos = new Map();
   let activeVideoId = null;
   let transitionVideoId = null;
   let preloadClipId = null;
@@ -188,7 +189,7 @@
       envelope.gain.setValueAtTime(1,end);
       envelope.gain.linearRampToValueAtTime(0,end+overlap);
     }
-    voice.connect(envelope).connect(routeAudio(element).gain);
+    voice.connect(envelope).connect(routeAudio(element).input);
     voice.onended=()=>{voice.disconnect();envelope.disconnect();state.voices.delete(voice);};
     voice.start(start,offset);
     state.voices.add(voice);
@@ -196,7 +197,12 @@
     state.end=end;
   }
   function routeAudio(element) {
-    if (!audioContext) audioContext = new AudioContext();
+    if (!audioContext) {
+      // 48 kHz, the renderer's rate: EQ coefficients and dynamics timing are the export's own.
+      try { audioContext = new AudioContext({sampleRate:48000,latencyHint:'playback'}); }
+      catch { audioContext = new AudioContext(); }
+      window.SpliceMixer?.attach(audioContext);
+    }
     let route = audioNodes.get(element);
     if (!route) {
       const source = audioContext.createMediaElementSource(element);
@@ -204,13 +210,17 @@
       const pan = audioContext.createStereoPanner();
       const analyser=audioContext.createAnalyser();
       analyser.fftSize=256;
-      source.connect(gain).connect(pan).connect(analyser).connect(audioContext.destination);
-      route={source,gain,pan,analyser,samples:new Float32Array(analyser.fftSize)};
+      // The mixer inserts the clip's channel map and effects before `gain` and sends `analyser` to its track bus.
+      const input = audioContext.createGain();
+      source.connect(input).connect(gain).connect(pan).connect(analyser);
+      route={source,input,gain,pan,analyser,samples:new Float32Array(analyser.fftSize)};
+      if (!window.SpliceMixer) analyser.connect(audioContext.destination);
       audioNodes.set(element,route);
     }
     element.volume=1;
     return route;
   }
+  let mixerConfigured=null;
   let meterSampleAt=-Infinity, meterValues={};
   function meters() {
     const now=performance.now();
@@ -231,7 +241,8 @@
   function disconnectAudio(element) {
     const route=audioNodes.get(element);
     if(!route)return;
-    route.source.disconnect();route.gain.disconnect();route.pan.disconnect();route.analyser.disconnect();
+    window.SpliceMixer?.releaseRoute(route);
+    route.source.disconnect();route.input.disconnect();route.gain.disconnect();route.pan.disconnect();route.analyser.disconnect();
     for (const node of route.outputPanners || []) node.disconnect();
     audioNodes.delete(element);
   }
@@ -257,8 +268,14 @@
       last.connect(route.analyser);
       route.outputStages = mix.outputStages;
     }
+    if (window.SpliceMixer) {
+      if (mixerConfigured!==project) { window.SpliceMixer.configure(project); mixerConfigured=project; }
+      const item = resolveClipMedia(clip).item, stream = clipAudioStream(clip,item);
+      const channels = item?.audioStreamChannels?.[stream] ?? item?.audioStreamDetails?.[stream]?.channels ?? item?.audioChannels;
+      window.SpliceMixer.routeClip(route,clip,project,channels);
+    }
     const gain=clip.type==='video' && clip.embeddedAudio===false ? 0 : audibility(clip);
-    const pan=clamp(((Number(clip.pan)||0)+(Number(mix.pan)||0))/100,-1,1);
+    const pan=clamp(((Number(clip.pan)||0)+trackPan(clip.track))/100,-1,1);
     if (gain!==route.gainLevel) {
       route.gain.gain.setTargetAtTime(gain,audioContext.currentTime,.012);
       route.gainLevel=gain;
@@ -318,7 +335,7 @@
   // original) are immutable. Everything else is copied so drafts never alias.
   function cloneState(value, key) {
     if (value === null || typeof value !== "object") return value;
-    if (key === "lut") return value;
+    if (key === "lut" || key === "inputLut") return value;
     if (Array.isArray(value)) return value.map((item) => cloneState(item));
     const copy = {};
     for (const name of Object.keys(value)) copy[name] = cloneState(value[name], name);
@@ -331,9 +348,14 @@
     if (Array.isArray(left) !== Array.isArray(right)) return false;
     if (Array.isArray(left))
       return left.length === right.length && left.every((item, index) => sameValue(item, right[index]));
-    const keys = Object.keys(left).filter((key) => left[key] !== undefined);
-    if (keys.length !== Object.keys(right).filter((key) => right[key] !== undefined).length) return false;
-    return keys.every((key) => sameValue(left[key], right[key]));
+    let present = 0;
+    for (const key of Object.keys(left)) {
+      if (left[key] === undefined) continue;
+      if (!sameValue(left[key], right[key])) return false;
+      present++;
+    }
+    for (const key of Object.keys(right)) if (right[key] !== undefined) present--;
+    return present === 0;
   }
   // After an edit, point unchanged clips and media back at the previous state's
   // objects so fifty undo steps of a 2,000-clip timeline hold one copy of each.
@@ -663,30 +685,72 @@
     return Math.max(0, t + resolved.inShift);
   };
   const trackSettings = track => project.trackMix?.[String(track)] || {};
+  // Track automation (timeline seconds): volume (%) and pan, linear or eased, as the renderer evaluates it.
+  const trackCurve = (track, key) => {
+    const points=trackSettings(track).keyframes?.[key];
+    return points?.length ? [...points].sort((a,b)=>a.time-b.time) : null;
+  };
+  const trackLevel = track => {
+    const points=trackCurve(track,'volume');
+    return clamp((points ? curveValue(points,time,100) : (trackSettings(track).gain??100))/100,0,2);
+  };
+  const trackPan = track => {
+    const points=trackCurve(track,'pan');
+    return points ? curveValue(points,time,0) : Number(trackSettings(track).pan)||0;
+  };
   const soloActive = () => Object.values(project.trackMix || {}).some(m => m.solo);
   let transitionFollowers=new Map();
   let videoDipFollowers=new Map();
+  let soundIn=new Map(), soundOut=new Map();
   const followingTransition = clip => transitionFollowers.get(clip.id);
+  // How a clip's sound enters (render_movie._sound_transition is the same rule): dissolve and
+  // wipe crossfade; a dip fades the outgoing sound out over the part before the cut and the
+  // incoming one in over the part after it; a cut cuts. A linked sound clip without a transition
+  // of its own follows its picture, embedded sound follows its clip; audioTransition overrides.
+  const SOUND_KINDS={dissolve:'crossfade',wipe:'crossfade',fade:'dip'};
+  function soundTransitionOf(clip, pictures) {
+    const override=clip.audioTransition||'auto';
+    let source=clip;
+    if (clip.type==='audio' && !SOUND_KINDS[clip.transition] && clip.linkGroup)
+      source=pictures.get(clip.linkGroup+':'+Math.round(clip.start*project.fps))||clip;
+    if (override==='cut') return null;
+    const kind=override==='crossfade'||override==='dip' ? override : SOUND_KINDS[source.transition];
+    if (!kind) return null;
+    const duration=clamp(Number(source.transitionDuration||.5),1/project.fps,7200);
+    return {kind,duration,before:clamp(Number(source.transitionBefore)||0,0,duration),power:source.transitionMatchName==='Constant Power',clock:source.transitionClock||null};
+  }
+  const soundTransition = clip => (indexTransitions(), soundIn.get(clip.id)||null);
   function indexTransitions() {
     duration();
     if (indexedFor===project) return;
     indexedFor=project;
     const cuts=new Map();transitionFollowers=new Map();videoDipFollowers=new Map();
+    const pictures=new Map(), soundCuts=new Map();soundIn=new Map();soundOut=new Map();
+    for(const clip of project.clips) if(clip.type==='video' && clip.linkGroup) pictures.set(clip.linkGroup+':'+Math.round(clip.start*project.fps),clip);
+    for(const clip of project.clips) if(clip.type!=='title') {
+      const sound=soundTransitionOf(clip,pictures);
+      if(!sound) continue;
+      soundIn.set(clip.id,sound);
+      const key=`${clip.type}:${clip.track}:${Math.round(clip.start*project.fps)}`;
+      if(!soundCuts.has(key)) soundCuts.set(key,clip);
+    }
     for(const clip of project.clips) if(['dissolve','wipe'].includes(clip.transition) || (clip.type==='video' && clip.transition==='fade'))
       cuts.set(`${clip.type}:${clip.track}:${Math.round(clip.start*project.fps)}`,clip);
+    if (!cuts.size && !soundCuts.size) return;
     for(const clip of project.clips) {
-      const next=cuts.get(`${clip.type}:${clip.track}:${Math.round((clip.start+clip.duration)*project.fps)}`);
+      const key=`${clip.type}:${clip.track}:${Math.round((clip.start+clip.duration)*project.fps)}`;
+      const next=cuts.get(key), nextSound=soundCuts.get(key);
       if(next && next.id!==clip.id) (next.transition==='fade'?videoDipFollowers:transitionFollowers).set(clip.id,next);
+      if(nextSound && nextSound.id!==clip.id) soundOut.set(clip.id,{next:nextSound,sound:soundIn.get(nextSound.id)});
     }
   }
-  const audioTransitionGain = (clip, progress) => {
-    const value=clamp(progress,0,1);
-    return clip.transitionMatchName==='Constant Power' ? Math.sin(value*Math.PI/2) : value;
-  };
-  // Enabled sound clips heard now, including a clip fading out through the crossfade of the clip
-  // after it (which may be disabled: the fade then runs against silence).
-  const soundingAudioClips = () => project.clips.filter(c=>c.type==='audio' && isEnabled(c) && c.start-transitionBefore(c)<=time &&
-    time<c.start+c.duration+(followingTransition(c)?transitionLength(followingTransition(c))-transitionBefore(followingTransition(c)):0));
+  const soundingAudioClips = () => project.clips.filter(c=>{
+      if (c.type!=='audio' || !isEnabled(c)) return false;
+      const sound=soundIn.get(c.id), out=soundOut.get(c.id);
+      const tail=out?.sound.kind==='crossfade' && !(Number(c.fadeOut)>0) ?
+        Math.min(out.sound.duration,out.sound.before+out.next.duration)-out.sound.before : 0;
+      return c.start-(sound?.kind==='crossfade'?sound.before:0)<=time && time<c.start+c.duration+tail;
+    });
   const audibility = clip => {
     if (!multicamAngleActive(clip, time)) return 0;
     const mix = trackSettings(clip.track);
@@ -702,29 +766,54 @@
       const level = clamp((origin + rate*local)/duration, 0, 1);
       fade *= clip.transitionMatchName === 'Constant Power' ? Math.sin(Math.PI*level/2) : level;
     }
-    if(['dissolve','wipe','fade'].includes(clip.transition)) fade*=audioTransitionGain(clip,transitionProgress(clip));
-    const next=followingTransition(clip);
-    if(next) fade*=audioTransitionGain(next,1-transitionProgress(next));
+    const curve=(sound,value)=>{const u=clamp(value,0,1);return sound.power?Math.sin(u*Math.PI/2):u;};
+    const sound=soundTransition(clip);
+    if (sound?.kind==='crossfade') {
+      const elapsed=time-clip.start+sound.before;
+      const progress=sound.clock ? (sound.clock.origin+elapsed)/sound.clock.duration : elapsed/Math.min(sound.duration,clip.duration+sound.before);
+      fade*=curve(sound,progress);
+    } else if (local<0) return 0; // only a crossfade plays a sound before its clip starts
+    else if (sound) {
+      const rise=Math.min(sound.duration-sound.before,clip.duration);
+      if (sound.clock) fade*=curve(sound,(sound.clock.origin+local+sound.before)/sound.clock.duration);
+      else if (rise>1e-9) fade*=curve(sound,local/rise);
+    }
+    const out=soundOut.get(clip.id);
+    if (out?.sound.kind==='crossfade') {
+      const elapsed=time-out.next.start+out.sound.before;
+      const progress=out.sound.clock ? (out.sound.clock.origin+elapsed)/out.sound.clock.duration : elapsed/Math.min(out.sound.duration,out.sound.before+out.next.duration);
+      fade*=curve(out.sound,1-progress);
+    } else if (time>=clip.start+clip.duration) return 0;
+    else if (out && out.sound.before>1e-9) fade*=curve(out.sound,(clip.start+clip.duration-time)/out.sound.before);
     const outputGain = (mix.outputStages || []).reduce((gain, stage) => gain * stage.gain/100, 1);
-    return clamp(animated(clip,'volume',Number(clip.volume??100))/100,0,2) * clamp((mix.gain??100)/100,0,2) * outputGain * clamp(fade,0,1);
+    return clamp(animated(clip,'volume',Number(clip.volume??100))/100,0,2) * trackLevel(clip.track) * outputGain * clamp(fade,0,1);
   };
-  const filterFor = (clip) => {
-    const c = clip.color || {};
-    return `brightness(${Number(c.brightness ?? 100)}%) contrast(${Number(c.contrast ?? 100)}%) saturate(${Number(c.saturation ?? 100)}%)`;
-  };
-  const gradeGains = c => {
-    const exposure=clamp(Number(c.exposure)||0,-4,4), temperature=clamp(Number(c.temperature)||0,-100,100)/100;
-    const tint=clamp(Number(c.tint)||0,-100,100)/100, gain=2**exposure;
-    return [gain*(1+.35*temperature-.1*tint),gain*(1+.2*tint),gain*(1-.35*temperature-.1*tint)];
-  };
+  // Exposure and white balance gains (one formula, color-grade.js).
+  const gradeGains = c => window.SpliceGrade.gains(c);
   const decode709 = value => Math.sign(value)*Math.abs(value)**2.4;
   const encode709 = value => Math.sign(value)*Math.abs(value)**(1/2.4);
   const decodePixels709 = Array.from({length:256},(_,level)=>decode709(level/255));
-  const decodePixelsPQ = Array.from({length:256},(_,level)=>{
-    const value=(level/255)**(32/2523);
-    return (10000/203)*(Math.max(0,value-3424/4096)/(2413/128-(2392/128)*value))**(16384/2610);
+  // Inverse of the signed linear Rec.709 grading-proxy packing in media_proxy.py.
+  const decodeGradePixels = Array.from({length:256},(_,level)=>{
+    if (level<32) return -Math.expm1((32-level)/3.45)/256;
+    if (level>206) return Math.exp((level-206)/11);
+    return ((level-32)/174)**2.4;
   });
-  function hasHdrGrade(color={}) {
+  const primaryColorKeys = ['brightness','contrast','saturation','exposure','temperature','tint'];
+  function hdrStaticColor(clip) {
+    const color = clip?.color || {};
+    if (color.grade?.bypass) return {};
+    const keys = clip?.keyframes || {};
+    const out = {};
+    for (const key of primaryColorKeys) {
+      if (keys[key]?.length) continue;
+      if (key in color) out[key] = color[key];
+    }
+    return out;
+  }
+  function hasHdrGrade(clipOrColor={}) {
+    const color = 'color' in clipOrColor || 'keyframes' in clipOrColor ? hdrStaticColor(clipOrColor) : clipOrColor;
+    if (color.grade?.bypass) return false;
     return ['brightness','contrast','saturation'].some(key=>(color[key]??100)!==100) ||
       ['exposure','temperature','tint'].some(key=>Number(color[key])||0);
   }
@@ -733,7 +822,7 @@
     const item=clip && resolveClipMedia(clip).item;
     if (!item?.src) return;
     const stream=clipAudioStream(clip,item);
-    if (item.hdr && hasHdrGrade(clip.color||{})) {
+    if (item.hdr && hasHdrGrade(clip)) {
       const graded=window.SpliceMedia?.preparePreview(item,stream,true)?.src;
       if (graded) return graded;
     }
@@ -749,16 +838,12 @@
   function gradeHdrPreview(pixels, color, gains, gradingData) {
     const brightness=(color.brightness??100)/100, contrast=(color.contrast??100)/100, saturation=(color.saturation??100)/100;
     const displayGrade=brightness!==1 || contrast!==1 || saturation!==1;
-    const decode=gradingData?decodePixelsPQ:decodePixels709;
+    const decode=gradingData?decodeGradePixels:decodePixels709;
     for(let i=0;i<pixels.length;i+=4) {
       if (!pixels[i+3]) continue;
       let r=decode[pixels[i]],g=decode[pixels[i+1]],b=decode[pixels[i+2]];
       const before=Math.max(r,g,b);
-      if (gradingData) {
-        // Unpack the proxy's linear BT.2020 primaries into the working gamut.
-        const red=1.66049*r-.58764*g-.07285*b, green=-.12455*r+1.13290*g-.00835*b;
-        b=-.01815*r-.10058*g+1.11873*b;r=red;g=green;
-      } else if (before>hdrShoulder) {
+      if (!gradingData && before>hdrShoulder) {
         const inverse=(before*shoulderB-shoulderScale*shoulderA)/(shoulderScale-before);
         const ratio=Math.min(hdrPeak,inverse)/before;
         r*=ratio;g*=ratio;b*=ratio;
@@ -818,13 +903,14 @@
       return preceding(clip);
   }
   function transitionShortages(source) {
+    const transitions = source.clips.filter(clip => ['dissolve','wipe','fade'].includes(clip.transition));
+    if (!transitions.length) return new Map();
     const media = new Map(source.media.map(item=>[item.id,item]));
     const boundary = (clip, point) => `${clip.type}:${clip.track}:${Math.round(point*source.fps)}`;
     const ends = new Map(source.clips.filter(clip=>clip.type!=='title' && media.get(clip.mediaId)?.nativeGenerator!==1414680150)
       .map(clip=>[boundary(clip,clip.start+clip.duration),clip]));
     const shortages = new Map();
-    for (const clip of source.clips) {
-      if (!['dissolve','wipe','fade'].includes(clip.transition)) continue;
+    for (const clip of transitions) {
       const before=transitionBefore(clip);
       const after=requestedTransitionLength(clip)-before;
       const prior=ends.get(boundary(clip,clip.start));
@@ -876,6 +962,18 @@
     catch (error) {
       if (error.name!=='InvalidStateError') throw error;
     }
+  }
+  function layerVideo(cache, id, source) {
+    let element=cache.get(id);
+    if (!element) {
+      element=document.createElement('video');element.muted=true;element.playsInline=true;
+      element.preload='auto';element.style.display='none';document.body.append(element);cache.set(id,element);
+    }
+    if (element.getAttribute('src')!==source) element.src=source;
+    return element;
+  }
+  function releaseLayerVideo(cache,id,element) {
+    element.pause();disconnectAudio(element);element.removeAttribute('src');element.load();element.remove();cache.delete(id);
   }
   function syncMedia(forceSeek = false) {
     ensureElements();
@@ -1013,18 +1111,13 @@
     }
     const currentVideoIds=new Set(layers.keys());
     for (const [id,element] of layerVideos) if (!currentVideoIds.has(id) || id===activeVideoId || id===preloadClipId) {
-      element.pause();disconnectAudio(element);element.removeAttribute('src');element.load();element.remove();layerVideos.delete(id);
+      releaseLayerVideo(layerVideos,id,element);
     }
     for (const layer of layers.values()) {
       if (layer.id===activeVideoId || layer.id===preloadClipId) continue;
       const layerSource=programSource(layer);
       if (!layerSource) continue;
-      let element=layerVideos.get(layer.id);
-      if(!element) {
-        element=document.createElement('video');element.muted=true;element.playsInline=true;
-        element.preload='auto';element.style.display='none';element.src=layerSource;document.body.append(element);layerVideos.set(layer.id,element);
-      }
-      if (element.getAttribute('src') !== layerSource) element.src = layerSource;
+      const element=layerVideo(layerVideos,layer.id,layerSource);
       const preload = preloading.has(layer.id);
       const target=sourceTime(layer,preload?layer.start-transitionBefore(layer):time);
       seekVideo(element,layer,target,forceSeek);
@@ -1035,6 +1128,24 @@
     }
     // The outgoing transition decoder is managed separately from the other layers.
     if (previous) layers.set(previous.id, previous);
+    // Bypass and split show the ordinary tone-mapped proxy. Decoding the 8-bit
+    // grading proxy back to a neutral image can change saturated colours.
+    const references=new Set();
+    if ((monitor.bypass || monitor.split!=null) && !mutedTracks.video) {
+      for (const layer of layers.values()) {
+        const item=resolveClipMedia(layer).item;
+        if (preloading.has(layer.id) || trackHidden('video',layer.track) || !item?.hdr || !hasHdrGrade(layer)) continue;
+        const main=videoFor(layer), gradingSource=window.SpliceMedia?.hdrPreviewStatus(item,clipAudioStream(layer,item))?.src;
+        if (!gradingSource || main?.getAttribute('src')!==gradingSource) continue;
+        const fresh=comparisonVideos.get(layer.id)?.getAttribute('src')!==item.src;
+        const ref=layerVideo(comparisonVideos,layer.id,item.src), target=main.currentTime;
+        const skew=Math.abs(ref.currentTime-target)>1/(item.fps || project.fps);
+        seekVideo(ref,layer,target,forceSeek || fresh || (skew && !ref.seeking));
+        syncClipPlayback(ref,layer,target,forceSeek,false);
+        references.add(layer.id);
+      }
+    }
+    for (const [id,element] of comparisonVideos) if (!references.has(id)) releaseLayerVideo(comparisonVideos,id,element);
     for (const layer of layers.values()) {
       if (!preloading.has(layer.id) && layer.embeddedAudio !== false && separateMulticamSound(layer))
         audioClips.push({...layer, type:'audio', track:-64});
@@ -1091,15 +1202,8 @@
       auditions.delete(element);
     }
   }
-  function curveValue(points,local,base) {
-    if (!points.length) return base;
-    if (local<=points[0].time) return points[0].value;
-    for (let i=1;i<points.length;i++) if(local<=points[i].time) {
-      const a=points[i-1],b=points[i],u=(local-a.time)/(b.time-a.time);
-      return a.value+(b.value-a.value)*u;
-    }
-    return points.at(-1).value;
-  }
+  // Linear segments, or eased (smoothstep) after a point marked `ease` (audio automation).
+  const curveValue = (points,local,base) => window.SpliceAudioDSP.curveValue(points,local,base);
   function animated(clip,key,base) {
     const points=(clip.keyframes?.[key]||[]).filter(p=>Number.isFinite(p.time)&&Number.isFinite(p.value)).sort((a,b)=>a.time-b.time);
     return curveValue(points,time-clip.start,base);
@@ -1109,6 +1213,12 @@
     for (const [key,points] of Object.entries(keys||{})) {
       if (!points.length) continue;
       const ordered=[...points].sort((a,b)=>a.time-b.time);
+      if (primaryColorKeys.includes(key)) {
+        // The monitor blends graded pictures. Keep their original endpoints, including
+        // the ones outside a trimmed clip, and rebase them onto its new local clock.
+        cropped[key]=ordered.map(point=>({...point,time:point.time-from}));
+        continue;
+      }
       cropped[key]=[
         {time:0,value:curveValue(ordered,from,0)},
         ...ordered.filter(point=>point.time>from+1e-6 && point.time<to-1e-6)
@@ -1173,64 +1283,53 @@
     return right;
   }
   const layerCanvases = new Map();
-  const dissolveCanvas=document.createElement('canvas');
   const blackGenerator=document.createElement('canvas');blackGenerator.width=16;blackGenerator.height=9;
   blackGenerator.getContext('2d').fillRect(0,0,16,9);
-  function paintVideo(ctx,element,clip,canvas,alpha=1,brightness=1) {
-    if (!element || (element instanceof HTMLVideoElement && element.readyState < 2)) return;
-    if (!multicamAngleActive(clip, time)) return;
-    if (clip.pictureDip) {
-      const {origin, rate, duration} = clip.pictureDip;
-      brightness *= clamp((origin + rate * (time - clip.start) - (rate < 0 ? 1/project.fps : 0)) / duration, 0, 1);
-    }
-    const color=clip.color||{}, lut=color.lutIntensity===0?null:color.lut;
-    const gains=gradeGains(color);
-    const graded=gains.some(g=>Math.abs(g-1)>.0001);
-    const item=resolveClipMedia(clip).item;
-    const gradingSource=item?.hdr && window.SpliceMedia?.hdrPreviewStatus(item,clipAudioStream(clip,item))?.src;
+  // An HDR clip graded with static brightness/contrast/exposure controls is graded in linear light
+  // on the CPU (as the export grades it before the tone map) at the monitor's size; the result is a
+  // layer the picture pipeline composites like any other. When bypassed while showing HDR grading
+  // data, it still runs the neutral Rec.709 Mobius tone map so bypass preserves tone mapping.
+  function hdrLayer(element,clip,canvas,bypass=false) {
+    const color=bypass ? {} : hdrStaticColor(clip), gains=bypass ? [1,1,1] : gradeGains(color), item=resolveClipMedia(clip).item;
+    const gradingSource=window.SpliceMedia?.hdrPreviewStatus(item,clipAudioStream(clip,item))?.src;
     const gradingData=!!gradingSource && element.getAttribute('src')===gradingSource;
-    const hdrGrade=item?.hdr && (gradingData || hasHdrGrade(color));
-    const previewScale=(lut || hdrGrade) && playing ? .5 : 1;
-    const drawWidth=Math.max(1,Math.round(canvas.width*previewScale));
-    const drawHeight=Math.max(1,Math.round(canvas.height*previewScale));
-    const sourceWidth=element.videoWidth||element.width||canvas.width;
-    const sourceHeight=element.videoHeight||element.height||canvas.height;
-    const fit=Math.min(drawWidth/sourceWidth,drawHeight/sourceHeight);
-    const scale=clamp(animated(clip,"scale",Number(clip.transform?.scale??100))/100,.1,4);
-    const x=clamp(animated(clip,"x",Number(clip.transform?.x??0)),-100,100)*drawWidth/100;
-    const y=clamp(animated(clip,"y",Number(clip.transform?.y??0)),-100,100)*drawHeight/100;
-    const rotation=clamp(animated(clip,"rotation",Number(clip.transform?.rotation??0)),-180,180)*Math.PI/180;
-    let target=ctx;
-    if ((lut && window.SpliceLUT) || graded || hdrGrade) {
-      let layer=layerCanvases.get(clip.id);
-      if (!layer) { layer=document.createElement('canvas'); layerCanvases.set(clip.id,layer); }
-      if (layer.width!==drawWidth || layer.height!==drawHeight) {layer.width=drawWidth;layer.height=drawHeight;}
-      target=layer.getContext('2d',{willReadFrequently:true});
-      target.clearRect(0,0,layer.width,layer.height);
-    }
-    alpha *= clamp(animated(clip,"opacity",Number(clip.opacity??100))/100,0,1);
-    target.save(); target.globalAlpha=target===ctx?alpha:1; target.filter=hdrGrade?'none':filterFor(clip);
-    if (target===ctx && brightness<1) target.filter+=` brightness(${brightness})`;
-    target.translate(drawWidth/2+x,drawHeight/2+y); target.rotate(rotation);
-    target.drawImage(element,-sourceWidth*fit*scale/2,-sourceHeight*fit*scale/2,sourceWidth*fit*scale,sourceHeight*fit*scale);
-    target.restore();
-    if (target!==ctx) {
-      const image=target.getImageData(0,0,drawWidth,drawHeight);
-      if (hdrGrade) gradeHdrPreview(image.data,color,gains,gradingData);
-      else if (graded) {
-        const pixels=image.data;
-        for(let i=0;i<pixels.length;i+=4) {
-          pixels[i]=Math.min(255,pixels[i]*gains[0]);
-          pixels[i+1]=Math.min(255,pixels[i+1]*gains[1]);
-          pixels[i+2]=Math.min(255,pixels[i+2]*gains[2]);
-        }
-      }
-      if (lut && window.SpliceLUT) window.SpliceLUT.applyImageData(image,lut,clip.color.lutIntensity??100);
-      target.putImageData(image,0,0);
-      ctx.save();ctx.globalAlpha=alpha;
-      if (brightness<1) ctx.filter=`brightness(${brightness})`;
-      ctx.drawImage(target.canvas,0,0,canvas.width,canvas.height);ctx.restore();
-    }
+    const sourceWidth=element.videoWidth||canvas.width, sourceHeight=element.videoHeight||canvas.height;
+    const fit=Math.min(1,canvas.width/sourceWidth,canvas.height/sourceHeight);
+    const width=Math.max(1,Math.round(sourceWidth*fit)), height=Math.max(1,Math.round(sourceHeight*fit));
+    const key=bypass ? `${clip.id}:bypass` : clip.id;
+    let layer=layerCanvases.get(key);
+    if (!layer) { layer=document.createElement('canvas'); layerCanvases.set(key,layer); }
+    if (layer.width!==width || layer.height!==height) {layer.width=width;layer.height=height;}
+    const target=layer.getContext('2d',{willReadFrequently:true});
+    target.drawImage(element,0,0,width,height);
+    const image=target.getImageData(0,0,width,height);
+    gradeHdrPreview(image.data,color,gains,gradingData);
+    target.putImageData(image,0,0);
+    return layer;
+  }
+  // Monitor-only switches (not saved, not exported): grade bypass, before/after split, views.
+  const monitor={bypass:false,split:null,view:'normal'};
+  let comparing=false;
+  document.addEventListener('splice-monitor-change',()=>{
+    const active=monitor.bypass || monitor.split!=null;
+    if (active!==comparing) { comparing=active;syncMedia(false); }
+  });
+  // The grade of one clip at the playhead, for the picture pipeline: one prepared grade, or the two
+  // keyframe gradings and their mix (color-grade.js keySegment), plus the source's input LUT.
+  function gradeOf(clip,bypass) {
+    const resolved=resolveClipMedia(clip), item=resolved.item, input=resolved.media?.inputLut||item?.inputLut||null, Grade=window.SpliceGrade;
+    if (!Grade) return null;
+    const clipBypass=bypass || !!clip.color?.grade?.bypass;
+    if (clipBypass) return input?{a:Grade.prepare({}),input}:null;
+    let color=clip.color||{};
+    // HDR static primaries run in linear light (hdrLayer); animated primaries and wheels/curves/LUTs run here.
+    if (item?.hdr) color=Object.fromEntries(Object.entries(color).filter(([key])=>!primaryColorKeys.includes(key)));
+    const segment=Grade.keySegment(clip,time-clip.start);
+    const subject=segment?{...clip,color}:null;
+    const a=Grade.prepare(segment?Grade.colorAt(subject,segment.a):color);
+    const b=segment && segment.b!==segment.a ? Grade.prepare(Grade.colorAt(subject,segment.b)) : null;
+    if (a.identity && !b && !input) return null;
+    return {a,b,weight:segment?.weight||0,input};
   }
   function videoFor(clip) {
     if (resolveClipMedia(clip).item?.nativeGenerator===1112293707) return blackGenerator;
@@ -1284,14 +1383,9 @@
     const rotation=animated(clip,"rotation",Number(clip.transform?.rotation??0));
     return opacity>=100 && scale>=100 && !x && !y && !rotation;
   }
-  function drawFrame(canvas) {
-    const active = at('video', time);
-    if (!mutedTracks.video && active && programSource(active) && multicamAngleActive(active, time) &&
-        video?.readyState < 2 && previewProjects.get(canvas) === project) return;
-    previewProjects.set(canvas, project);
-    const ctx = canvas.getContext("2d");
-    ctx.fillStyle = '#000';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
+  // The frame at the playhead as a display list for the picture pipeline (gl-preview.js).
+  function framePlan(canvas,bypass=monitor.bypass) {
+    const plan={width:canvas.width,height:canvas.height,ops:[],view:monitor.view};
     const visible=project.clips.filter(clip=>clip.type!=='audio' && (isEnabled(clip) || standIn(clip)) && !trackHidden(clip.type,clip.track) && (clip.type==='video' ? !mutedTracks.video &&
       clip.start-transitionBefore(clip)<=time && time<clip.start+clip.duration :
       !mutedTracks.title && clip.title && clip.start<=time && time<clip.start+clip.duration));
@@ -1311,36 +1405,58 @@
     for (let index=visible.length-1;index>=0;index--) {
       if (coversFrame(visible[index],canvas,outgoingIds)) { firstShown=index; break; }
     }
+    const layerOp=(clip,alpha=1,brightness=1,wipe=null,wipeOut=null)=>{
+      const element=videoFor(clip), item=resolveClipMedia(clip).item;
+      if (!element || (element instanceof HTMLVideoElement && element.readyState < 2)) return null;
+      if (!multicamAngleActive(clip, time)) return null;
+      if (clip.pictureDip) {
+        const {origin, rate, duration} = clip.pictureDip;
+        brightness *= clamp((origin + rate * (time - clip.start) - (rate < 0 ? 1/project.fps : 0)) / duration, 0, 1);
+      }
+      const clipBypass=bypass || !!clip.color?.grade?.bypass;
+      const gradingSource=item?.hdr ? window.SpliceMedia?.hdrPreviewStatus(item,clipAudioStream(clip,item))?.src : null;
+      const gradingData=!!gradingSource && element instanceof HTMLVideoElement && element.getAttribute('src')===gradingSource;
+      const hdr=item?.hdr && element instanceof HTMLVideoElement && (clipBypass ? gradingData : hasHdrGrade(clip));
+      const ref=clipBypass && gradingData && comparisonVideos.get(clip.id);
+      const ready=ref?.readyState>=2 && ref.currentSrc===ref.src && !ref.seeking &&
+        Math.abs(ref.currentTime-element.currentTime)<1/(item.fps || project.fps);
+      const source=ready ? ref : hdr?hdrLayer(element,clip,canvas,clipBypass):element;
+      return {type:'video',element:source,clip,exact:source instanceof HTMLVideoElement,
+        input:{matrix:item?.hdr?'bt709':window.SpliceGrade?.matrixName(item?.colorSpace,item?.colorMatrix)||'bt601',fullRange:false},
+        grade:gradeOf(clip,bypass), brightness, wipe, wipeOut,
+        alpha:alpha*clamp(animated(clip,"opacity",Number(clip.opacity??100))/100,0,1),
+        geometry:{sourceWidth:source.videoWidth||source.width||canvas.width,sourceHeight:source.videoHeight||source.height||canvas.height,
+          scale:clamp(animated(clip,"scale",Number(clip.transform?.scale??100))/100,.1,4),
+          x:clamp(animated(clip,"x",Number(clip.transform?.x??0)),-100,100),
+          y:clamp(animated(clip,"y",Number(clip.transform?.y??0)),-100,100),
+          rotation:clamp(animated(clip,"rotation",Number(clip.transform?.rotation??0)),-180,180)*Math.PI/180}};
+    };
     for (const clip of visible.slice(firstShown)) {
       if (clip.type==='title') {
-        paintTitle(ctx,canvas,clip);
+        plan.ops.push({type:'title',clip,paint:(ctx,target)=>paintTitle(ctx,target,clip)});
         continue;
       }
-      if (outgoingIds.has(clip.id) || resolveClipMedia(clip).item?.nativeGenerator===1414680150) continue;
+      if (outgoingIds.has(clip.id)) continue;
+      if (mediaOf(clip)?.adjustment) {
+        const grade=gradeOf(clip,bypass);
+        if (grade && isEnabled(clip)) plan.ops.push({type:'adjust',clip,grade,alpha:clamp(animated(clip,"opacity",Number(clip.opacity??100))/100,0,1)});
+        continue;
+      }
+      if (resolveClipMedia(clip).item?.nativeGenerator===1414680150) continue;
       if (clip.transition==='fade' && time<clip.start) continue;
-      const element=videoFor(clip);
       const progress=transitionProgress(clip);
       const previous=dissolvePairs.get(clip.id);
       if (previous) {
-        if (dissolveCanvas.width!==canvas.width || dissolveCanvas.height!==canvas.height) {
-          dissolveCanvas.width=canvas.width;dissolveCanvas.height=canvas.height;
-        }
-        const mix=dissolveCanvas.getContext('2d');
-        mix.clearRect(0,0,canvas.width,canvas.height);
-        paintVideo(mix,videoFor(previous),previous,canvas,1-progress);
-        // A disabled incoming clip is transparent: the clip before dissolves out to what is underneath.
-        if (isEnabled(clip)) {
-          mix.save();mix.globalCompositeOperation='lighter';
-          paintVideo(mix,element,clip,canvas,progress);mix.restore();
-        }
-        ctx.drawImage(dissolveCanvas,0,0);
+        // As the export blends: (beneath + outgoing) * (1-p) + (beneath + incoming) * p.
+        // A disabled incoming clip is transparent: outgoing dissolves out to what is underneath.
+        const incoming=isEnabled(clip)?layerOp(clip):null, outgoing=layerOp(previous);
+        if (outgoing || incoming) plan.ops.push({type:'dissolve',outgoing,incoming,progress});
         continue;
       }
       const wipedOff=wipeOuts.get(clip.id);
       if (wipedOff) {
-        ctx.save();ctx.beginPath();ctx.rect(canvas.width*progress,0,canvas.width*(1-progress),canvas.height);ctx.clip();
-        paintVideo(ctx,videoFor(wipedOff),wipedOff,canvas);
-        ctx.restore();
+        const op=layerOp(wipedOff,1,1,null,progress);
+        if (op) plan.ops.push(op);
         continue;
       }
       // Any other disabled stand-in paints nothing (a dip it carries still darkens the clip before).
@@ -1351,13 +1467,25 @@
       const nextDip=videoDipFollowers.get(clip.id);
       if (nextDip && transitionBefore(nextDip)>0) brightness*=clamp((nextDip.start-time)/transitionBefore(nextDip),0,1);
       if (clip.transition==='wipe') {
-        const tail=transitionTail(clip,time);
-        if (tail) paintVideo(ctx,videoFor(tail),tail,canvas);
-        ctx.save();ctx.beginPath();ctx.rect(0,0,canvas.width*progress,canvas.height);ctx.clip();
+        const tail=transitionTail(clip,time), under=tail&&layerOp(tail);
+        if (under) plan.ops.push(under);
       }
-      paintVideo(ctx,element,clip,canvas,clip.transition==='dissolve'?progress:1,brightness);
-      if (clip.transition==='wipe') ctx.restore();
+      const op=layerOp(clip,clip.transition==='dissolve'?progress:1,brightness,clip.transition==='wipe'?progress:null);
+      if (op) plan.ops.push(op);
     }
+    return plan;
+  }
+  function drawFrame(canvas) {
+    const active = at('video', time);
+    if (!mutedTracks.video && active && programSource(active) && multicamAngleActive(active, time) &&
+        video?.readyState < 2 && previewProjects.get(canvas) === project) return;
+    previewProjects.set(canvas, project);
+    const plan=framePlan(canvas);
+    if (monitor.split!=null) { plan.split=monitor.split; plan.beforeOps=framePlan(canvas,true).ops; }
+    window.SplicePicture.render(canvas,plan);
+    const shown=new Set();
+    for (const op of [...plan.ops,...(plan.beforeOps||[])]) for (const part of [op,op.outgoing,op.incoming]) if (part?.element) shown.add(part.element);
+    window.SplicePicture.forget(shown);
   }
   function tick(timestamp) {
     if (playing) {
@@ -1420,6 +1548,17 @@
     if (mix.outputStages !== undefined && (!Array.isArray(mix.outputStages) || mix.outputStages.length > 64 ||
         mix.outputStages.some(s => !Number.isFinite(s?.gain) || s.gain < 0 || s.gain > 200 ||
           !Number.isFinite(s.pan) || Math.abs(s.pan) > 100))) throw new Error('Invalid nested output mixer settings.');
+    const dsp=window.SpliceAudioDSP;
+    dsp.validateFx(mix.fx);
+    if (mix.keyframes!=null) {
+      if (typeof mix.keyframes!=='object' || Array.isArray(mix.keyframes) || Object.keys(mix.keyframes).some(k=>!['volume','pan'].includes(k)))
+        throw new Error("Track automation has volume and pan keyframes only.");
+      if (mix.keyframes.volume) dsp.validateAutomation(mix.keyframes.volume,0,200,2000,'track volume');
+      if (mix.keyframes.pan) dsp.validateAutomation(mix.keyframes.pan,-100,100,2000,'track pan');
+    }
+    if (mix.route!==undefined && !['front','center','lfe','surround'].includes(mix.route)) throw new Error("Invalid track routing.");
+    if (mix.channels!==undefined && !['stereo','mono'].includes(mix.channels)) throw new Error("Invalid track channels.");
+    if (mix.stem!==undefined && (typeof mix.stem!=='string' || mix.stem.length>32)) throw new Error("Stem names are up to 32 characters.");
   }
   // LUT tables are immutable once validated; skip re-checking 100k samples on every edit.
   const validatedLuts = new WeakSet();
@@ -1467,6 +1606,7 @@
         value.trackCounts.video < 1 || value.trackCounts.video > 64 ||
         value.trackCounts.audio < 1 || value.trackCounts.audio > 64))
       throw new Error("This project file has invalid track counts.");
+    if (value.masterFx != null) window.SpliceAudioDSP.validateFx(value.masterFx, ['eq','comp']);
     if (value.trackMix != null) {
       if (typeof value.trackMix !== "object" || Array.isArray(value.trackMix))
         throw new Error("This project file has invalid audio mixer settings.");
@@ -1534,6 +1674,15 @@
         if (item.subclipOut != null && (!Number.isFinite(item.subclipOut) || item.subclipOut <= (item.subclipIn || 0)))
           throw new Error("This project file has an invalid subclip out point.");
       }
+      // Source colour settings: untagged matrix choice, technical input LUT, adjustment marker.
+      if (item.colorMatrix !== undefined && !['bt709','bt601'].includes(item.colorMatrix))
+        throw new Error("This project file has an invalid source colour setting.");
+      if (item.adjustment !== undefined && typeof item.adjustment !== 'boolean')
+        throw new Error("This project file has invalid media.");
+      if (item.inputLut != null && !validatedLuts.has(item.inputLut)) {
+        window.SpliceLUT.validate(item.inputLut,100);
+        validatedLuts.add(item.inputLut);
+      }
       mediaIds.add(item.id);
       mediaById.set(item.id, item);
     }
@@ -1586,10 +1735,17 @@
             !clock.rate || Math.abs(clock.rate) > 16 || !Number.isFinite(clock.duration) || clock.duration <= 0))
           throw new Error("This project file has an invalid retimed fade.");
       }
+      if (clip.audioFx != null) window.SpliceAudioDSP.validateFx(clip.audioFx);
+      if (clip.channelMap !== undefined && !['stereo','left','right','mono','swap'].includes(clip.channelMap))
+        throw new Error("This project file has an invalid channel mapping.");
+      if (clip.audioTransition !== undefined && !['auto','cut','crossfade','dip'].includes(clip.audioTransition))
+        throw new Error("This project file has an invalid sound transition.");
       if (clip.keyframes != null && (typeof clip.keyframes !== "object" || Array.isArray(clip.keyframes) ||
           Object.values(clip.keyframes).some(points => !Array.isArray(points) ||
             points.some(point => !point || !Number.isFinite(point.time) || !Number.isFinite(point.value)))))
         throw new Error("This project file has invalid keyframes.");
+      if (clip.keyframes) window.SpliceGrade.keyTimes(clip);
+      if (clip.color?.grade !== undefined) window.SpliceGrade.validateGrade(clip.color.grade);
       if (clip.color?.lut) {
         const intensity = clip.color.lutIntensity ?? 100;
         if (!Number.isFinite(intensity) || intensity < 0 || intensity > 100) throw new Error('Invalid LUT intensity.');
@@ -1636,7 +1792,12 @@
   function reserveTrackMix(track, mix = {}, clips, addedMixes) {
     const current = addedMixes[track] ?? project.trackMix?.[track];
     if ((mix.gain ?? 100) === (current?.gain ?? 100) && (mix.pan ?? 0) === (current?.pan ?? 0) &&
-        !!mix.mute === !!current?.mute && !!mix.solo === !!current?.solo && sameValue(mix.outputStages, current?.outputStages)) return true;
+        !!mix.mute === !!current?.mute && !!mix.solo === !!current?.solo &&
+        sameValue(mix.outputStages, current?.outputStages) &&
+        sameValue(mix.fx, current?.fx) && sameValue(mix.keyframes, current?.keyframes) &&
+        (mix.route ?? 'front') === (current?.route ?? 'front') &&
+        (mix.channels ?? 'stereo') === (current?.channels ?? 'stereo') &&
+        (mix.stem ?? '') === (current?.stem ?? '')) return true;
     // A64 can carry embedded multicam sound even when it has no timeline audio clips.
     if (current || track === -64 || clips.some(c => c.track === track)) return false;
     addedMixes[track] = {...mix};
@@ -1646,6 +1807,14 @@
     return freeAudioTrack(project, clip.start, clip.start + clip.duration, {
       preferred, clips, ignore, canUse:track => reserveTrackMix(track, mix, clips, addedMixes),
     });
+  }
+  // Intersect the selected picture's source range with the recording, then place it on the timeline.
+  function syncSoundPlacement(picture, sound, offset, fps) {
+    const speed = Number(picture.speed) || 1;
+    let start = picture.start, length = picture.duration, inPoint = Number(picture.in || 0) + offset;
+    if (inPoint < 0) { start += -inPoint/speed; length -= -inPoint/speed; inPoint = 0; }
+    if (sound.duration && inPoint + length*speed > sound.duration) length = (sound.duration - inPoint)/speed;
+    return length > 1/fps ? {start: Math.round(start*1e9)/1e9, duration: length, in: inPoint} : null;
   }
   function freeAudioTrack(source, from, to, {preferred = -1, clips = source.clips, ignore, canUse} = {}) {
     const candidates = new Set([preferred, ...Array.from({length:64}, (_, i) => -1-i)]);
@@ -1674,12 +1843,10 @@
       sound.keyframes = {volume: cloneState(clip.keyframes.volume)};
       delete clip.keyframes.volume;
     }
-    if (["dissolve", "wipe", "fade"].includes(clip.transition)) {
-      sound.transition = "dissolve";
-      sound.transitionDuration = clip.transitionDuration;
-      if (clip.transitionClock) sound.transitionClock = {...clip.transitionClock};
-      if (clip.transitionBefore) sound.transitionBefore = clip.transitionBefore;
-    }
+    // The linked sound follows its picture's transition (the same rule as embedded sound);
+    // a sound transition override carries over.
+    if (clip.audioTransition) sound.audioTransition = clip.audioTransition;
+    for (const key of ["channelMap", "audioFx"]) if (key in clip) sound[key] = cloneState(clip[key]);
     clip.embeddedAudio = false;
     clip.linkGroup = group;
     for (const key of ["pan", "fadeIn", "fadeOut", "fadeClock"]) delete clip[key];
@@ -2068,6 +2235,8 @@
       linkedSelection,
     }),
     drawFrame,
+    framePlan,
+    monitor,
     refreshMedia() { syncMedia(true);notify(); },
     editProject(fn) {
       const next = cloneState(project);
@@ -2110,12 +2279,69 @@
     updateTrackMix(track, patch) {
       const key=String(track);
       const next={ gain:100, pan:0, mute:false, solo:false, ...project.trackMix?.[key], ...patch };
+      for (const name of Object.keys(next)) if (next[name]===undefined) delete next[name];
       validateTrackMix(key,next);
       if (sameValue(next, project.trackMix?.[key])) return;
       snapshot();
       project.trackMix ||= {};
       project.trackMix[key] = next;
       syncMedia(); notify();
+    },
+    clipAudioStream,
+    syncSoundPlacement,
+    // Dual-system sound: link each picture clip to its separately recorded sound.
+    // `offset` is seconds: a picture source time t plays the sound file at t + offset.
+    // scratch: 'mute' turns the camera's own sound off (embeddedAudio false), 'keep' leaves it.
+    syncSound(items, {scratch = 'mute'} = {}) {
+      if (!Array.isArray(items) || !items.length) throw Error('Nothing to sync.');
+      if (!['mute','keep'].includes(scratch)) throw Error('Choose mute or keep for the camera sound.');
+      const made = [];
+      Editor.withoutLinks(() => Editor.editProject(next => {
+        for (const {pictureId, mediaId, offset} of items) {
+          const picture = next.clips.find(clip => clip.id === pictureId && clip.type === 'video');
+          const sound = next.media.find(item => item.id === mediaId);
+          if (!picture || !sound) throw Error('A clip or sound file to sync is missing.');
+          if (picture.reverse) throw Error('Reversed clips cannot be synced to sound.');
+          if (!Number.isFinite(offset)) throw Error('Invalid sync offset.');
+          ensureEditable(picture);
+          const speed = Number(picture.speed) || 1;
+          const placement = syncSoundPlacement(picture, sound, offset, next.fps);
+          if (!placement) throw Error(`${sound.name || 'The sound file'} does not overlap ${picture.title || 'the picture clip'} at that offset.`);
+          const track = freeAudioTrack(next, placement.start, placement.start + placement.duration);
+          if (track === null) throw Error("There is no free, unlocked audio track for the synced sound.");
+          const group = picture.linkGroup || uid();
+          const clip = {id: uid(), mediaId, type: 'audio', track, ...placement, title: '', volume: 100,
+            transition: 'none', linkGroup: group, ...(speed !== 1 ? {speed} : {})};
+          picture.linkGroup = group;
+          if (scratch === 'mute') {
+            picture.embeddedAudio = false;
+            for (const member of groupMembers(picture, next)) {
+              if (member.type === 'audio' && member.mediaId === picture.mediaId) member.enabled = false;
+            }
+          }
+          next.clips.push(clip);
+          made.push(clip.id);
+        }
+      }));
+      return made;
+    },
+    // Master bus EQ and compressor (null removes them).
+    setMasterFx(fx) {
+      window.SpliceAudioDSP.validateFx(fx, ['eq','comp']);
+      if (sameValue(fx ?? undefined, project.masterFx)) return;
+      snapshot();
+      if (fx) project.masterFx = cloneState(fx); else delete project.masterFx;
+      syncMedia(); notify();
+    },
+    // Track automation: points [{time (timeline s), value, ease?}] replace the property's curve.
+    setTrackAutomation(track, key, points) {
+      if (!['volume','pan'].includes(key)) throw Error('Track automation has volume and pan keyframes only.');
+      const mix=project.trackMix?.[String(track)]||{};
+      const sorted=[...points].map(point=>({time:Math.round(Number(point.time)*1e6)/1e6,value:Number(point.value),
+        ...(point.ease?{ease:true}:{})})).sort((a,b)=>a.time-b.time);
+      const keyframes={...(mix.keyframes||{}),[key]:sorted};
+      if (!sorted.length) delete keyframes[key];
+      Editor.updateTrackMix(track,{keyframes:Object.keys(keyframes).length?keyframes:undefined});
     },
     beginGesture() { if (gesture) return; gestureBefore=project; gesture=true; },
     endGesture() {
@@ -2698,6 +2924,15 @@
       if (groups.size) {
         for (const clip of project.clips) if (groups.has(clip.linkGroup)) ensureEditable(clip);
         Editor.editProject((next) => {
+          const pictures=new Map(next.clips.filter(c=>c.type==='video'&&groups.has(c.linkGroup))
+            .map(c=>[c.linkGroup+':'+Math.round(c.start*project.fps),c]));
+          for (const clip of next.clips) {
+            const picture=clip.type==='audio' && !SOUND_KINDS[clip.transition] && pictures.get(clip.linkGroup+':'+Math.round(clip.start*project.fps));
+            if (picture && SOUND_KINDS[picture.transition]) {
+              clip.transition=SOUND_KINDS[picture.transition]==='dip'?'fade':'dissolve';
+              for (const key of ['transitionDuration','transitionBefore']) if (key in picture) clip[key]=picture[key];
+            }
+          }
           for (const clip of next.clips) if (groups.has(clip.linkGroup)) delete clip.linkGroup;
         });
         return "unlinked";
@@ -3011,15 +3246,22 @@
           `${safe}.splice.json`,
         );
     },
-    async exportVideo(options = {}, onProgress = () => {}, signal) {
+    // The timeline as an export request sends it (also used by the render queue).
+    async prepareExport() {
       if (!duration()) throw new Error("Add clips to the timeline before exporting.");
-      if (signal?.aborted) throw signal.reason || new DOMException("Export cancelled", "AbortError");
       const prepared = window.SpliceMedia?.forPremiere
         ? await window.SpliceMedia.forPremiere(project)
         : structuredClone(project);
-      if (signal?.aborted) throw signal.reason || new DOMException("Export cancelled", "AbortError");
       delete prepared.premiereOriginal; delete prepared.premiereManaged;
-      prepared.renderOptions = { mutedTracks };
+      prepared.renderOptions = { mutedTracks: structuredClone(mutedTracks) };
+      return prepared;
+    },
+    // `download: false` (Analyze program) keeps the result in the job report instead of saving a file.
+    async exportVideo(options = {}, onProgress = () => {}, signal, {download = true} = {}) {
+      if (!duration()) throw new Error("Add clips to the timeline before exporting.");
+      if (signal?.aborted) throw signal.reason || new DOMException("Export cancelled", "AbortError");
+      const prepared = await this.prepareExport();
+      if (signal?.aborted) throw signal.reason || new DOMException("Export cancelled", "AbortError");
       const response = await fetch("/api/exports", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -3054,12 +3296,14 @@
           if (job.state === "cancelled") throw new Error("Export cancelled.");
           if (job.state === "complete") {
             const safe = (project.name || "Untitled").replace(/[^a-z0-9_-]+/gi, "-").replace(/^-+|-+$/g, "") || "Untitled";
-            const extension = ["mp4","mov","wav"].includes(job.extension) ? job.extension : "mp4";
+            const extension = ["mp4","mov","mxf","wav","zip","json"].includes(job.extension) ? job.extension : "mp4";
             const downloadURL = endpoint + "/file?name=" + encodeURIComponent(safe + "." + extension);
-            const anchor = document.createElement("a");
-            anchor.href = downloadURL;
-            anchor.download = safe + "." + extension;
-            anchor.click();
+            if (download) {
+              const anchor = document.createElement("a");
+              anchor.href = downloadURL;
+              anchor.download = safe + "." + extension;
+              anchor.click();
+            }
             return { id, url: job.previewable === false ? null : endpoint + "/preview", downloadURL,
               extension, mime: job.mime, previewable: job.previewable !== false };
           }

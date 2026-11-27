@@ -72,6 +72,18 @@ window.SpliceNested = (() => {
     return Math.round(value * f) / f;
   }
 
+  // Track automation points between `from` and `from + span` on the child's clock, with the
+  // curve's values at both ends (a segment cut by an end keeps its easing).
+  function automationWindow(points, from, span) {
+    const ordered = [...points].sort((a, b) => a.time - b.time);
+    const at = t => window.SpliceAudioDSP.curveValue(ordered, t, ordered[0].value);
+    const easeAt = t => !!ordered.filter(p => p.time <= t).pop()?.ease;
+    const point = (time, value, ease) => ({time, value, ...(ease ? {ease:true} : {})});
+    const inside = ordered.filter(p => p.time > from + 1e-9 && p.time < from + span - 1e-9)
+      .map(p => point(p.time - from, p.value, p.ease));
+    return [point(0, at(from), easeAt(from)), ...inside, point(span, at(from + span), false)];
+  }
+
   function freeTrack(clips, kind, preferred, from, to, isLocked) {
     const step = kind === 'audio' ? -1 : 1;
     const candidates = [preferred];
@@ -155,6 +167,10 @@ window.SpliceNested = (() => {
     };
     // A solo on a track outside the selection can silence the whole selection.
     if (project.trackMix) childProject.trackMix = structuredClone(project.trackMix);
+    // Track automation is on the timeline clock: move it onto the child's clock with the clips.
+    for (const mix of Object.values(childProject.trackMix || {}))
+      for (const [key, points] of Object.entries(mix?.keyframes || {}))
+        if (Array.isArray(points) && points.length) mix.keyframes[key] = automationWindow(points, minStart, span);
     if (project.trackState) childProject.trackState = structuredClone(project.trackState);
 
     const hasVideo = selected.some(c => c.type === 'video' || c.type === 'title');
@@ -189,7 +205,11 @@ window.SpliceNested = (() => {
     const solo = Object.values(project.trackMix || {}).some(m => m.solo);
     const unavailableAudio = t => {
       const mix = project.trackMix?.[t] || {};
-      if (isLocked(t, 'audio') || mix.mute || (mix.gain ?? 100) !== 100 || (mix.pan ?? 0) !== 0 || mix.outputStages?.length) return true;
+      const hasFx = mix.fx && Object.values(mix.fx).some(stage => stage && stage.enabled !== false);
+      const hasKeys = mix.keyframes && Object.values(mix.keyframes).some(points => Array.isArray(points) && points.length);
+      if (isLocked(t, 'audio') || mix.mute || (mix.gain ?? 100) !== 100 || (mix.pan ?? 0) !== 0 ||
+          mix.outputStages?.length || hasFx || hasKeys || mix.channels === 'mono' ||
+          (mix.route && mix.route !== 'front')) return true;
       return solo && !mix.solo && project.clips.some(c => c.track === t);
     };
     const audioTrack = hasAudio ? freeTrack(remaining, 'audio', Math.min(-1, prefAudio || -1), minStart, minStart + span, unavailableAudio) : null;
@@ -441,9 +461,18 @@ window.SpliceNested = (() => {
     const names = [];
     for (const [key, value] of Object.entries(clip.transform || {}))
       if (value !== (key === 'scale' ? 100 : 0)) names.push(key);
-    for (const [key, value] of Object.entries(clip.color || {})) {
-      if (key === 'lutIntensity' || (key === 'lut' && !value)) continue;
-      if (value !== (['brightness','contrast','saturation'].includes(key) ? 100 : 0)) names.push(key);
+    const color = clip.color || {};
+    const gradeBypass = !!color.grade?.bypass;
+    if (!gradeBypass) {
+      for (const [key, value] of Object.entries(color)) {
+        if (key === 'lutIntensity' || key === 'lutName' || (key === 'lut' && !value)) continue;
+        if (key === 'grade') {
+          if (value && (window.SpliceGrade ? !window.SpliceGrade.prepare({grade: value}).identity : Object.keys(value).length))
+            names.push('grade');
+          continue;
+        }
+        if (value !== (['brightness','contrast','saturation'].includes(key) ? 100 : 0)) names.push(key);
+      }
     }
     if ((clip.opacity ?? 100) !== 100) names.push('opacity');
     if (clip.transition && clip.transition !== 'none') names.push(clip.transition);
@@ -474,6 +503,26 @@ window.SpliceNested = (() => {
       if (editor.isTrackLocked?.(c.track, c.type))
         throw new Error(`Unlock ${c.type} track ${Math.abs(c.track)} before unnesting.`);
     }
+    // Outer audio finishing (clip effects and channel mapping, the parent track's effects,
+    // automation, channel mode and surround routing) acts on the nested mix as a whole and has
+    // no per-child equivalent on the unnested tracks. Keep it on the nested clip.
+    const enabledFx = fx => !!fx && Object.values(fx).some(stage => stage && stage.enabled !== false &&
+      (!Array.isArray(stage.bands) || stage.bands.length));
+    const finishing = new Set();
+    for (const c of outerClips) {
+      if (c.type !== 'audio' && c.embeddedAudio === false) continue;
+      const mix = project.trackMix?.[c.track] || {};
+      if (enabledFx(c.audioFx)) finishing.add('clip audio effects');
+      if (c.channelMap && c.channelMap !== 'stereo') finishing.add('clip channel mapping');
+      if (c.type !== 'audio') continue;
+      if (enabledFx(mix.fx)) finishing.add('track audio effects');
+      if (mix.keyframes && Object.values(mix.keyframes).some(points => Array.isArray(points) && points.length))
+        finishing.add('track automation');
+      if (mix.channels === 'mono') finishing.add('mono track');
+      if (mix.route && mix.route !== 'front') finishing.add(mix.route + ' track routing');
+    }
+    if (finishing.size)
+      throw new Error('Cannot unnest losslessly: outer ' + [...finishing].join(', ') + ' must remain on the nested mix.');
 
     const outerIds = new Set(outerClips.map(c => c.id));
     const child = item.nestedProject;
@@ -536,8 +585,17 @@ window.SpliceNested = (() => {
       // above the fader's 200% limit likewise needs its original second stage.
       if (outerMix.pan || gain > 200) stages.push({gain:gain > 200 ? outerMix.gain : 100, pan:outerMix.pan || 0});
       stages.push(...(outerMix.outputStages || []));
+      // Child track automation runs on the child's clock: bring it onto the parent's.
+      let keyframes = mix.keyframes;
+      if (keyframes && Object.values(keyframes).some(points => Array.isArray(points) && points.length)) {
+        if (outerSound.reverse || (Number(outerSound.speed) || 1) !== 1)
+          throw new Error('Cannot unnest losslessly: child track automation on a retimed nested clip must remain on the nested composite.');
+        const from = Number(outerSound.in) || 0;
+        keyframes = Object.fromEntries(Object.entries(keyframes).filter(([, points]) => points?.length).map(([key, points]) =>
+          [key, automationWindow(points, from, outerSound.duration).map(p => ({...p, time:snapToFps(p.time + outerSound.start, 48000)}))]));
+      }
       // Solo is local to the child sequence. Carry its audible result onto the parent's buses.
-      return {...mix, gain:gain > 200 ? mix.gain : gain, ...(stages.length ? {outputStages:stages} : {}),
+      return {...mix, ...(keyframes ? {keyframes} : {}), gain:gain > 200 ? mix.gain : gain, ...(stages.length ? {outputStages:stages} : {}),
         mute:!!(mix.mute || (childSolo && !mix.solo) || outerMix.mute || (parentSolo && !outerMix.solo)), solo:!!outerMix.solo};
     }
     function placeSound(sound, preferred, clips, mix) {

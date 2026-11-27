@@ -469,13 +469,12 @@
   background: transparent;
   white-space: nowrap;
 }
+/* The compact viewer header (studio.css) sets gaps and the Scopes toggle; size Multicam with it. */
+@container viewer (max-width: 640px) {
+  .multicam-toggle { padding: 1px 5px; font-size: 10px; }
+}
 @container viewer (max-width: 480px) {
-  .panel-top { padding: 0 10px; gap: 6px; }
-  .monitor-subtitle { display: none; }
-  .viewer-actions { gap: 6px; }
   #monitor-resolution { display: none; }
-  .multicam-toggle,
-  .scope-dock-toggle { padding: 2px 6px; font-size: 10.5px; }
 }
 
 /* Keep bin browser strictly inside narrow Media Pool panels */

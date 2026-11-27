@@ -181,7 +181,7 @@ window.SpliceMedia = (() => {
                                  body:JSON.stringify({project,minimumDuration}),signal:AbortSignal.timeout(3600000)});
         const body=await response.json();
         if(!response.ok||!localMedia(body.src))throw Error(body.error||'Nested preview failed');
-        item.src=body.src;item.proxyState='ready';item.offline=false;
+        item.src=body.src;item.colorSpace='bt709';item.proxyState='ready';item.offline=false;
       }catch(e){item.proxyState='unavailable';item.proxyError=e.message;}
       window.Editor?.refreshMedia?.();
     })();
