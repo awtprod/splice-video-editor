@@ -18,7 +18,7 @@ sys.path.insert(0, str(ROOT / 'tests'))
 
 from interchange import cut as interchange_cut  # noqa: E402
 from premiere import MEDIA_ROOT, open_project, save_project  # noqa: E402
-from render_movie import render_to_file  # noqa: E402
+from render_movie import _expand_editorial_clips, render_to_file  # noqa: E402
 from test_render_audio_mix import AMPLITUDE, left_channel, tone_level  # noqa: E402
 
 W, H, FPS = 64, 36, 25
@@ -342,6 +342,31 @@ class MulticamNestedExportTests(unittest.TestCase):
                                      duration=1, **{'in':0}))
         with self.assertRaisesRegex(ValueError, 'cascaded nested track mix'):
             save_project(project)
+
+    def test_late_angle_keeps_picture_and_sound_ramps(self):
+        angle = dict(mediaId='green', offset=2, duration=2)
+        mc = dict(id='mc', type='video', duration=4, multicam=dict(angles=[angle], audioMode='follow'))
+        ramp = [dict(time=0, value=0), dict(time=4, value=100)]
+        clip = self._vclip('camera', 'mc', 0, 4, fadeIn=4, keyframes=dict(opacity=ramp, volume=ramp))
+        movie = self._render(dict(width=W, height=H, fps=FPS, media=[*self.media, mc], clips=[clip]), 'late')
+        frames = frames_rgb(movie)
+        self.assertEqual(dominant_channel(frames[49]), 'black')
+        self.assertAlmostEqual(mean_rgb(frames[50])[1], 127, delta=6)
+        self.assertAlmostEqual(tone_level(left_channel(movie), 625, 2.04, 2.12),
+                               AMPLITUDE * (2.08 / 4)**2, delta=.005)
+
+    def test_angle_window_advances_existing_effect_clocks(self):
+        angle = dict(mediaId='green', offset=1, duration=2)
+        mc = dict(id='mc', type='video', duration=4, multicam=dict(angles=[angle], audioMode='follow'))
+        clip = self._vclip('camera', 'mc', 0, 4, reverse=True, fadeOut=3,
+                           pictureDip=dict(origin=3, rate=-.5, duration=4),
+                           fadeClock=dict(origin=1, rate=.5, duration=5),
+                           keyframes=dict(x=[dict(time=0, value=-40), dict(time=4, value=40)]))
+        expanded, = _expand_editorial_clips(dict(media=[*self.media, mc], clips=[clip]))['clips']
+        self.assertEqual(expanded['pictureDip'], dict(origin=2.5, rate=-.5, duration=4))
+        self.assertEqual(expanded['fadeClock'], dict(origin=1.5, rate=.5, duration=5))
+        self.assertEqual(expanded['keyframes']['x'], [dict(time=0, value=-20), dict(time=2, value=20)])
+        self.assertEqual(expanded['fadeOut'], 3)
 
     def test_multicam_outlasts_selected_angle(self):
         angles = [dict(mediaId='red', offset=0, duration=2), dict(mediaId='blue', offset=0, duration=8)]

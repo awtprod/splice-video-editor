@@ -423,6 +423,12 @@ window.SpliceMulticam = (() => {
     return setMulticamView(!viewEnabled);
   }
 
+  function audioFadeClock(clip) {
+    if (clip.fadeClock) return clip.fadeClock;
+    if (clip.fadeIn || clip.fadeOut) return {origin:0, rate:1, duration:clip.duration};
+    return null;
+  }
+
   function switchAngle(angleIndex, { cut = true } = {}) {
     const editor = window.Editor;
     const state = editor.get();
@@ -463,46 +469,20 @@ window.SpliceMulticam = (() => {
         if (partner && audioMode === 'follow') partner.multicamAngle = angleIndex;
         return;
       }
-      const speed = Number(target.speed) || 1;
-      const leftDur = Math.round((snapped - target.start) * fps) / fps;
-      const rightDur = Math.round((target.start + target.duration - snapped) * fps) / fps;
-      if (leftDur < frame - 1e-6 || rightDur < frame - 1e-6) {
-        target.multicamAngle = angleIndex;
-        if (partner && audioMode === 'follow') partner.multicamAngle = angleIndex;
-        return;
-      }
-      const rightVideo = structuredClone(target);
-      rightVideo.id = uid();
-      rightVideo.start = snapped;
-      rightVideo.duration = rightDur;
-      if (!target.reverse) rightVideo.in = (Number(target.in) || 0) + leftDur * speed;
-      else target.in = (Number(target.in) || 0) + rightDur * speed;
+      const split = clip => {
+        // Gain automation and the fade envelope run on independent clocks.
+        const clock = audioFadeClock(clip);
+        if (clock) clip.fadeClock = clock;
+        clip.in ??= 0;
+        return editor.splitClipAt(clip, snapped, next);
+      };
+      const rightVideo = split(target);
       rightVideo.multicamAngle = angleIndex;
-      rightVideo.transition = 'none';
-      delete rightVideo.transitionBefore;
-      delete rightVideo.transitionDuration;
-      delete rightVideo.transitionMatchName;
-      delete rightVideo.premiereIndex;
-      target.duration = leftDur;
 
       if (partner && partner.start < snapped - frame * 0.5 && partner.start + partner.duration > snapped + frame * 0.5) {
         const leftGroup = uid(), rightGroup = uid();
-        const pSpeed = Number(partner.speed) || 1;
-        const pLeftDur = Math.round((snapped - partner.start) * fps) / fps;
-        const pRightDur = Math.round((partner.start + partner.duration - snapped) * fps) / fps;
-        const rightAudio = structuredClone(partner);
-        rightAudio.id = uid();
-        rightAudio.start = snapped;
-        rightAudio.duration = pRightDur;
-        if (!partner.reverse) rightAudio.in = (Number(partner.in) || 0) + pLeftDur * pSpeed;
-        else partner.in = (Number(partner.in) || 0) + pRightDur * pSpeed;
+        const rightAudio = split(partner);
         if (audioMode === 'follow') rightAudio.multicamAngle = angleIndex;
-        rightAudio.transition = 'none';
-        delete rightAudio.transitionBefore;
-        delete rightAudio.transitionDuration;
-        delete rightAudio.transitionMatchName;
-        delete rightAudio.premiereIndex;
-        partner.duration = pLeftDur;
         target.linkGroup = leftGroup;
         partner.linkGroup = leftGroup;
         rightVideo.linkGroup = rightGroup;
@@ -562,6 +542,34 @@ window.SpliceMulticam = (() => {
       out.start = Math.round((base.reverse ? base.start + (mcIn + mcSpan - ovEnd) / speed : base.start + (ovStart - mcIn) / speed) * fps) / fps;
       out.duration = Math.round(((ovEnd - ovStart) / speed) * fps) / fps;
       if (out.duration < 1 / fps - 1e-6) return null;
+      const head = out.start - base.start;
+      if (head > 1e-6 || out.duration < base.duration - 1e-6) {
+        if (base.keyframes) out.keyframes = editor.clipKeyframeWindow(base.keyframes, head, head + out.duration);
+        const fade = audioFadeClock(base);
+        if (fade) out.fadeClock = {...fade, origin:fade.origin + fade.rate * head};
+        const before = base.transitionBefore || 0;
+        const span = Math.min(base.duration + before, base.transitionDuration ?? .5);
+        if (base.pictureDip) out.pictureDip.origin += out.pictureDip.rate * head;
+        const incoming = ['fade','wipe','dissolve'].includes(base.transition);
+        const remaining = span - before - head;
+        if (incoming && (remaining <= 0 || (base.transition === 'fade' && (head > 0 || out.duration < remaining)))) {
+          if (remaining > 0 && !base.pictureDip) {
+            out.pictureDip = kind === 'audio' ? {origin:head + before, rate:1, duration:span}
+              : {origin:head, rate:1, duration:span - before};
+          }
+          out.transition = 'none';
+          delete out.transitionBefore;
+          delete out.transitionDuration;
+          delete out.transitionClock;
+        } else if (incoming && (head > 0 || out.duration < remaining)) {
+          // Keep the remaining transition on the timeline, with its original progress.
+          const lead = head > 0 ? 0 : before;
+          out.transitionBefore = lead;
+          out.transitionDuration = Math.min(remaining, out.duration) + lead;
+          out.transitionClock = {origin:(base.transitionClock?.origin ?? 0) + before + head - lead,
+            rate:1, duration:base.transitionClock?.duration ?? span};
+        }
+      }
       out.in = angIn + (ovStart - offset);
       delete out.multicamAngle;
       delete out.multicamAudioAngle;

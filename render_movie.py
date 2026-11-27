@@ -101,7 +101,7 @@ def _disabled_stand_ins(clips, fps):
                                                (clip.get('track', 0), round((float(clip['start'])+float(clip['duration']))*fps)) in joined):
             stand_in = {key: value for key, value in clip.items() if key in
                         ('id', 'type', 'track', 'start', 'duration', 'transition', 'transitionBefore', 'transitionDuration',
-                         'transitionMatchName')}
+                         'transitionMatchName', 'transitionClock')}
             stand_in.update(mediaId=DISABLED_MEDIA, enabled=False)
             kept.append(stand_in)
     return kept
@@ -682,7 +682,7 @@ def _fade_clock(clip, key):
     origin = _number(clock.get('origin'), 'fade origin', -MAX_TIMELINE_SECONDS, MAX_TIMELINE_SECONDS)
     rate = _number(clock.get('rate'), 'fade rate', -16, 16)
     duration = _number(clock.get('duration'), 'fade duration', .001, MAX_TIMELINE_SECONDS)
-    if not rate:
+    if not rate or (key == 'transitionClock' and rate != 1):
         raise ValueError('Invalid fade rate')
     return origin, rate, duration
 
@@ -1295,6 +1295,8 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
             # trip so its pixels match the window that holds the dip.
             chain += f',format={dip_rgb}'
         overlap_transition = previous is not None and clip.get('transition') in ('dissolve','wipe')
+        progress_origin, _, progress_duration = (_fade_clock(clip, 'transitionClock')
+            if clip.get('transitionClock') else (0, 1, transition_duration))
         if overlap_transition:
             prior_item = media_by_id[previous['mediaId']]
             prior_speed=_number(previous.get('speed',1),'speed',.1,16)
@@ -1334,14 +1336,18 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
                 filters.append(f'[{active}][tail{number}]overlay={prior_position}:{overlay}[under{number}]')
                 active = f'under{number}'
         elif clip.get('transition') == 'dissolve' and not disabled:
-            chain += f',fade=t=in:st=0:d={transition_duration:.6f}:alpha=1'
+            if clip.get('transitionClock'):
+                chain += _mask_alpha(f'min(1,(T+{progress_origin:.9f})/{progress_duration:.9f})', alpha_format, full_alpha)
+            else:
+                chain += f',fade=t=in:st=0:d={transition_duration:.6f}:alpha=1'
         if disabled:
             pass
         elif clip.get('transition') == 'wipe':
             left = _horizontal_position(clip,width,'W',_keyframe_clock(clip,fps,'T',before))
             # The frame at the wipe's end is fully revealed: T and the printed
             # duration can differ by rounding, so compare with 1 us of slack.
-            mask = f'if(gte(T,{transition_duration-1e-6:.9f}),1,lt(X+({left}),{width}*T/{transition_duration:.9f}))'
+            t = f'(T+{progress_origin:.9f})'
+            mask = f'if(gte({t},{progress_duration-1e-6:.9f}),1,lt(X+({left}),{width}*{t}/{progress_duration:.9f}))'
             chain += _mask_alpha(mask,alpha_format,full_alpha)
         elif clip.get('_wipeMask'):
             # Same format round trip as the window that holds the wipe.
@@ -1351,13 +1357,14 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
         wipe_off = overlap_transition and disabled and clip.get('transition') == 'wipe'
         if overlap_transition and clip.get('transition') == 'dissolve' or wipe_off:
             filters.append(f'[without{number}][clip{number}]overlay={position}:{overlay}[incoming{number}]')
-            end = render_start+transition_duration
-            progress = f'(T-{render_start:.9f})/{transition_duration:.9f}'
+            progress_start = render_start - progress_origin
+            end = progress_start + progress_duration
+            progress = f'(T-({progress_start:.9f}))/{progress_duration:.9f}'
             # A wipe to a disabled clip uncovers the layers beneath from the left.
             mix = f'if(lt(X,W*{progress}),B,A)' if wipe_off else f'A*(1-{progress})+B*{progress}'
             # (The wipe's last frame is fully uncovered: compare with 1 us of slack, as the wipe mask does.)
             finish = end-1e-6 if wipe_off else end
-            blend = f'if(lte(T,{render_start:.9f}),A,if(gte(T,{finish:.9f}),B,{mix}))'
+            blend = f'if(lte(T,{progress_start:.9f}),A,if(gte(T,{finish:.9f}),B,{mix}))'
             filters.append(f"[{active}][incoming{number}]blend=all_expr='{blend}'[base{number+1}]")
         else:
             filters.append(f'[{active}][clip{number}]overlay={position}:{overlay}[base{number+1}]')
@@ -1469,11 +1476,14 @@ def _audio_events(clips, media_by_id, fps, probes, track_mix, solo, span, heartb
                 _keyframe_expr(clip,'volume',float(clip.get('volume',100)),0,200,f'({t}-{before:.6f})')))
         if clip.get('transition') in ('dissolve','wipe','fade'):
             incoming=min(_number(clip.get('transitionDuration',.5),'transition duration',1/float(fps)),render_length)
-            envelope.append(_transition_envelope(clip, 0, 1, incoming))
+            clock = _fade_clock(clip, 'transitionClock') if clip.get('transitionClock') else (0, 1, incoming)
+            envelope.append(_transition_envelope(clip, *clock))
         if next_clip:
-            fade_start=before+length-next_before
-            envelope.append(lambda t, n=next_clip, s=fade_start, d=next_duration:
-                            _audio_transition_gain(n,f'max(0,min(1,1-({t}-{s:.9f})/{d:.9f}))'))
+            shift, _, next_span = (_fade_clock(next_clip, 'transitionClock') if next_clip.get('transitionClock')
+                              else (0, 1, next_duration))
+            fade_start=before+length-next_before-shift
+            envelope.append(lambda t, n=next_clip, s=fade_start, d=next_span:
+                            _audio_transition_gain(n,f'max(0,min(1,1-({t}-({s:.9f}))/{d:.9f}))'))
         if fade_in or fade_out:
             head = (lambda t, b=before, f=fade_in: f'max(0,({t}-{b:.9f})/{f:.9f})') if fade_in else (lambda t: '1')
             tail = (lambda t, r=before+fade_length, f=fade_out: f'max(0,({r:.9f}-{t})/{f:.9f})') if fade_out else (lambda t: '1')
@@ -1795,6 +1805,35 @@ def _expand_editorial_clips(project):
         else:
             out['start'] = mc_start + (ov_start - mc_in) / speed
         out['duration'] = (ov_end - ov_start) / speed
+        head = out['start'] - mc_start
+        if head > 1e-6 or out['duration'] < mc_dur - 1e-6:
+            if base_clip.get('keyframes'):
+                out['keyframes'] = _slice_keyframes(base_clip['keyframes'], head, out['duration'])
+            for key in ('fadeClock', 'pictureDip'):
+                if base_clip.get(key):
+                    origin, rate, length = _fade_clock(base_clip, key)
+                    out[key] = dict(origin=origin + rate * head, rate=rate, duration=length)
+                elif key == 'fadeClock' and (base_clip.get('fadeIn') or base_clip.get('fadeOut')):
+                    out[key] = dict(origin=head, rate=1, duration=mc_dur)
+            transition = base_clip.get('transition')
+            if transition in ('fade', 'wipe', 'dissolve'):
+                before = _number(base_clip.get('transitionBefore', 0), 'transition lead')
+                span = min(mc_dur + before, _number(base_clip.get('transitionDuration', .5), 'transition duration'))
+                if head >= span - before or (transition == 'fade' and (head > 0 or out['duration'] < span - before)):
+                    if transition == 'fade' and head < span - before and not out.get('pictureDip'):
+                        out['pictureDip'] = (dict(origin=head + before, rate=1, duration=span) if kind == 'audio'
+                                             else dict(origin=head, rate=1, duration=span - before))
+                    out['transition'] = 'none'
+                    out.pop('transitionBefore', None)
+                    out.pop('transitionDuration', None)
+                    out.pop('transitionClock', None)
+                elif head > 0 or out['duration'] < span - before:
+                    lead = 0 if head > 0 else before
+                    origin, _, duration = (_fade_clock(base_clip, 'transitionClock')
+                                           if base_clip.get('transitionClock') else (0, 1, span))
+                    out['transitionBefore'] = lead
+                    out['transitionDuration'] = min(span - before - head, out['duration']) + lead
+                    out['transitionClock'] = dict(origin=origin + before + head - lead, rate=1, duration=duration)
         out['in'] = ang_in + (ov_start - offset)
         out.pop('multicamAngle', None)
         out.pop('multicamAudioAngle', None)
@@ -2355,7 +2394,9 @@ def _render_picture(project, picture, first, stop, total_frames, fps, width, hei
                 clip['duration']=overlap_end-overlap_start
                 clip['in']=float(clip.get('in',0)) + ((b-overlap_end) if clip.get('reverse') else (overlap_start-cut))*speed
                 clip['transitionBefore']=0
-                if overlap_start > cut+.5/fps: clip['transition']='none'
+                if overlap_start > cut+.5/fps:
+                    clip['transition']='none'
+                    clip.pop('transitionClock', None)
                 clip['_keyframeShift']=overlap_start-cut
             if id(original) in dip_format: clip['_dipFormat'] = True
             if id(original) in wipe_mask: clip['_wipeMask'] = True

@@ -636,6 +636,11 @@
   const requestedTransitionLength = clip => clamp(Number(clip.transitionDuration || .5), 1/project.fps, 7200);
   const transitionBefore = clip => clamp(Number(clip.transitionBefore)||0,0,requestedTransitionLength(clip));
   const transitionLength = clip => Math.min(requestedTransitionLength(clip),clip.duration+transitionBefore(clip));
+  const transitionProgress = clip => {
+    const elapsed = time - clip.start + transitionBefore(clip);
+    const clock = clip.transitionClock;
+    return clamp(clock ? (clock.origin + elapsed)/clock.duration : elapsed/transitionLength(clip), 0, 1);
+  };
   const rawSourceTime = (clip, atTime) => {
     const speed=clamp(Number(clip.speed)||1,.1,16), local=atTime-clip.start;
     return Number(clip.in||0)+(clip.reverse ? clip.duration-local : local)*speed-(clip.reverse?1e-6:0);
@@ -692,9 +697,9 @@
       const level = clamp((origin + rate*local)/duration, 0, 1);
       fade *= clip.transitionMatchName === 'Constant Power' ? Math.sin(Math.PI*level/2) : level;
     }
-    if(['dissolve','wipe','fade'].includes(clip.transition)) fade*=audioTransitionGain(clip,(time-clip.start+transitionBefore(clip))/transitionLength(clip));
+    if(['dissolve','wipe','fade'].includes(clip.transition)) fade*=audioTransitionGain(clip,transitionProgress(clip));
     const next=followingTransition(clip);
-    if(next) fade*=audioTransitionGain(next,1-(time-next.start+transitionBefore(next))/transitionLength(next));
+    if(next) fade*=audioTransitionGain(next,1-transitionProgress(next));
     const outputGain = (mix.outputStages || []).reduce((gain, stage) => gain * stage.gain/100, 1);
     return clamp(animated(clip,'volume',Number(clip.volume??100))/100,0,2) * clamp((mix.gain??100)/100,0,2) * outputGain * clamp(fade,0,1);
   };
@@ -1135,7 +1140,7 @@
     const speed=Number(clip.speed)||1;
     const right={...structuredClone(clip),id:uid(),start:cut,duration:duration-offset,
       in:clip.reverse?clip.in:clip.in+offset*speed,transition:'none'};
-    for (const key of ['premiereTrack','premiereIndex','transitionBefore','transitionDuration','transitionMatchName']) delete right[key];
+    for (const key of ['premiereTrack','premiereIndex','transitionBefore','transitionDuration','transitionMatchName','transitionClock']) delete right[key];
     shiftFadeClocks(right, clip, offset);
     if (clip.pictureDip && clip.transitionMatchName) right.transitionMatchName = clip.transitionMatchName;
     const keys=structuredClone(clip.keyframes||{});
@@ -1309,7 +1314,7 @@
       if (outgoingIds.has(clip.id) || resolveClipMedia(clip).item?.nativeGenerator===1414680150) continue;
       if (clip.transition==='fade' && time<clip.start) continue;
       const element=videoFor(clip);
-      const progress=clamp((time-(clip.start-transitionBefore(clip)))/transitionLength(clip),0,1);
+      const progress=transitionProgress(clip);
       const previous=dissolvePairs.get(clip.id);
       if (previous) {
         if (dissolveCanvas.width!==canvas.width || dissolveCanvas.height!==canvas.height) {
@@ -1569,7 +1574,9 @@
         throw new Error("This project file has an invalid clip.");
       if (clip.type === "title" && clip.title != null && typeof clip.title !== "string")
         throw new Error("A title in this project has invalid text.");
-      for (const clock of [clip.pictureDip, clip.fadeClock]) {
+      if (clip.transitionClock && clip.transitionClock.rate !== 1)
+        throw new Error("This project file has an invalid transition clock.");
+      for (const clock of [clip.pictureDip, clip.fadeClock, clip.transitionClock]) {
         if (clock != null && (!Number.isFinite(clock.origin) || !Number.isFinite(clock.rate) ||
             !clock.rate || Math.abs(clock.rate) > 16 || !Number.isFinite(clock.duration) || clock.duration <= 0))
           throw new Error("This project file has an invalid retimed fade.");
@@ -1665,6 +1672,7 @@
     if (["dissolve", "wipe", "fade"].includes(clip.transition)) {
       sound.transition = "dissolve";
       sound.transitionDuration = clip.transitionDuration;
+      if (clip.transitionClock) sound.transitionClock = {...clip.transitionClock};
       if (clip.transitionBefore) sound.transitionBefore = clip.transitionBefore;
     }
     clip.embeddedAudio = false;
@@ -1747,7 +1755,7 @@
       const cutInRange = clip.start >= from - 1e-6 && (lift ? clip.start <= to + 1e-6 : clip.start < to - 1e-6);
       if (cutInRange || (head < to - 1e-6 && tail > from + 1e-6)) {
         clip.transition = "none";
-        for (const key of ["transitionBefore", "transitionDuration", "transitionMatchName"]) delete clip[key];
+        for (const key of ["transitionBefore", "transitionDuration", "transitionClock", "transitionMatchName"]) delete clip[key];
       }
     }
     const touched = new Set(source.clips.filter((clip) => clip.linkGroup && crossing(clip)).map((clip) => clip.linkGroup));
@@ -1913,7 +1921,7 @@
     Editor.editProject((next) => {
       const target = next.clips.find((c) => c.id === id);
       for (const key of ["pan", "opacity", "transform", "keyframes", "fadeIn", "fadeOut", "transitionBefore",
-        "transitionDuration", "transitionMatchName", "pictureDip", "fadeClock"]) delete target[key];
+        "transitionDuration", "transitionClock", "transitionMatchName", "pictureDip", "fadeClock"]) delete target[key];
       target.volume = 100;
       target.transition = "none";
       if (target.type === "video") target.color = {brightness: 100, contrast: 100, saturation: 100};
@@ -2286,7 +2294,7 @@
       if ('track' in patch && (!Number.isInteger(patch.track) || Math.abs(patch.track)>64 ||
           (clip.type==='audio' ? patch.track>=0 : patch.track<=0))) throw Error('Choose a valid timeline track.');
       ensureEditable(clip, "track" in patch ? Number(patch.track) : clip.track);
-      const clearDip = clip.pictureDip && ('transition' in patch || 'transitionDuration' in patch);
+      const clearDip = (clip.pictureDip || clip.transitionClock) && ('transition' in patch || 'transitionDuration' in patch);
       const clearFadeClock = clip.fadeClock && ('fadeIn' in patch || 'fadeOut' in patch);
       if (!clearDip && !clearFadeClock && Object.entries(patch).every(([key,value]) => sameValue(clip[key],value))) return;
       const linkedFields=["start","duration","in","speed","reverse"];
@@ -2320,7 +2328,10 @@
         for(const change of changes){
           const target=next.clips.find(c=>c.id===change.id), original={...target};
           Object.assign(target,change.patch);
-          if (target.id === id && clearDip) delete target.pictureDip;
+          if (target.id === id && clearDip) {
+            delete target.pictureDip;
+            delete target.transitionClock;
+          }
           if (target.id === id && clearFadeClock) delete target.fadeClock;
           if (change.patch.transition==='none') {
             delete target.transitionBefore;

@@ -988,6 +988,52 @@ async function testUnnestMix(page, files) {
   }
 }
 
+async function testCameraEffectTiming(page, files) {
+  await freshProjectWithMedia(page, [files.red, files.green], 'Camera effect timing');
+  const mc = await page.evaluate(() => SpliceMulticam.createMulticam({name:'Two cameras', audioMode:'follow',
+    angleMediaIds:Editor.get().project.media.slice().sort((a,b) => a.name.localeCompare(b.name)).map(m => m.id)}).id);
+  for (const scenario of ['cut', 'late', 'flattened', 'fade', 'dissolve', 'wipe', 'fade flat', 'dissolve flat', 'wipe flat']) {
+    const transition = ['fade','wipe','dissolve'].find(kind => scenario.startsWith(kind));
+    await page.evaluate(({mc, scenario, transition}) => {
+      const ramp = [{time:0,value:0}, {time:4,value:100}];
+      Editor.editProject(p => {
+        const late = scenario !== 'cut';
+        Object.assign(p.media.find(m => m.id === mc).multicam.angles[1], {offset:late ? 2 : 0, duration:late ? 2 : 4});
+        const base = {mediaId:mc, start:0, in:0, duration:4, linkGroup:'camera', multicamAngle:late ? 1 : 0,
+          ...(transition ? {transition, transitionDuration:4} : {})};
+        p.clips = [{...base, id:'v', type:'video', track:1, embeddedAudio:false, keyframes:{opacity:ramp}},
+          {...base, id:'a', type:'audio', track:-1, fadeIn:4, keyframes:{volume:ramp}}];
+      });
+      Editor.select('v');
+      Editor.seek(2);
+      if (scenario === 'cut') SpliceMulticam.switchAngle(1);
+      if (scenario === 'flattened' || scenario.endsWith(' flat')) SpliceMulticam.flattenClips(['v']);
+    }, {mc, scenario, transition});
+    const preview = await programColor(page, 2);
+    const gains = await page.evaluate(() => Object.values(Editor.audioGains()));
+    assert.deepEqual(gains, [transition ? .125 : .25], scenario + ' preview gain');
+    assert.ok(Math.abs(preview[1] - (transition ? 64 : 127)) < 10, scenario + ' preview ' + preview);
+    if (!transition) await capture(page, 'camera-effect-' + scenario + '.png');
+    const url = await page.evaluate(async () =>
+      (await Editor.exportVideo({codec:'h264', limiter:false}, undefined, AbortSignal.timeout(60000))).downloadURL);
+    const response = await page.request.get(new URL(url, page.url()).href);
+    assert.ok(response.ok());
+    const file = path.join(path.dirname(files.red), scenario + '.mp4');
+    fs.writeFileSync(file, await response.body());
+    const rgb = colorAt(file, 2);
+    const pcm = readPcm(file);
+    const rms = t => {
+      const samples = pcm.slice(Math.round(t*48000), Math.round((t+.04)*48000));
+      return Math.sqrt(samples.reduce((s,v) => s + v*v, 0)/samples.length);
+    };
+    const ratio = rms(2.04)/rms(3.84);
+    assert.ok(Math.abs(rgb[1] - preview[1]) < 10, scenario + ' export ' + rgb);
+    assert.ok(Math.abs(ratio - (2.06/3.86)**(transition ? 3 : 2)) < .025, scenario + ' audio ratio ' + ratio);
+    if (scenario === 'cut') assert.ok(Math.abs(rms(1.94)/rms(2.04) - (1.96/2.06)**2) < .04);
+    console.log('Camera effect timing:', {scenario, preview, gains, rgb, ratio});
+  }
+}
+
 async function testFlattenRouting(page, files) {
   await freshProjectWithMedia(page, [files.red, files.green, files.blue], 'Flatten routing');
   const {mcId, cameras} = await page.evaluate(() => {
@@ -1151,6 +1197,7 @@ async function main() {
           }
         }), kind), kind === 'cycle' ? /Circular/ : /four levels/);
       }
+      await testCameraEffectTiming(page, files);
       await testNestedSequences(page, files, splice.temp);
       await testMulticam(page, files);
       await testAudioParity(page, files);

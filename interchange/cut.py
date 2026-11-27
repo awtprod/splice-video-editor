@@ -320,6 +320,8 @@ def _event(cut: Cut, clip: dict, subclips: dict | None = None) -> Event | None:
     if kind == 'title':
         event.text = clean(clip.get('title'), 2000)
         event.title_style = clip.get('titleStyle') if isinstance(clip.get('titleStyle'), dict) else {}
+    if clip.get('transitionClock'):
+        report.note(f'{label}: cropped transition timing is not carried by timeline interchange.')
     if clip.get('pictureDip') or clip.get('fadeClock'):
         report.note(f'{label}: retimed fades are not carried by timeline interchange.')
     keys = clip.get('keyframes') if isinstance(clip.get('keyframes'), dict) else {}

@@ -629,6 +629,8 @@ def save_project(data):
             if float(current['start']) < float(previous['start']) + float(previous['duration']) - .001:
                 raise ValueError(f'Premiere track {lane[1]} contains overlapping clips')
     for clip in data.get('clips', []):
+        if clip.get('transitionClock'):
+            raise ValueError('Premiere cannot write a partially cropped transition. Save a Splice project or replace the transition.')
         if (clip.get('color') or {}).get('lut'):
             raise ValueError('Premiere export cannot write imported LUTs; save a Splice project or remove the LUT')
     if any(mix.get('solo', False) for mix in (data.get('trackMix') or {}).values()):
