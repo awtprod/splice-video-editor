@@ -133,6 +133,10 @@ uniform sampler3D u_in3; uniform sampler2D u_in1;
 uniform int u_inSize; uniform int u_inWidth; uniform vec3 u_inMin, u_inMax;
 uniform float u_alpha, u_gain;
 uniform vec4 u_wipe;             // x: wipe edge in pixels (or -1), y: canvas height
+uniform vec2 u_canvas;
+#if FX == 1
+${window.SpliceEffects.GLSL}
+#endif
 float tab(sampler2D t, int row, float x, int channel) {
   float p = clamp(x, 0.0, 1.0)*${TABLE - 1}.0; int i0 = int(p); int i1 = min(i0+1, ${TABLE - 1});
   float a = texelFetch(t, ivec2(i0, row), 0)[channel], b = texelFetch(t, ivec2(i1, row), 0)[channel];
@@ -177,14 +181,22 @@ vec3 grade(vec3 x, sampler2D t, int flags, mat3 m) {
 }
 void main() {
   vec4 source;
+  float fxKeyA = 1.0;
 #if SOURCE == 0
   source = texture(u_y, v_uv);
+#if FX == 1
+  // Key and despill on the source's chroma, before any grade (effects.js / effects_engine.py).
+  if ((u_fxFlags & 2) != 0) { vec2 c0 = fxChroma(source.rgb); fxKeyA = fxKeyAlpha(c0); source.rgb = fxRechroma(source.rgb, c0, fxDespill(c0)); }
+#endif
 #else
   float Y = texture(u_y, v_uv).r - u_yuvOffset.x;
 #if SOURCE == 2
   vec2 C = texture(u_u, v_uv).rg;
 #else
   vec2 C = vec2(texture(u_u, v_uv).r, texture(u_v, v_uv).r);
+#endif
+#if FX == 1
+  if ((u_fxFlags & 2) != 0) { fxKeyA = fxKeyAlpha(C); C = fxDespill(C); }
 #endif
   C -= u_yuvOffset.y;
 #if SOURCE == 3
@@ -207,7 +219,28 @@ void main() {
   x *= u_gain;
   if (u_wipe.x >= 0.0 && gl_FragCoord.x >= u_wipe.x) discard;
   if (u_wipe.z >= 0.0 && gl_FragCoord.x < u_wipe.z) discard;
+#if FX == 1
+  // Crop and masks in the clip's picture (v_uv), or in the frame for an adjustment clip.
+  vec2 uvFx = (u_fxFlags & 8) != 0 ? vec2(gl_FragCoord.x/u_canvas.x, 1.0-gl_FragCoord.y/u_canvas.y) : v_uv;
+  float fxA = fxKeyA*fxGeometry(uvFx);
+  if ((u_fxFlags & 4) != 0) { outColor = vec4(vec3(source.a*u_alpha*fxA), 1.0); return; }
+  outColor = vec4(x, source.a*u_alpha*fxA);
+#else
   outColor = vec4(x, source.a*u_alpha);
+#endif
+}`;
+  // A layer with a blend mode: drawn alone (straight alpha), then mixed with the frame beneath.
+  const BLEND_FRAGMENT = () => `#version 300 es
+precision highp float;
+in vec2 v_uv; out vec4 outColor;
+uniform sampler2D u_a, u_b; uniform int u_mode; uniform float u_opacity;
+${window.SpliceEffects.BLEND_GLSL}
+void main() {
+  vec4 b = texture(u_a, v_uv), s = texture(u_b, v_uv);
+  float as = s.a*u_opacity;
+  vec3 m = vec3(fxBlend(u_mode, b.r, s.r), fxBlend(u_mode, b.g, s.g), fxBlend(u_mode, b.b, s.b));
+  m = s.rgb + (m-s.rgb)*b.a;
+  outColor = vec4(b.rgb + (m-b.rgb)*as, as + b.a*(1.0-as));
 }`;
   // Full-frame passes: copy, mix of two composites, monitoring views.
   const PASS_VERTEX = `#version 300 es
@@ -272,7 +305,7 @@ void main() {
       let program = this.variants.get(key);
       if (!program) {
         const defines = Object.entries(features).map(([name, value]) => `#define ${name} ${value}`).join('\n');
-        program = kind === 'layer' ? this.link(VERTEX, FRAGMENT(defines)) : this.link(PASS_VERTEX, PASS_FRAGMENT(defines));
+        program = kind === 'layer' ? this.link(VERTEX, FRAGMENT(defines)) : kind === 'blend' ? this.link(PASS_VERTEX, BLEND_FRAGMENT()) : this.link(PASS_VERTEX, PASS_FRAGMENT(defines));
         this.variants.set(key, program); this.programs.push(program.program);
       }
       return program;
@@ -471,16 +504,16 @@ void main() {
       gl.uniform3fv(u[`u_${name}Min`], binding?.lut.domainMin || [0,0,0]); gl.uniform3fv(u[`u_${name}Max`], binding?.lut.domainMax || [1,1,1]);
       if (u[`u_${name}Mix`]) gl.uniform1f(u[`u_${name}Mix`], Math.max(0, Math.min(1, intensity/100)));
     }
-    features(sourceKind, grade) {
+    features(sourceKind, grade, fx) {
       const a = grade?.a;
       const lookKind = lut => !lut ? 0 : lut.curve ? 2 : 1;
       return {SOURCE:sourceKind, SETS:grade ? (grade.b ? 2 : 1) : 0, HUE:a?.tables.hueSat ? 1 : 0,
-        LOOK:lookKind(a?.look), INPUT:lookKind(grade?.input)};
+        LOOK:lookKind(a?.look), INPUT:lookKind(grade?.input), FX:fx && (fx.alpha || fx.alphaView) ? 1 : 0};
     }
-    drawLayer(op, width, height) {
+    drawLayer(op, width, height, straight = false) {
       const gl = this.gl;
       const source = this.sourceTextures(op);
-      const {program, uniforms:u} = this.program('layer', this.features(source.kind === 1 && source.frame.format === 'I420A' ? 3 : source.kind, op.grade));
+      const {program, uniforms:u} = this.program('layer', this.features(source.kind === 1 && source.frame.format === 'I420A' ? 3 : source.kind, op.grade, op.fx));
       gl.useProgram(program);
       gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, source.state.y); gl.uniform1i(u.u_y, 0);
       gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, source.state.u); gl.uniform1i(u.u_u, 1);
@@ -499,10 +532,25 @@ void main() {
       gl.uniform1f(u.u_angle, g.rotation);
       gl.uniform1f(u.u_alpha, op.alpha); gl.uniform1f(u.u_gain, op.brightness ?? 1);
       gl.uniform4f(u.u_wipe, op.wipe == null ? -1 : op.wipe*width, height, op.wipeOut == null ? -1 : op.wipeOut*width, 0);
-      gl.enable(gl.BLEND);
-      gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+      if (op.fx) window.SpliceEffects.bindUniforms(gl, u, op.fx, g.sourceWidth/g.sourceHeight);
+      if (straight) gl.uniform1f(u.u_alpha, 1);
+      if (!straight) { gl.enable(gl.BLEND); gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA); }
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
       gl.disable(gl.BLEND);
+    }
+    // A blend-mode layer: draw it alone with straight alpha, then mix it with a copy of the frame.
+    blendLayer(op, acc, layer, backdrop, width, height) {
+      const gl = this.gl;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer); gl.viewport(0, 0, width, height);
+      gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+      this.drawLayer(op, width, height, true);
+      this.passTo(backdrop.framebuffer, acc.texture, null, 0);
+      const {program, uniforms:u} = this.program('blend', {});
+      gl.useProgram(program); gl.bindFramebuffer(gl.FRAMEBUFFER, acc.framebuffer); gl.viewport(0, 0, width, height);
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, backdrop.texture); gl.uniform1i(u.u_a, 0);
+      gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, layer.texture); gl.uniform1i(u.u_b, 1);
+      gl.uniform1i(u.u_mode, window.SpliceEffects.BLEND_INDEX[op.fx.blend] || 0); gl.uniform1f(u.u_opacity, op.alpha);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     }
     // Copy `from` into `to` (or mix two composites, or apply the monitoring view on the way out).
     passTo(framebuffer, a, b, mix, view = 0, flip = false, before = null, split = -1) {
@@ -521,10 +569,12 @@ void main() {
       this.passTo(scratch.framebuffer, acc.texture, null, 0);
       gl.bindFramebuffer(gl.FRAMEBUFFER, acc.framebuffer);
       gl.viewport(0, 0, width, height);
-      const {program, uniforms:u} = this.program('layer', this.features(0, op.grade));
+      const {program, uniforms:u} = this.program('layer', this.features(0, op.grade, op.fx));
       gl.useProgram(program);
       gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, scratch.texture); gl.uniform1i(u.u_y, 0);
       this.bindGrade(u, op.grade);
+      // A masked adjustment clip (power window): its masks are in frame coordinates.
+      if (op.fx?.alpha) { window.SpliceEffects.bindUniforms(gl, u, {...op.fx, key:null}, width/height); gl.uniform1i(u.u_fxFlags, (op.fx.crop ? 1 : 0) | 8); }
       gl.uniform2f(u.u_canvas, width, height); gl.uniform2f(u.u_center, width/2, height/2); gl.uniform2f(u.u_size, width, -height);
       gl.uniform1f(u.u_angle, 0); gl.uniform1f(u.u_alpha, op.alpha); gl.uniform1f(u.u_gain, 1); gl.uniform4f(u.u_wipe, -1, height, -1, 0);
       gl.enable(gl.BLEND); gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
@@ -544,7 +594,8 @@ void main() {
       const gl = this.gl;
       for (const op of ops) {
         gl.bindFramebuffer(gl.FRAMEBUFFER, acc.framebuffer); gl.viewport(0, 0, width, height);
-        if (op.type === 'video') this.drawLayer(op, width, height);
+        if (op.type === 'video' && op.fx?.blend) this.blendLayer(op, acc, this.target(depth+1, width, height), this.target(depth+2, width, height), width, height);
+        else if (op.type === 'video') this.drawLayer(op, width, height);
         else if (op.type === 'title') {
           const canvas = this.titleTexture(op, width, height);
           this.drawLayer({element:canvas, exact:false, alpha:1, geometry:{sourceWidth:width, sourceHeight:height, x:0, y:0, scale:1, rotation:0}}, width, height);
@@ -635,18 +686,19 @@ void main() {
       if (!frame) { if (element instanceof HTMLVideoElement) stats.exactDecode = false; return {source:element}; }
       const fullRange = frame.colorSpace?.fullRange ?? op.input.fullRange;
       const matrix = G.inputMatrix(op.input.matrix, fullRange);
-      const key = frame.key + (op.grade ? '|yuv' : `|rgb|${op.input.matrix}|${fullRange}`);
+      const yuv = !!(op.grade || op.fx?.key);
+      const key = frame.key + (yuv ? '|yuv' : `|rgb|${op.input.matrix}|${fullRange}`);
       let entry = this.sources.get(element);
       if (!entry) { entry = {canvas:document.createElement('canvas'), key:''}; this.sources.set(element, entry); }
       if (entry.key !== key) {
         const {width, height} = frame, canvas = entry.canvas;
         if (canvas.width !== width || canvas.height !== height) { canvas.width = width; canvas.height = height; }
         const ctx = canvas.getContext('2d', {willReadFrequently:true}), image = ctx.createImageData(width, height);
-        copyPlanes(frame, image.data, op.grade ? null : matrix);
+        copyPlanes(frame, image.data, yuv ? null : matrix);
         ctx.putImageData(image, 0, 0);
         entry.key = key;
       }
-      return {source:entry.canvas, matrix:op.grade ? matrix : null};
+      return {source:entry.canvas, matrix:yuv ? matrix : null};
     }
     gradePixels(image, grade, matrix) {
       if (!grade) return;
@@ -680,12 +732,21 @@ void main() {
         lctx.save(); lctx.translate(width/2+g.x*width/100, height/2+g.y*height/100); lctx.rotate(g.rotation);
         lctx.drawImage(source, -g.sourceWidth*fit*g.scale/2, -g.sourceHeight*fit*g.scale/2, g.sourceWidth*fit*g.scale, g.sourceHeight*fit*g.scale);
         lctx.restore();
-        if (op.grade || op.brightness < 1) {
+        const fx = op.fx && (op.fx.alpha || op.fx.alphaView);
+        if (fx || op.grade || op.brightness < 1) {
           const image = lctx.getImageData(0, 0, width, height);
-          this.gradePixels(image, op.grade, matrix);
+          // Key, despill, crop and masks on the layer's pixels in the clip's picture coordinates (effects.js).
+          if (fx) window.SpliceEffects.canvasPass(image, op, width, height, !!matrix, matrix && !op.grade ? (y, u, v, out) => decodeRgb(matrix, y, u, v, out) : null);
+          if (!op.fx?.alphaView) this.gradePixels(image, op.grade, matrix);
           if (op.brightness < 1) for (let i = 0; i < image.data.length; i += 4) { image.data[i] *= op.brightness; image.data[i+1] *= op.brightness; image.data[i+2] *= op.brightness; }
           lctx.putImageData(image, 0, 0);
         }
+      }
+      if (op.fx?.blend) {
+        const base = ctx.getImageData(0, 0, width, height);
+        window.SpliceEffects.blendPixels(base, lctx.getImageData(0, 0, width, height), op.fx.blend, op.alpha ?? 1);
+        ctx.putImageData(base, 0, 0);
+        return;
       }
       ctx.save(); ctx.globalAlpha = op.alpha ?? 1;
       if (op.wipe != null) { ctx.beginPath(); ctx.rect(0, 0, width*op.wipe, height); ctx.clip(); }
@@ -698,8 +759,13 @@ void main() {
         else if (op.type === 'adjust') {
           const image = ctx.getImageData(0, 0, width, height), original = new Uint8ClampedArray(image.data);
           this.gradePixels(image, op.grade);
-          const a = op.alpha;
-          for (let i = 0; i < original.length; i += 4) for (let c = 0; c < 3; c++) image.data[i+c] = original[i+c]+(image.data[i+c]-original[i+c])*a;
+          const a = op.alpha, E = window.SpliceEffects, fx = op.fx?.alpha ? op.fx : null;
+          for (let i = 0, p = 0; i < original.length; i += 4, p++) {
+            // A masked adjustment clip grades only inside its masks (frame coordinates).
+            const w = fx ? a*(fx.crop ? E.cropAlpha(fx.crop, (p % width+.5)/width, ((p/width | 0)+.5)/height, width/height) : 1)*
+              E.masksAlpha(fx.masks, (p % width+.5)/width, ((p/width | 0)+.5)/height, width/height) : a;
+            for (let c = 0; c < 3; c++) image.data[i+c] = original[i+c]+(image.data[i+c]-original[i+c])*w;
+          }
           ctx.putImageData(image, 0, 0);
         } else if (op.type === 'dissolve') {
           const A = this.scratch(5+depth*2, width, height), B = this.scratch(6+depth*2, width, height);

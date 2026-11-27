@@ -20,6 +20,7 @@ from splice_platform import data_directory, font_roots, installed_font
 import audio_dsp
 import audio_loudness
 import delivery
+import effects_engine
 
 
 PQ = ('bt2020','smpte2084','bt2020nc')
@@ -586,9 +587,10 @@ def _hdr_still_filter(profile, depth):
 
 def _fit_picture(width, height, color, lut, alpha_format, depth, profile=None, rec709=False,
                  *, still_frames=0, hdr_profile=None, conform_pq=False, high_depth=None,
-                 graded=None, animate_still=False):
+                 graded=None, animate_still=False, effects='', effects_label='fx'):
     """``graded``: the table-based grade (color_grade) for this clip, which replaces the CSS-style
-    filters and the LUT."""
+    filters and the LUT. ``effects``: effects_engine.fit_effects, applied before the grade; a
+    grade drops alpha, so the matte is split off and merged back after it."""
     wide_yuv = f'format=yuv444p{max(10,depth)}le'
     if high_depth is None:
         high_depth = depth > 8
@@ -612,6 +614,10 @@ def _fit_picture(width, height, color, lut, alpha_format, depth, profile=None, r
                                       for value,default in zip(profile,REC709))
             grade += (f',zscale=pin={primaries}:tin={transfer}:min={matrix}:p=bt2020:t=linear,format=gbrpf32le,'
                       'zscale=t=smpte2084:m=bt2020nc:r=limited:npl=203,'+wide_yuv)
+    if effects:
+        label = '_'+effects_label.replace('-', '_')
+        grade = (f'{effects},split[{label}_c][{label}_a];[{label}_a]alphaextract[{label}_m];'
+                 f'[{label}_c]null{grade},format=yuva444p16le[{label}_g];[{label}_g][{label}_m]alphamerge') if grade else effects
     repeat = f',loop=loop={still_frames-1}:size=1:start=0,setpts=N' if still_frames>1 else ''
     if animate_still:
         # The grade and its alpha branch need a frame at each sequence timestamp.
@@ -722,10 +728,12 @@ def _adjustment_layer(filters, active, number, clip, item, directory, profile, f
     opacity = _number(clip.get('opacity', 100), 'opacity', 0, 100)/100
     opacity_keys = (clip.get('keyframes') or {}).get('opacity')
     mask = ''
+    window = effects_engine.adjustment_alpha(clip, _keyframe_clock(clip, fps, 'T', start), fps)
     if opacity_keys:
-        mask = _mask_alpha(f"({_keyframe_expr(clip,'opacity',opacity*100,0,100,_keyframe_clock(clip,fps,'T',start))})/100", alpha_format, full_alpha)
-    elif opacity != 1:
-        mask = _mask_alpha(f'{opacity:.6f}', alpha_format, full_alpha)
+        mask = _mask_alpha(f"({_keyframe_expr(clip,'opacity',opacity*100,0,100,_keyframe_clock(clip,fps,'T',start))})/100"
+                           + (f'*({window})' if window else ''), alpha_format, full_alpha)
+    elif opacity != 1 or window:
+        mask = _mask_alpha(f'{opacity:.6f}' + (f'*({window})' if window else ''), alpha_format, full_alpha)
     filters.append(f'[{active}]split[adjust{number}_under][adjust{number}_in]')
     filters.append(f'[adjust{number}_in]setparams=colorspace={SETPARAMS_MATRIX[matrix]}:range=tv,zscale,format={WORKING_FORMAT}{chain},'
                    f'zscale=m={ZSCALE_MATRIX[matrix]}:r=limited,format={alpha_format}{mask}[adjust{number}_graded]')
@@ -1019,8 +1027,12 @@ def _keyframe_expr(clip, key, base, low, high, clock):
         at=_number(point.get('time'),f'{key} keyframe time',0,MAX_TIMELINE_SECONDS)
         value=_number(point.get('value'),f'{key} keyframe value',low,high)
         ordered.append((at,value))
+        effects_engine.validate_point_shape(point, key)
     ordered.sort()
     if any(b[0]<=a[0] for a,b in zip(ordered,ordered[1:])): raise ValueError(f'Duplicate {key} keyframes')
+    if effects_engine.eased(effects_engine.ordered_points(points)):
+        # Eased and bezier segments (effects_engine): straight lines every 1/100 s, a balanced expression.
+        return effects_engine.keyframe_expr(points, base, low, high, clock, .01)
     expr=f'{ordered[-1][1]:.6f}'
     for (at,value),(next_at,next_value) in reversed(list(zip(ordered,ordered[1:]))):
         ramp=f'{value:.6f}+({next_value-value:.6f})*({clock}-{at:.6f})/{next_at-at:.6f}'
@@ -1030,12 +1042,14 @@ def _keyframe_expr(clip, key, base, low, high, clock):
 
 def _slice_keyframes(keyframes, offset, length):
     if not keyframes: return keyframes
-    if not isinstance(keyframes,dict) or len(keyframes)>12: raise ValueError('Invalid keyframes')
+    if not isinstance(keyframes,dict) or len(keyframes)>12+len(effects_engine.EFFECT_KEY_BOUNDS): raise ValueError('Invalid keyframes')
     result={}
     for key,points in keyframes.items():
         bounds={'opacity':(0,100),'x':(-100,100),'y':(-100,100),'scale':(10,400),'rotation':(-180,180),'volume':(0,200),
                 # Grade keyframes (color_grade.ANIMATED).
-                'exposure':(-4,4),'temperature':(-100,100),'tint':(-100,100),'brightness':(0,200),'contrast':(0,200),'saturation':(0,200)}
+                'exposure':(-4,4),'temperature':(-100,100),'tint':(-100,100),'brightness':(0,200),'contrast':(0,200),'saturation':(0,200),
+                # Speed ramps, crop and masks (effects_engine).
+                **effects_engine.EFFECT_KEY_BOUNDS}
         if key not in bounds or not isinstance(points,list): raise ValueError('Invalid keyframes')
         if len(points)>MAX_KEYFRAMES: raise ValueError(f'A clip has more than {MAX_KEYFRAMES} {key} keyframes, the export limit')
         if not points: continue
@@ -1045,6 +1059,12 @@ def _slice_keyframes(keyframes, offset, length):
                          'value':_number(point.get('value'),'keyframe value',*bounds[key]),
                          **({'ease':True} if point.get('ease') is True else {})} for point in points),key=lambda point:point['time'])
         if any(right['time']<=left['time'] for left,right in zip(ordered,ordered[1:])): raise ValueError('Duplicate keyframes')
+        for point, original in zip(ordered, sorted(points, key=lambda point: point.get('time') if isinstance(point.get('time'), (int, float)) else 0)):
+            effects_engine.validate_point_shape(original, key)
+        if effects_engine.eased(sorted(points, key=lambda point: point['time'])):
+            # Eased segments cut by the window keep their shape (effects_engine.window_points).
+            result[key] = effects_engine.window_points(points, offset, offset+length)
+            continue
         def value_at(at):
             if at<=ordered[0]['time']: return ordered[0]['value'], False
             for left,right in zip(ordered,ordered[1:]):
@@ -1267,9 +1287,13 @@ def _check_clip(clip, media_by_id, probes, heartbeat=None):
         if clip['type'] != 'video': raise ValueError('Premiere generator has no audio stream')
         return item
     speed = _number(clip.get('speed',1),'speed',.1,16)
-    if before and not item.get('_renderStill') and not clip.get('reverse') and float(clip.get('in',0))-before*speed < -.01:
+    effects_engine.validate_effects(clip.get('effects'))
+    ramp = None if item.get('_renderStill') else effects_engine.clip_ramp(clip)
+    lead = ramp.source(-before) if ramp else -before*speed
+    if before and not item.get('_renderStill') and not clip.get('reverse') and float(clip.get('in',0))+lead < -.01:
         raise ValueError('Incoming clip lacks pre-cut footage for its transition')
-    required = float(clip.get('in',0))+(float(clip.get('duration',0))+(before if clip.get('reverse') else 0))*speed
+    required = float(clip.get('in',0))+(ramp.source(float(clip.get('duration',0))) if ramp else
+                                        (float(clip.get('duration',0))+(before if clip.get('reverse') else 0))*speed)
     if required > item['_actualDuration'] + .05:
         raise ValueError(f"{item.get('name', 'Media')} ends before this clip's out point")
     if clip['type'] not in item['_kinds']:
@@ -1406,12 +1430,15 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
         dip_head = transition_duration-before if incoming_dip else 0
         if incoming_dip:
             before = 0
+        ramp = None if item.get('nativeGenerator') is not None or item.get('_renderStill') else effects_engine.clip_ramp(clip)
         plan = dict(start=start, length=length, speed=speed, before=before, transition_duration=transition_duration,
                     dip_head=dip_head, render_start=start-before, render_length=length+before,
-                    render_source=source_in if clip.get('reverse') else source_in-before*speed)
+                    render_source=source_in if clip.get('reverse') else source_in+ramp.source(-before) if ramp else source_in-before*speed,
+                    ramp=ramp)
         plans[number] = plan
         if item.get('nativeGenerator') is None and not item.get('_renderStill'):
-            uses.append((item['id'], plan['render_source'], plan['render_source']+plan['render_length']*speed, ('main', number)))
+            uses.append((item['id'], plan['render_source'], source_in+ramp.source(length)+.05 if ramp else
+                         plan['render_source']+plan['render_length']*speed, ('main', number)))
         previous = video_clips[predecessors[number]] if number in predecessors else None
         if previous is not None and clip.get('transition') in ('dissolve','wipe'):
             prior_item = media_by_id[previous['mediaId']]
@@ -1419,10 +1446,14 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
             tail = max(0, transition_duration - before)
             plan['tail'] = tail
             prior_in = float(previous.get('in',0))
-            prior_source = prior_in-tail*prior_speed if previous.get('reverse') else prior_in+float(previous['duration'])*prior_speed
+            prior_ramp = None if prior_item.get('_renderStill') else effects_engine.clip_ramp(previous)
+            prior_source = (prior_in-tail*prior_speed if previous.get('reverse') else
+                            prior_in+prior_ramp.source(float(previous['duration'])) if prior_ramp else prior_in+float(previous['duration'])*prior_speed)
             plan['prior_source'] = prior_source
+            plan['prior_ramp'] = prior_ramp
             if prior_item.get('nativeGenerator') is None and not prior_item.get('_renderStill'):
-                uses.append((prior_item['id'], prior_source, prior_source+tail*prior_speed, ('tail', number)))
+                uses.append((prior_item['id'], prior_source, prior_in+prior_ramp.source(float(previous['duration'])+tail)+.05 if prior_ramp else
+                             prior_source+tail*prior_speed, ('tail', number)))
     inputs = []
     input_of = {}
     by_media = {}
@@ -1498,7 +1529,9 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
         reverse = bool(clip.get('reverse'))
         index, render_source = source_input(item['id'], ('main', number), plan['render_source'])
         color = clip.get('color') or {}
-        transform,position=_transform(clip,width,height,before,fps,place_on_canvas=wide)
+        live_fx = None if item.get('_disabled') else effects_engine.effects_for(clip)
+        blend_mode = live_fx['blend'] if live_fx and live_fx['blend'] != 'normal' else None
+        transform,position=_transform(clip,width,height,before,fps,place_on_canvas=wide or bool(blend_mode))
         opacity=_number(clip.get('opacity',100),'opacity',0,100)/100
         opacity_keys=(clip.get('keyframes') or {}).get('opacity')
         first_frame, frames = _frame_span(render_start, render_length, fps)
@@ -1521,12 +1554,24 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
                      f'setpts=PTS-STARTPTS,trim=end_frame={frames}')
             transform, position = '', 'null' if wide else 'x=0:y=0'
         else:
-            prefix = _picture_input(index,render_source,render_length,speed,width,height,fps,reverse,still_frames,
-                                    frames=frames,origin=origin)
+            if plan['ramp'] and index is not None:
+                # Exact frame sampling along the integrated speed curve (effects_engine.ramp_input).
+                prefix = effects_engine.ramp_input(index, plan['ramp'], render_source-plan['ramp'].source(-before),
+                                                   origin-before, frames, fps, FORWARD_SAMPLE_TOLERANCE)
+            else:
+                prefix = _picture_input(index,render_source,render_length,speed,width,height,fps,reverse,still_frames,
+                                        frames=frames,origin=origin)
+            from color_grade import source_matrix
+            fx_chain = effects_engine.fit_effects(
+                clip, live_fx, source_matrix(item.get('_sourceProfile'), item.get('colorMatrix')),
+                _grade_clock(clip, fps, start-first_frame/fps, frames, reverse and not still_frames), fps) if live_fx else ''
+            fx_animated = any(effects_engine.EFFECT_KEY_BOUNDS.get(key) and key != 'speed' for key in (clip.get('keyframes') or {}))
             fit = _fit_picture(width,height,fit_color,lut_filter,alpha_format,depth,item.get('_sourceProfile'),rec709,
                                still_frames=still_frames,hdr_profile=hdr_profile,conform_pq=conform_pq,
                                high_depth=high_depth, graded=graded,
-                               animate_still=still_frames>1 and not clip_bypass and len(_grade_key_times(clip))>1)
+                               animate_still=still_frames>1 and ((not clip_bypass and len(_grade_key_times(clip))>1) or
+                                                                 (bool(fx_chain) and fx_animated)),
+                               effects=fx_chain, effects_label=f'fx{number}')
             # Reverse after scaling so the buffered window holds sequence-size frames.
             flip = ',reverse' if reverse and not still_frames and index is not None else ''
             chain = f'{prefix},{fit}{flip}{transform}'
@@ -1578,7 +1623,10 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
         if overlap_transition:
             prior_item = media_by_id[previous['mediaId']]
             prior_speed=_number(previous.get('speed',1),'speed',.1,16)
+            prior_ramp_end = plan.get('prior_ramp')
             prior_available=(float(previous.get('in',0))/prior_speed if previous.get('reverse') else
+                             (prior_item['_actualDuration']-(float(previous.get('in',0))+prior_ramp_end.source(float(previous['duration']))))/
+                             max(.1, prior_ramp_end.speed(float(previous['duration']))) if prior_ramp_end else
                              (prior_item['_actualDuration']-(float(previous.get('in',0))+float(previous['duration'])*prior_speed))/prior_speed)
             frame_duration = 1 / float(fps)
             tail = plan['tail']
@@ -1586,6 +1634,7 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
                 raise ValueError(f'Transition at {start:.2f}s needs {tail:.2f}s of unused outgoing footage')
             prior_reverse = bool(previous.get('reverse'))
             prior_index, prior_source = source_input(previous['mediaId'], ('tail', number), plan['prior_source'])
+            prior_ramp = plan.get('prior_ramp')
             prior_tail={**previous,'keyframes':{},'transform':dict(previous.get('transform') or {})}
             for key in ('x','y','scale','rotation','opacity'):
                 points=(previous.get('keyframes') or {}).get(key) or []
@@ -1613,8 +1662,14 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
             # A disabled outgoing clip has no tail: the incoming clip dissolves or wipes in over what lies beneath.
             if tail + 1e-6 >= frame_duration and not prior_item.get('_disabled'):
                 tail_origin = _sample_origin(start, tail, cut_frame, tail_frames, fps, prior_reverse)
-                prior_prefix = _picture_input(prior_index,prior_source,tail,prior_speed,width,height,fps,prior_reverse,
-                                              still_tail,frames=tail_frames,origin=tail_origin)
+                if prior_ramp and prior_index is not None:
+                    tail_local = cut_frame/float(fps)-float(previous['start'])
+                    prior_prefix = effects_engine.ramp_input(
+                        prior_index, prior_ramp, prior_source-prior_ramp.source(float(previous['duration'])),
+                        tail_local, tail_frames, fps, FORWARD_SAMPLE_TOLERANCE)
+                else:
+                    prior_prefix = _picture_input(prior_index,prior_source,tail,prior_speed,width,height,fps,prior_reverse,
+                                                  still_tail,frames=tail_frames,origin=tail_origin)
                 prior_fit = _fit_picture(width,height,prior_fit_color,prior_lut,alpha_format,depth,
                                          prior_item.get('_sourceProfile'),rec709,still_frames=still_tail,
                                          hdr_profile=hdr_profile,conform_pq=conform_pq,high_depth=high_depth,
@@ -1646,8 +1701,12 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
         filters.append(chain)
         wipe_off = overlap_transition and disabled and clip.get('transition') == 'wipe'
         if overlap_transition and clip.get('transition') == 'dissolve' or wipe_off:
-            _composite_layer(filters, f'without{number}', f'clip{number}', f'incoming{number}', position, overlay,
-                             first_frame, frames, window_frames, base_format)
+            if blend_mode:
+                effects_engine.blend_composite(filters, f'without{number}', f'clip{number}', f'incoming{number}', position,
+                                               first_frame, frames, window_frames, base_format, blend_mode, overlay)
+            else:
+                _composite_layer(filters, f'without{number}', f'clip{number}', f'incoming{number}', position, overlay,
+                                 first_frame, frames, window_frames, base_format)
             progress_start = render_start - progress_origin
             end = progress_start + progress_duration
             progress = f'(T-({progress_start:.9f}))/{progress_duration:.9f}'
@@ -1657,6 +1716,9 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
             finish = end-1e-6 if wipe_off else end
             blend = f'if(lte(T,{progress_start:.9f}),A,if(gte(T,{finish:.9f}),B,{mix}))'
             filters.append(f"[{active}][incoming{number}]blend=all_expr='{blend}'[base{number+1}]")
+        elif blend_mode:
+            effects_engine.blend_composite(filters, active, f'clip{number}', f'base{number+1}', position,
+                                           first_frame, frames, window_frames, base_format, blend_mode, overlay)
         else:
             _composite_layer(filters, active, f'clip{number}', f'base{number+1}', position, overlay,
                              first_frame, frames, window_frames, base_format)
@@ -1771,8 +1833,12 @@ def _automation(points, key, low, high, limit):
         if not isinstance(ease, bool): raise ValueError(f'Invalid {key} keyframe: ease must be true or false')
         ordered.append((_number(point.get('time'), f'{key} keyframe time', 0, MAX_TIMELINE_SECONDS),
                         _number(point.get('value'), f'{key} keyframe value', low, high), ease))
+        effects_engine.validate_point_shape(point, key)
     ordered.sort()
     if any(b[0] <= a[0] for a, b in zip(ordered, ordered[1:])): raise ValueError(f'Duplicate {key} keyframes')
+    if any(point.get('interp') not in (None, 'linear') for point in points):
+        # Eased and bezier automation as straight lines every 10 ms (effects_engine.linear_knots).
+        return [(at, value, False) for at, value in effects_engine.linear_knots(points, .01, low, high)]
     return ordered
 
 
@@ -1782,6 +1848,9 @@ def _curve_expr(ordered, clock, base):
     Mirrors engine.js curveValue."""
     if not ordered:
         return f'{base:.6f}'
+    if len(ordered) > 40 and not any(ease for _, _, ease in ordered):
+        # Long (linearized) curves nest as a balanced tree: FFmpeg's parser nests about 100 levels.
+        return effects_engine._tree([(at, value) for at, value, _ in ordered], clock)
     expr = f'{ordered[-1][1]:.9f}'
     for (at, value, ease), (next_at, next_value, _) in reversed(list(zip(ordered, ordered[1:]))):
         fraction = f'(({clock})-{at:.9f})/{next_at-at:.9f}'
@@ -1883,6 +1952,7 @@ def _audio_events(clips, media_by_id, fps, probes, track_mix, solo, span, heartb
         source_in = float(clip.get('in', 0)); length = float(clip['duration']); start = float(clip['start'])
         speed = _number(clip.get('speed', 1), 'speed', .1, 16)
         reverse = bool(clip.get('reverse'))
+        ramp = None if item.get('_renderStill') else effects_engine.clip_ramp(clip)
         sound = _sound_transition(clip, pictures, fps)
         before = sound['before'] if sound and sound['kind'] == 'crossfade' else 0.0
         # A dip starts the incoming sound at the cut; only a crossfade pre-rolls it.
@@ -1942,7 +2012,7 @@ def _audio_events(clips, media_by_id, fps, probes, track_mix, solo, span, heartb
         clip_pan = _number(clip.get('pan', 0), 'pan', -100, 100)
         fx = audio_dsp.normalize(clip.get('audioFx'), label='clip audio effects')
         processing = [*([mapping_filter] if mapping_filter else []),
-                      *tempo_filters(speed), *audio_dsp.ffmpeg_filters(fx), f'volume={static:.6f}']
+                      *([] if ramp else tempo_filters(speed)), *audio_dsp.ffmpeg_filters(fx), f'volume={static:.6f}']
         timeline0 = start-before   # timeline time of event-local t = 0
         pan_keys = _curve_window(plan['pan_keys'], timeline0, start+length+after)
         pan = None
@@ -2010,22 +2080,27 @@ def _audio_events(clips, media_by_id, fps, probes, track_mix, solo, span, heartb
             post.append('aformat=channel_layouts=stereo,pan=5.1|' + TRACK_ROUTES[plan['route']])
         total = render_length+after
         if before and not item.get('_renderStill'):
-            if not reverse and source_in-before*speed < -.01:
+            if not reverse and source_in+(ramp.source(-before) if ramp else -before*speed) < -.01:
                 raise ValueError('Incoming sound lacks pre-cut footage for its crossfade')
             if reverse and source_in+(length+before)*speed > item['_actualDuration']+.05:
                 raise ValueError('Incoming sound lacks pre-cut footage for its crossfade')
         if after:
-            available = (source_in/speed if reverse else (item['_actualDuration']-source_in-length*speed)/speed)
+            available = (source_in/speed if reverse else
+                         (item['_actualDuration']-source_in-ramp.source(length))/max(.1, ramp.speed(length)) if ramp else
+                         (item['_actualDuration']-source_in-length*speed)/speed)
             if available+1e-3 < after: raise ValueError('Audio crossfade needs more outgoing source footage')
         # Tempo, resampling and effects carry state from sample to sample: such an
         # event is always rendered in one piece (see _audio_schedule).
         stateful = (abs(speed-1) > 1e-9 or any(rate != AUDIO_RATE for rate in stream_rates.values())
-                    or bool(fx) or (bool(plan['fx']) and not plan['dynamics']))
+                    or bool(fx) or (bool(plan['fx']) and not plan['dynamics']) or bool(ramp))
         events.append(dict(path=item['_path'], streams=streams, rates=stream_rates,
-                           source=source_in-after*speed if reverse else source_in-before*speed,
+                           source=source_in-after*speed if reverse else source_in+ramp.source(-before) if ramp else source_in-before*speed,
                            length=total, speed=speed, reverse=reverse, start=timeline0,
                            processing=','.join(processing), envelope=envelope, pan=pan, post=','.join(post),
-                           stateful=stateful, track=key))
+                           stateful=stateful, track=key,
+                           **({'ramp': dict(ramp=ramp, before=before, origin=source_in,
+                                            mode=(effects_engine.validate_effects(clip.get('effects')) or {}).get('speedAudio', 'pitch'))}
+                              if ramp else {})))
     events.sort(key=lambda event: event['start'])
     return events
 
@@ -2144,6 +2219,8 @@ def _prerender_event(event, u0, u1, target, directory, cancelled, heartbeat, lay
     in one FFmpeg run, reading only that span of its source, envelope and
     track processing included. Returns a plain 48 kHz event that chunks can
     slice without restarting any filter state."""
+    if event.get('ramp'):
+        return effects_engine.prerender_ramp(event, u0, u1, target, directory, cancelled, heartbeat, layout)
     low, high = _event_source_span(event, u0, u1)
     offset = _seek_offset(low)
     seek = ['-ss', f'{offset:.0f}'] if offset > 0 else []
@@ -2435,6 +2512,8 @@ def _expand_editorial_clips(project):
             raw_dur = ang_media.get('duration')
         ang_dur = _number(raw_dur, 'multicam angle duration', 0.001, MAX_SOURCE_SECONDS) if raw_dur else math.inf
         speed = _number(base_clip.get('speed', 1), 'speed', 0.1, 16)
+        if (base_clip.get('keyframes') or {}).get('speed'):
+            raise ValueError('Speed ramps on multicam clips are not supported. Flatten the multicam clip first.')
         mc_in = _number(base_clip.get('in', 0), 'source in', 0, MAX_SOURCE_SECONDS)
         mc_dur = _number(base_clip.get('duration', 0), 'duration', 0.001, MAX_TIMELINE_SECONDS)
         mc_start = _number(base_clip.get('start', 0), 'start', 0, MAX_TIMELINE_SECONDS)
@@ -3308,7 +3387,8 @@ def _picture_windows(project, picture, first, stop, total_frames, fps, width, he
             else:
                 clip['start']=overlap_start-begin
                 clip['duration']=overlap_end-overlap_start
-                clip['in']=float(clip.get('in',0)) + ((b-overlap_end) if clip.get('reverse') else (overlap_start-cut))*speed
+                clip['in']=float(clip.get('in',0)) + ((b-overlap_end)*speed if clip.get('reverse') else
+                                                      effects_engine.source_delta(original, 0, overlap_start-cut))
                 clip['transitionBefore']=0
                 if overlap_start > cut+.5/fps:
                     clip['transition']='none'

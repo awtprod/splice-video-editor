@@ -289,7 +289,9 @@
     if (shouldPlay && element.paused) element.play().catch(() => {});
     else if (!shouldPlay && !element.paused) element.pause();
   }
-  const clipPlaybackRate = clip => clamp((Number(clip.speed)||1)*Math.abs(playbackRate),.0625,16);
+  // A speed ramp plays at its instantaneous speed (effects.js); a freeze holds its frame.
+  const clipSpeedNow = clip => { const ramp=window.SpliceEffects.rampPoints(clip); return ramp ? window.SpliceEffects.rampSpeed(ramp,time-clip.start) : Number(clip.speed)||1; };
+  const clipPlaybackRate = clip => clamp(clipSpeedNow(clip)*Math.abs(playbackRate),.0625,16);
   function syncClipPlayback(element, clip, target, forceSeek, audible=true) {
     const rate=clipPlaybackRate(clip);
     const item=resolveClipMedia(clip).item, stream=clipAudioStream(clip,item);
@@ -301,13 +303,15 @@
     if (stream!==(item?.audioStream??null) && element.getAttribute('src')===item?.src) audible=false;
     if (separateMulticamSound(clip)) audible=false;
     element.playbackRate=rate;
-    setMediaPlaying(element,playing && playbackRate>0 && !clip.reverse && rate>=.25);
-    element.muted=!audible || clip.reverse || rate<.25;
+    const ramp=window.SpliceEffects.rampPoints(clip), frozen=ramp && clipSpeedNow(clip)<.0625;
+    if (ramp) element.preservesPitch=(clip.effects?.speedAudio||'pitch')==='pitch';
+    setMediaPlaying(element,playing && playbackRate>0 && !clip.reverse && rate>=.25 && !frozen);
+    element.muted=!audible || clip.reverse || rate<.25 || frozen || (ramp && clip.effects?.speedAudio==='mute');
     if (!audible) return;
     setAudio(element,clip);
-    if (clip.reverse || rate<.25) auditionAudio(element,clip,target,rate,forceSeek);
+    if ((clip.reverse || rate<.25) && !ramp) auditionAudio(element,clip,target,rate,forceSeek);
   }
-  const seekTolerance = clip => Math.max(1/project.fps,Math.min(1,Number(clip.speed)||1)*.3);
+  const seekTolerance = clip => Math.max(1/project.fps,Math.min(1,clipSpeedNow(clip))*.3);
   let history = [];
   let future = [];
   const subscribers = new Set();
@@ -545,8 +549,10 @@
   };
   const frameSeconds = () => 1 / project.fps;
   // Timeline seconds before the clip's first frame and after its last that the source can still supply.
-  const sourceHead = (clip) => resolveClipMedia(clip).item?.still ? Infinity : clip.in / (Number(clip.speed) || 1);
-  const sourceTail = (clip) => resolveClipMedia(clip).item?.still ? Infinity :
+  const rampEnds = clip => { const ramp = window.SpliceEffects.rampPoints(clip); return ramp && [Math.max(.1, ramp[0].value/100), Math.max(.1, ramp[ramp.length-1].value/100)]; };
+  const sourceHead = (clip) => resolveClipMedia(clip).item?.still ? Infinity : clip.in / (rampEnds(clip)?.[0] || Number(clip.speed) || 1);
+  const sourceTail = (clip) => resolveClipMedia(clip).item?.still ? Infinity : rampEnds(clip) ?
+    (mediaDurationOf(clip) - clip.in - window.SpliceEffects.sourceDelta(clip, 0, clip.duration)) / rampEnds(clip)[1] :
     (mediaDurationOf(clip) - clip.in) / (Number(clip.speed) || 1) - clip.duration;
   const roomBefore = (clip) => clip.reverse ? sourceTail(clip) : sourceHead(clip);
   const roomAfter = (clip) => clip.reverse ? sourceHead(clip) : sourceTail(clip);
@@ -669,6 +675,8 @@
     return clamp(clock ? (clock.origin + elapsed)/clock.duration : elapsed/transitionLength(clip), 0, 1);
   };
   const rawSourceTime = (clip, atTime) => {
+    const ramp=window.SpliceEffects.rampPoints(clip);
+    if (ramp && !clip.reverse) return Number(clip.in||0)+window.SpliceEffects.rampSource(ramp,atTime-clip.start);
     const speed=clamp(Number(clip.speed)||1,.1,16), local=atTime-clip.start;
     return Number(clip.in||0)+(clip.reverse ? clip.duration-local : local)*speed-(clip.reverse?1e-6:0);
   };
@@ -1203,7 +1211,7 @@
     }
   }
   // Linear segments, or eased (smoothstep) after a point marked `ease` (audio automation).
-  const curveValue = (points,local,base) => window.SpliceAudioDSP.curveValue(points,local,base);
+  const curveValue = (points,local,base) => window.SpliceEffects.curveValue(points,local,base);
   function animated(clip,key,base) {
     const points=(clip.keyframes?.[key]||[]).filter(p=>Number.isFinite(p.time)&&Number.isFinite(p.value)).sort((a,b)=>a.time-b.time);
     return curveValue(points,time-clip.start,base);
@@ -1219,12 +1227,8 @@
         cropped[key]=ordered.map(point=>({...point,time:point.time-from}));
         continue;
       }
-      cropped[key]=[
-        {time:0,value:curveValue(ordered,from,0)},
-        ...ordered.filter(point=>point.time>from+1e-6 && point.time<to-1e-6)
-          .map(point=>({time:point.time-from,value:point.value})),
-        {time:to-from,value:curveValue(ordered,to,0)},
-      ];
+      // Eased and bezier segments cut by the window keep their shape (effects.js windowPoints).
+      cropped[key]=window.SpliceEffects.windowPoints(ordered,from,to);
     }
     return cropped;
   }
@@ -1254,7 +1258,7 @@
       throw new Error('Move the cut outside the start of the following transition.');
     const speed=Number(clip.speed)||1;
     const right={...structuredClone(clip),id:uid(),start:cut,duration:duration-offset,
-      in:clip.reverse?clip.in:clip.in+offset*speed,transition:'none'};
+      in:clip.reverse?clip.in:clip.in+window.SpliceEffects.sourceDelta(clip,0,offset),transition:'none'};
     for (const key of ['premiereTrack','premiereIndex','transitionBefore','transitionDuration','transitionMatchName','transitionClock']) delete right[key];
     shiftFadeClocks(right, clip, offset);
     if (clip.pictureDip && clip.transitionMatchName) right.transitionMatchName = clip.transitionMatchName;
@@ -1308,7 +1312,7 @@
     return layer;
   }
   // Monitor-only switches (not saved, not exported): grade bypass, before/after split, views.
-  const monitor={bypass:false,split:null,view:'normal'};
+  const monitor={bypass:false,split:null,view:'normal',alphaView:null};
   let comparing=false;
   document.addEventListener('splice-monitor-change',()=>{
     const active=monitor.bypass || monitor.split!=null;
@@ -1377,6 +1381,7 @@
     const element=videoFor(clip);
     if (!(element instanceof HTMLVideoElement) || element.readyState<2 || !element.videoWidth || !element.videoHeight) return false;
     if (Math.abs(element.videoWidth/element.videoHeight-canvas.width/canvas.height)>.01) return false;
+    if (window.SpliceEffects.live(clip.effects)) return false;
     const opacity=animated(clip,"opacity",Number(clip.opacity??100));
     const scale=animated(clip,"scale",Number(clip.transform?.scale??100));
     const x=animated(clip,"x",Number(clip.transform?.x??0)), y=animated(clip,"y",Number(clip.transform?.y??0));
@@ -1424,6 +1429,7 @@
       return {type:'video',element:source,clip,exact:source instanceof HTMLVideoElement,
         input:{matrix:item?.hdr?'bt709':window.SpliceGrade?.matrixName(item?.colorSpace,item?.colorMatrix)||'bt601',fullRange:false},
         grade:gradeOf(clip,bypass), brightness, wipe, wipeOut,
+        fx:window.SpliceEffects.layerFx(clip,time-clip.start,item?.hdr?'bt709':window.SpliceGrade?.matrixName(item?.colorSpace,item?.colorMatrix)||'bt601',monitor.alphaView===clip.id),
         alpha:alpha*clamp(animated(clip,"opacity",Number(clip.opacity??100))/100,0,1),
         geometry:{sourceWidth:source.videoWidth||source.width||canvas.width,sourceHeight:source.videoHeight||source.height||canvas.height,
           scale:clamp(animated(clip,"scale",Number(clip.transform?.scale??100))/100,.1,4),
@@ -1439,7 +1445,8 @@
       if (outgoingIds.has(clip.id)) continue;
       if (mediaOf(clip)?.adjustment) {
         const grade=gradeOf(clip,bypass);
-        if (grade && isEnabled(clip)) plan.ops.push({type:'adjust',clip,grade,alpha:clamp(animated(clip,"opacity",Number(clip.opacity??100))/100,0,1)});
+        if (grade && isEnabled(clip)) plan.ops.push({type:'adjust',clip,grade,alpha:clamp(animated(clip,"opacity",Number(clip.opacity??100))/100,0,1),
+          fx:window.SpliceEffects.layerFx(clip,time-clip.start,'bt709')});
         continue;
       }
       if (resolveClipMedia(clip).item?.nativeGenerator===1414680150) continue;
@@ -1518,7 +1525,7 @@
     const end=Math.max(0,...clips.map(c=>{
       const next=followingTransition(c);
       const handle=c.reverse?transitionBefore(c):next?transitionLength(next)-transitionBefore(next):0;
-      return c.in+(c.duration+handle)*(Number(c.speed)||1);
+      return c.in+window.SpliceEffects.sourceDelta(c,0,c.duration+handle);
     }));
     if(!replacement.still && replacement.duration+1e-6<end) throw Error(replacement.name+' is shorter than the source used on this timeline.');
   }
@@ -1745,6 +1752,11 @@
             points.some(point => !point || !Number.isFinite(point.time) || !Number.isFinite(point.value)))))
         throw new Error("This project file has invalid keyframes.");
       if (clip.keyframes) window.SpliceGrade.keyTimes(clip);
+      if (clip.keyframes || clip.effects) {
+        try { window.SpliceEffects.validateKeyframes(clip.keyframes); window.SpliceEffects.validateEffects(clip.effects); }
+        catch (error) { throw new Error('This project file has invalid effects: '+error.message+'.'); }
+        if (clip.keyframes?.speed?.length && clip.reverse) throw new Error('Speed ramps play forward. Turn off Reverse to ramp this clip.');
+      }
       if (clip.color?.grade !== undefined) window.SpliceGrade.validateGrade(clip.color.grade);
       if (clip.color?.lut) {
         const intensity = clip.color.lutIntensity ?? 100;
@@ -2092,7 +2104,7 @@
   function resetClipNow(id) {
     Editor.editProject((next) => {
       const target = next.clips.find((c) => c.id === id);
-      for (const key of ["pan", "opacity", "transform", "keyframes", "fadeIn", "fadeOut", "transitionBefore",
+      for (const key of ["pan", "opacity", "transform", "keyframes", "effects", "fadeIn", "fadeOut", "transitionBefore",
         "transitionDuration", "transitionClock", "transitionMatchName", "pictureDip", "fadeClock"]) delete target[key];
       target.volume = 100;
       target.transition = "none";
@@ -2241,6 +2253,7 @@
     editProject(fn) {
       const next = cloneState(project);
       fn(next);
+      window.SpliceEffects.normalizeRamps?.(next);
       if (!linkingActive()) dropLoneLinks(next);
       shareUnchanged(project, next);
       validateProject(next);
@@ -2583,6 +2596,7 @@
       const clip=project.clips.find(c=>c.id===id);
       if(!clip)return;
       if(clip.nativeTimeRemap)throw Error('Edit this Premiere speed curve in Premiere.');
+      if(window.SpliceEffects.rampPoints(clip))throw Error('Remove the speed ramp to set a constant speed.');
       if(!Number.isFinite(speed) || speed<.1 || speed>16)throw Error('Choose a clip speed between 10% and 1600%.');
       const oldSpeed=Number(clip.speed)||1;
       if(Math.abs(speed-oldSpeed)<1e-6)return;
@@ -2615,18 +2629,20 @@
       const memberIds=new Set([clip.id,...partners.map(c=>c.id)]);
       const rippleShift=edge==="start"?-shift:shift;
       for(const member of project.clips.filter(c=>memberIds.has(c.id))){
-        const nextIn=member.in+(edge==="start"&&!member.reverse?shift*(Number(member.speed)||1):edge==="end"&&member.reverse?-shift*(Number(member.speed)||1):0);
+        const nextIn=member.in+(edge==="start"&&!member.reverse?window.SpliceEffects.sourceDelta(member,0,shift):edge==="end"&&member.reverse?-shift*(Number(member.speed)||1):0);
         const nextDuration=member.duration+(edge==="start"?-shift:shift);
         const source=resolveClipMedia(member).item;
         const maxDur=mediaDurationOf(member);
         if(nextDuration<1/project.fps-.001 ||
-           (!source?.still && (nextIn<-.001 || (Number.isFinite(maxDur) && nextIn+nextDuration*(Number(member.speed)||1)>maxDur+.01))))
+           (!source?.still && (nextIn<-.001 || (Number.isFinite(maxDur) && (window.SpliceEffects.rampPoints(member) ?
+             member.in+window.SpliceEffects.sourceDelta(member,0,(edge==="start"?shift:0)+nextDuration) :
+             nextIn+nextDuration*(Number(member.speed)||1))>maxDur+.01))))
           throw new Error("Linked clip cannot be trimmed beyond its source.");
       }
       Editor.editProject(next=>{
         for(const member of next.clips.filter(c=>memberIds.has(c.id))){
           const original=(gestureBefore||project).clips.find(c=>c.id===member.id);
-          if(edge==="start"){if(!ripple)member.start=snap(member.start+shift);if(!member.reverse)member.in=Math.max(0,member.in+shift*(Number(member.speed)||1));member.duration=snap(member.duration-shift);}
+          if(edge==="start"){if(!ripple)member.start=snap(member.start+shift);if(!member.reverse)member.in=Math.max(0,member.in+window.SpliceEffects.sourceDelta(member,0,shift));member.duration=snap(member.duration-shift);}
           else{member.duration=snap(member.duration+shift);if(member.reverse)member.in=Math.max(0,member.in-shift*(Number(member.speed)||1));}
           const headShift = ripple ? original.duration-member.duration : member.start-original.start;
           resizeKeyframes(member,original,edge==='start'?headShift:0);
@@ -2667,7 +2683,7 @@
             const original=(gestureBefore||project).clips.find(c=>c.id===clip.id);
             clip.start += shift;
             clip.duration -= shift;
-            if (!clip.reverse) clip.in = Math.max(0,clip.in+shift*speed);
+            if (!clip.reverse) clip.in = Math.max(0,clip.in+window.SpliceEffects.sourceDelta(clip,0,shift));
             resizeKeyframes(clip,original,clip.start-original.start);
           }
         }
@@ -2745,7 +2761,7 @@
             const right = find(part.after), speed = Number(right.speed) || 1;
             right.start = snap(right.start + shift);
             right.duration = snap(right.duration - shift);
-            if (!right.reverse) right.in = Math.max(0, right.in + shift * speed);
+            if (!right.reverse) right.in = Math.max(0, right.in + window.SpliceEffects.sourceDelta(right, 0, shift));
             resizeKeyframes(right, original(right), shift);
           }
         }
