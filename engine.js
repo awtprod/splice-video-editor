@@ -232,6 +232,7 @@
     const route=audioNodes.get(element);
     if(!route)return;
     route.source.disconnect();route.gain.disconnect();route.pan.disconnect();route.analyser.disconnect();
+    for (const node of route.outputPanners || []) node.disconnect();
     audioNodes.delete(element);
   }
   function setAudio(element,clip) {
@@ -239,6 +240,23 @@
     const route=routeAudio(element);
     route.track=clip.track;
     const mix=trackSettings(clip.track);
+    // A nested bus pans the child's stereo output, after the source's own mono/stereo pan.
+    if (!sameValue(route.outputStages, mix.outputStages)) {
+      route.pan.disconnect();
+      for (const node of route.outputPanners || []) node.disconnect();
+      route.outputPanners = [];
+      let last = route.pan;
+      for (const stage of mix.outputStages || []) {
+        if (!stage.pan) continue;
+        const node = audioContext.createStereoPanner();
+        node.pan.value = stage.pan/100;
+        last.connect(node);
+        route.outputPanners.push(node);
+        last = node;
+      }
+      last.connect(route.analyser);
+      route.outputStages = mix.outputStages;
+    }
     const gain=clip.type==='video' && clip.embeddedAudio===false ? 0 : audibility(clip);
     const pan=clamp(((Number(clip.pan)||0)+(Number(mix.pan)||0))/100,-1,1);
     if (gain!==route.gainLevel) {
@@ -670,7 +688,8 @@
     if(['dissolve','wipe','fade'].includes(clip.transition)) fade*=audioTransitionGain(clip,(time-clip.start+transitionBefore(clip))/transitionLength(clip));
     const next=followingTransition(clip);
     if(next) fade*=audioTransitionGain(next,1-(time-next.start+transitionBefore(next))/transitionLength(next));
-    return clamp(animated(clip,'volume',Number(clip.volume??100))/100,0,2) * clamp((mix.gain??100)/100,0,2) * clamp(fade,0,1);
+    const outputGain = (mix.outputStages || []).reduce((gain, stage) => gain * stage.gain/100, 1);
+    return clamp(animated(clip,'volume',Number(clip.volume??100))/100,0,2) * clamp((mix.gain??100)/100,0,2) * outputGain * clamp(fade,0,1);
   };
   const filterFor = (clip) => {
     const c = clip.color || {};
@@ -1366,6 +1385,9 @@
       throw new Error("This project file has invalid audio mixer settings.");
     if (mix.gain < 0 || mix.gain > 200) throw new Error("Track gain must be between 0% and 200%.");
     if (mix.pan < -100 || mix.pan > 100) throw new Error("Track pan must be between -100 and 100.");
+    if (mix.outputStages !== undefined && (!Array.isArray(mix.outputStages) || mix.outputStages.length > 64 ||
+        mix.outputStages.some(s => !Number.isFinite(s?.gain) || s.gain < 0 || s.gain > 200 ||
+          !Number.isFinite(s.pan) || Math.abs(s.pan) > 100))) throw new Error('Invalid nested output mixer settings.');
   }
   // LUT tables are immutable once validated; skip re-checking 100k samples on every edit.
   const validatedLuts = new WeakSet();
@@ -1570,7 +1592,7 @@
   function reserveTrackMix(track, mix = {}, clips, addedMixes) {
     const current = addedMixes[track] ?? project.trackMix?.[track];
     if ((mix.gain ?? 100) === (current?.gain ?? 100) && (mix.pan ?? 0) === (current?.pan ?? 0) &&
-        !!mix.mute === !!current?.mute && !!mix.solo === !!current?.solo) return true;
+        !!mix.mute === !!current?.mute && !!mix.solo === !!current?.solo && sameValue(mix.outputStages, current?.outputStages)) return true;
     // A64 can carry embedded multicam sound even when it has no timeline audio clips.
     if (current || track === -64 || clips.some(c => c.track === track)) return false;
     addedMixes[track] = {...mix};
@@ -2018,7 +2040,7 @@
     },
     isTrackLocked(track, kind) { return trackLocked(kind || (track < 0 ? "audio" : "video"), track); },
     isTrackSyncLocked(track, kind) { return syncLocked(kind || (track < 0 ? "audio" : "video"), track); },
-    isTrackHidden(track, kind) { return trackHidden(kind || (track < 0 ? "audio" : "video"), track); },
+    isTrackHidden(track, kind, source) { return trackHidden(kind || (track < 0 ? "audio" : "video"), track, source); },
     // A title lane and the video lane of the same number are one Premiere video track, so they
     // share one state, stored under 'video:N' (a title lane without its own entry follows it).
     setTrackState(track, kind, patch) {

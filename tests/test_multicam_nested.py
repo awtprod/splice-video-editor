@@ -238,6 +238,33 @@ class MulticamNestedExportTests(unittest.TestCase):
 
     # -- 2. Multicam Export Parity ---------------------------------------------------------------
 
+    def test_premiere_requires_flattening_used_multicam_only(self):
+        cameras = copy.deepcopy(self.media)
+        wrapper = dict(cameras[0], id='mc', name='Cameras', multicam=dict(
+            angles=[dict(mediaId='red', offset=0), dict(mediaId='blue', offset=.4)], audioMode='camera1'))
+        project = dict(name='Angle cut', width=W, height=H, fps=FPS, media=[*cameras, wrapper],
+                       clips=[self._vclip('cut', 'mc', 0, 1, src_in=.8, multicamAngle=1)])
+        with self.assertRaisesRegex(ValueError, '(?i)flatten.*multicam'):
+            save_project(project)
+        # The pool can retain its virtual asset after the editor flattens the timeline.
+        wrapper['src'] = 'blob:preview'
+        project['clips'] = [self._vclip('cut', 'blue', 0, 1, src_in=.4, embeddedAudio=False)]
+        reopened = open_project(save_project(project))
+        picture = next(c for c in reopened['clips'] if c['type'] == 'video')
+        media = next(m for m in reopened['media'] if m['id'] == picture['mediaId'])
+        self.assertEqual(media['name'], 'blue.mov')
+        self.assertAlmostEqual(picture['in'], .4)
+
+    def test_premiere_reports_cascaded_pan_only_for_tracks_in_use(self):
+        project = dict(name='Nested mix', width=W, height=H, fps=FPS, media=self.media,
+                       clips=[self._vclip('cut', 'blue', 0, 1, embeddedAudio=False)],
+                       trackMix={'-1': {'gain':50, 'outputStages':[{'gain':100, 'pan':-40}]}})
+        save_project(project)
+        project['clips'].append(dict(id='mic', type='audio', mediaId='red', track=-1, start=0,
+                                     duration=1, **{'in':0}))
+        with self.assertRaisesRegex(ValueError, 'cascaded nested track mix'):
+            save_project(project)
+
     def test_multicam_outlasts_selected_angle(self):
         angles = [dict(mediaId='red', offset=0, duration=2), dict(mediaId='blue', offset=0, duration=8)]
         multicam = dict(id='mc', type='video', duration=8, multicam=dict(angles=angles, audioMode='follow'))

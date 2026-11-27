@@ -837,7 +837,7 @@ async function testAudioParity(page, files) {
 
 async function testUnnestMix(page, files) {
   await freshProjectWithMedia(page, [files.red, files.green], 'Unnest mix');
-  for (const scenario of ['gain and pan','muted','child solo','parent solo','relocated','embedded']) {
+  for (const scenario of ['parent gain','parent pan','boost','gain and pan','muted','child solo','parent solo','relocated','embedded']) {
     const nest = await page.evaluate(scenario => {
       const [camera, other] = [...Editor.get().project.media].filter(m => !m.nestedProject)
         .sort((a,b) => a.name.localeCompare(b.name));
@@ -864,9 +864,13 @@ async function testUnnestMix(page, files) {
     await page.evaluate(async ({nest, scenario}) => {
       await SpliceNested.enter(nest.mediaId);
       Editor.updateTrackMix(scenario === 'embedded' ? 1 : -1,
-        {gain:45, pan:55, mute:scenario === 'muted', solo:scenario === 'child solo'});
+        {gain:scenario === 'boost' ? 160 : 45, pan:55, mute:scenario === 'muted', solo:scenario === 'child solo'});
       if (scenario === 'parent solo') Editor.updateTrackMix(-2, {solo:true});
       SpliceNested.exit();
+      if (['parent gain','parent pan','boost'].includes(scenario)) {
+        const outer = Editor.get().project.clips.find(c => c.mediaId === nest.mediaId);
+        Editor.updateTrackMix(outer.track, {gain:scenario === 'boost' ? 180 : 50, pan:scenario === 'parent pan' ? -40 : 0});
+      }
     }, {nest, scenario});
     const before = await page.evaluate(stereoWavLevels);
     await page.evaluate(id => SpliceNested.unnestClip(id), nest.clipIds[0]);
@@ -955,6 +959,47 @@ async function testNestVisibility(page, files) {
   console.log('Nested H.264 export RGB:', colors);
   assert.ok(Math.max(...colors[0]) < 25);
   assert.equal(dominantColor(colors[1]), 'green');
+
+  // Swap the output lanes in the parent while the child keeps V1 hidden and V2 visible.
+  await page.evaluate(() => {
+    Editor.setTrackState(1, 'video', {hidden:false});
+    Editor.setTrackState(2, 'video', {hidden:true});
+    Editor.editProject(p => {
+      const nest = p.clips[0];
+      nest.track = 3;
+      p.clips.push({...nest, id:'neighbor', mediaId:p.media.find(m => m.name.includes('CamA_Red')).id,
+        track:1, start:2, duration:1, embeddedAudio:false, nestedSequence:undefined});
+    });
+  });
+  await page.evaluate(id => SpliceNested.unnestClip(id), nest.clipIds[0]);
+  const visible = [];
+  for (const t of [.5,1.5,2.5]) visible.push(await programColor(page,t));
+  console.log('Program RGB after unnesting onto different parent lanes:', visible);
+  assert.ok(Math.max(...visible[0]) < 25);
+  assert.equal(dominantColor(visible[1]), 'green');
+  assert.equal(dominantColor(visible[2]), 'red');
+  await capture(page, 'unnest-visible-lanes.png');
+}
+
+async function testUnnestComponents(page, files) {
+  await freshProjectWithMedia(page,[files.red,files.green],'Unnest one component');
+  for (const component of ['audio','video']) {
+    const outer = await page.evaluate(component => {
+      Editor.editProject(p => {
+        const camera = p.media.find(m => m.name.includes('CamA_Red'));
+        p.clips = [{id:'cam', type:'video', track:1, mediaId:camera.id, start:0, duration:1, in:0, embeddedAudio:true},
+          {id:'title', type:'title', track:2, start:0, duration:1, in:0, title:'Child'},
+          {id:'mic', type:'audio', track:-1, mediaId:camera.id, start:0, duration:1, in:0}];
+      });
+      const nest = SpliceNested.nestSelection(['cam','title','mic']);
+      Editor.editProject(p => { p.clips = p.clips.filter(c => c.type === component); delete p.clips[0].linkGroup; });
+      return Editor.get().project.clips.find(c => c.mediaId === nest.mediaId).id;
+    }, component);
+    const result = await page.evaluate(id => SpliceNested.unnestClip(id).map(c => [c.type,c.embeddedAudio]), outer);
+    console.log('Remaining nest component', component, result);
+    if (component === 'audio') assert.deepEqual(result.map(c => c[0]), ['audio','audio']);
+    else assert.deepEqual(result, [['video',false],['title',undefined]]);
+  }
 }
 
 async function main() {
@@ -980,6 +1025,7 @@ async function main() {
       await testUnnestMix(page, files);
       await testFlattenRouting(page, files);
       await testNestVisibility(page, files);
+      await testUnnestComponents(page, files);
       await testSubclips(page, files);
       await testBinsAndMetadata(page, files);
       assert.deepEqual(errors, [], '1440x900: zero page errors');

@@ -72,7 +72,7 @@ COLOR_FIELDS = {'brightness': 100, 'contrast': 100, 'saturation': 100, 'exposure
 TRANSFORM_FIELDS = {'x': 0, 'y': 0, 'scale': 100, 'rotation': 0}
 KEYFRAME_FIELDS = ('opacity', 'x', 'y', 'scale', 'rotation', 'volume')
 TRACK_STATE_FIELDS = {'locked': 'written', 'hidden': 'written', 'syncLocked': 'reported'}
-TRACK_MIX_FIELDS = {'mute': 'written', 'gain': 'reported', 'pan': 'reported', 'solo': 'reported'}
+TRACK_MIX_FIELDS = {'mute': 'written', 'gain': 'reported', 'pan': 'reported', 'solo': 'reported', 'outputStages': 'reported'}
 #: Media fields the project format names: what the writer reads; ``name`` (a rename in Splice) is
 #: reported. Fields Splice adds when it measures or links a file are facts of the file, not edits.
 MEDIA_FIELDS = {
@@ -988,7 +988,7 @@ class Writer:
             for field in sorted(set(a) | set(b)):
                 if TRACK_MIX_FIELDS.get(field) == 'written':
                     continue
-                neutral = {'gain': 100, 'pan': 0, 'solo': False}.get(field)
+                neutral = {'gain': 100, 'pan': 0, 'solo': False, 'outputStages': []}.get(field)
                 if not _same(a.get(field, neutral), b.get(field, neutral)):
                     report.add(NOT_WRITTEN, 'Track mixer gain, pan and solo (the Fairlight mixer is not written)',
                                f'{name} · track {key} ({field})')

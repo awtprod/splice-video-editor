@@ -560,6 +560,9 @@ def save_project(data):
     if any(item.get('parentMediaId') for item in media_by_id.values()):
         from render_movie import resolve_subclip_source
         data = {**data, 'clips': [resolve_subclip_source(clip, media_by_id) for clip in data['clips']]}
+    if any(media_by_id.get(c.get('mediaId'), {}).get('multicam') for c in data['clips']):
+        raise ValueError('Flatten multicam clips on the timeline before saving to Premiere. '
+                         'Save a Splice project to keep the editable angles.')
     lanes = {}
     for item in data.get('clips', []):
         lane = ('audio' if item.get('type') == 'audio' else 'video', int(item.get('track', 1)))
@@ -574,6 +577,11 @@ def save_project(data):
             raise ValueError('Premiere export cannot write imported LUTs; save a Splice project or remove the LUT')
     if any(mix.get('solo', False) for mix in (data.get('trackMix') or {}).values()):
         raise ValueError('Premiere export cannot write track solo; save a Splice project or disable solo')
+    used_audio_tracks = {str(c.get('track')) for c in data['clips']
+                         if c.get('type') == 'audio' or (c.get('type') == 'video' and c.get('embeddedAudio', True))}
+    if any(str(track) in used_audio_tracks and mix.get('outputStages')
+           for track, mix in (data.get('trackMix') or {}).items()):
+        raise ValueError('Premiere cannot write the cascaded nested track mix. Export the audio mix or save a Splice project.')
     original = data.get('premiereOriginal')
     if original and len(original) > 70 * 1024 * 1024:
         raise ValueError('Original Premiere project is too large')
@@ -783,6 +791,8 @@ def save_project(data):
         collect(project.root_item)
     bin_cache = {}
     for item in data.get('media', []):
+        if item.get('multicam'):
+            continue  # The virtual pool item has no single source file.
         src = item.get('src', '')
         if original and item.get('premiereItemUID') in existing_uid:
             available[item['id']] = existing_uid[item['premiereItemUID']]

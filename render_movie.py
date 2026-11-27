@@ -1408,6 +1408,17 @@ def _audio_events(clips, media_by_id, fps, probes, track_mix, solo, span, heartb
                 raise ValueError('The selected source audio stream is unavailable')
             streams = {selection:streams[selection]}
         panner = _stereo_pan(pan,2 if len(streams)>1 else next(iter(streams.values())))
+        # The parent's pan acts on stereo after the child has been panned.
+        stages = mix.get('outputStages', [])
+        if not isinstance(stages, list) or len(stages) > 64:
+            raise ValueError('Invalid nested output mixer settings')
+        for stage in stages:
+            if not isinstance(stage, dict):
+                raise ValueError('Invalid nested output mixer stage')
+            gain *= _number(stage.get('gain'), 'nested output gain', 0, 200)/100
+            output_pan = _number(stage.get('pan'), 'nested output pan', -100, 100)/100
+            if output_pan:
+                panner += ',' + _stereo_pan(output_pan, 2)
         fade_in = min(length,_number(clip.get('fadeIn',0),'fade in',0,MAX_TIMELINE_SECONDS))
         processing=','.join([*tempo_filters(speed),f'volume={gain:.4f}',panner])
         envelope=[]

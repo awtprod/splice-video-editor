@@ -248,7 +248,7 @@ def build_cut(project: dict, options: dict | None = None) -> Cut:
             report.note(f'Caption "{str(caption.get("text", ""))[:40]}" at {cut.timecode(max(0, seconds_frames(_number(caption.get("start"), 0, 0), rate) - first))}: '
                         'captions are not part of timeline interchange; export them as subtitles.')
     for key, mix in cut.track_mix.items():
-        if isinstance(mix, dict) and (mix.get('gain', 100) != 100 or mix.get('pan', 0) or mix.get('mute') or mix.get('solo')):
+        if isinstance(mix, dict) and (mix.get('gain', 100) != 100 or mix.get('pan', 0) or mix.get('mute') or mix.get('solo') or mix.get('outputStages')):
             report.note(f'Audio track A{abs(int(key))} mixer settings (gain, pan, mute or solo) are not carried; '
                         'interchange formats have no track mixer.')
     return cut

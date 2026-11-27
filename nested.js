@@ -200,7 +200,7 @@ window.SpliceNested = (() => {
     const solo = Object.values(project.trackMix || {}).some(m => m.solo);
     const unavailableAudio = t => {
       const mix = project.trackMix?.[t] || {};
-      if (isLocked(t, 'audio') || mix.mute || (mix.gain ?? 100) !== 100 || (mix.pan ?? 0) !== 0) return true;
+      if (isLocked(t, 'audio') || mix.mute || (mix.gain ?? 100) !== 100 || (mix.pan ?? 0) !== 0 || mix.outputStages?.length) return true;
       return solo && !mix.solo && project.clips.some(c => c.track === t);
     };
     const audioTrack = hasAudio ? freeTrack(remaining, 'audio', Math.min(-1, prefAudio || -1), minStart, minStart + span, unavailableAudio) : null;
@@ -474,9 +474,6 @@ window.SpliceNested = (() => {
     }
 
     const outerIds = new Set(outerClips.map(c => c.id));
-    const speed = Number(primary.speed) || 1;
-    const winStart = Number(primary.in) || 0;
-    const winEnd = winStart + primary.duration * speed;
     const child = item.nestedProject;
     const fps = project.fps || 25;
 
@@ -511,31 +508,39 @@ window.SpliceNested = (() => {
     const workingClips = project.clips.filter(c => !outerIds.has(c.id));
     const isLocked = (t, k) => editor.isTrackLocked?.(t, k);
     const addedMixes = {};
+    const hiddenTracks = new Set();
     const childSolo = Object.values(child.trackMix || {}).some(m => m.solo);
     const parentSolo = Object.values(project.trackMix || {}).some(m => m.solo);
-    const outerSound = outerClips.find(c => c.type === 'audio') || outerClips.find(c => c.type === 'video' && c.embeddedAudio !== false);
-    const outerMix = project.trackMix?.[outerSound?.track];
-    function childMix(track) {
+    function childMix(track, outerSound) {
       const mix = child.trackMix?.[track] || {};
+      const outerMix = project.trackMix?.[outerSound.track] || {};
+      const gain = (mix.gain ?? 100) * (outerMix.gain ?? 100) / 100;
+      const stages = [...(mix.outputStages || [])];
+      // A second stereo pan cannot be represented by adding the pan angles. A gain
+      // above the fader's 200% limit likewise needs its original second stage.
+      if (outerMix.pan || gain > 200) stages.push({gain:gain > 200 ? outerMix.gain : 100, pan:outerMix.pan || 0});
+      stages.push(...(outerMix.outputStages || []));
       // Solo is local to the child sequence. Carry its audible result onto the parent's buses.
-      return {...mix, mute:!!(mix.mute || (childSolo && !mix.solo) || !outerSound || outerSound.enabled === false ||
-        outerMix?.mute || (parentSolo && !outerMix?.solo)), solo:!!outerMix?.solo};
+      return {...mix, gain:gain > 200 ? mix.gain : gain, ...(stages.length ? {outputStages:stages} : {}),
+        mute:!!(mix.mute || (childSolo && !mix.solo) || outerMix.mute || (parentSolo && !outerMix.solo)), solo:!!outerMix.solo};
     }
     function placeSound(sound, preferred, clips, mix) {
       sound.track = editor.audioTrackForMix(sound, preferred, clips, mix, addedMixes);
       if (sound.track === null) throw new Error('Unnesting needs a free, unlocked audio track that preserves the child mix.');
     }
 
-    for (const cc of child.clips || []) {
+    function expandChild(cc, outer, picture, sound) {
+      const speed = Number(outer.speed) || 1;
+      const winStart = Number(outer.in) || 0, winEnd = winStart + outer.duration * speed;
       const ovStart = Math.max(cc.start, winStart);
       const ovEnd = Math.min(cc.start + cc.duration, winEnd);
-      if (ovEnd <= ovStart + 1e-6) continue;
+      if (ovEnd <= ovStart + 1e-6) return;
       const cSpeed = Number(cc.speed) || 1;
       const trimHead = ovStart - cc.start;
       const newDuration = snapToFps((ovEnd - ovStart) / speed, fps);
-      if (newDuration < 1 / fps - 1e-6) continue;
-      const offset = primary.reverse ? winEnd - ovEnd : ovStart - winStart;
-      const newStart = snapToFps(primary.start + offset / speed, fps);
+      if (newDuration < 1 / fps - 1e-6) return;
+      const offset = outer.reverse ? winEnd - ovEnd : ovStart - winStart;
+      const newStart = snapToFps(outer.start + offset / speed, fps);
       const out = structuredClone(cc);
       out.id = uid();
       if (out.mediaId && mediaRemap.has(out.mediaId)) out.mediaId = mediaRemap.get(out.mediaId);
@@ -543,9 +548,9 @@ window.SpliceNested = (() => {
       out.duration = newDuration;
       if (!out.reverse) out.in = (Number(out.in) || 0) + trimHead * cSpeed;
       else out.in = (Number(out.in) || 0) + (cc.start + cc.duration - ovEnd) * cSpeed;
-      if (primary.reverse) out.reverse = !cc.reverse;
+      if (outer.reverse) out.reverse = !cc.reverse;
       if (speed !== 1) out.speed = cSpeed * speed;
-      if (primary.enabled === false) out.enabled = false;
+      if (outer.enabled === false) out.enabled = false;
       delete out.premiereIndex;
       delete out.premiereTrack;
       if (out.linkGroup) {
@@ -553,31 +558,67 @@ window.SpliceNested = (() => {
         out.linkGroup = linkRemap.get(out.linkGroup);
       }
       const occupied = [...workingClips, ...expanded];
-      if (out.type === 'audio') {
-        placeSound(out, cc.track, occupied, childMix(cc.track));
+      const soundTrack = sound && editor.separateMulticamSound(cc, child) ? -64 : cc.track;
+      if (!picture) {
+        out.type = 'audio';
+        delete out.embeddedAudio;
+        placeSound(out, cc.type === 'audio' ? cc.track : -1, occupied, childMix(soundTrack, sound));
       } else {
-        out.track = freeTrack(occupied, 'video', cc.track, out.start, out.start + out.duration, isLocked);
-        if (out.track === null) throw new Error('No free unlocked video track to unnest into.');
-        if (out.type === 'video' && out.embeddedAudio !== false && editor.hasSound(child.media.find(m => m.id === cc.mediaId), child)) {
-          const separate = editor.separateMulticamSound(cc, child);
-          const mix = childMix(separate ? -64 : cc.track);
-          if (!editor.reserveTrackMix(separate ? -64 : out.track, mix, occupied, addedMixes)) {
+        const hidden = editor.isTrackHidden(outer.track, 'video') || editor.isTrackHidden(cc.track, cc.type, child);
+        const available = (t, k) => isLocked(t,k) || hidden !== (hiddenTracks.has(t) || editor.isTrackHidden(t,k));
+        out.track = freeTrack(occupied, 'video', cc.track, out.start, out.start + out.duration, available);
+        if (out.track === null && hidden) {
+          // Hide only an empty lane. A parent clip outside this edit must keep its picture.
+          out.track = freeTrack(occupied, 'video', cc.track, out.start, out.start + out.duration,
+            (t,k) => isLocked(t,k) || occupied.some(c => c.type !== 'audio' && c.track === t));
+          if (out.track !== null) hiddenTracks.add(out.track);
+        }
+        if (out.track === null) throw new Error('No free unlocked video track with the required visibility to unnest into.');
+        if (out.type === 'video' && !sound) out.embeddedAudio = false;
+        if (sound) {
+          const mix = childMix(soundTrack, sound);
+          if (!editor.reserveTrackMix(soundTrack === -64 ? -64 : out.track, mix, occupied, addedMixes)) {
             // Keep the picture in place and give its sound a compatible audio lane.
             out.linkGroup ||= uid();
             const sound = {...out, type:'audio', id:uid()};
             placeSound(sound, -1, occupied, mix);
             out.embeddedAudio = false;
             expanded.push(out, sound);
-            continue;
+            return;
           }
         }
       }
       expanded.push(out);
     }
+    const childMedia = new Map(child.media.map(m => [m.id,m]));
+    function expandWindow(picture, sound) {
+      for (const cc of child.clips || []) {
+        const showPicture = picture && cc.type !== 'audio';
+        const playSound = sound && (cc.type === 'audio' || (cc.type === 'video' && cc.embeddedAudio !== false &&
+          editor.hasSound(childMedia.get(cc.mediaId), child)));
+        if (showPicture || playSound) expandChild(cc, showPicture ? picture : sound, showPicture, playSound && sound);
+      }
+    }
+    const sounds = new Set(outerClips.filter(c => c.type === 'audio'));
+    for (const picture of outerClips.filter(c => c.type === 'video')) {
+      // Keep the original embedded clips for coextensive V+A pairs. Independent cuts
+      // (including a J- or L-cut) must use the window and clock of their own component.
+      const paired = picture.embeddedAudio === false && [...sounds].find(c => c.start === picture.start &&
+        c.duration === picture.duration && c.in === picture.in && (c.speed || 1) === (picture.speed || 1) &&
+        !!c.reverse === !!picture.reverse && (c.enabled !== false) === (picture.enabled !== false));
+      if (paired) sounds.delete(paired);
+      expandWindow(picture, paired || (picture.embeddedAudio !== false && picture));
+    }
+    for (const sound of sounds) expandWindow(null, sound);
 
     if (!expanded.length) throw new Error('This nested clip has no content within its trimmed range.');
 
     editor.editProject(next => {
+      for (const track of hiddenTracks) {
+        next.trackState ||= {};
+        const key = 'video:'+track;
+        next.trackState[key] = {...next.trackState[key], hidden:true};
+      }
       if (Object.keys(addedMixes).length) next.trackMix = {...next.trackMix, ...addedMixes};
       if (addedMedia.length) next.media.push(...addedMedia);
       next.clips = next.clips.filter(c => !outerIds.has(c.id));
