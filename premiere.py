@@ -577,8 +577,13 @@ def _native_fade_keys(item, clips, fps, has_sound):
             knots.append(duration * head / (head + tail))
         times = {0, length, *(max(0, min(length, (k-origin)/rate)) for k in knots)}
         base = float(item.get(key, 100))
+        # The native writer rounds local times. An endpoint wins its bucket so
+        # its gain is evaluated at the actual clip boundary.
+        native_times = {round(t, 5): t for t in sorted(times)}
+        for endpoint in (0, length):
+            native_times[round(endpoint, 5)] = endpoint
         points = []
-        for time in sorted(times):
+        for time in native_times.values():
             t = origin + time * rate
             gain = max(0, min(1, t/head if head else 1, (duration-t)/tail if tail else 1))
             points.append({'time': time, 'value': base*gain})

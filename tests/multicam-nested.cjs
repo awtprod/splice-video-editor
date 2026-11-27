@@ -235,7 +235,7 @@ async function testNestedSequences(page, files, directory) {
       for (const clip of p.clips) Object.assign(clip, {reverse:true, in:.4, duration:3});
       const child = p.media.find(m => m.id === outer.mediaId).nestedProject;
       Object.assign(child.clips.find(c => c.start === 2), {reverse:true, fadeOut:2});
-      Object.assign(child.clips.find(c => c.start === 0), {transition:'fade', transitionDuration:.8});
+      Object.assign(child.clips.find(c => c.start === 0), {transition:'fade', transitionDuration:.8, fadeIn:1});
     });
     return SpliceNested.unnestClip(clipId).sort((a,b) => a.start-b.start)
       .map(c => [c.start, c.duration, c.reverse, Number(c.in.toFixed(2)), c.pictureDip || null]);
@@ -244,7 +244,7 @@ async function testNestedSequences(page, files, directory) {
   const whole = await decoded('reversed-flat');
   await page.evaluate(() => {
     for (const [key, cut] of [['fadeClock', .8], ['pictureDip', 2.6]]) {
-      Editor.select(Editor.get().project.clips.find(c => c[key]).id);
+      Editor.select(Editor.get().project.clips.find(c => c[key] && c.start <= cut && cut < c.start + c.duration).id);
       Editor.seek(cut);
       Editor.split();
     }
@@ -254,7 +254,7 @@ async function testNestedSequences(page, files, directory) {
   const edits = await page.evaluate(() => {
     const results = [];
     for (const [key, cut] of [['fadeClock', .8], ['pictureDip', 2.6]]) {
-      const clip = Editor.get().project.clips.find(c => c[key]);
+      const clip = Editor.get().project.clips.find(c => c[key] && c.start <= cut && cut < c.start + c.duration);
       Editor.select(clip.id);
       Editor.seek(cut);
       Editor.split();
@@ -272,6 +272,38 @@ async function testNestedSequences(page, files, directory) {
   assert.ok(Math.abs(edits[0][0] - .52) < 1e-6 && edits[0][1] === 2 && !edits[0][2]);
   assert.ok(Math.abs(edits[1][0] - .72) < 1e-6);
 
+  const clocksAfterEdit = await page.evaluate(() => {
+    const id = Editor.get().project.clips.find(c => c.pictureDip && c.fadeClock).id;
+    return [{fadeOut:.24}, {transition:'none'}].map(patch => {
+      Editor.updateClip(id, patch);
+      const edited = Editor.get().project.clips.find(c => c.id === id);
+      const clocks = [!!edited.pictureDip, !!edited.fadeClock];
+      Editor.undo();
+      return clocks;
+    });
+  });
+  assert.deepEqual(clocksAfterEdit, [[true, false], [false, true]]);
+  const resetTime = 2.92;
+  const faded = await programColor(page, resetTime);
+  await page.evaluate(() => {
+    const clip = Editor.get().project.clips.find(c => c.pictureDip && c.fadeClock);
+    Editor.resetClip(clip.id);
+    const reset = Editor.get().project.clips.find(c => c.id === clip.id);
+    if ('pictureDip' in reset || 'fadeClock' in reset) throw Error('Reset retained a nested fade clock');
+  });
+  const restored = await programColor(page, resetTime);
+  assert.equal(dominantColor(restored), 'blue');
+  assert.ok(faded[2] < restored[2] * .8, 'reset removes the reversed picture dip');
+  await decoded('reversed-reset', ['wav']);
+  const level = (file, time) => {
+    const samples = readPcm(path.join(directory, file)).subarray(Math.round(time*48000), Math.round((time+.04)*48000));
+    return Math.sqrt(samples.reduce((sum, v) => sum + v*v, 0) / samples.length);
+  };
+  const full = level('reversed-reset.wav', 2);
+  assert.ok(full > 100 && Math.abs(level('reversed-reset.wav', resetTime) / full - 1) < .05);
+  assert.ok(level('reversed-flat.wav', resetTime) < full * .5, 'reset restores full camera sound');
+  await page.evaluate(() => Editor.undo());
+
   await page.evaluate(() => {
     Editor.undo();
     Editor.editProject(p => {
@@ -281,9 +313,9 @@ async function testNestedSequences(page, files, directory) {
       child.clips = child.clips.filter(c => c.start === 0);
     });
   });
-  async function decoded(label) {
+  async function decoded(label, codecs = ['prores', 'wav']) {
     const hashes = [];
-    for (const codec of ['prores', 'wav']) {
+    for (const codec of codecs) {
       const job = await page.evaluate(codec => Editor.exportVideo({codec, limiter:false}), codec);
       const response = await page.request.get(new URL(job.downloadURL, page.url()).href);
       assert.equal(response.status(), 200);

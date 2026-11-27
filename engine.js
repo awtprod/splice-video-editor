@@ -1652,8 +1652,12 @@
     const group = clip.linkGroup || uid();
     const sound = {id: uid(), mediaId: clip.mediaId, type: "audio", track, start: clip.start,
       duration: clip.duration, in: clip.in, title: "", volume: clip.volume ?? 100, transition: "none", linkGroup: group};
-    for (const key of ["speed", "reverse", "pan", "fadeIn", "fadeOut", "audioStream"])
+    for (const key of ["speed", "reverse", "pan", "fadeIn", "fadeOut", "audioStream", "fadeClock"])
       if (key in clip) sound[key] = clip[key];
+    if (clip.pictureDip) {
+      sound.pictureDip = cloneState(clip.pictureDip);
+      if (clip.transitionMatchName) sound.transitionMatchName = clip.transitionMatchName;
+    }
     if (clip.keyframes?.volume) {
       sound.keyframes = {volume: cloneState(clip.keyframes.volume)};
       delete clip.keyframes.volume;
@@ -1665,7 +1669,7 @@
     }
     clip.embeddedAudio = false;
     clip.linkGroup = group;
-    for (const key of ["pan", "fadeIn", "fadeOut"]) delete clip[key];
+    for (const key of ["pan", "fadeIn", "fadeOut", "fadeClock"]) delete clip[key];
     source.clips.push(sound);
     return sound;
   }
@@ -1909,7 +1913,7 @@
     Editor.editProject((next) => {
       const target = next.clips.find((c) => c.id === id);
       for (const key of ["pan", "opacity", "transform", "keyframes", "fadeIn", "fadeOut", "transitionBefore",
-        "transitionDuration", "transitionMatchName"]) delete target[key];
+        "transitionDuration", "transitionMatchName", "pictureDip", "fadeClock"]) delete target[key];
       target.volume = 100;
       target.transition = "none";
       if (target.type === "video") target.color = {brightness: 100, contrast: 100, saturation: 100};
@@ -2282,7 +2286,9 @@
       if ('track' in patch && (!Number.isInteger(patch.track) || Math.abs(patch.track)>64 ||
           (clip.type==='audio' ? patch.track>=0 : patch.track<=0))) throw Error('Choose a valid timeline track.');
       ensureEditable(clip, "track" in patch ? Number(patch.track) : clip.track);
-      if (Object.entries(patch).every(([key,value]) => sameValue(clip[key],value))) return;
+      const clearDip = clip.pictureDip && ('transition' in patch || 'transitionDuration' in patch);
+      const clearFadeClock = clip.fadeClock && ('fadeIn' in patch || 'fadeOut' in patch);
+      if (!clearDip && !clearFadeClock && Object.entries(patch).every(([key,value]) => sameValue(clip[key],value))) return;
       const linkedFields=["start","duration","in","speed","reverse"];
       // A trim through updateClip (a new duration) takes the partners at the edge it moves.
       const trimmed="duration" in patch && !sameValue(clip.duration,patch.duration);
@@ -2314,6 +2320,8 @@
         for(const change of changes){
           const target=next.clips.find(c=>c.id===change.id), original={...target};
           Object.assign(target,change.patch);
+          if (target.id === id && clearDip) delete target.pictureDip;
+          if (target.id === id && clearFadeClock) delete target.fadeClock;
           if (change.patch.transition==='none') {
             delete target.transitionBefore;
             delete target.transitionMatchName;

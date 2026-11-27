@@ -306,6 +306,21 @@ class MulticamNestedExportTests(unittest.TestCase):
         self.assertEqual(len(native_pcm), len(pcm))
         self.assertLess(max(abs(a-b) for a, b in zip(pcm, native_pcm)), 1e-6)
 
+    def test_eightfold_reversed_fade_out_reopens_with_exact_endpoint(self):
+        clip = dict(id='rise', type='audio', track=-1, mediaId='green', start=0,
+                    duration=.12, reverse=True, speed=8, fadeOut=.96, **{'in': 0},
+                    fadeClock=dict(origin=.96, rate=-8, duration=.96))
+        project = dict(name='Fast reversed fade', width=W, height=H, fps=FPS, media=self.media, clips=[clip])
+        path = self.directory / 'fast-fade.prproj'
+        path.write_bytes(save_project(project))
+        audio, = open_project(path.read_bytes())['clips']
+        self.assertTrue(audio['reverse'])
+        self.assertEqual(audio['speed'], 8)
+        points = audio['keyframes']['volume']
+        self.assertEqual([p['time'] for p in points], [0, .12])
+        self.assertAlmostEqual(points[0]['value'], 100 / (48000 * .96), places=5)
+        self.assertEqual(points[-1]['value'], 100)
+
     def test_retimed_dip_camera_sound_and_lower_layer(self):
         clip = self._vclip('dip', 'red', 0, 1, track=2,
                            pictureDip=dict(origin=.25, rate=.5, duration=1))
