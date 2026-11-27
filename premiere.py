@@ -553,6 +553,57 @@ def _merged_track_states(states):
     return merged
 
 
+def _native_fade_keys(item, clips, fps, has_sound):
+    """Map a decomposed clip's local clock to Premiere's linear automation."""
+    from render_movie import AUDIO_RATE, _fade_clock
+    keys = dict(item.get('keyframes') or {})
+    length = float(item['duration'])
+    dip = item.get('pictureDip')
+    fades = item.get('fadeIn', 0) or item.get('fadeOut', 0)
+
+    def envelope(key, clock, frequency, head, tail):
+        origin, rate, duration = clock
+        if frequency == AUDIO_RATE:
+            origin = round(origin * frequency) / frequency
+        if rate < 0:
+            origin -= 1 / frequency
+        if not all(isinstance(fade, (int, float)) and math.isfinite(fade) and fade >= 0 for fade in (head, tail)):
+            raise ValueError('Invalid audio fade')
+        head, tail = min(head, duration), min(tail, duration)
+        if keys.get(key):
+            raise ValueError(f'Premiere cannot combine retimed fades and existing {key} automation.')
+        knots = [0, head, duration-tail, duration]
+        if head + tail > duration:
+            knots.append(duration * head / (head + tail))
+        times = {0, length, *(max(0, min(length, (k-origin)/rate)) for k in knots)}
+        base = float(item.get(key, 100))
+        points = []
+        for time in sorted(times):
+            t = origin + time * rate
+            gain = max(0, min(1, t/head if head else 1, (duration-t)/tail if tail else 1))
+            points.append({'time': time, 'value': base*gain})
+        keys[key] = points
+
+    if fps <= 0:
+        raise ValueError('Invalid sequence frame rate')
+    if dip:
+        clock = _fade_clock(item, 'pictureDip')
+        if item['type'] != 'audio':
+            if any(c['type'] != 'audio' and c.get('enabled', True) and c['track'] < item['track']
+                   and c['start'] < item['start'] + length and c['start'] + c['duration'] > item['start']
+                   for c in clips):
+                raise ValueError('Premiere opacity automation cannot preserve a retimed dip over a lower layer.')
+            envelope('opacity', clock, fps, clock[2], 0)
+        if has_sound:
+            if fades or item.get('transitionMatchName') == 'Constant Power':
+                raise ValueError('Premiere cannot preserve this combined or constant-power retimed audio fade.')
+            envelope('volume', clock, AUDIO_RATE, clock[2], 0)
+    if has_sound and item.get('fadeClock') and fades:
+        envelope('volume', _fade_clock(item, 'fadeClock'), AUDIO_RATE,
+                 item.get('fadeIn', 0), item.get('fadeOut', 0))
+    return {**item, 'keyframes': keys, 'fadeIn': 0, 'fadeOut': 0}
+
+
 def save_project(data):
     if not isinstance(data, dict):
         raise ValueError('Invalid project')
@@ -977,6 +1028,8 @@ def save_project(data):
         if source_changed or length_changed or 'premiereIndex' not in item:
             clip.out_point = py_premiere.Time.from_seconds(start + duration * speed)
             clip.end = py_premiere.Time.from_seconds(float(item.get('start', 0)) + duration)
+        if item.get('pictureDip') or item.get('fadeClock'):
+            item = _native_fade_keys(item, items, requested_fps, is_audio or companion is not None)
         if companion is not None:
             if abs(speed-companion.speed)>.000001:
                 _set_clip_speed(companion,speed)

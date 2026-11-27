@@ -81,7 +81,7 @@ async function waitForNestedPreview(page, mediaId) {
 // ---------------------------------------------------------------------------
 // 1. Native Nested Sequences
 // ---------------------------------------------------------------------------
-async function testNestedSequences(page, files) {
+async function testNestedSequences(page, files, directory) {
   await freshProjectWithMedia(page, [files.red, files.green, files.blue], 'Nest Main');
   // Place Red (0..2s) and Green (2..4s) on V1.
   const clipIds = await page.evaluate(() => {
@@ -234,15 +234,71 @@ async function testNestedSequences(page, files) {
       const outer = p.clips.find(c => c.type === 'video');
       for (const clip of p.clips) Object.assign(clip, {reverse:true, in:.4, duration:3});
       const child = p.media.find(m => m.id === outer.mediaId).nestedProject;
-      child.clips.find(c => c.start === 2).reverse = true;
+      Object.assign(child.clips.find(c => c.start === 2), {reverse:true, fadeOut:2});
       Object.assign(child.clips.find(c => c.start === 0), {transition:'fade', transitionDuration:.8});
     });
     return SpliceNested.unnestClip(clipId).sort((a,b) => a.start-b.start)
       .map(c => [c.start, c.duration, c.reverse, Number(c.in.toFixed(2)), c.pictureDip || null]);
   }, reopenedClipId);
   assert.deepEqual(reversed, [[0, 1.4, false, .6, null], [1.4, 1.6, true, .4, {origin:2, rate:-1, duration:.8}]]);
-  await page.evaluate(async id => {
+  const whole = await decoded('reversed-flat');
+  await page.evaluate(() => {
+    for (const [key, cut] of [['fadeClock', .8], ['pictureDip', 2.6]]) {
+      Editor.select(Editor.get().project.clips.find(c => c[key]).id);
+      Editor.seek(cut);
+      Editor.split();
+    }
+  });
+  assert.deepEqual(await decoded('reversed-split'), whole);
+  await page.evaluate(() => { Editor.undo(); Editor.undo(); });
+  const edits = await page.evaluate(() => {
+    const results = [];
+    for (const [key, cut] of [['fadeClock', .8], ['pictureDip', 2.6]]) {
+      const clip = Editor.get().project.clips.find(c => c[key]);
+      Editor.select(clip.id);
+      Editor.seek(cut);
+      Editor.split();
+      const right = Editor.get().project.clips.find(c => c.start === cut);
+      Editor.trimEdge(right.id, 'start', cut + .08);
+      Editor.trimEdge(right.id, 'end', right.start + right.duration - .04);
+      const trimmed = Editor.get().project.clips.find(c => c.id === right.id);
+      results.push([trimmed[key].origin, trimmed.fadeOut || 0, trimmed.keyframes?.volume]);
+      Editor.undo();
+      Editor.undo();
+      Editor.undo();
+    }
+    return results;
+  });
+  assert.ok(Math.abs(edits[0][0] - .52) < 1e-6 && edits[0][1] === 2 && !edits[0][2]);
+  assert.ok(Math.abs(edits[1][0] - .72) < 1e-6);
+
+  await page.evaluate(() => {
     Editor.undo();
+    Editor.editProject(p => {
+      const outer = p.clips.find(c => c.type === 'video');
+      for (const c of p.clips) Object.assign(c, {in:0, duration:4, reverse:false});
+      const child = p.media.find(m => m.id === outer.mediaId).nestedProject;
+      child.clips = child.clips.filter(c => c.start === 0);
+    });
+  });
+  async function decoded(label) {
+    const hashes = [];
+    for (const codec of ['prores', 'wav']) {
+      const job = await page.evaluate(codec => Editor.exportVideo({codec, limiter:false}), codec);
+      const response = await page.request.get(new URL(job.downloadURL, page.url()).href);
+      assert.equal(response.status(), 200);
+      const file = path.join(directory, label + (codec === 'wav' ? '.wav' : '.mov'));
+      fs.writeFileSync(file, await response.body());
+      hashes.push(ffmpeg(['-i', file, ...(codec === 'wav' ? ['-c:a','pcm_s24le'] : ['-an']),
+        '-f','hash','-hash','sha256','-']).toString());
+    }
+    return hashes;
+  }
+  const padded = await decoded('padded-nest');
+  await page.evaluate(id => SpliceNested.unnestClip(id), reopenedClipId);
+  assert.deepEqual(await decoded('padded-flat'), padded);
+  await page.evaluate(() => { Editor.undo(); Editor.undo(); });
+  await page.evaluate(async id => {
     await SpliceNested.enter(id);
     Editor.editProject(p => { p.clips = []; });
     SpliceNested.exit();
@@ -1063,7 +1119,7 @@ async function main() {
           }
         }), kind), kind === 'cycle' ? /Circular/ : /four levels/);
       }
-      await testNestedSequences(page, files);
+      await testNestedSequences(page, files, splice.temp);
       await testMulticam(page, files);
       await testAudioParity(page, files);
       await testUnnestMix(page, files);

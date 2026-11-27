@@ -643,7 +643,14 @@ window.SpliceNested = (() => {
     }
     for (const sound of sounds) expandWindow(null, sound);
 
-    if (!expanded.length) throw new Error('This nested clip has no content within its trimmed range.');
+    const last = outerClips.reduce((a,b) => a.start+a.duration >= b.start+b.duration ? a : b);
+    const end = last.start + last.duration;
+    const delivered = [...shifted, ...expanded].reduce((out,c) => Math.max(out, c.start+c.duration), last.start);
+    if (end - delivered > .5/fps) {
+      // A disabled graphic needs no source footage, even for a completely empty child.
+      expanded.push({id:uid(), type:'title', title:'', track:pictureOuter?.track || 1,
+        start:delivered, duration:end-delivered, in:0, enabled:false});
+    }
 
     editor.editProject(next => {
       if (inserted) {
@@ -670,7 +677,7 @@ window.SpliceNested = (() => {
       next.clips = next.clips.filter(c => !outerIds.has(c.id));
       next.clips.push(...expanded);
     });
-    editor.select(expanded[0].id);
+    editor.select(expanded[0]?.id || null);
     return expanded;
   }
 

@@ -277,6 +277,47 @@ class MulticamNestedExportTests(unittest.TestCase):
         self.assertEqual(media['name'], 'blue.mov')
         self.assertAlmostEqual(picture['in'], .4)
 
+    def test_retimed_fades_reopen_as_native_automation(self):
+        clips = [self._vclip('dip', 'red', 0, 1, reverse=True, embeddedAudio=False,
+                             pictureDip=dict(origin=1, rate=-1, duration=1)),
+                 dict(id='rise', type='audio', track=-1, mediaId='green', start=0,
+                      duration=1, reverse=True, fadeOut=1, **{'in': 0},
+                      fadeClock=dict(origin=1, rate=-1, duration=1))]
+        project = dict(name='Native retimed fades', width=W, height=H, fps=FPS, media=self.media, clips=clips)
+        reopened = open_project(save_project(project))
+        for kind, key in [('audio', 'volume'), ('video', 'opacity')]:
+            clip = next(c for c in reopened['clips'] if c['type'] == kind)
+            keys = clip['keyframes'][key]
+            self.assertTrue(clip['reverse'])
+            for point in keys:
+                expected = (min(1, point['time'] + 1/48000) if kind == 'audio' else
+                            max(0, 1 - point['time'] - 1/FPS))
+                self.assertAlmostEqual(point['value'], 100*expected, delta=.001)
+            self.assertEqual((keys[0]['time'], keys[-1]['time']), (0, 1))
+
+        before, after = (self._render(p, name) for name, p in [('flat', project), ('reopen', reopened)])
+        frames, native_frames = frames_rgb(before), frames_rgb(after)
+        self.assertEqual(len(native_frames), len(frames))
+        for frame, native_frame in zip(frames, native_frames):
+            # FFmpeg's RGB fade and its alpha-over-black path quantize separately.
+            self.assertLessEqual(max(abs(a-b) for a, b in zip(mean_rgb(frame), mean_rgb(native_frame))), 3)
+        pcm, native_pcm = (left_channel(self._render(p, name, 'wav'))
+                           for name, p in [('flat', project), ('reopen', reopened)])
+        self.assertEqual(len(native_pcm), len(pcm))
+        self.assertLess(max(abs(a-b) for a, b in zip(pcm, native_pcm)), 1e-6)
+
+    def test_retimed_dip_camera_sound_and_lower_layer(self):
+        clip = self._vclip('dip', 'red', 0, 1, track=2,
+                           pictureDip=dict(origin=.25, rate=.5, duration=1))
+        project = dict(name='Trimmed dip', width=W, height=H, fps=FPS, media=self.media, clips=[clip])
+        reopened = open_project(save_project(project))
+        for kind, key in [('audio', 'volume'), ('video', 'opacity')]:
+            component = next(c for c in reopened['clips'] if c['type'] == kind)
+            self.assertEqual(component['keyframes'][key], [{'time': 0, 'value': 25}, {'time': 1, 'value': 75}])
+        project['clips'].append(self._vclip('under', 'blue', 0, 1))
+        with self.assertRaisesRegex(ValueError, 'dip over a lower layer'):
+            save_project(project)
+
     def test_premiere_reports_cascaded_pan_only_for_tracks_in_use(self):
         project = dict(name='Nested mix', width=W, height=H, fps=FPS, media=self.media,
                        clips=[self._vclip('cut', 'blue', 0, 1, embeddedAudio=False)],

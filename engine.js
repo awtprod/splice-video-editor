@@ -1108,7 +1108,14 @@
     }
     return cropped;
   }
+  function shiftFadeClocks(clip, original, shift) {
+    for (const key of ['pictureDip', 'fadeClock']) {
+      const clock = original?.[key];
+      if (clock) clip[key] = {...clock, origin:clock.origin + shift*clock.rate};
+    }
+  }
   function resizeKeyframes(clip, original, shift) {
+    shiftFadeClocks(clip, original, shift);
     if (!original?.keyframes) return;
     clip.keyframes = Math.abs(shift)<1e-6 && Math.abs(original.duration-clip.duration)<1e-6 ?
       structuredClone(original.keyframes) : clipKeyframeWindow(original.keyframes,shift,shift+clip.duration);
@@ -1129,9 +1136,11 @@
     const right={...structuredClone(clip),id:uid(),start:cut,duration:duration-offset,
       in:clip.reverse?clip.in:clip.in+offset*speed,transition:'none'};
     for (const key of ['premiereTrack','premiereIndex','transitionBefore','transitionDuration','transitionMatchName']) delete right[key];
+    shiftFadeClocks(right, clip, offset);
+    if (clip.pictureDip && clip.transitionMatchName) right.transitionMatchName = clip.transitionMatchName;
     const keys=structuredClone(clip.keyframes||{});
     const fadeIn=clamp(Number(clip.fadeIn)||0,0,duration), fadeOut=clamp(Number(clip.fadeOut)||0,0,duration);
-    if (offset<fadeIn || offset>duration-fadeOut) {
+    if (!clip.fadeClock && (offset<fadeIn || offset>duration-fadeOut)) {
       if (keys.volume?.length) throw new Error('Move the cut outside the combined fade and gain automation.');
       const gain=clip.volume??100;
       const times=[0, duration, Math.min(fadeIn,duration), Math.max(0,duration-fadeOut)];
@@ -1141,8 +1150,10 @@
       clip.fadeIn=0;
       right.fadeOut=0;
     }
-    clip.fadeOut=0;
-    right.fadeIn=0;
+    if (!clip.fadeClock) {
+      clip.fadeOut=0;
+      right.fadeIn=0;
+    }
     if (Object.values(keys).some(points=>points.length)) {
       clip.keyframes=clipKeyframeWindow(keys,0,offset);
       right.keyframes=clipKeyframeWindow(keys,offset,duration);
@@ -2313,7 +2324,7 @@
               const ratio=target.duration/original.duration;
               target.keyframes=Object.fromEntries(Object.entries(original.keyframes).map(([key,points])=>
                 [key,points.map(point=>({...point,time:point.time*ratio}))]));
-            } else resizeKeyframes(target,original,0);
+            } else resizeKeyframes(target,original,edge === "start" ? target.start-original.start : 0);
           }
         }
       });
