@@ -14,24 +14,13 @@ window.SpliceNested = (() => {
   function subtreeDepth(project, seen = new Set()) {
     if (!project || !Array.isArray(project.media)) return 0;
     let best = 0;
-    for (const item of project.media) {
-      if (!item?.nestedProject) continue;
-      const key = typeof item.nestedSequence === 'string' ? item.nestedSequence : 'p:' + item.nestedSequence;
-      if (seen.has(key)) throw new Error('Circular nested sequence reference.');
-      const next = new Set(seen);
-      next.add(key);
-      best = Math.max(best, 1 + subtreeDepth(item.nestedProject, next));
-    }
+    for (const item of project.media) best = Math.max(best, mediaDepth(item, seen));
     return best;
   }
 
   function mediaDepth(item, seen = new Set()) {
     if (!item?.nestedProject) return 0;
-    const key = typeof item.nestedSequence === 'string' ? item.nestedSequence : 'p:' + item.nestedSequence;
-    if (seen.has(key)) throw new Error('Circular nested sequence reference.');
-    const next = new Set(seen);
-    next.add(key);
-    return 1 + subtreeDepth(item.nestedProject, next);
+    return 1 + subtreeDepth(item.nestedProject, window.Editor.nestedAncestors(item, seen));
   }
 
   function nextSequenceName(project) {
@@ -506,9 +495,22 @@ window.SpliceNested = (() => {
     const linkRemap = new Map();
     const expanded = [];
     const workingClips = project.clips.filter(c => !outerIds.has(c.id));
-    const isLocked = (t, k) => editor.isTrackLocked?.(t, k);
     const addedMixes = {};
-    const hiddenTracks = new Set();
+    const pictureOuter = outerClips.find(c => c.type === 'video');
+    const layers = [...new Set(child.clips.filter(c => c.type !== 'audio').map(c => c.track))].sort((a,b) => a-b);
+    // Insert child layers at the nest's position. Keep an extra parent lane if its
+    // visibility differs, so other edits on that lane keep their settings.
+    const slot = pictureOuter?.track;
+    const hiddenLayer = track => !!pictureOuter && (editor.isTrackHidden(slot, 'video') ||
+      editor.isTrackHidden(track, 'video', child));
+    const reuseSlot = pictureOuter && layers.length && hiddenLayer(layers[0]) === editor.isTrackHidden(slot, 'video');
+    const inserted = pictureOuter ? Math.max(0, layers.length - (reuseSlot ? 1 : 0)) : 0;
+    const parentLane = track => inserted && track > slot ? track + inserted : track;
+    const childLane = track => slot + layers.indexOf(track) + (reuseSlot ? 0 : 1);
+    const hiddenTracks = layers.filter(hiddenLayer).map(childLane);
+    const shifted = workingClips.map(c => c.type === 'audio' ? c : {...c, track:parentLane(c.track)});
+    if (shifted.some(c => c.track > 64) || (pictureOuter && slot + inserted > 64))
+      throw new Error('Unnesting would exceed the 64 video track limit.');
     const childSolo = Object.values(child.trackMix || {}).some(m => m.solo);
     const parentSolo = Object.values(project.trackMix || {}).some(m => m.solo);
     function childMix(track, outerSound) {
@@ -516,6 +518,7 @@ window.SpliceNested = (() => {
       const outerMix = project.trackMix?.[outerSound.track] || {};
       const gain = (mix.gain ?? 100) * (outerMix.gain ?? 100) / 100;
       const stages = [...(mix.outputStages || [])];
+      if (outerSound.volume != null && outerSound.volume !== 100) stages.push({gain:outerSound.volume, pan:0});
       // A second stereo pan cannot be represented by adding the pan angles. A gain
       // above the fader's 200% limit likewise needs its original second stage.
       if (outerMix.pan || gain > 200) stages.push({gain:gain > 200 ? outerMix.gain : 100, pan:outerMix.pan || 0});
@@ -548,36 +551,65 @@ window.SpliceNested = (() => {
       out.duration = newDuration;
       if (!out.reverse) out.in = (Number(out.in) || 0) + trimHead * cSpeed;
       else out.in = (Number(out.in) || 0) + (cc.start + cc.duration - ovEnd) * cSpeed;
+      if (outer.reverse || trimHead || ovEnd < cc.start + cc.duration || speed !== 1) {
+        const tail = ovEnd - cc.start;
+        const keys = cc.keyframes || {};
+        const fade = cc.transition === 'fade' ? Math.min(cc.duration,
+          (cc.transitionDuration ?? .5) - (cc.transitionBefore || 0)) : 0;
+        if (cc.pictureDip) {
+          out.pictureDip.origin += out.pictureDip.rate*(outer.reverse ? tail : trimHead);
+          out.pictureDip.rate *= outer.reverse ? -speed : speed;
+        } else if (fade > 0) {
+          out.transition = 'none';
+          delete out.transitionBefore;
+          out.pictureDip = {duration:fade, origin:outer.reverse ? tail : trimHead,
+            rate:outer.reverse ? -speed : speed};
+        }
+        if (cc.fadeIn || cc.fadeOut || cc.fadeClock) {
+          const clock = cc.fadeClock || {origin:0, rate:1, duration:cc.duration};
+          out.fadeClock = {duration:clock.duration,
+            origin:clock.origin + clock.rate*(outer.reverse ? tail : trimHead),
+            rate:clock.rate*(outer.reverse ? -speed : speed)};
+        }
+        if (Object.keys(keys).length) {
+          out.keyframes = {};
+          for (const [key,points] of Object.entries(keys)) {
+            const step = outer.reverse ? (key === 'volume' ? 1/48000 : 1/fps) : 0;
+            const curve = editor.clipKeyframeWindow({[key]:points}, trimHead-step, tail-step)[key];
+            if (!curve) continue;
+            if (outer.reverse) curve.reverse();
+            out.keyframes[key] = curve.map(p => ({time:Math.max(0, (outer.reverse ? tail-trimHead-p.time : p.time)/speed), value:p.value}));
+          }
+        }
+      }
       if (outer.reverse) out.reverse = !cc.reverse;
       if (speed !== 1) out.speed = cSpeed * speed;
-      if (outer.enabled === false) out.enabled = false;
+      if (outer.enabled === false || outer.disabled === true) out.enabled = false;
       delete out.premiereIndex;
       delete out.premiereTrack;
       if (out.linkGroup) {
         if (!linkRemap.has(out.linkGroup)) linkRemap.set(out.linkGroup, uid());
         out.linkGroup = linkRemap.get(out.linkGroup);
       }
-      const occupied = [...workingClips, ...expanded];
+      const occupied = [...shifted, ...expanded];
       const soundTrack = sound && editor.separateMulticamSound(cc, child) ? -64 : cc.track;
       if (!picture) {
         out.type = 'audio';
         delete out.embeddedAudio;
         placeSound(out, cc.type === 'audio' ? cc.track : -1, occupied, childMix(soundTrack, sound));
       } else {
-        const hidden = editor.isTrackHidden(outer.track, 'video') || editor.isTrackHidden(cc.track, cc.type, child);
-        const available = (t, k) => isLocked(t,k) || hidden !== (hiddenTracks.has(t) || editor.isTrackHidden(t,k));
-        out.track = freeTrack(occupied, 'video', cc.track, out.start, out.start + out.duration, available);
-        if (out.track === null && hidden) {
-          // Hide only an empty lane. A parent clip outside this edit must keep its picture.
-          out.track = freeTrack(occupied, 'video', cc.track, out.start, out.start + out.duration,
-            (t,k) => isLocked(t,k) || occupied.some(c => c.type !== 'audio' && c.track === t));
-          if (out.track !== null) hiddenTracks.add(out.track);
+        out.track = childLane(cc.track);
+        const opacity = (outer.opacity ?? 100) / 100;
+        if (opacity !== 1) {
+          out.opacity = (out.opacity ?? 100) * opacity;
+          for (const point of out.keyframes?.opacity || []) point.value *= opacity;
         }
-        if (out.track === null) throw new Error('No free unlocked video track with the required visibility to unnest into.');
         if (out.type === 'video' && !sound) out.embeddedAudio = false;
         if (sound) {
           const mix = childMix(soundTrack, sound);
-          if (!editor.reserveTrackMix(soundTrack === -64 ? -64 : out.track, mix, occupied, addedMixes)) {
+          const bus = soundTrack === -64 ? -64 : out.track;
+          if (bus > slot && bus <= slot + inserted && !addedMixes[bus]) addedMixes[bus] = mix;
+          if (!editor.reserveTrackMix(bus, mix, occupied, addedMixes)) {
             // Keep the picture in place and give its sound a compatible audio lane.
             out.linkGroup ||= uid();
             const sound = {...out, type:'audio', id:uid()};
@@ -614,6 +646,20 @@ window.SpliceNested = (() => {
     if (!expanded.length) throw new Error('This nested clip has no content within its trimmed range.');
 
     editor.editProject(next => {
+      if (inserted) {
+        for (const c of next.clips) if (c.type !== 'audio') c.track = parentLane(c.track);
+        for (const prop of ['trackState', 'trackMix']) {
+          const entries = Object.entries(next[prop] || {}).map(([key,value]) => {
+            const parts = key.split(':');
+            const track = parentLane(Number(parts.pop()));
+            if (track > 64) throw new Error('Unnesting would exceed the 64 video track limit.');
+            return [[...parts,track].join(':'),value];
+          });
+          next[prop] = Object.fromEntries(entries);
+        }
+        if (next.trackCounts) next.trackCounts.video = Math.min(64, Math.max(slot + inserted,
+          parentLane(next.trackCounts.video)));
+      }
       for (const track of hiddenTracks) {
         next.trackState ||= {};
         const key = 'video:'+track;

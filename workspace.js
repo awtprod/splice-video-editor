@@ -211,7 +211,7 @@
     if (bin && !(window.SpliceBins ? window.SpliceBins.mediaMatchesBin(media, bin) : (bin === "@root" ? !media.bin : media.bin === bin))) return false;
     if (filter !== "all" && filter !== media.type && !(filter === "offline" && media.offline)) return false;
     const text = [media.name, media.bin, media.path, media.sourcePath, media.reel, mediaTimecode(media),
-      media.scene, media.shot, media.take, media.logNote, media.colorLabel].filter(Boolean).join(" ");
+      media.scene, media.camera, media.shot, media.take, media.logNote, media.colorLabel].filter(Boolean).join(" ");
     return !term || text.toLowerCase().includes(term);
   }
   function sortedMedia(items, project) {

@@ -231,6 +231,12 @@ def build_cut(project: dict, options: dict | None = None) -> Cut:
         event = _event(cut, clip, subclips)
         if event is not None:
             cut.events.append(event)
+            item = media_by_id.get(str(clip.get('mediaId')), {})
+            fields = [label for key, label in (('scene', 'scene'), ('shot', 'shot'), ('take', 'take'),
+                      ('logNote', 'log note'), ('colorLabel', 'label'), ('bin', 'bin'), ('camera', 'camera'))
+                      if item.get(key)]
+            if fields:
+                report.note(f"{event.name}: editorial metadata omitted: {', '.join(fields)}.")
     _timecode_policy(cut, options.get('unknownTimecode'))
     _separate_overlaps(cut)
     cut.events.sort(key=lambda e: (e.kind == 'audio', abs(e.track), e.record_in))
@@ -314,6 +320,8 @@ def _event(cut: Cut, clip: dict, subclips: dict | None = None) -> Event | None:
     if kind == 'title':
         event.text = clean(clip.get('title'), 2000)
         event.title_style = clip.get('titleStyle') if isinstance(clip.get('titleStyle'), dict) else {}
+    if clip.get('pictureDip') or clip.get('fadeClock'):
+        report.note(f'{label}: retimed fades are not carried by timeline interchange.')
     keys = clip.get('keyframes') if isinstance(clip.get('keyframes'), dict) else {}
     for key, points in keys.items():
         if key not in KEYFRAME_KEYS or not isinstance(points, list):

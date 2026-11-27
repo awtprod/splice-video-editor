@@ -59,7 +59,7 @@ CLIP_FIELDS = {
     'transform': 'written', 'transition': 'written', 'transitionDuration': 'written',
     'transitionBefore': 'written', 'transitionMatchName': 'written', 'speed': 'reported', 'reverse': 'reported',
     'keyframes': 'reported', 'color': 'reported', 'opacity': 'reported', 'fadeIn': 'reported',
-    'fadeOut': 'reported', 'pan': 'reported', 'title': 'reported', 'titleStyle': 'reported', 'text': 'reported',
+    'fadeClock': 'reported', 'pictureDip': 'reported', 'fadeOut': 'reported', 'pan': 'reported', 'title': 'reported', 'titleStyle': 'reported', 'text': 'reported',
     'markers': 'reported', 'embeddedAudio': 'reported', 'audioStream': 'reported',
     'nestedSequence': 'reported', 'multicamAngle': 'reported', 'multicamAudioAngle': 'reported',
     'colorLabel': 'reported',
@@ -80,7 +80,7 @@ MEDIA_FIELDS = {
     'offline': 'meta', 'bin': 'meta', 'thumb': 'meta', 'resolveMediaId': 'written', 'resolveAudioTracks': 'meta',
     'nativeUnsupported': 'written', 'nestedSequence': 'reported', 'nestedProject': 'reported',
     'multicam': 'reported', 'parentMediaId': 'reported', 'subclipIn': 'reported', 'subclipOut': 'reported',
-    'subclipLimits': 'meta', 'scene': 'meta', 'shot': 'meta', 'take': 'meta', 'reel': 'meta', 'logNote': 'meta',
+    'subclipLimits': 'meta', 'scene': 'meta', 'shot': 'meta', 'camera': 'meta', 'take': 'meta', 'reel': 'meta', 'logNote': 'meta',
     'colorLabel': 'meta', 'audioChannels': 'meta',
     'still': 'meta', 'width': 'meta', 'height': 'meta', 'fps': 'meta', 'size': 'meta', 'codec': 'meta',
     'audioStreams': 'meta', 'timecode': 'meta', 'proxy': 'meta', 'premiereId': 'meta', 'mediaKey': 'meta',
@@ -901,6 +901,7 @@ class Writer:
         if color.get('lut') and not _same(color.get('lut'), before_color.get('lut')):
             report.add(NOT_WRITTEN, 'Splice LUTs (Resolve grades are not written)', where)
         for field, what in (('fadeIn', 'Clip fades (Resolve fade handles are not written)'),
+                            ('pictureDip', 'Retimed picture dip'), ('fadeClock', 'Retimed audio fade'),
                             ('fadeOut', 'Clip fades (Resolve fade handles are not written)'),
                             ('markers', 'Clip markers (not written: Resolve keeps the markers its clips have)'),
                             ('title', 'Clip names changed in Splice (Resolve keeps its item names)'),

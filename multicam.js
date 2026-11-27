@@ -634,14 +634,24 @@ window.SpliceMulticam = (() => {
       }
     }
 
-    if (!produced.length) throw new Error('No angle footage overlapped the selected multicam clip(s).');
+    // Preserve the sequence out with an ordinary disabled clip when both streams run out.
+    const last = targets.reduce((a,b) => a.start+a.duration >= b.start+b.duration ? a : b);
+    const end = last.start + last.duration;
+    const delivered = [...project.clips.filter(c => !targetIds.has(c.id)), ...produced]
+      .reduce((value,c) => Math.max(value, c.start+c.duration), 0);
+    if (end - delivered > 0.5/fps) {
+      const start = Math.max(last.start, delivered);
+      const angle = mediaById.get(last.mediaId).multicam.angles[0];
+      produced.push({id:uid(), type:last.type, track:last.track, start, duration:end-start,
+        in:0, mediaId:angle.mediaId, enabled:false, embeddedAudio:false});
+    }
 
     editor.editProject(next => {
       if (Object.keys(addedMixes).length) next.trackMix = {...next.trackMix, ...addedMixes};
       next.clips = next.clips.filter(c => !targetIds.has(c.id));
       next.clips.push(...produced);
     });
-    editor.select(produced[0].id);
+    if (produced.length) editor.select(produced[0].id);
     ensureGrid(editor.get());
     return produced;
   }

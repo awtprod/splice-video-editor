@@ -682,9 +682,16 @@
     const mix = trackSettings(clip.track);
     if (mutedTracks.audio || mix.mute || (soloActive() && !mix.solo)) return 0;
     const local = time - clip.start;
-    const fadeIn = clamp(Number(clip.fadeIn)||0,0,clip.duration);
-    const fadeOut = clamp(Number(clip.fadeOut)||0,0,clip.duration);
-    let fade = Math.min(1, fadeIn ? local/fadeIn : 1, fadeOut ? (clip.duration-local)/fadeOut : 1);
+    const fadeLength = clip.fadeClock?.duration ?? clip.duration;
+    const fadeTime = clip.fadeClock ? clip.fadeClock.origin + clip.fadeClock.rate*local : local;
+    const fadeIn = clamp(Number(clip.fadeIn)||0,0,fadeLength);
+    const fadeOut = clamp(Number(clip.fadeOut)||0,0,fadeLength);
+    let fade = Math.min(1, fadeIn ? fadeTime/fadeIn : 1, fadeOut ? (fadeLength-fadeTime)/fadeOut : 1);
+    if (clip.pictureDip) {
+      const {origin,rate,duration} = clip.pictureDip;
+      const level = clamp((origin + rate*local)/duration, 0, 1);
+      fade *= clip.transitionMatchName === 'Constant Power' ? Math.sin(Math.PI*level/2) : level;
+    }
     if(['dissolve','wipe','fade'].includes(clip.transition)) fade*=audioTransitionGain(clip,(time-clip.start+transitionBefore(clip))/transitionLength(clip));
     const next=followingTransition(clip);
     if(next) fade*=audioTransitionGain(next,1-(time-next.start+transitionBefore(next))/transitionLength(next));
@@ -1151,6 +1158,10 @@
   function paintVideo(ctx,element,clip,canvas,alpha=1,brightness=1) {
     if (!element || (element instanceof HTMLVideoElement && element.readyState < 2)) return;
     if (!multicamAngleActive(clip, time)) return;
+    if (clip.pictureDip) {
+      const {origin, rate, duration} = clip.pictureDip;
+      brightness *= clamp((origin + rate * (time - clip.start) - (rate < 0 ? 1/project.fps : 0)) / duration, 0, 1);
+    }
     const color=clip.color||{}, lut=color.lutIntensity===0?null:color.lut;
     const gains=gradeGains(color);
     const graded=gains.some(g=>Math.abs(g-1)>.0001);
@@ -1391,6 +1402,16 @@
   }
   // LUT tables are immutable once validated; skip re-checking 100k samples on every edit.
   const validatedLuts = new WeakSet();
+  function nestedAncestors(item, seen) {
+    const id = item.nestedSequence;
+    const named = Number.isInteger(id) || (typeof id === 'string' && id.length > 0);
+    if (seen.has(item.nestedProject) || (named && seen.has(id)))
+      throw new Error("Circular nested sequence reference.");
+    const next = new Set(seen);
+    next.add(item.nestedProject);
+    if (named) next.add(id);
+    return next;
+  }
   function validateProject(value, depth = 0, seen = new Set()) {
     if (depth > 4) throw new Error("This project nests sequences more than four levels deep.");
     if (
@@ -1466,13 +1487,8 @@
         mediaIds.has(item.id)
       )
         throw new Error("This project file has invalid media.");
-      if ((Number.isInteger(item.nestedSequence) || (typeof item.nestedSequence === "string" && item.nestedSequence)) && item.nestedProject != null) {
-        const seqKey = typeof item.nestedSequence === "string" ? item.nestedSequence : "p:" + item.nestedSequence;
-        if (seen.has(seqKey)) throw new Error("Circular nested sequence reference.");
-        const nextSeen = new Set(seen);
-        nextSeen.add(seqKey);
-        validateProject(item.nestedProject, depth + 1, nextSeen);
-      }
+      if (item.nestedProject)
+        validateProject(item.nestedProject, depth + 1, nestedAncestors(item, seen));
       if (item.multicam != null) {
         const mc = item.multicam;
         if (!mc || typeof mc !== "object" || !Array.isArray(mc.angles) || mc.angles.length < 1 || mc.angles.length > 9)
@@ -1542,6 +1558,11 @@
         throw new Error("This project file has an invalid clip.");
       if (clip.type === "title" && clip.title != null && typeof clip.title !== "string")
         throw new Error("A title in this project has invalid text.");
+      for (const clock of [clip.pictureDip, clip.fadeClock]) {
+        if (clock != null && (!Number.isFinite(clock.origin) || !Number.isFinite(clock.rate) ||
+            !clock.rate || Math.abs(clock.rate) > 16 || !Number.isFinite(clock.duration) || clock.duration <= 0))
+          throw new Error("This project file has an invalid retimed fade.");
+      }
       if (clip.keyframes != null && (typeof clip.keyframes !== "object" || Array.isArray(clip.keyframes) ||
           Object.values(clip.keyframes).some(points => !Array.isArray(points) ||
             points.some(point => !point || !Number.isFinite(point.time) || !Number.isFinite(point.value)))))
@@ -2735,7 +2756,7 @@
       atomically(() => resetClipNow(id));
     },
     atomically,
-    splitClipAt,
+    splitClipAt, clipKeyframeWindow, nestedAncestors,
     split() {
       const clip = selected() || at("video", time);
       const cut = snap(time);

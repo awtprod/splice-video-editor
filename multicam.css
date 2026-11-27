@@ -299,7 +299,7 @@
 }
 .media-badge-pill {
   position: absolute;
-  left: 5px;
+  right: 5px;
   top: 5px;
   font-size: 9px;
   font-weight: 700;
@@ -513,4 +513,3 @@
 .inspector-editorial-actions button:hover {
   background: #303a30;
 }
-

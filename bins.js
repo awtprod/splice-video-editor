@@ -511,7 +511,7 @@ window.SpliceBins = (() => {
     window.Editor.editProject(next => {
       const item = next.media.find(m => m.id === mediaId);
       if (!item) return;
-      for (const field of ['scene', 'shot', 'take', 'reel', 'logNote']) {
+      for (const field of ['scene', 'shot', 'camera', 'take', 'reel', 'logNote']) {
         if (!(field in patch)) continue;
         const val = String(patch[field] ?? '').trim();
         if (val) item[field] = val;
@@ -571,6 +571,7 @@ window.SpliceBins = (() => {
       `<div class="mc-field-row">` +
       `<label>Scene<input name="scene" type="text" value="${esc(item.scene || '')}" placeholder="e.g. 12A"></label>` +
       `<label>Shot<input name="shot" type="text" value="${esc(item.shot || '')}" placeholder="e.g. CU"></label>` +
+      `<label>Camera<input name="camera" type="text" value="${esc(item.camera || '')}" placeholder="e.g. A"></label>` +
       `</div>` +
       `<div class="mc-field-row">` +
       `<label>Take<input name="take" type="text" value="${esc(item.take || '')}" placeholder="e.g. 3"></label>` +
@@ -596,6 +597,7 @@ window.SpliceBins = (() => {
       updateMediaMetadata(mediaId, {
         scene: form.elements.scene.value,
         shot: form.elements.shot.value,
+        camera: form.elements.camera.value,
         take: form.elements.take.value,
         reel: form.elements.reel.value,
         bin: form.elements.bin.value,
@@ -620,6 +622,7 @@ window.SpliceBins = (() => {
     grid.innerHTML =
       `<label>Scene<input type="text" data-meta="scene" value="${esc(item.scene || '')}" placeholder="Scene"></label>` +
       `<label>Shot<input type="text" data-meta="shot" value="${esc(item.shot || '')}" placeholder="Shot"></label>` +
+      `<label>Camera<input type="text" data-meta="camera" value="${esc(item.camera || '')}" placeholder="Camera"></label>` +
       `<label>Take<input type="text" data-meta="take" value="${esc(item.take || '')}" placeholder="Take"></label>` +
       `<label>Reel<input type="text" data-meta="reel" value="${esc(item.reel || '')}" placeholder="Reel"></label>` +
       `<label>Color label<select data-meta="colorLabel">${colorOptions}</select></label>` +

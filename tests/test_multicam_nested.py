@@ -120,6 +120,28 @@ class MulticamNestedExportTests(unittest.TestCase):
 
     # -- 1. Native Nested Sequences --------------------------------------------------------------
 
+    def test_reversed_trimmed_dip_matches_decomposed_picture_and_pcm(self):
+        child = dict(name='Child', width=W, height=H, fps=FPS, media=self.media, clips=[
+            self._vclip('r', 'red', 0, .8, src_in=.4, transition='fade', transitionDuration=.24),
+            self._vclip('g', 'green', .8, .8, fadeIn=.32, fadeOut=.2)])
+        nest = dict(id='n', type='video', duration=1.6, nestedProject=child, nestedSequence='seq')
+        project = dict(width=W, height=H, fps=FPS, media=[nest],
+                       clips=[self._vclip('outer', 'n', 0, 1.28, src_in=.16, reverse=True)])
+        flat = dict(width=W, height=H, fps=FPS, media=self.media, clips=[
+            self._vclip('g', 'green', 0, .64, reverse=True, fadeIn=.32, fadeOut=.2,
+                        fadeClock=dict(origin=.64, rate=-1, duration=.8)),
+            self._vclip('r', 'red', .64, .64, src_in=.56, reverse=True,
+                        pictureDip=dict(origin=.8, rate=-1, duration=.24))])
+        for codec in ('prores', 'wav'):
+            before = self._render(project, 'reverse-before', codec)
+            after = self._render(flat, 'reverse-after', codec)
+            if codec == 'prores':
+                self.assertEqual(frames_rgb(before), frames_rgb(after))
+            def pcm(path):
+                return subprocess.check_output(['ffmpeg', '-v', 'error', '-i', str(path),
+                                                '-vn', '-f', 's24le', '-'], timeout=30)
+            self.assertEqual(pcm(before), pcm(after))
+
     def test_native_nested_sequence_trim_edit_and_disabled_clip(self):
         child = dict(
             name='Nested Sequence 1', width=W, height=H, fps=FPS,
@@ -491,6 +513,13 @@ class MulticamNestedExportTests(unittest.TestCase):
         self.assertEqual(ev.name, 'CamA Subclip')
         # clip.in (0.4) + subclipIn (2.0) = 2.4s exact source_in!
         self.assertAlmostEqual(float(ev.source_in), 2.4, places=6)
+        from interchange.api import export_timeline
+        sub_media.update(scene='12', take='3', logNote='good', colorLabel='red', bin='Day', camera='A')
+        for fmt in ('fcpxml', 'xmeml', 'edl', 'otio'):
+            report = export_timeline(proj, {'formats': [fmt]})['report']
+            self.assertIn('scene, take, log note, label, bin, camera', report)
+        with self.assertRaisesRegex(ValueError, 'flatten multicam.*decompose in place'):
+            export_timeline({**proj, 'clips': proj['clips'][1:]})
         joined = '\n'.join(cut.report.general)
         self.assertIn('un-flattened multicam', joined)
         self.assertIn('nested sequence', joined)

@@ -235,11 +235,12 @@ async function testNestedSequences(page, files) {
       for (const clip of p.clips) Object.assign(clip, {reverse:true, in:.4, duration:3});
       const child = p.media.find(m => m.id === outer.mediaId).nestedProject;
       child.clips.find(c => c.start === 2).reverse = true;
+      Object.assign(child.clips.find(c => c.start === 0), {transition:'fade', transitionDuration:.8});
     });
     return SpliceNested.unnestClip(clipId).sort((a,b) => a.start-b.start)
-      .map(c => [c.start, c.duration, c.reverse, Number(c.in.toFixed(2))]);
+      .map(c => [c.start, c.duration, c.reverse, Number(c.in.toFixed(2)), c.pictureDip || null]);
   }, reopenedClipId);
-  assert.deepEqual(reversed, [[0, 1.4, false, .6], [1.4, 1.6, true, .4]]);
+  assert.deepEqual(reversed, [[0, 1.4, false, .6, null], [1.4, 1.6, true, .4, {origin:2, rate:-1, duration:.8}]]);
   await page.evaluate(async id => {
     Editor.undo();
     await SpliceNested.enter(id);
@@ -613,6 +614,7 @@ async function testBinsAndMetadata(page, files) {
   await page.locator('#media-metadata-dialog').waitFor({state: 'visible'});
   await page.locator('#media-metadata-dialog input[name="scene"]').fill('12A');
   await page.locator('#media-metadata-dialog input[name="shot"]').fill('CU');
+  await page.locator('#media-metadata-dialog input[name="camera"]').fill('Camera C146');
   await page.locator('#media-metadata-dialog input[name="take"]').fill('3');
   await page.locator('#media-metadata-dialog input[name="reel"]').fill('A001');
   await page.locator('#media-metadata-dialog input[name="logNote"]').fill('Hero smile');
@@ -653,6 +655,10 @@ async function testBinsAndMetadata(page, files) {
   // Sort by Scene ascending -> 04B comes before 12A (non-empty values order predictably).
   await page.locator('.media-table-head [data-sort="scene"]').click();
   await settle(page);
+  await page.locator('#media-search').fill('C146');
+  await settle(page);
+  assert.equal(await page.locator('#library-body .media-row').count(), 1);
+  assert.match(await page.locator('#library-body .media-row').textContent(), /CamA_Red/);
   await page.locator('#media-search').fill('Hero smile');
   await settle(page);
   assert.equal(await page.locator('#library-body .media-row').count(), 1, 'search by Log Note filters to 1 matching row');
@@ -719,6 +725,16 @@ async function testViewportLayout(splice, viewport, files) {
     assert.equal(await page.evaluate(() => Editor.get().project.clips.length), 2, `${label}: clicking multicam tile cuts angle`);
 
     await capture(page, `multicam-grid-${label}.png`);
+
+    await page.evaluate(() => SpliceBins.createSubclip({name:'Badge geometry',
+      parentMediaId:Editor.get().project.media[0].id, subclipIn:0, subclipOut:1}));
+    await page.locator('#media-search').fill('Badge geometry');
+    const badge = page.locator('.media-badge-pill.subclip');
+    await badge.waitFor({state:'visible'});
+    assert.ok(await badge.evaluate(el => {
+      const a = el.getBoundingClientRect(), b = el.parentElement.querySelector('.media-icon').getBoundingClientRect();
+      return a.left >= b.right || a.right <= b.left || a.top >= b.bottom || a.bottom <= b.top;
+    }), label + ': SUB badge clears the media icon');
 
     if (viewport.width === 1024) {
       await page.locator('#media-view').click();
@@ -837,7 +853,7 @@ async function testAudioParity(page, files) {
 
 async function testUnnestMix(page, files) {
   await freshProjectWithMedia(page, [files.red, files.green], 'Unnest mix');
-  for (const scenario of ['parent gain','parent pan','boost','gain and pan','muted','child solo','parent solo','relocated','embedded']) {
+  for (const scenario of ['zero volume','parent gain','parent pan','boost','gain and pan','muted','child solo','parent solo','relocated','embedded']) {
     const nest = await page.evaluate(scenario => {
       const [camera, other] = [...Editor.get().project.media].filter(m => !m.nestedProject)
         .sort((a,b) => a.name.localeCompare(b.name));
@@ -867,6 +883,7 @@ async function testUnnestMix(page, files) {
         {gain:scenario === 'boost' ? 160 : 45, pan:55, mute:scenario === 'muted', solo:scenario === 'child solo'});
       if (scenario === 'parent solo') Editor.updateTrackMix(-2, {solo:true});
       SpliceNested.exit();
+      if (scenario === 'zero volume') Editor.editProject(p => p.clips.find(c => c.mediaId === nest.mediaId).volume = 0);
       if (['parent gain','parent pan','boost'].includes(scenario)) {
         const outer = Editor.get().project.clips.find(c => c.mediaId === nest.mediaId);
         Editor.updateTrackMix(outer.track, {gain:scenario === 'boost' ? 180 : 50, pan:scenario === 'parent pan' ? -40 : 0});
@@ -878,7 +895,7 @@ async function testUnnestMix(page, files) {
     console.log('Unnest stereo RMS:', {scenario, before, after});
     if (scenario === 'relocated') await capture(page, 'unnested-audio-tracks.png');
     assert.ok(before[1] > .005 && before[3] > .005, 'parent neighbor is audible');
-    assert.ok(scenario === 'muted' || scenario === 'parent solo' ? before[0] < .001 : before[0] > .001);
+    assert.ok(scenario === 'zero volume' || scenario === 'muted' || scenario === 'parent solo' ? before[0] < .001 : before[0] > .001);
     before.forEach((v,i) => assert.ok(Math.abs(v - after[i]) < Math.max(.0003, v*.03), scenario));
   }
 }
@@ -914,6 +931,15 @@ async function testFlattenRouting(page, files) {
     assert.ok(mode === 'muted' ? before[0] === 0 : before[0] > .001, mode);
     before.forEach((v,i) => assert.ok(Math.abs(after[i] - v) < .0001, mode + ' changes stereo output'));
   }
+  const tail = await page.evaluate(mcId => {
+    Editor.editProject(p => {
+      p.media.find(m => m.id === mcId).multicam.angles[0].duration = .8;
+      p.clips = [{id:'mc', type:'video', track:1, mediaId:mcId, start:0, duration:2,
+        in:0, multicamAngle:0, multicamAudioAngle:0}];
+    });
+    return SpliceMulticam.flattenClips(['mc']).map(c => [c.start, c.duration, c.enabled !== false]);
+  }, mcId);
+  assert.deepEqual(tail, [[0,.8,true],[0,.8,true],[.8,1.2,false]]);
   const exhausted = await page.evaluate(mcId => {
     Editor.editProject(p => {
       p.clips = [{id:'mc', type:'audio', mediaId:mcId, track:-1, start:0, duration:1, in:0}];
@@ -969,6 +995,8 @@ async function testNestVisibility(page, files) {
       nest.track = 3;
       p.clips.push({...nest, id:'neighbor', mediaId:p.media.find(m => m.name.includes('CamA_Red')).id,
         track:1, start:2, duration:1, embeddedAudio:false, nestedSequence:undefined});
+      p.clips.push({...p.clips.at(-1), id:'under', track:1, start:1, duration:1},
+        {...p.clips.at(-1), id:'over', track:4, start:1.8, duration:.2});
     });
   });
   await page.evaluate(id => SpliceNested.unnestClip(id), nest.clipIds[0]);
@@ -978,6 +1006,9 @@ async function testNestVisibility(page, files) {
   assert.ok(Math.max(...visible[0]) < 25);
   assert.equal(dominantColor(visible[1]), 'green');
   assert.equal(dominantColor(visible[2]), 'red');
+  assert.equal(dominantColor(await programColor(page,1.9)), 'red', 'upper parent layer stays above child');
+  const layers = await page.evaluate(() => Editor.get().project.clips.map(c => [c.id,c.track]));
+  assert.ok(layers.find(([id]) => id === 'over')[1] > layers.find(([id]) => id === 'under')[1]);
   await capture(page, 'unnest-visible-lanes.png');
 }
 
@@ -1019,6 +1050,19 @@ async function main() {
     // Full end-to-end functional suite at 1440x900
     const {page, errors} = await openPage(splice, {width: 1440, height: 900});
     try {
+      for (const kind of ['cycle','depth']) {
+        await assert.rejects(page.evaluate(kind => Editor.editProject(p => {
+          const child = () => ({name:'child', width:160, height:90, fps:25, media:[], clips:[]});
+          let parent = p;
+          for (let level = 0; level < 5; level++) {
+            const next = kind === 'cycle' && level === 1 ? p : child();
+            parent.media.push({id:'level'+level, name:'child', src:'', type:'video', duration:1,
+              ...(level % 2 ? {nestedSequence:false} : {}), nestedProject:next});
+            if (next === p) break;
+            parent = next;
+          }
+        }), kind), kind === 'cycle' ? /Circular/ : /four levels/);
+      }
       await testNestedSequences(page, files);
       await testMulticam(page, files);
       await testAudioParity(page, files);
