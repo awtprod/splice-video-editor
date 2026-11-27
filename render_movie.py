@@ -718,11 +718,6 @@ def _grade_key_times(clip):
     return key_times(clip)
 
 
-def _grade_color_at(clip, local):
-    from color_grade import color_at
-    return color_at(clip, local)
-
-
 def _has_color_work(clip, item):
     """Whether a clip's picture is graded at all (else it passes through untouched)."""
     from color_grade import grade_active, key_times, validate_grade
@@ -971,7 +966,8 @@ def _slice_keyframes(keyframes, offset, length):
         if len(points)>MAX_KEYFRAMES: raise ValueError(f'A clip has more than {MAX_KEYFRAMES} {key} keyframes, the export limit')
         if not points: continue
         if any(not isinstance(point,dict) for point in points): raise ValueError('Invalid keyframes')
-        ordered=sorted(({'time':_number(point.get('time'),'keyframe time',0,MAX_SOURCE_SECONDS),
+        earliest = -MAX_SOURCE_SECONDS if key in PRIMARY_COLOR_KEYS else 0
+        ordered=sorted(({'time':_number(point.get('time'),'keyframe time',earliest,MAX_SOURCE_SECONDS),
                          'value':_number(point.get('value'),'keyframe value',*bounds[key])} for point in points),key=lambda point:point['time'])
         if any(right['time']<=left['time'] for left,right in zip(ordered,ordered[1:])): raise ValueError('Duplicate keyframes')
         def value_at(at):
@@ -1463,20 +1459,14 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
                     else: prior_tail['transform'][key]=terminal
             prior_transform,prior_position=_transform(prior_tail,width,height,fps=fps)
             prior_color=previous.get('color') or {}
-            prior_times=_grade_key_times(previous)
-            if prior_times:
-                # After its last grade keyframe the outgoing clip holds that grade, as in the monitor.
-                # Keep 1-point keyframes for animated primaries so an HDR clip's tail evaluates in
-                # the same post-tonemap stage as the clip body.
-                prior_color=_grade_color_at(previous,prior_times[-1])
-                prior_tail['keyframes'] = {
-                    key: [{'time': 0, 'value': prior_color[key]}]
-                    for key in PRIMARY_COLOR_KEYS
-                    if (previous.get('keyframes') or {}).get(key) and key in prior_color
-                }
-            prior_tail['color']=prior_color
+            prior_tail['keyframes'] = {key: points for key, points in (previous.get('keyframes') or {}).items()
+                                       if key in PRIMARY_COLOR_KEYS}
+            prior_tail['_keyframeShift'] = float(previous.get('_keyframeShift', 0)) + float(previous['duration'])
+            cut_frame, tail_frames = _frame_span(start, tail, fps)
+            still_tail = tail_frames if prior_item.get('_renderStill') else 0
             prior_graded=None if prior_item.get('_disabled') else _picture_grade(
-                prior_tail, prior_item, directory, f'tail-{number}', profile, fps=fps, zero=0, frames=1, reverse=False,
+                prior_tail, prior_item, directory, f'tail-{number}', profile, fps=fps, zero=0, frames=tail_frames,
+                reverse=prior_reverse and not prior_item.get('_renderStill'),
                 hdr_master=bool(hdr_profile) or conform_pq)
             prior_hdr=(prior_item.get('_sourceProfile') or REC709)[1] in HDR_TRANSFERS
             prior_bypass = bool(isinstance(prior_color, dict) and (prior_color.get('grade') or {}).get('bypass'))
@@ -1486,15 +1476,13 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
             prior_opacity=_number(prior_tail.get('opacity',100),'opacity',0,100)/100
             # A disabled outgoing clip has no tail: the incoming clip dissolves or wipes in over what lies beneath.
             if tail + 1e-6 >= frame_duration and not prior_item.get('_disabled'):
-                cut_frame, tail_frames = _frame_span(start, tail, fps)
-                still_tail = tail_frames if prior_item.get('_renderStill') else 0
                 tail_origin = _sample_origin(start, tail, cut_frame, tail_frames, fps, prior_reverse)
                 prior_prefix = _picture_input(prior_index,prior_source,tail,prior_speed,width,height,fps,prior_reverse,
                                               still_tail,frames=tail_frames,origin=tail_origin)
                 prior_fit = _fit_picture(width,height,prior_fit_color,prior_lut,alpha_format,high_depth,
                                          prior_item.get('_sourceProfile'),rec709,still_frames=still_tail,
                                          hdr_profile=hdr_profile,conform_pq=conform_pq,
-                                         graded=prior_graded)
+                                         graded=prior_graded, animate_still=still_tail>1 and not prior_bypass and len(_grade_key_times(prior_tail))>1)
                 prior_flip = ',reverse' if prior_reverse and not still_tail and prior_index is not None else ''
                 prior_alpha = _mask_alpha(f'{prior_opacity:.6f}',alpha_format,full_alpha) if prior_opacity!=1 else ''
                 filters.append(f'{prior_prefix},{prior_fit}{prior_flip}{prior_transform}{prior_alpha},setpts=PTS+{cut_frame}[tail{number}]')

@@ -130,10 +130,15 @@
         gradeKeys.includes(automationProperty) ? number(color[automationProperty],['brightness','contrast','saturation'].includes(automationProperty)?100:0) :
         number(transform[automationProperty],automationProperty==='scale'?100:0);
       const current=atKeyframe(points,local,base);
+      const keyButtons=points.map(point=>{
+        const outside=point.time < -1e-6 || point.time > clip.duration+1e-6;
+        const when=point.time.toFixed(2);
+        return `<button type="button" data-key-time="${point.time}" ${outside?'disabled':''} title="${outside?'Keyframe outside this trim':'Go to keyframe at '+when+' seconds'}">${when}s · ${point.value}</button>`;
+      }).join('');
       html += section('Keyframes',
         `<label class="splice-number"><span>Property</span><select aria-label="Keyframe property" data-key-property>${available.map(key=>option(key,automation[key][0],automationProperty)).join('')}</select></label>` +
         `<div class="splice-key-edit"><label><span class="splice-key-time">Value at ${local.toFixed(2)} s</span><input aria-label="Keyframe value" type="number" class="splice-key-value" min="${spec[1]}" max="${spec[2]}" step="${spec[3]}" value="${current}"></label><button type="button" data-key-add>Add / update</button></div>` +
-        (points.length ? `<div class="splice-key-list">${points.map(point=>`<button type="button" data-key-time="${point.time}" title="Go to keyframe at ${point.time.toFixed(2)} seconds">${point.time.toFixed(2)}s · ${point.value}</button>`).join('')}</div><button type="button" class="splice-key-delete" data-key-delete>Delete keyframe at playhead</button>` : '<p class="splice-handle">No keyframes. Add one at the playhead to animate this property.</p>'));
+        (points.length ? `<div class="splice-key-list">${keyButtons}</div><button type="button" class="splice-key-delete" data-key-delete>Delete keyframe at playhead</button>` : '<p class="splice-handle">No keyframes. Add one at the playhead to animate this property.</p>'));
     }
     if (clip.type === 'audio' || clip.type === 'video' && clip.embeddedAudio !== false) {
       const track = clip.track;

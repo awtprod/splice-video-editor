@@ -91,6 +91,31 @@ async function main() {
     await page.waitForFunction(() => Editor.get().selected && Editor.get().project.media.find(m => m.id === Editor.get().selected.mediaId)?.adjustment);
     await page.evaluate(() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))));
     assert.equal(await page.locator('.grade-source').count(), 0, 'adjustment clip hides Source matrix/input LUT UI');
+    await page.locator('[data-workspace="edit"]').click();
+    const rightId = await page.evaluate(() => {
+      Editor.select('test-0');
+      Editor.updateClip('test-0', {keyframes:{exposure:[{time:0,value:-1},{time:1,value:1}]}});
+      Editor.seek(.52);
+      Editor.split();
+      return Editor.get().project.clips.find(c => c.start === .52 && c.keyframes?.exposure).id;
+    });
+    const saved = page.waitForEvent('download');
+    await page.evaluate(() => Editor.saveProject('splice'));
+    const file = await saved;
+    const json = fs.readFileSync(await file.path(), 'utf8');
+    await page.evaluate(async ({json, rightId}) => {
+      await Editor.openProject(new File([json], 'grade.splice.json'));
+      Editor.select(rightId);
+      Editor.seek(.72);
+    }, {json, rightId});
+    await page.locator('[data-key-property]').selectOption('exposure');
+    assert.ok(await page.locator('[data-key-time="-0.52"]').isDisabled());
+    await page.locator('.splice-key-value').fill('.3');
+    await page.locator('[data-key-add]').click();
+    const points = await page.evaluate(id => Editor.get().project.clips.find(c => c.id === id).keyframes.exposure, rightId);
+    assert.deepEqual(points, [{time:-.52,value:-1},{time:.2,value:.3},{time:.48,value:1}]);
+    if (process.env.SPLICE_PROOF_DIR)
+      await page.locator('[data-key-property]').locator('..').locator('..').screenshot({path:path.join(process.env.SPLICE_PROOF_DIR, 'reopened-grade-keys.png')});
     assert.deepEqual(errors, []);
     console.log('Grade actions, cube download, monitor controls, locked-track and adjustment UI passed.');
   } finally {

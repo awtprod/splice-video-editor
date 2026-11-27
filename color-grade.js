@@ -262,7 +262,7 @@
       const points = clip.keyframes?.[key] ?? [];
       if (!Array.isArray(points) || points.length > MAX_KEY_TIMES) fail('too many ' + key + ' keyframes');
       for (const point of points) {
-        if (!Number.isFinite(point?.time) || point.time < 0 || !finite(point.value, low, high)) fail(key + ' keyframe');
+        if (!finite(point?.time, -1e9, 1e9) || !finite(point.value, low, high)) fail(key + ' keyframe');
         times.add(point.time);
       }
     }

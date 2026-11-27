@@ -124,6 +124,13 @@ async function main() {
     }
     cases.push({name:'input LUT on the source', source:'flat', inputLut:true, clips:[{track:1, color:{saturation:120}}], times:[.48]});
     one('extended input LUT before desaturation', {saturation:0}, 'headroom');
+    for (const [name, lut] of [['1D', luts.short1D], ['3D', luts.lut33]])
+      one('extended input with partial '+name+' look', {lut, lutIntensity:50}, 'headroom');
+    for (const edit of ['uncut', 'split', 'trimmed']) {
+      cases.push({name:edit+' grade ramp', edit, source:'tag709', length:2, times:[.48, 1, 1.48],
+        clips:[{track:1, color:{}, keyframes:{exposure:[{time:0,value:-1}, {time:2,value:1}],
+          saturation:[{time:0,value:60}, {time:1.64,value:115}]}}]});
+    }
     // Keyframed exposure ramp over two seconds: -1 EV to +1 EV, sampled at five points.
     cases.push({name:'exposure ramp keyframes', source:'tag709', length:2, clips:[{track:1, color:{}, keyframes:{exposure:[{time:0, value:-1}, {time:1, value:.2}, {time:2, value:1}]}}],
       times:[0, .48, 1, 1.48, 1.96]});
@@ -136,6 +143,8 @@ async function main() {
     // Transitions: second clip on V1 starts at .5 with a 0.6 s transition centred on the cut; sampled mid-way.
     for (const transition of ['dissolve', 'fade', 'wipe'])
       cases.push({name:`${transition} mid-way`, source:'tag709', transition, clips:[], times:[.48]});
+    cases.push({name:'dissolve with trimmed grade ramp', source:'tag709', transition:'dissolve', clips:[],
+      tailKeys:{exposure:[{time:-.24,value:-1}, {time:1.76,value:1}]}, times:[.60,.68]});
     if (process.env.SPLICE_PARITY_ONLY) { const keep = process.env.SPLICE_PARITY_ONLY.split(','); cases.splice(0, cases.length, ...cases.filter(item => keep.includes(item.name))); }
     // ---- Build the timeline.
     const timeline = [];
@@ -144,11 +153,9 @@ async function main() {
       item.start = at;
       const length = item.length || 1;
       if (item.transition) {
-        timeline.push({key:item.name+'a', mediaKey:'tag709', track:1, start:at, duration:.5, in:.5, color:{brightness:80}});
+        timeline.push({key:item.name+'a', mediaKey:'tag709', track:1, start:at, duration:.5, in:.5, color:{brightness:80}, keyframes:item.tailKeys});
         timeline.push({key:item.name+'b', mediaKey:'flat', track:1, start:at+.5, duration:.5, in:.5, color:{grade:{gain:[1.1, 1, .9, 1]}},
           transition:item.transition, transitionDuration:.6, transitionBefore:.3});
-        // Mid-way through the transition (it runs from .2 to .8).
-        item.times = [.48];
       } else for (const clip of item.clips) timeline.push({key:item.name+clip.track, mediaKey:clip.adjustment ? null : clip.source || item.source, adjustment:clip.adjustment,
         track:clip.track, start:at, duration:length, in:.2, color:clip.color, opacity:clip.opacity, keyframes:clip.keyframes});
       at += length;
@@ -174,6 +181,19 @@ async function main() {
           SpliceLUT.parseCube('LUT_3D_SIZE 2\n' + '-0.5 0.5 1.5\n'.repeat(8), 'Headroom');
       });
     }, {timeline, inputLut:luts.input});
+    for (const {edit, start} of cases.filter(c => c.edit && c.edit !== 'uncut')) {
+      await page.evaluate(({edit, start}) => {
+        const id = Editor.get().project.clips.find(c => c.start === start).id;
+        if (edit === 'split') {
+          Editor.select(id);
+          Editor.seek(start+1);
+          Editor.split();
+        } else {
+          Editor.trimEdge(id, 'start', start+.24);
+          Editor.trimEdge(id, 'end', start+1.76);
+        }
+      }, {edit, start});
+    }
     // ---- Read the monitor at every sample point.
     const sampleTimes = cases.flatMap(item => item.times.map(t => ({item, time:item.start+t, frame:Math.round((item.start+t)*FPS)})));
     async function readMonitor() {
@@ -280,6 +300,7 @@ async function main() {
     // ---- Compare.
     const worst = (a, b) => Math.max(...a.flatMap((patch, i) => patch.map((v, c) => Math.abs(v-b[i][c]))));
     const rows = [], failures = [];
+    const uncut = sampleTimes.findIndex(sample => sample.item.edit === 'uncut');
     sampleTimes.forEach((sample, index) => {
       const hdr = isHdr(sample);
       const row = {case:sample.item.name+(sample.item.times.length > 1 ? ` @${(sample.time-sample.item.start).toFixed(2)}s` : ''),
@@ -289,6 +310,13 @@ async function main() {
       const limits = {prores:hdr ? TOLERANCE.hdr : TOLERANCE.prores, h264:hdr ? TOLERANCE.hdrH264 : TOLERANCE.h264};
       row.limit = `${limits.prores}/${limits.h264}`;
       rows.push(row);
+      if (uncut >= 0 && ['split','trimmed'].includes(sample.item.edit)) {
+        const original = uncut+sample.item.times.findIndex(t => Math.abs(sample.time-sample.item.start-t)<1e-6);
+        for (const [path, pictures] of Object.entries({webgl:gl, canvas, prores:exports.prores})) {
+          const error = worst(pictures[index], pictures[original]);
+          if (error > 1) failures.push(`${row.case}: ${path} differs from the uncut frame by ${error.toFixed(2)} codes`);
+        }
+      }
       for (const key of ['prores', 'canvas', 'restored']) if (row[key] > limits.prores) failures.push(`${row.case}: monitor (${key === 'prores' ? 'WebGL2' : key}) vs ProRes ${row[key].toFixed(2)} > ${limits.prores}`);
       if (row.h264 > limits.h264) failures.push(`${row.case}: monitor vs H.264 ${row.h264.toFixed(2)} > ${limits.h264}`);
     });

@@ -283,7 +283,7 @@ def key_times(clip):
         if not isinstance(points, list) or len(points) > MAX_KEY_TIMES:
             raise ValueError(f'Invalid {key} keyframes')
         for point in points:
-            if not isinstance(point, dict) or not _finite(point.get('time'), 0, 1e9) or not _finite(point.get('value'), low, high):
+            if not isinstance(point, dict) or not _finite(point.get('time'), -1e9, 1e9) or not _finite(point.get('value'), low, high):
                 raise ValueError(f'Invalid {key} keyframe')
             times.add(point['time'])
     if len(times) > MAX_KEY_TIMES:
@@ -380,7 +380,6 @@ def look_filter(lut, intensity, directory, name):
     domain_min = lut.get('domainMin', [0, 0, 0])
     domain_max = lut.get('domainMax', [1, 1, 1])
     custom = domain_min != [0, 0, 0] or domain_max != [1, 1, 1]
-    mix_after = custom and intensity != 100
     chain = ''
     if custom:
         # Validate through the serializer first (it checks the domain), then write the affine map.
@@ -388,15 +387,15 @@ def look_filter(lut, intensity, directory, name):
         columns = [[-domain_min[c]/(domain_max[c]-domain_min[c]), (1-domain_min[c])/(domain_max[c]-domain_min[c])] for c in range(3)]
         _write_1d(directory/f'{name}-domain.cube', columns)
         chain += f',lut1d=file={_filter_path(directory/f"{name}-domain.cube")}:interp=linear'
-    level = 100 if mix_after else intensity
     if lut.get('curve'):
-        (directory/f'{name}.cube').write_text(cube1d_text(lut, level, normalized_domain=custom))
+        (directory/f'{name}.cube').write_text(cube1d_text(lut, 100, normalized_domain=custom))
         chain += f',lut1d=file={_filter_path(directory/f"{name}.cube")}:interp=linear'
     else:
-        (directory/f'{name}.cube').write_text(cube_text(lut, level, normalized_domain=custom))
+        (directory/f'{name}.cube').write_text(cube_text(lut, 100, normalized_domain=custom))
         chain += f',lut3d=file={_filter_path(directory/f"{name}.cube")}:interp=trilinear'
-    if not mix_after:
+    if intensity == 100:
         return chain
+    # Only the lookup is domain-limited. Its dry signal retains the incoming headroom.
     label = '_look_'+name.replace('-', '_')
     return (f',split[{label}_a][{label}_b];[{label}_b]null{chain}[{label}_g];'
             f'[{label}_g][{label}_a]blend=all_mode=normal:all_opacity={intensity/100:.12g}')

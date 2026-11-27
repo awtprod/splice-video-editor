@@ -1027,6 +1027,12 @@
     for (const [key,points] of Object.entries(keys||{})) {
       if (!points.length) continue;
       const ordered=[...points].sort((a,b)=>a.time-b.time);
+      if (primaryColorKeys.includes(key)) {
+        // The monitor blends graded pictures. Keep their original endpoints, including
+        // the ones outside a trimmed clip, and rebase them onto its new local clock.
+        cropped[key]=ordered.map(point=>({...point,time:point.time-from}));
+        continue;
+      }
       cropped[key]=[
         {time:0,value:curveValue(ordered,from,0)},
         ...ordered.filter(point=>point.time>from+1e-6 && point.time<to-1e-6)
