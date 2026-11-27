@@ -71,19 +71,28 @@
     }
     return usable;
   }
-  // R'G'B' (0..1) of planes at integer source position, for the Canvas fallback.
-  function planeConverter(frame, input) {
-    const {data, layout, width} = frame, m = G.inputMatrix(input.matrix, frame.colorSpace?.fullRange ?? input.fullRange);
-    const [y0, c0] = m.offset, rows = m.rows, nv12 = frame.format === 'NV12';
-    return (x, y, out) => {
-      const Y = data[layout[0].offset+y*layout[0].stride+x]/255, cx = x >> 1, cy = y >> 1;
-      const U = (nv12 ? data[layout[1].offset+cy*layout[1].stride+2*cx] : data[layout[1].offset+cy*layout[1].stride+cx])/255-c0;
-      const V = (nv12 ? data[layout[1].offset+cy*layout[1].stride+2*cx+1] : data[layout[2].offset+cy*layout[2].stride+cx])/255-c0;
-      const L = Y-y0;
-      out[0] = rows[0][0]*L+rows[0][2]*V; out[1] = rows[1][0]*L+rows[1][1]*U+rows[1][2]*V; out[2] = rows[2][0]*L+rows[2][1]*U;
-      out[3] = frame.format === 'I420A' ? data[layout[3].offset+y*layout[3].stride+x] : 255;
-      return out;
-    };
+  function decodeRgb(matrix, y, cb, cr, out) {
+    const l = y/255-matrix.offset[0], u = cb/255-matrix.offset[1], v = cr/255-matrix.offset[1];
+    const rows = matrix.rows;
+    out[0] = rows[0][0]*l+rows[0][2]*v;
+    out[1] = rows[1][0]*l+rows[1][1]*u+rows[1][2]*v;
+    out[2] = rows[2][0]*l+rows[2][1]*u;
+  }
+  function copyPlanes(frame, pixels, matrix) {
+    const {data, layout, width, height} = frame, nv12 = frame.format === 'NV12', rgb = [0, 0, 0];
+    for (let y = 0, i = 0; y < height; y++) for (let x = 0; x < width; x++, i += 4) {
+      const cx = x >> 1, cy = y >> 1;
+      const yCode = data[layout[0].offset+y*layout[0].stride+x];
+      const chroma = layout[1].offset+cy*layout[1].stride+(nv12 ? 2*cx : cx);
+      const cb = data[chroma], cr = data[nv12 ? chroma+1 : layout[2].offset+cy*layout[2].stride+cx];
+      if (matrix) {
+        decodeRgb(matrix, yCode, cb, cr, rgb);
+        for (let c = 0; c < 3; c++) pixels[i+c] = Math.round(rgb[c]*255);
+      } else {
+        pixels[i] = yCode; pixels[i+1] = cb; pixels[i+2] = cr;
+      }
+      pixels[i+3] = frame.format === 'I420A' ? data[layout[3].offset+y*layout[3].stride+x] : 255;
+    }
   }
 
   // ---------------------------------------------------------------- WebGL2 renderer
@@ -617,29 +626,29 @@ void main() {
       if (canvas.width !== width || canvas.height !== height) { canvas.width = width; canvas.height = height; }
       return canvas;
     }
-    // The source picture as R'G'B': decoded from the exact planes when possible.
+    // For a graded layer, carry Y'CbCr through the geometry pass and decode directly into
+    // the float grade. Storing decoded RGB in ImageData here would clip out-of-gamut values.
     sourceCanvas(op) {
       const element = op.element;
       const frame = op.exact === false ? null : requestPlanes(element);
       if (op.exact !== false && element instanceof HTMLVideoElement && frame?.key !== frameKey(element)) stats.stale++;
-      if (!frame) { if (element instanceof HTMLVideoElement) stats.exactDecode = false; return element; }
+      if (!frame) { if (element instanceof HTMLVideoElement) stats.exactDecode = false; return {source:element}; }
+      const fullRange = frame.colorSpace?.fullRange ?? op.input.fullRange;
+      const matrix = G.inputMatrix(op.input.matrix, fullRange);
+      const key = frame.key + (op.grade ? '|yuv' : `|rgb|${op.input.matrix}|${fullRange}`);
       let entry = this.sources.get(element);
       if (!entry) { entry = {canvas:document.createElement('canvas'), key:''}; this.sources.set(element, entry); }
-      if (entry.key !== frame.key + op.input.matrix) {
+      if (entry.key !== key) {
         const {width, height} = frame, canvas = entry.canvas;
         if (canvas.width !== width || canvas.height !== height) { canvas.width = width; canvas.height = height; }
-        const ctx = canvas.getContext('2d', {willReadFrequently:true}), image = ctx.createImageData(width, height), out = image.data;
-        const convert = planeConverter(frame, op.input), rgb = [0, 0, 0, 255];
-        for (let y = 0, i = 0; y < height; y++) for (let x = 0; x < width; x++, i += 4) {
-          convert(x, y, rgb);
-          out[i] = Math.round(Math.max(0, Math.min(1, rgb[0]))*255); out[i+1] = Math.round(Math.max(0, Math.min(1, rgb[1]))*255); out[i+2] = Math.round(Math.max(0, Math.min(1, rgb[2]))*255); out[i+3] = rgb[3];
-        }
+        const ctx = canvas.getContext('2d', {willReadFrequently:true}), image = ctx.createImageData(width, height);
+        copyPlanes(frame, image.data, op.grade ? null : matrix);
         ctx.putImageData(image, 0, 0);
-        entry.key = frame.key + op.input.matrix;
+        entry.key = key;
       }
-      return entry.canvas;
+      return {source:entry.canvas, matrix:op.grade ? matrix : null};
     }
-    gradePixels(image, grade) {
+    gradePixels(image, grade, matrix) {
       if (!grade) return;
       const data = image.data, cache = new Map(), x = [0, 0, 0], y = [0, 0, 0], scratch = [0, 0, 0];
       const a = grade.a, b = grade.b, w = grade.weight || 0, input = grade.input;
@@ -650,7 +659,8 @@ void main() {
         const key = data[i] << 16 | data[i+1] << 8 | data[i+2];
         let packed = cache.get(key);
         if (packed === undefined) {
-          x[0] = data[i]/255; x[1] = data[i+1]/255; x[2] = data[i+2]/255;
+          if (matrix) decodeRgb(matrix, data[i], data[i+1], data[i+2], x);
+          else { x[0] = data[i]/255; x[1] = data[i+1]/255; x[2] = data[i+2]/255; }
           y[0] = x[0]; y[1] = x[1]; y[2] = x[2];
           G.evaluate(A, x, scratch);
           if (B) { G.evaluate(B, y, scratch); for (let c = 0; c < 3; c++) x[c] += (y[c]-x[c])*w; }
@@ -661,18 +671,18 @@ void main() {
       }
     }
     drawLayer(ctx, op, width, height) {
-      const source = op.type === 'title' ? null : this.sourceCanvas(op);
       const layer = this.scratch(4, width, height), lctx = layer.getContext('2d', {willReadFrequently:true});
       lctx.clearRect(0, 0, width, height);
       if (op.type === 'title') op.paint(lctx, layer);
       else {
+        const {source, matrix} = this.sourceCanvas(op);
         const g = op.geometry, fit = Math.min(width/g.sourceWidth, height/g.sourceHeight);
         lctx.save(); lctx.translate(width/2+g.x*width/100, height/2+g.y*height/100); lctx.rotate(g.rotation);
         lctx.drawImage(source, -g.sourceWidth*fit*g.scale/2, -g.sourceHeight*fit*g.scale/2, g.sourceWidth*fit*g.scale, g.sourceHeight*fit*g.scale);
         lctx.restore();
         if (op.grade || op.brightness < 1) {
           const image = lctx.getImageData(0, 0, width, height);
-          this.gradePixels(image, op.grade);
+          this.gradePixels(image, op.grade, matrix);
           if (op.brightness < 1) for (let i = 0; i < image.data.length; i += 4) { image.data[i] *= op.brightness; image.data[i+1] *= op.brightness; image.data[i+2] *= op.brightness; }
           lctx.putImageData(image, 0, 0);
         }

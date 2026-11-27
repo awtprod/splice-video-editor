@@ -27,7 +27,7 @@ const centers = PATCHES.map((_, i) => [Math.floor(((i%4)+.5)*W/4), Math.floor((M
 // proxy (H.264 CRF 19), which adds its own rounding. Transitions blend in Y'CbCr in the export.
 const TOLERANCE = {prores:2, h264:4, hdr:5, hdrH264:6};
 
-function patchSource(file, {matrix = 'bt709', range = 'tv', tags = true, transfer = null, color = null} = {}) {
+function patchSource(file, {matrix = 'bt709', range = 'tv', tags = true, transfer = null, color = null, yuv = null} = {}) {
   const rgb = Buffer.alloc(W*H*3);
   for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
     const c = color || PATCHES[Math.floor(y*2/H)*4+Math.floor(x*4/W)];
@@ -46,6 +46,7 @@ function patchSource(file, {matrix = 'bt709', range = 'tv', tags = true, transfe
       `setparams=colorspace=${matrix === 'bt601' ? 'smpte170m' : 'bt709'}:color_primaries=${matrix === 'bt601' ? 'smpte170m' : 'bt709'}:color_trc=${matrix === 'bt601' ? 'smpte170m' : 'bt709'}:range=${range}` :
       'setparams=colorspace=unknown:color_primaries=unknown:color_trc=unknown:range=tv');
   }
+  if (yuv) graph += `,lutyuv=y=${yuv[0]}:u=${yuv[1]}:v=${yuv[2]}`;
   ffmpeg(['-y', '-stream_loop', '-1', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-s', `${W}x${H}`, '-r', String(FPS), '-i', raw,
     '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo', '-t', '4', '-vf', graph, ...codec, '-g', '1', '-c:a', 'aac', '-shortest', file]);
   fs.rmSync(raw);
@@ -72,7 +73,7 @@ async function main() {
   const files = {};
   try {
     const sources = {tag709:{}, untagged:{matrix:'bt601', tags:false}, override709:{tags:false}, tag601:{matrix:'bt601'}, full709:{range:'pc'},
-      hlg:{transfer:'hlg'}, pq:{transfer:'pq'}, flat:{color:[100,180,220]}, headroom:{color:[128,128,128]}};
+      hlg:{transfer:'hlg'}, pq:{transfer:'pq'}, flat:{color:[100,180,220]}, headroom:{color:[128,128,128]}, wideRgb:{yuv:[235,16,240]}};
     for (const [name, spec] of Object.entries(sources)) { files[name] = path.join(splice.temp, name+'.mp4'); patchSource(files[name], spec); }
     const {page, errors} = await openPage(splice, {width:1440, height:900});
     page.setDefaultTimeout(60000);
@@ -89,6 +90,13 @@ async function main() {
     const cases = [];
     const one = (name, color, source = 'tag709', extra = {}) => cases.push({name, source, clips:[{track:1, color, ...extra}], times:[.48]});
     one('identity', {});
+    one('decoded headroom before desaturation', {saturation:0}, 'wideRgb');
+    const fastRamp = {exposure:[{time:0,value:-1}, {time:.04,value:1}]};
+    for (const mode of ['forward', 'reverse', 'adjustment']) {
+      const graded = {track:1, start:.02, color:{}, keyframes:fastRamp, reverse:mode === 'reverse'};
+      const clips = mode === 'adjustment' ? [{track:1, color:{}}, {...graded, track:2, adjustment:true}] : [graded];
+      cases.push({name:'fractional start '+mode, source:'tag709', clips, times:[.04,.08]});
+    }
     for (const v of [50, 150]) one(`brightness ${v}`, {brightness:v});
     for (const v of [50, 160]) one(`contrast ${v}`, {contrast:v});
     one('contrast 160 pivot 0.3', {contrast:160, grade:{pivot:.3}});
@@ -149,6 +157,8 @@ async function main() {
       cases.push({name:`${transition} mid-way`, source:'tag709', transition, clips:[], times:[.48]});
     cases.push({name:'dissolve with trimmed grade ramp', source:'tag709', transition:'dissolve', clips:[],
       tailKeys:{exposure:[{time:-.24,value:-1}, {time:1.76,value:1}]}, times:[.60,.68]});
+    cases.push({name:'fractional outgoing grade', source:'tag709', transition:'dissolve', clips:[], tailStart:.02,
+      tailKeys:{exposure:[{time:.48,value:-1}, {time:.56,value:1}]}, times:[.52,.56]});
     if (process.env.SPLICE_PARITY_ONLY) { const keep = process.env.SPLICE_PARITY_ONLY.split(','); cases.splice(0, cases.length, ...cases.filter(item => keep.includes(item.name))); }
     // ---- Build the timeline.
     const timeline = [];
@@ -157,11 +167,12 @@ async function main() {
       item.start = at;
       const length = item.length || 1;
       if (item.transition) {
-        timeline.push({key:item.name+'a', mediaKey:'tag709', track:1, start:at, duration:.5, in:.5, color:{brightness:80}, keyframes:item.tailKeys});
+        const lead = item.tailStart || 0;
+        timeline.push({key:item.name+'a', mediaKey:'tag709', track:1, start:at+lead, duration:.5-lead, in:.5, color:{brightness:80}, keyframes:item.tailKeys});
         timeline.push({key:item.name+'b', mediaKey:'flat', track:1, start:at+.5, duration:.5, in:.5, color:{grade:{gain:[1.1, 1, .9, 1]}},
           transition:item.transition, transitionDuration:.6, transitionBefore:.3});
       } else for (const clip of item.clips) timeline.push({key:item.name+clip.track, mediaKey:clip.adjustment ? null : clip.source || item.source, adjustment:clip.adjustment,
-        track:clip.track, start:at, duration:length, in:.2, color:clip.color, opacity:clip.opacity, keyframes:clip.keyframes});
+        track:clip.track, start:at+(clip.start || 0), duration:length-(clip.start || 0), in:.2, reverse:clip.reverse, color:clip.color, opacity:clip.opacity, keyframes:clip.keyframes});
       at += length;
     }
     await page.evaluate(({timeline, inputLut}) => {
@@ -175,6 +186,7 @@ async function main() {
           const out = {id:'clip-'+index, type:'video', mediaId, track:clip.track, start:clip.start, duration:clip.duration, in:clip.in,
             embeddedAudio:false, volume:100, transition:clip.transition || 'none', color:clip.color || {}};
           if (clip.opacity != null) out.opacity = clip.opacity;
+          if (clip.reverse) out.reverse = true;
           if (clip.keyframes) out.keyframes = clip.keyframes;
           if (clip.transition) { out.transitionDuration = clip.transitionDuration; out.transitionBefore = clip.transitionBefore; }
           return out;

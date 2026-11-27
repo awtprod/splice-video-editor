@@ -606,6 +606,7 @@ def _fit_picture(width, height, color, lut, alpha_format, high_depth, profile=No
 
 def _grade_clock(clip, fps, zero, frames, reverse):
     """Clip-local keyframe time of the frame a grade sees, as an expression of the filter time T.
+    zero is the clip start relative to the first displayed frame, which can fall between keys.
     The grade runs before a reversed clip is flipped, so its frame k is shown at frames-1-k."""
     rate = float(fps)
     constant = _frames(float(clip.get('_keyframeShift', 0) or 0), rate) - _frames(zero, rate)
@@ -1380,7 +1381,7 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
         opacity_keys=(clip.get('keyframes') or {}).get('opacity')
         first_frame, frames = _frame_span(render_start, render_length, fps)
         graded = None if item.get('_disabled') else _picture_grade(
-            clip, item, directory, f'clip-{number}', profile, fps=fps, zero=before, frames=frames,
+            clip, item, directory, f'clip-{number}', profile, fps=fps, zero=start-first_frame/fps, frames=frames,
             reverse=reverse and not item.get('_renderStill'),
             hdr_master=bool(hdr_profile) or conform_pq)
         hdr_source = (item.get('_sourceProfile') or REC709)[1] in HDR_TRANSFERS
@@ -1460,11 +1461,11 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
             prior_color=previous.get('color') or {}
             prior_tail['keyframes'] = {key: points for key, points in (previous.get('keyframes') or {}).items()
                                        if key in PRIMARY_COLOR_KEYS}
-            prior_tail['_keyframeShift'] = float(previous.get('_keyframeShift', 0)) + float(previous['duration'])
             cut_frame, tail_frames = _frame_span(start, tail, fps)
             still_tail = tail_frames if prior_item.get('_renderStill') else 0
             prior_graded=None if prior_item.get('_disabled') else _picture_grade(
-                prior_tail, prior_item, directory, f'tail-{number}', profile, fps=fps, zero=0, frames=tail_frames,
+                prior_tail, prior_item, directory, f'tail-{number}', profile, fps=fps,
+                zero=float(previous['start'])-cut_frame/fps, frames=tail_frames,
                 reverse=prior_reverse and not prior_item.get('_renderStill'),
                 hdr_master=bool(hdr_profile) or conform_pq)
             prior_hdr=(prior_item.get('_sourceProfile') or REC709)[1] in HDR_TRANSFERS
