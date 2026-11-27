@@ -95,6 +95,10 @@ VIDEO_CODECS = {
                 profiles=EXR_PROFILES, default_profile='half', rate_modes=(), extension='exr'),
     'wav': dict(label='Audio only (WAV)', encoder=None, kind='audio', intra=True, containers=('wav',),
                 profiles={}, default_profile=None, rate_modes=()),
+    'stems': dict(label='Audio stems', encoder=None, kind='audio', intra=True, containers=('zip',),
+                  profiles={}, default_profile=None, rate_modes=(), internal=True),
+    'loudness': dict(label='Loudness analysis', encoder=None, kind='audio', intra=True, containers=('json',),
+                     profiles={}, default_profile=None, rate_modes=(), internal=True),
 }
 HARDWARE = {
     # encoder names per family and what FFmpeg needs to feed it system-memory frames.
@@ -107,7 +111,7 @@ HARDWARE = {
 AUDIO_CODECS = {
     'aac': dict(label='AAC', encoder='aac', lossy=True, containers=('mp4', 'mov')),
     'pcm16': dict(label='PCM 16-bit', encoder='pcm_s16le', lossy=False, containers=('mov', 'mxf', 'wav', 'folder')),
-    'pcm24': dict(label='PCM 24-bit', encoder='pcm_s24le', lossy=False, containers=('mov', 'mxf', 'wav', 'folder')),
+    'pcm24': dict(label='PCM 24-bit', encoder='pcm_s24le', lossy=False, containers=('mov', 'mxf', 'wav', 'folder', 'zip', 'json')),
     'pcm32f': dict(label='PCM 32-bit float', encoder='pcm_f32le', lossy=False, containers=('mov', 'wav', 'folder')),
 }
 CONTAINERS = {
@@ -116,8 +120,10 @@ CONTAINERS = {
     'mxf': dict(label='MXF OP1a', extension='mxf', mime='application/mxf', muxer='mxf', timecode=True, subtitles=None),
     'folder': dict(label='Numbered files', extension=None, mime=None, muxer='image2', timecode=False, subtitles=None),
     'wav': dict(label='WAV', extension='wav', mime='audio/wav', muxer='wav', timecode=False, subtitles=None),
+    'zip': dict(label='ZIP', extension='zip', mime='application/zip', muxer='zip', timecode=False, subtitles=None),
+    'json': dict(label='JSON', extension='json', mime='application/json', muxer='json', timecode=False, subtitles=None),
 }
-DEFAULT_AUDIO = {'mp4': 'aac', 'mov': 'pcm24', 'mxf': 'pcm24', 'folder': 'pcm24', 'wav': 'pcm24'}
+DEFAULT_AUDIO = {'mp4': 'aac', 'mov': 'pcm24', 'mxf': 'pcm24', 'folder': 'pcm24', 'wav': 'pcm24', 'zip': 'pcm24', 'json': 'pcm24'}
 X264_SPEEDS = ('ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow')
 COLOR_SPACES = ('source', 'rec709', 'pq', 'hlg')
 # MXF frame rates FFmpeg's muxer writes without -strict unofficial.
@@ -233,6 +239,8 @@ KNOWN_OPTIONS = {
     # The renderer's original options (render_movie._export_settings and the audio group).
     'codec', 'crf', 'audioBitrate', 'colorSpace', 'range', 'limiter', 'limiterCeiling', 'aacPeakSafe', 'subtitleLanguage',
     'captions',
+    # Audio finishing options (render_movie._audio_options, audio_loudness).
+    'audioLayout', 'isoTracks', 'normalize', 'normalizeMode',
     # Delivery options (this module).
     'profile', 'container', 'rateControl', 'videoBitrate', 'speed', 'encoder', 'alpha', 'audioCodec', 'hdr', 'timecode',
     'reel', 'title', 'comment', 'faststart', 'startNumber', 'padding', 'burnIns', 'outputSize', 'fit', 'captionFiles',
@@ -752,6 +760,8 @@ def describe():
     """The codec table for the dialog (plain JSON)."""
     codecs = {}
     for key, info in VIDEO_CODECS.items():
+        if info.get('internal'):
+            continue
         codecs[key] = dict(label=info['label'], kind=info['kind'], containers=list(info['containers']), intra=info['intra'],
                            rateModes=list(info['rate_modes']), hardware=list(info.get('hardware', ())),
                            defaultProfile=info['default_profile'], hdr=bool(info.get('hdr')),

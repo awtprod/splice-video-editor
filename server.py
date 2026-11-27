@@ -233,6 +233,12 @@ def media_proxy_route(handler, body):
                                      grading_data=payload.get('gradingData') is True)})
 
 
+@post('/api/audio/sync', limit=MAX_SMALL_BODY)
+def audio_sync(handler, body):
+    from audio_sync import sync_pairs
+    handler._json(200, {'results': sync_pairs(_json_body(body))})
+
+
 @post('/api/exports')
 def start_export(handler, body):
     payload = _json_body(body)

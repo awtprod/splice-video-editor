@@ -221,7 +221,7 @@ class RenderQueue:
                 raise ValueError(f'Two exports in this batch would both be named {name}')
             names.add(key)
             captions = set(spec['caption_files'])
-            if not delivery.CONTAINERS[spec['container']]['subtitles']:
+            if spec['kind'] != 'audio' and not delivery.CONTAINERS[spec['container']]['subtitles']:
                 captions.add('srt')
             targets = _targets(folder, name, spec, sorted(captions) if project.get('captions') and options.get('captions', True) else ())
             for target in targets:

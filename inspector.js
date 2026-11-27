@@ -26,9 +26,11 @@
     }
     return points.at(-1).value;
   }
-  function render(state, element, editor) {
+  let previousView;
+  function render(state, element, editor, reuse = false) {
     const clip = state.selected;
     if (!clip) {
+      previousView = null;
       element.innerHTML = '<div class="inspector-empty">Select a clip to edit its settings.</div>';
       return;
     }
@@ -109,11 +111,13 @@
         (clip.keyframes?.volume?.length ? '<p class="splice-handle">Gain keyframes control the level. Edit them below.</p>' : '') +
         label('Pan', 'pan', number(clip.pan, 0), -100, 100, 1, '', '') +
         field('Fade in', 'fadeIn', number(clip.fadeIn, 0).toFixed(2), 0, clip.duration, .04) +
-        field('Fade out', 'fadeOut', number(clip.fadeOut, 0).toFixed(2), 0, clip.duration, .04));
+        field('Fade out', 'fadeOut', number(clip.fadeOut, 0).toFixed(2), 0, clip.duration, .04) +
+        audioRouting(clip, state.project) +
+        `<div class="audio-fx-mount" data-owner="clip:${escape(clip.id)}" aria-label="Clip audio effects"></div>`);
     }
     if (clip.type === 'audio') {
       html += section('Incoming transition',
-        `<label class="splice-number"><span>Style</span><select aria-label="Audio transition style" data-field="transition">${clip.transition==='native'?option('native','Imported: '+(clip.transitionMatchName||'Premiere effect'),'native'):''}${option('none','Cut',clip.transition || 'none')}${option('dissolve','Crossfade',clip.transition || 'none')}</select></label>` +
+        `<label class="splice-number"><span>Style</span><select aria-label="Audio transition style" data-field="transition">${clip.transition==='native'?option('native','Imported: '+(clip.transitionMatchName||'Premiere effect'),'native'):''}${option('none','Cut',clip.transition || 'none')}${option('dissolve','Crossfade',clip.transition || 'none')}${option('fade','Dip (out, then in)',clip.transition || 'none')}</select></label>` +
         field('Length','transitionDuration',number(clip.transitionDuration,.5).toFixed(2),1/fps,7200,1/fps));
     }
     if (['video','audio','title'].includes(clip.type)) {
@@ -151,8 +155,14 @@
       `<p class="splice-compat">This imported Premiere transition (${escape(clip.transitionMatchName||'unknown effect')}) stays in the native project. MP4 export cannot render it yet. Choose a supported transition to export video.</p>`);
     // The scope canvas survives the re-render: it keeps its picture and the scopes' record of
     // the frame it shows, so an edit does not repaint (or blank) the scope.
+    // An unrelated timeline edit can leave the selected clip, all displayed values,
+    // and their event bindings intact. Explicit refreshes still reset edited fields.
+    if (reuse && previousView?.root === element.firstElementChild && previousView.clip === clip &&
+        previousView.source === source && previousView.html === html) return;
     const previousScope = element.querySelector('.splice-scope');
+    const previousFx = element.querySelector('.audio-fx-mount');
     element.innerHTML = html;
+    previousView = {root: element.firstElementChild, clip, source, html};
     const freshScope = element.querySelector('.splice-scope');
     if (previousScope && freshScope) {
       previousScope.style.height = freshScope.style.height;
@@ -194,7 +204,7 @@
             render(editor.get(),element,editor);
           } else {
             editor.updateClip(active.id, group ? {[group]: {...(active[group] || {}), [key]: value}} : {[key]: value});
-            if(['align','track','pan','fadeIn','fadeOut','transition','transitionDuration'].includes(key)) render(editor.get(),element,editor);
+            if(['align','track','pan','fadeIn','fadeOut','transition','transitionDuration','channelMap','audioTransition'].includes(key)) render(editor.get(),element,editor);
           }
         } catch(error) {
           window.alert(error.message || 'This clip cannot be changed.');
@@ -245,6 +255,7 @@
       editor.seek(clip.start+Number(button.dataset.keyTime));
       render(editor.get(),element,editor);
     });
+    if (clip.type === 'audio' || clip.type === 'video' && clip.embeddedAudio !== false) mountAudioFx(element, clip, editor, locked, previousFx);
     window.SpliceScopes.bind(element);
     // Never forced here: the scopes' own throttle and unchanged-frame check decide (the preview
     // loop paints them too). A new canvas gets one paint on the next animation frame.
@@ -252,6 +263,8 @@
     paintMeters(state);
   }
   function paintMeters(state=window.Editor?.get()) {
+    const fxMount=document.querySelector('.audio-fx-mount');
+    if (fxMount && window.SpliceAudioFX) window.SpliceAudioFX.paintReduction(fxMount, fxMount.dataset.owner);
     for (const meter of document.querySelectorAll('.splice-meter')) {
       const peak=Number(state?.audioMeters?.[meter.dataset.track] || 0);
       meter.firstElementChild.style.width=`${Math.min(100,Math.max(0,peak*100))}%`;
@@ -277,6 +290,34 @@
   // The large docked scope, when it is open, is the one painted.
   function paintScope(canvas=document.querySelector('.scope-dock .splice-scope')||document.querySelector('.splice-scope'),force=false) {
     window.SpliceScopes.paint(canvas,force);
+  }
+  // Channel mapping and the sound's transition (follow the picture, or override).
+  function audioRouting(clip, project) {
+    const maps={stereo:'As recorded',left:'Left to both channels',right:'Right to both channels',mono:'Sum to mono',swap:'Swap left and right'};
+    const linkedPicture=clip.type==='audio' && clip.linkGroup ? project.clips.find(other=>other.type==='video' && other.linkGroup===clip.linkGroup &&
+      Math.abs(other.start-clip.start)<.5/(project.fps||25)) : null;
+    const follows=clip.type==='video' ? clip.transition : (['dissolve','wipe','fade'].includes(clip.transition) ? null : linkedPicture?.transition);
+    const names={dissolve:'crossfade',wipe:'crossfade',fade:'dip',none:'cut'};
+    const auto=follows!=null ? `Follow picture (${names[follows]||'cut'})` : 'Follow clip transition';
+    const transitions={auto,cut:'Cut',crossfade:'Crossfade',dip:'Dip (out, then in)'};
+    return `<label class="splice-number"><span>Channels</span><select aria-label="Source channel mapping" data-field="channelMap">${Object.entries(maps).map(([key,name])=>option(key,name,clip.channelMap||'stereo')).join('')}</select></label>` +
+      `<label class="splice-number"><span>Sound transition in</span><select aria-label="Sound transition at the clip's start" data-field="audioTransition">${Object.entries(transitions).map(([key,name])=>option(key,name,clip.audioTransition||'auto')).join('')}</select></label>`;
+  }
+  function mountAudioFx(element, clip, editor, locked, previous) {
+    const mount=element.querySelector('.audio-fx-mount');
+    if (!mount || !window.SpliceAudioFX) return;
+    // An edit on another clip does not change these controls or the response curve.
+    if (previous && previous.dataset.owner === mount.dataset.owner &&
+        previous.effects === clip.audioFx && previous.trackLocked === locked) {
+      mount.replaceWith(previous);
+      return;
+    }
+    mount.effects = clip.audioFx;
+    mount.trackLocked = locked;
+    window.SpliceAudioFX.render(mount, clip.audioFx, {owner:'clip-'+clip.id, disabled:locked, onChange:fx=>{
+      editor.updateClip(clip.id,{audioFx:fx});
+      render(editor.get(),element,editor);
+    }});
   }
   window.SpliceInspector = {render,paintScope,paintMeters};
 })();

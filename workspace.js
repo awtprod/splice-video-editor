@@ -634,6 +634,7 @@
         surface.append(clipNode(clip,lane,project,selectedId,group));
       }
       paintDensity(surface,tiny,lane.kind);
+      if(lane.kind==="audio")window.SpliceAutomation?.renderLane(surface,lane,project,editor,{px,seconds:duration});
     });
     // Rebuilt headers can lose their scroll offset; level them with the lanes at the next frame
     // rather than forcing a synchronous layout of the rebuilt timeline here. A newly opened
@@ -714,6 +715,7 @@
       renderTimeline(state);
       lastProject = signature;
     }
+    window.SpliceAudioPanel?.refresh(state);
     const mediaSignature = [state.revision, tab, $("bin-filter").value, $("media-search").value, $("media-filter").value,
       mediaView, mediaSort.key, mediaSort.direction].join("|");
     if (mediaSignature !== lastMedia) {
@@ -725,7 +727,7 @@
       (projectChanged &&
         !document.activeElement?.closest?.("#inspector-content"))
     ) {
-      window.SpliceInspector?.render(state, $("inspector-content"), editor);
+      window.SpliceInspector?.render(state, $("inspector-content"), editor, true);
       lastSelection = state.selectedId;
     }
     if (!projectChanged) return;
@@ -839,6 +841,8 @@
         document
           .querySelectorAll("[data-workspace]")
           .forEach((b) => b.classList.toggle("active", b === button));
+        // The Audio workspace swaps the media pool for the mixer and loudness meter.
+        window.SpliceAudioPanel?.toggle(button.dataset.workspace === "audio");
         if (
           button.dataset.workspace === "color" ||
           button.dataset.workspace === "audio"
@@ -1449,6 +1453,7 @@
     clearMarks:()=>editor.clearMarks(),
     rippleStart:()=>rippleTrimToPlayhead("start"),
     rippleEnd:()=>rippleTrimToPlayhead("end"),
+    syncSound:()=>window.SpliceSync?.open(),
   };
   const mod=e=>e.ctrlKey||e.metaKey;
   // A binding matches e.code or the (lower-cased) key, with exactly these modifiers held.
@@ -1536,6 +1541,7 @@
     return e.key===" " || e.key==="Enter";
   }
   window.SpliceKeys={keyBelongsToControl};
+  window.SpliceWorkspace={refresh:()=>renderTimeline(editor.get()),selection:()=>selection().map(clip=>clip.id)};
   document.addEventListener("keydown", (e) => {
     if (document.querySelector("dialog:modal") || e.target?.closest?.(".source-dialog, .sync-menu")) return;
     const typing=keyBelongsToControl(document.activeElement,e);

@@ -386,8 +386,8 @@ window.SpliceDelivery = (() => {
     }
     context.validate = check;
     context.deliveryOptions = options;
-    context.queueOnly = () => info()?.kind === 'images' || (codec.value !== 'wav' && context.captionsInRange() &&
-      (srt.checked || vtt.checked || container.value === 'mxf'));
+    context.queueOnly = () => form.elements.audioDeliver?.value !== 'stems' && (info()?.kind === 'images' || (codec.value !== 'wav' && context.captionsInRange() &&
+      (srt.checked || vtt.checked || container.value === 'mxf')));
     context.renderViaQueue = () => addQueue.onclick();
 
     /* Queue, batch and presets. */
@@ -400,7 +400,7 @@ window.SpliceDelivery = (() => {
         throw error;
       }
     }
-    const sessionOptionKeys = ['range', 'limiter', 'limiterCeiling', 'aacPeakSafe', 'subtitleLanguage'];
+    const sessionOptionKeys = ['range', 'limiter', 'limiterCeiling', 'aacPeakSafe', 'subtitleLanguage', 'normalize', 'normalizeMode', 'audioLayout'];
     const currentOptions = () => context.requestOptions();
     addQueue.onclick = async () => {
       const options = currentOptions();
@@ -434,7 +434,7 @@ window.SpliceDelivery = (() => {
       const name = prompt('Name this preset');
       if (!name?.trim()) return;
       const options = currentOptions();
-      for (const key of sessionOptionKeys) delete options[key];
+      for (const key of [...sessionOptionKeys, 'isoTracks']) delete options[key];
       try {
         const saved = await post('/api/delivery/presets', {presets: [...table.userPresets, {name: name.trim(), purpose: 'Saved from the Export dialog.', options}]});
         table.userPresets = saved.userPresets; fillPresets();
