@@ -451,6 +451,76 @@ class EffectRenders(unittest.TestCase):
         self.assertEqual(len(result['files']), 4)   # FCPXML, XMEML, OTIO and the video EDL
 
 
+class QueueAndMulticam(unittest.TestCase):
+    """Effects render through the RenderQueue into ProRes 422 HQ, ProRes 4444 with alpha and H.264,
+    and an effect on a multicam clip applies to the camera it shows."""
+
+    def setUp(self):
+        from premiere import MEDIA_ROOT
+        MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
+        self.media = Path(tempfile.mkdtemp(prefix='effects-queue-', dir=MEDIA_ROOT))
+        self.addCleanup(shutil.rmtree, self.media, True)
+        self.state = Path(tempfile.mkdtemp(prefix='effects-queue-state-'))
+        self.addCleanup(shutil.rmtree, self.state, True)
+        self.folder = Path(tempfile.mkdtemp(prefix='effects-queue-out-'))
+        self.addCleanup(shutil.rmtree, self.folder, True)
+        reveal = mock.patch.dict(os.environ, {'SPLICE_NO_REVEAL': '1'})
+        reveal.start()
+        self.addCleanup(reveal.stop)
+        self.green = self.media/'green.mp4'
+        ffmpeg('-f', 'lavfi', '-i', f'color=c=0x20c040:s={W}x{H}:r=25:d=2,drawbox=x=60:y=30:w=40:h=36:c=0xc04060:t=fill',
+               '-vf', 'format=yuv420p', '-c:v', 'libx264', '-qp', '0', '-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709', self.green)
+        from premiere import MEDIA_ROOT as root
+        self.src = '/media/'+str(self.green.relative_to(root))
+
+    def test_render_queue_deliveries_carry_effects(self):
+        from export_jobs import ExportJobs
+        from render_queue import RenderQueue
+        jobs = ExportJobs()
+        queue = RenderQueue(jobs, root=self.state)
+        self.addCleanup(lambda: (queue.shutdown(), jobs.shutdown()))
+        clip = {'type': 'video', 'mediaId': 'g', 'track': 1, 'start': 0, 'duration': 1, 'in': 0, 'embeddedAudio': False,
+                'effects': {'key': {'color': '#20c040', 'similarity': 12, 'smoothness': 8},
+                            'masks': [{'shape': 'rectangle', 'x': 50, 'y': 50, 'width': 80, 'height': 80}]}}
+        project = {'name': 'Queue effects', 'width': W, 'height': H, 'fps': 25,
+                   'media': [{'id': 'g', 'src': self.src, 'type': 'video', 'duration': 2}], 'clips': [clip]}
+        ids = queue.add(project, [{'options': {'codec': 'prores', 'profile': 'hq'}, 'name': 'hq'},
+                                  {'options': {'codec': 'prores', 'profile': '4444', 'alpha': True}, 'name': 'alpha'},
+                                  {'options': {'codec': 'h264'}, 'name': 'web'}], folder=str(self.folder))
+        deadline = time.monotonic()+300
+        while time.monotonic() < deadline:
+            states = {job['name']: job['state'] for job in queue.list()['jobs']}
+            if all(state in ('complete', 'failed', 'cancelled') for state in states.values()):
+                break
+            time.sleep(.2)
+        self.assertEqual(states, {'hq': 'complete', 'alpha': 'complete', 'web': 'complete'}, queue.list())
+        self.assertEqual(len(ids), 3)
+        for name in ('hq.mov', 'web.mp4'):
+            frame = frames_rgb(self.folder/name)[0][12]
+            self.assertLess(max(patch_avg(frame, 140, 80)), 3, f'{name}: the keyed screen shows the black beneath')
+            self.assertGreater(patch_avg(frame, 80, 48)[0], 150, f'{name}: the subject stays')
+        frame, size = frames_rgb(self.folder/'alpha.mov', alpha=True)
+        self.assertLess(patch_avg(frame[12], 140, 80, size)[3], 3, '4444: the keyed screen is transparent')
+        self.assertLess(patch_avg(frame[12], 4, 4, size)[3], 3, '4444: outside the mask is transparent')
+        self.assertGreater(patch_avg(frame[12], 80, 48, size)[3], 252, '4444: the subject is opaque')
+
+    def test_effects_on_a_multicam_clip_apply_to_the_shown_camera(self):
+        other = self.media/'blue.mp4'
+        ffmpeg('-f', 'lavfi', '-i', f'color=c=0x3060c0:s={W}x{H}:r=25:d=2', '-vf', 'format=yuv420p', '-c:v', 'libx264', '-qp', '0', other)
+        from premiere import MEDIA_ROOT as root
+        media = [{'id': 'g', 'src': self.src, 'type': 'video', 'duration': 2},
+                 {'id': 'b', 'src': '/media/'+str(other.relative_to(root)), 'type': 'video', 'duration': 2},
+                 {'id': 'mc', 'type': 'video', 'name': 'Multicam', 'duration': 2,
+                  'multicam': {'angles': [{'mediaId': 'g', 'offset': 0, 'name': 'A'}, {'mediaId': 'b', 'offset': 0, 'name': 'B'}]}}]
+        clip = {'id': 'm', 'type': 'video', 'mediaId': 'mc', 'track': 1, 'start': 0, 'duration': 1, 'in': 0, 'embeddedAudio': False,
+                'multicamAngle': 1, 'transition': 'none', 'effects': {'crop': {'left': 50, 'right': 0, 'top': 0, 'bottom': 0}}}
+        out = self.folder/'multicam.mov'
+        render_to_file({'name': 'mc', 'width': W, 'height': H, 'fps': 25, 'media': media, 'clips': [clip]}, out, options={'codec': 'prores'})
+        frame = frames_rgb(out)[0][12]
+        self.assertLess(max(patch_avg(frame, 30, 48)), 3, 'cropped half: black')
+        self.assertGreater(patch_avg(frame, 130, 48)[2], 150, 'the other half: camera B (blue)')
+
+
 @unittest.skipUnless(shutil.which('node'), 'node')
 class StabilizeServer(unittest.TestCase):
     """The stabilize routes: only Splice's own window, only media Splice knows, ids not paths."""
