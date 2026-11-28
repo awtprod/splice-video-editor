@@ -56,6 +56,13 @@ ANALYSIS_ID = re.compile(r'^[0-9a-f]{32}$')
 # Refusals effects.js repeats word for word at load, in edits and on paste (MESSAGES there).
 MULTICAM_RAMP = 'Speed ramps on multicam clips are not supported. Flatten the multicam clip first.'
 STABILIZE_SOURCE = 'Stabilize the clips inside a nested or multicam clip, or a video clip'
+# Motion analysis reads the file as FFmpeg decodes it, not the clip's developed RAW picture.
+STABILIZE_RAW = 'Splice cannot stabilize a camera RAW clip yet. Stabilize an exported copy of the clip instead.'
+
+
+def _is_raw(item):
+    from render_movie import _is_raw_media_item
+    return _is_raw_media_item(item)
 
 
 def effect_key_message(key):
@@ -1374,6 +1381,8 @@ class Stabilizer:
         if source_out <= source_in or source_out-source_in > 3*3600:
             raise ValueError('Stabilize a range of up to three hours')
         path = _media_path(src)
+        if _is_raw({'src': src}):
+            raise ValueError(STABILIZE_RAW)
         stat = path.stat()
         analysis = hashlib.sha256(f'{STABILIZE_VERSION}|{path}|{stat.st_size}|{stat.st_mtime_ns}|{source_in:.6f}|{source_out:.6f}'.encode()).hexdigest()[:32]
         directory = _analysis_dir(analysis)
@@ -1660,6 +1669,8 @@ def apply_stabilization(project, cancelled=None, heartbeat=None):
             item = items.get(clip.get('mediaId')) or {}
             if item.get('nestedProject') or item.get('multicam') or item.get('nativeGenerator') is not None:
                 raise ValueError(STABILIZE_SOURCE)
+            if _is_raw(item):
+                raise ValueError(STABILIZE_RAW)
     prepared = None
     for index, clip in enumerate(clips):
         if not isinstance(clip, dict) or clip.get('type') != 'video' or clip.get('enabled') is False or clip.get('disabled'):

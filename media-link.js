@@ -62,9 +62,12 @@ window.SpliceLink = (() => {
             row.append(element('button', {type: 'button', className: 'link-folder', textContent: '▸ ' + entry.name,
                                           onclick: () => show(entry.path)}));
           } else if (selectFiles) {
-            const box = element('input', {type: 'checkbox', disabled: entry.kind === 'raw', onchange: onChange});
-            row.append(element('label', {title: entry.kind === 'raw' ? 'Camera RAW needs a transcode from the vendor tool' : entry.path},
-              box, element('span', {textContent: entry.name}), element('small', {textContent: size(entry.size)})));
+            const box = element('input', {type: 'checkbox', onchange: onChange});
+            const labelSpan = element('span', {textContent: entry.name});
+            if (entry.kind === 'raw') labelSpan.append(element('span', {className: 'raw-pill', textContent: 'RAW'}));
+            // A numbered RAW frame sequence is listed once, by its first frame.
+            const detail = entry.frames > 1 ? `${entry.frames} frames` : size(entry.size);
+            row.append(element('label', {title: entry.path}, box, labelSpan, element('small', {textContent: detail})));
           } else {
             row.append(element('label', {title: entry.path}, element('span', {textContent: entry.name}),
                                element('small', {textContent: size(entry.size)})));

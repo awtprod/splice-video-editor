@@ -345,14 +345,16 @@
   const MESSAGES = {
     multicamRamp:'Speed ramps on multicam clips are not supported. Flatten the multicam clip first.',
     stabilizeSource:'Stabilize the clips inside a nested or multicam clip, or a video clip',
+    stabilizeRaw:'Splice cannot stabilize a camera RAW clip yet. Stabilize an exported copy of the clip instead.',
   };
   const effectKeyMessage = key => /^mask\.\d+\./.test(key) ? `Invalid keyframes: ${key.slice(0, 40)} (a clip has at most ${MAX_MASKS} masks)` : `Invalid keyframes: ${key.slice(0, 40)}`;
   // Effects a clip's media cannot take (a ramp on a multicam clip; stabilization of a nested,
-  // multicam or generated clip): the same refusals as the export, whether bypassed or not.
+  // multicam, generated or camera RAW clip): the same refusals as the export, whether bypassed or not.
   function validateEffectsSource(clip, item) {
     if (!item || clip.type !== 'video') return;
     if (clip.keyframes?.speed?.length && item.multicam) fail(MESSAGES.multicamRamp);
     if (clip.effects?.stabilize && (item.nestedProject || item.multicam || item.nativeGenerator != null)) fail(MESSAGES.stabilizeSource);
+    if (clip.effects?.stabilize && item.raw === true) fail(MESSAGES.stabilizeRaw);
   }
   // Keyframes of effect properties (speed, crop.*, mask.N.*): bounds and interpolation fields.
   function validateKeyframes(keyframes) {

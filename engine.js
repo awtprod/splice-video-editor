@@ -836,6 +836,13 @@
     const stabilized=stabilizedPreview(clip);
     if (stabilized) return stabilized.src;
     const stream=clipAudioStream(clip,item);
+    if (item.raw) {
+      if (item.rawAttachedProxy && item.rawDecoderAvailable === false) return item.rawAttachedPreview || item.rawAttachedProxy;
+      if (clip.rawSettings && typeof clip.rawSettings === 'object') {
+        const rawSrc=window.SpliceMedia?.prepareRawPreview?.(item,clip.rawSettings,stream)?.src;
+        if (rawSrc) return rawSrc;
+      }
+    }
     if (item.hdr && hasHdrGrade(clip)) {
       const graded=window.SpliceMedia?.preparePreview(item,stream,true)?.src;
       if (graded) return graded;
@@ -1758,6 +1765,7 @@
             points.some(point => !point || !Number.isFinite(point.time) || !Number.isFinite(point.value)))))
         throw new Error("This project file has invalid keyframes.");
       if (clip.keyframes) window.SpliceGrade.keyTimes(clip);
+      if (clip.rawSettings != null) window.SpliceRawUI?.validateRawSettings?.(clip.rawSettings);
       if (clip.keyframes || clip.effects) {
         try { window.SpliceEffects.validateKeyframes(clip.keyframes); window.SpliceEffects.validateEffects(clip.effects); }
         catch (error) { throw new Error('This project file has invalid effects: '+error.message+'.'); }

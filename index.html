@@ -17,6 +17,7 @@
     <link rel="stylesheet" href="multicam.css" />
     <link rel="stylesheet" href="audio-finishing.css" />
     <link rel="stylesheet" href="effects.css" />
+    <link rel="stylesheet" href="raw.css" />
   </head>
   <body>
     <div class="app-shell">
@@ -65,6 +66,7 @@
             <button id="new-project">New project…</button><button id="open-resolve">Open Resolve project (.drp)…</button><button id="open-resolve-library">Open from Resolve library…</button><button id="save-resolve-library">Save to Resolve library…</button><button id="resolve-compatibility">Resolve compatibility details…</button><button id="save-as">Save Premiere as…</button>
             <button id="save-working">Save working project…</button>
             <button id="link-media">Link media in place…</button><button id="media-cache">Media cache…</button>
+            <button id="raw-decoders">RAW Decoders…</button>
             <button id="render-queue">Render queue…</button>
             <button id="export-timeline">Export timeline…</button><button id="import-timeline">Import timeline…</button>
             <button id="versions">Recent projects &amp; recovery</button>
@@ -268,14 +270,14 @@
     <input
       type="file"
       id="media-input"
-      accept="video/*,audio/*,image/jpeg,image/png,.mxf,.mov,.mkv,.aiff,.bmp,.mts,.m2ts,.ts,.mpg,.dv,.tif,.tiff,.exr,.dpx,.webp"
+      accept="video/*,audio/*,image/jpeg,image/png,.mxf,.mov,.mkv,.aiff,.bmp,.mts,.m2ts,.ts,.mpg,.dv,.tif,.tiff,.exr,.dpx,.webp,.dng,.braw,.r3d,.ari,.arx,.crm,.nev,.cr2,.cr3,.arw,.nef,.raf,.orf,.rw2"
       multiple
       hidden
     />
     <input
       type="file"
       id="relink-input"
-      accept="video/*,audio/*,image/jpeg,image/png,.mxf,.mov,.mkv,.aiff,.bmp,.mts,.m2ts,.ts,.mpg,.dv,.tif,.tiff,.exr,.dpx,.webp"
+      accept="video/*,audio/*,image/jpeg,image/png,.mxf,.mov,.mkv,.aiff,.bmp,.mts,.m2ts,.ts,.mpg,.dv,.tif,.tiff,.exr,.dpx,.webp,.dng,.braw,.r3d,.ari,.arx,.crm,.nev,.cr2,.cr3,.arw,.nef,.raf,.orf,.rw2"
       multiple
       hidden
     />
@@ -296,6 +298,8 @@
     <script src="gl-preview.js"></script>
     <script src="color-monitor.js"></script>
     <script src="color-wheels.js"></script>
+    <script src="raw-inspector.js"></script>
+    <script src="raw-settings.js"></script>
     <script src="audio-dsp.js"></script>
     <script src="audio-mixer.js"></script>
     <script src="engine.js"></script>

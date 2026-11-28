@@ -115,17 +115,59 @@ window.SpliceMedia = (() => {
     if(!response.ok) throw Error(data.error||'Could not inspect the original source');
     return data;
   }
-  async function makeProxy(src, seekOptimized=false, audioStream=null, gradingData=false) {
+  async function makeProxy(src, seekOptimized=false, audioStream=null, gradingData=false, rawSettings=null) {
     const response=await fetch('/api/media/proxy',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({src,seekOptimized,audioStream,gradingData}),signal:AbortSignal.timeout(3650000)});
+      body:JSON.stringify({src,seekOptimized,audioStream,gradingData,rawSettings}),signal:AbortSignal.timeout(3650000)});
     const data=await response.json();
     if(!response.ok || !localMedia(data.src)) throw Error(data.error||'Could not create edit proxy');
     return data.src;
   }
+  async function makeRawProxy(src, rawSettings=null, seekOptimized=false, audioStream=null) {
+    const response=await fetch('/api/raw/preview',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({src,rawSettings,seekOptimized,audioStream}),signal:AbortSignal.timeout(3650000)});
+    const data=await response.json();
+    if(!response.ok || !localMedia(data.src)) throw Error(data.error||'Could not decode Camera RAW preview');
+    return data.src;
+  }
   const previewJobs = new Map();
   const previewKey = (item,stream,grading) => JSON.stringify([item.originalSrc||item.src,!!item.seekOptimized,stream,grading]);
+  const rawPreviewKey = (item,rawSettings,stream) => JSON.stringify(['raw',item.originalSrc||item.src,!!item.seekOptimized,stream??null,rawSettings||null]);
   function hdrPreviewStatus(item, stream=item?.audioStream??null) {
     return item?.src ? previewJobs.get(previewKey(item,stream,true)) : undefined;
+  }
+  function rawPreviewStatus(item, rawSettings, stream=item?.audioStream??null) {
+    return item?.src ? previewJobs.get(rawPreviewKey(item,rawSettings,stream)) : undefined;
+  }
+  // One RAW re-decode per source at a time: dragging Exposure queues decodes instead of
+  // tripping the server's encoder limit, and a setting superseded while queued is skipped.
+  const rawChains = new Map(), rawLatest = new Map();
+  function prepareRawPreview(item, rawSettings, stream=item?.audioStream??null, retry=false) {
+    if (!item?.src || item.offline || !item.raw) return;
+    const key=rawPreviewKey(item,rawSettings,stream), source=item.originalSrc||item.src;
+    let job=previewJobs.get(key);
+    if (job && !(retry && job.error)) return job;
+    job={pending:true};
+    previewJobs.set(key,job);
+    rawLatest.set(source,key);
+    if (previewJobs.size>500) {
+      const expired=[...previewJobs].find(([,entry])=>!entry.pending);
+      if (expired) previewJobs.delete(expired[0]);
+    }
+    const run=(rawChains.get(source)||Promise.resolve()).then(()=>{
+      if (rawLatest.get(source)!==key) { previewJobs.delete(key); return; }
+      return makeRawProxy(source,rawSettings,item.seekOptimized===true,stream).then(src=>{job.src=src;});
+    }).catch(error=>{
+      job.error=error.message;
+      // The server's two encoders were busy with other sources: let the next draw ask again.
+      if (/busy/i.test(job.error)) setTimeout(()=>{ if (previewJobs.get(key)===job) previewJobs.delete(key); },1500);
+    }).finally(()=>{
+      job.pending=false;
+      if (rawChains.get(source)===run) rawChains.delete(source);
+      window.Editor?.refreshMedia?.();
+    });
+    rawChains.set(source,run);
+    job.done=run;
+    return job;
   }
   function preparePreview(item, stream, grading=false, retry=false) {
     if (!item.src || item.offline) return;
@@ -200,7 +242,7 @@ window.SpliceMedia = (() => {
   }
   function needsSourceProbe(item) {
     return !Number.isInteger(item.audioStreams) || !Array.isArray(item.audioStreamDetails) || (item.audioStreams>1 && !Array.isArray(item.audioStreamChannels)) ||
-      (item.hdr && item.hdrPreviewVersion!==3) || (item.still && item.stillPreviewVersion!==1);
+      (item.hdr && item.hdrPreviewVersion!==3) || (item.still && item.stillPreviewVersion!==1) || (item.raw && !item.rawFormat);
   }
   async function restore(project) {
     const db = await open();
@@ -338,5 +380,5 @@ window.SpliceMedia = (() => {
     }
     return copy;
   }
-  return { importFile, remember, rememberMany, makeProxy, prepareNested, invalidateNested, preparePreview, hdrPreviewStatus, restore, matches, matchFolder, forPremiere };
+  return { importFile, remember, rememberMany, makeProxy, makeRawProxy, prepareNested, invalidateNested, preparePreview, prepareRawPreview, hdrPreviewStatus, rawPreviewStatus, restore, matches, matchFolder, forPremiere };
 })();

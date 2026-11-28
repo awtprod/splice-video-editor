@@ -150,6 +150,7 @@
   function stabilizeMarkup(clip, source) {
     if (source?.still || source?.nativeGenerator || window.SpliceNested?.isNativeNested?.(source) || window.SpliceMulticam?.isMulticamItem?.(source))
       return details('stabilize', 'Stabilization', '<p class="splice-handle">Stabilize the clips inside a nested or multicam clip, or a video clip.</p>');
+    if (source?.raw === true) return details('stabilize', 'Stabilization', `<p class="splice-handle">${esc(E.MESSAGES.stabilizeRaw)}</p>`);
     const s = clip.effects?.stabilize, status = jobs.get(s?.analysis) || null;
     const capability = capabilities.vidstab;
     let body = capability === false ? `<p class="splice-compat" role="alert">${esc(capabilities.message || 'This FFmpeg was built without libvidstab, so Splice cannot stabilize. Install an FFmpeg with vidstab (--enable-libvidstab).')}</p>` : '';

@@ -393,6 +393,32 @@ def _event(cut: Cut, clip: dict, subclips: dict | None = None) -> Event | None:
         report.note(f'{label}: the input LUT of its source ({source.input_lut}) is not carried.')
     if source is not None and source.color_matrix:
         report.note(f'{label}: the untagged color matrix override of its source ({source.color_matrix}) is not carried.')
+    raw_settings = clip.get('rawSettings')
+    if isinstance(raw_settings, dict) and raw_settings.get('decodeUsing') == 'clip':
+        capabilities = source.raw_capabilities if source is not None else None
+        try:
+            from raw_decode import unapplied_settings
+        except ImportError:  # pragma: no cover - interchange without the RAW engine
+            unapplied_settings = lambda settings, caps: []  # noqa: E731
+        ignored = set(unapplied_settings(raw_settings, capabilities))
+        applied, skipped = [], []
+        for key, text in (
+                ('iso', f"ISO {raw_settings['iso']}" if raw_settings.get('iso') is not None else None),
+                ('exposure', f"exposure {float(raw_settings['exposure']):+g} EV"
+                 if raw_settings.get('exposure') not in (None, 0, 0.0) else None),
+                ('kelvin', f"{int(round(float(raw_settings['kelvin'])))}K" if raw_settings.get('kelvin') is not None else None),
+                ('tint', f"tint {float(raw_settings['tint']):+g}" if raw_settings.get('tint') not in (None, 0, 0.0) else None),
+                ('colorSpace', str(raw_settings['colorSpace']) if raw_settings.get('colorSpace') else None),
+                ('gamma', str(raw_settings['gamma']) if raw_settings.get('gamma') else None),
+                ('highlightRecovery', 'highlight recovery' if raw_settings.get('highlightRecovery') else None)):
+            if text:
+                (skipped if key in ignored else applied).append(text)
+        summary = f" ({', '.join(applied)})" if applied else ''
+        report.note(f'{label}: its Splice Camera RAW decode overrides{summary} are not carried; receiving apps decode the original RAW using camera metadata.')
+        if skipped:
+            tool = (capabilities or {}).get('tool') or 'its decoder'
+            report.note(f"{label}: {tool} cannot take {', '.join(skipped)}, so Splice's own export did not apply "
+                        f"{'it' if len(skipped) == 1 else 'them'} either.")
     if clip.get('pan') not in (None, 0):
         report.note(f'{label}: clip pan is not carried by timeline interchange.')
     effects = _effects_named(clip.get('audioFx'))

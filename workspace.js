@@ -191,6 +191,8 @@
   const mediaTimecode = (media) => typeof media.timecode === "string" ? media.timecode : "";
   const mediaAudio = (media) => !Number.isInteger(media.audioStreams) ? "" : media.audioStreams === 0 ? "No audio" :
     media.audioStreams + (media.audioStreams === 1 ? " audio stream" : " audio streams");
+  // Camera RAW format and camera model, as the media (or the original a subclip came from) recorded them.
+  const mediaRaw = (media) => media.raw === true ? [media.rawFormatLabel || "Camera RAW", media.rawMetadata?.camera || ""] : [];
   const mediaColumns = [
     {key: "name", label: "Name", value: (media) => media.name},
     {key: "duration", label: "Duration", value: (media) => media.duration || 0, show: (media, project) => fmt(media.duration, project.fps)},
@@ -211,7 +213,7 @@
     if (bin && !(window.SpliceBins ? window.SpliceBins.mediaMatchesBin(media, bin) : (bin === "@root" ? !media.bin : media.bin === bin))) return false;
     if (filter !== "all" && filter !== media.type && !(filter === "offline" && media.offline)) return false;
     const text = [media.name, media.bin, media.path, media.sourcePath, media.reel, mediaTimecode(media),
-      media.scene, media.camera, media.shot, media.take, media.logNote, media.colorLabel].filter(Boolean).join(" ");
+      media.scene, media.camera, media.shot, media.take, media.logNote, media.colorLabel, ...mediaRaw(media)].filter(Boolean).join(" ");
     return !term || text.toLowerCase().includes(term);
   }
   function sortedMedia(items, project) {
@@ -226,7 +228,7 @@
   function mediaDetails(media, withPath = true) {
     return [mediaRate(media) && mediaRate(media) + " fps", mediaTimecode(media) && "TC " + mediaTimecode(media),
       media.scene && "Sc " + media.scene, media.shot && "Sh " + media.shot, media.take && "Tk " + media.take,
-      media.reel && "Reel " + media.reel, mediaAudio(media), media.logNote, withPath && media.sourcePath].filter(Boolean).join(" · ");
+      media.reel && "Reel " + media.reel, ...mediaRaw(media), mediaAudio(media), media.logNote, withPath && media.sourcePath].filter(Boolean).join(" · ");
   }
   function mediaKindPill(media) {
     if (window.SpliceNested?.isNativeNested?.(media) || Number.isInteger(media.nestedSequence))
