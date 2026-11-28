@@ -362,7 +362,7 @@ def save_decoder_config(updates: dict) -> dict[str, str]:
 @lru_cache(maxsize=1)
 def ffmpeg_has_prores_raw() -> tuple[bool, str | None]:
     """Check whether the installed FFmpeg includes the native ``prores_raw`` decoder."""
-    ffmpeg = shutil.which('ffmpeg')
+    ffmpeg = splice_platform.ffmpeg_tool('ffmpeg')
     if not ffmpeg:
         return False, None
     try:
@@ -442,11 +442,13 @@ def _resolve_backend(backend_id: str, cfg: dict | None = None, env_map: dict | N
     if backend_id == 'prores_raw':
         has_dec, version = ffmpeg_has_prores_raw()
         return {**base, 'available': has_dec, 'activeBackend': 'ffmpeg' if has_dec else None,
-                'path': shutil.which('ffmpeg') if has_dec else None, 'version': version if has_dec else None,
+                'path': splice_platform.ffmpeg_tool('ffmpeg') if has_dec else None, 'version': version if has_dec else None,
                 'configuredPath': None, 'sdkPath': None,
                 'guidance': None if has_dec else 'Install FFmpeg 8 or later (its prores_raw decoder).'}
     candidates = [c for c in (configured, env_map.get(backend_id)) if c]
-    candidates += [found for found in (shutil.which(cli) for cli in spec['cliNames']) if found]
+    # A decoder found on PATH by its real path: a PATH folder may be written in Windows' short 8.3
+    # form (C:\PROGRA~1\...), whose '~' the shell-metacharacter check would refuse.
+    candidates += [str(Path(found).resolve()) for found in (shutil.which(cli) for cli in spec['cliNames']) if found]
     candidates += list(spec['standardPaths'])
     cli_path = sdk_path = None
     for candidate in candidates:
@@ -850,7 +852,7 @@ def _parse_qt_meta(buf: bytes, start: int, end: int, info: dict, _depth: int = 0
 
 def _ffprobe_optional(path: Path) -> dict | None:
     """Run ffprobe safely, returning parsed JSON or None if FFmpeg cannot inspect the container."""
-    ffprobe = shutil.which('ffprobe')
+    ffprobe = splice_platform.ffmpeg_tool('ffprobe')
     if not ffprobe:
         return None
     try:
@@ -1235,7 +1237,7 @@ def _probe_cinemadng(path: Path) -> dict:
     kind = 'builtin'
     if meta['builtinDecodable']:
         decoder = (True, f"Built-in CinemaDNG ({meta['bitsPerSample']}-bit {meta['cfaName']})", None)
-    elif meta['compression'] in FFMPEG_DNG_COMPRESSIONS and shutil.which('ffmpeg'):
+    elif meta['compression'] in FFMPEG_DNG_COMPRESSIONS and splice_platform.ffmpeg_tool('ffmpeg'):
         decoder = (True, f"FFmpeg DNG + built-in color ({meta['bitsPerSample']}-bit, compression {meta['compression']})", None)
     else:
         libraw = _resolve_backend('libraw')
@@ -1570,7 +1572,7 @@ def _decode_cinemadng(path: Path, out_path: Path, settings: dict, info: dict, *,
     first = raw_bayer.parse_dng(seq['frames'][0])
     via_ffmpeg = False
     if not first['builtinDecodable']:
-        if first['compression'] in FFMPEG_DNG_COMPRESSIONS and shutil.which('ffmpeg'):
+        if first['compression'] in FFMPEG_DNG_COMPRESSIONS and splice_platform.ffmpeg_tool('ffmpeg'):
             via_ffmpeg = True
         else:
             libraw = _resolve_backend('libraw')

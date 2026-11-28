@@ -38,7 +38,8 @@ Upgrading replaces the previous version's program files completely. If Splice is
 
 - Splice is a local web application in its own window. `Splice.exe` starts Splice's Python server and opens the editor in an Electron window.
 - The server listens only on `127.0.0.1:47834` (this computer, not the network). It answers only the window that opened it.
-- The app uses **only its bundled FFmpeg**: other FFmpeg builds on the computer are never picked up. At startup it checks that this FFmpeg has every filter, encoder, decoder and muxer Splice uses.
+- The app uses **only its bundled FFmpeg**: other FFmpeg builds on the computer are never picked up, even one on your `PATH`. The server runs FFmpeg and ffprobe from the install folder by their full paths, and the bundled FFmpeg folder comes first on its `PATH`. At startup it checks that this FFmpeg has every filter, encoder, decoder and muxer Splice uses.
+- The rest of your `PATH` is kept, after the bundled FFmpeg folder, so camera RAW decoders you put on `PATH` are found (see below).
 
 ## Troubleshooting
 
@@ -52,7 +53,7 @@ Upgrading replaces the previous version's program files completely. If Splice is
 
 **Exports are hard to find.** The default folder is `%LOCALAPPDATA%\Splice\Exports`. Use *reveal* in the render queue, or choose another folder in the export dialog.
 
-**Camera RAW decoders are not found.** The app runs with only its bundled FFmpeg on `PATH`, so a decoder you installed and put on `PATH` is not found that way. Set its full path in **File → RAW Decoders…**, or install it in the vendor's standard folder (for example REDCINE-X PRO's or ARRI Reference Tool's default location). See [Camera RAW](camera-raw.md#setting-up-vendor-decoders).
+**Camera RAW decoders are not found.** Splice finds a decoder (`braw-decode`, `REDline`, `art-cmd`, `dcraw_emu`, …) in this order: the path set in **File → RAW Decoders…**, the decoder's environment variable, your `PATH`, then the vendor's standard install folder (for example REDCINE-X PRO's or ARRI Reference Tool's default location). If a decoder on `PATH` is not found, check that its folder is in your user or system `PATH` (quotes around a folder are fine) and restart Splice, which reads `PATH` when it starts. Or set its full path in the dialog. See [Camera RAW](camera-raw.md#setting-up-vendor-decoders).
 
 **An export was cancelled but files remain.** A cancelled job only shows as cancelled once its processes have exited and its scratch files are gone (see [Delivery](delivery.md#cancelling)). If Splice crashed instead, the leftovers are removed the next time it starts.
 

@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict')
 const { execFileSync } = require('node:child_process')
-const { existsSync, mkdirSync, mkdtempSync, readFileSync } = require('node:fs')
+const { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } = require('node:fs')
 const { tmpdir } = require('node:os')
 const path = require('node:path')
 const { _electron: electron } = require('playwright-core')
@@ -9,6 +9,10 @@ const { _electron: electron } = require('playwright-core')
 // staged copy (a Linux Electron build of the same shell, for local runs), and
 // SPLICE_EXECUTABLE at the Electron binary to drive (CI: a copy of Splice.exe
 // whose inspector fuse is back on, since Playwright needs it).
+//
+//   node tests/windows-installer.cjs               project round trip, exports, draft restore
+//   node tests/windows-installer.cjs --user-path   a RAW decoder on the user's PATH is found, and
+//                                                  the bundled FFmpeg is still the one used
 const windows = process.platform === 'win32'
 const installed = process.env.SPLICE_INSTALLED_APP ||
   path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Splice', 'Application')
@@ -19,10 +23,14 @@ const workspace = mkdtempSync(path.join(tmpdir(), 'splice-installer-'))
 const native = path.join(proof, 'Windows Installer.prproj')
 const rendered = path.join(proof, 'Windows Installer.mp4')
 
-async function windowForEditor() {
-  // Launch with only system directories on PATH to exercise the bundled runtimes.
+async function windowForEditor(userFolders = []) {
+  // Launch with only system directories on PATH (and the given folders before them) to
+  // exercise the bundled runtimes. On Windows the folders are quoted and followed by a blank
+  // entry, as users' PATHs often are.
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => key.toLowerCase() !== 'path'))
-  const systemPath = windows ? { Path: path.join(process.env.SystemRoot, 'System32') } : { PATH: '/usr/bin:/bin' }
+  const systemPath = windows
+    ? { Path: [...userFolders.map(folder => `"${folder}"`), '', path.join(process.env.SystemRoot, 'System32')].join(';') }
+    : { PATH: [...userFolders, '/usr/bin', '/bin'].join(':') }
   const app = await electron.launch({
     executablePath: executable,
     args: [`--user-data-dir=${path.join(workspace, 'profile')}`, ...(windows ? [] : ['--no-sandbox'])],
@@ -146,4 +154,41 @@ async function main() {
   }
 }
 
-main().catch(error => { console.error(error); process.exitCode = 1 })
+// A decoder the user put on PATH is found, as GET /api/raw/decoders reports it, while every
+// FFmpeg lookup and run still uses the bundled FFmpeg, although the same folder has an ffmpeg.
+async function decodersOnUserPath() {
+  mkdirSync(proof, { recursive: true })
+  const folder = path.join(workspace, 'user tools')
+  const ran = path.join(workspace, 'user-ffmpeg-ran.txt')
+  mkdirSync(folder)
+  const stub = name => path.join(folder, name + (windows ? '.cmd' : ''))
+  for (const name of ['braw-decode', 'ffmpeg', 'ffprobe']) {
+    const record = name === 'braw-decode' ? '' : windows ? `echo ${name}>>"${ran}"\r\n` : `echo ${name} >> '${ran}'\n`
+    writeFileSync(stub(name), windows ? `@echo off\r\n${record}exit /b 9\r\n` : `#!/bin/sh\n${record}exit 9\n`, { mode: 0o755 })
+  }
+  const bundled = name => path.join(installed, 'resources', 'ffmpeg', name + (windows ? '.exe' : ''))
+  const same = (a, b) => windows ? path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase() : path.resolve(a) === path.resolve(b)
+  const { app, page } = await windowForEditor([folder])
+  try {
+    const { decoders } = await page.evaluate(() => fetch('/api/raw/decoders').then(response => response.json()))
+    const braw = decoders.find(decoder => decoder.id === 'braw')
+    assert.equal(braw.available, true, `braw-decode on the user's PATH was not found: ${JSON.stringify(braw)}`)
+    assert.ok(same(realpathSync.native(braw.path), realpathSync.native(stub('braw-decode'))), braw.path)
+    const prores = decoders.find(decoder => decoder.id === 'prores_raw')
+    if (windows) assert.equal(prores.available, true, 'the bundled FFmpeg 9.1 has prores_raw')
+    if (prores.available) assert.ok(same(prores.path, bundled('ffmpeg')), `prores_raw uses ${prores.path}`)
+    // The export dialog's capabilities: found, and test encodes run, with the bundled FFmpeg.
+    const { machine } = await page.evaluate(() => fetch('/api/delivery/capabilities').then(response => response.json()))
+    assert.ok(same(machine.ffmpeg, bundled('ffmpeg')), `delivery uses ${machine.ffmpeg}`)
+    assert.ok(!existsSync(ran), `the user's ffmpeg ran: ${existsSync(ran) && readFileSync(ran, 'utf8')}`)
+    const report = { userPath: folder, braw: braw.path, proresRaw: prores.path, deliveryFFmpeg: machine.ffmpeg,
+      userFFmpegRan: false }
+    writeFileSync(path.join(proof, 'user-path.json'), JSON.stringify(report, null, 2))
+    console.log(JSON.stringify(report))
+  } finally {
+    await app.close()
+  }
+}
+
+;(process.argv[2] === '--user-path' ? decodersOnUserPath : main)()
+  .catch(error => { console.error(error); process.exitCode = 1 })
