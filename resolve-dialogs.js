@@ -344,7 +344,7 @@ window.SpliceResolve = (() => {
     return wrap;
   }
   async function saveToLibrary() {
-    const state = Editor.get(), current = state.project, source = current.resolveSource;
+    const state = Editor.get(), current = window.SpliceNested?.rootProject?.() || state.project, source = current.resolveSource;
     const timelines = await editedTimelines(current);
     const node = document.createElement('dialog');
     node.className = 'studio-dialog resolve-library resolve-save';

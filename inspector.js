@@ -36,6 +36,8 @@
       return;
     }
     const source = state.project.media.find(item => item.id === clip.mediaId);
+    // RAW controls follow the media the clip plays: a multicam clip's active angle, a subclip's original.
+    const rawSource = (editor.resolveClipMedia ? editor.resolveClipMedia(clip, state.project).item : source) || null;
     const title = clip.title || source?.name || 'Title';
     const color = clip.color || {};
     const transform = clip.transform || {};
@@ -45,16 +47,43 @@
     const maximumDuration = !source?.still && source?.duration ? Math.max(1/fps, (source.duration - (clip.in || 0))/number(clip.speed,1)) : 7200;
     let html = `<div class="splice-clip-heading"><small>${escape(clip.type)} · ${clip.track > 0 ? 'V' + clip.track : 'A' + Math.abs(clip.track)}</small><strong>${escape(title)}</strong></div>`;
     if(locked) html += '<p class="splice-compat">This track is locked. Unlock it in the timeline to edit this clip.</p>';
+    if (window.SpliceNested?.isNativeNested?.(source)) {
+      html += section('Nested sequence',
+        '<div class="inspector-editorial-actions">' +
+        '<button type="button" data-action="enter-nest">Open nested sequence</button>' +
+        '<button type="button" data-action="unnest-clip">Unnest in place</button>' +
+        '</div>');
+    }
+    if (window.SpliceMulticam?.isMulticamItem?.(source)) {
+      const angles = source.multicam.angles;
+      const curAngle = (clip.type === 'audio' ? clip.multicamAudioAngle : undefined) ?? clip.multicamAngle ?? 0;
+      const opts = angles.map((a, i) => clip.type === 'video' && !editor.isPictureAngle(a, state.project) ? '' : option(String(i), `${i + 1}: ${a.name || 'Angle ' + (i + 1)}`, String(curAngle))).join('');
+      html += section('Multicam',
+        `<label class="splice-number"><span>Active angle</span><select aria-label="Multicam angle" data-action="mc-angle">${opts}</select></label>` +
+        '<div class="inspector-editorial-actions">' +
+        `<button type="button" data-action="mc-view">${window.SpliceMulticam.isViewEnabled() ? 'Close multicam view' : 'Multicam monitor'}</button>` +
+        '<button type="button" data-action="mc-flatten">Flatten multicam</button>' +
+        '</div>');
+    }
+    if (source?.parentMediaId) {
+      const sIn = Number(source.subclipIn) || 0;
+      const sOut = Number(source.subclipOut) || (sIn + (Number(source.duration) || 0));
+      html += section('Subclip',
+        `<p class="splice-handle">Bounds: ${escape(editor.formatTimecode(sIn, fps))} – ${escape(editor.formatTimecode(sOut, fps))}</p>` +
+        '<div class="inspector-editorial-actions"><button type="button" data-action="remove-subclip-limits">Remove subclip limits</button></div>');
+    }
+    const labelColors = window.SpliceBins?.COLOR_LABELS || [];
     html += section('Timing',
       field('Timeline start', 'start', number(clip.start, 0).toFixed(2), 0, 7200, 1/fps) +
       (clip.type==='title' ? field('Video track','track',clip.track,1,64,1) : '') +
       (clip.type === 'title' || source?.still ? '' : field('Source in', 'in', number(clip.in, 0).toFixed(2), 0, source?.duration || 7200, 1/fps)) +
-      field('Duration', 'duration', number(clip.duration, 1).toFixed(2), 1/fps, maximumDuration, 1/fps));
+      field('Duration', 'duration', number(clip.duration, 1).toFixed(2), 1/fps, maximumDuration, 1/fps) +
+      (labelColors.length ? `<label class="splice-number"><span>Color label</span><select aria-label="Clip color label" data-field="colorLabel">${labelColors.map(c => option(c.key, c.name, clip.colorLabel || '')).join('')}</select></label>` : ''));
     if (clip.type!=='title' && !source?.still && !clip.nativeTimeRemap) html += section('Speed',
       field('Speed (%)','speedPercent',Math.round(number(clip.speed,1)*10000)/100,10,800,.01) +
       `<label class="splice-safe-toggle"><input aria-label="Reverse clip" type="checkbox" data-field="reverse" ${clip.reverse?'checked':''}> Reverse clip</label>`);
     if (clip.type === 'video') {
-      if (window.SpliceRawUI && source?.raw === true) html += window.SpliceRawUI.markup(clip, source);
+      if (window.SpliceRawUI && rawSource?.raw === true) html += window.SpliceRawUI.markup(clip, rawSource);
       const previous = state.project.clips.find(item => item.type==='video' && item.track===clip.track && item.id!==clip.id &&
         Math.round((item.start+item.duration)*fps)===Math.round(clip.start*fps));
       const previousMedia = previous && state.project.media.find(item=>item.id===previous.mediaId);
@@ -181,7 +210,7 @@
     for(const key of ['scale','x','y','rotation','opacity','volume',...gradeKeys])
       if(clip.keyframes?.[key]?.length) element.querySelector(`[data-field="${key}"]:not([data-group="trackMix"])`)?.setAttribute('disabled','');
     if(clip.transition==='native') element.querySelector('[data-field="transitionDuration"]')?.setAttribute('disabled','');
-    if(locked) for(const input of element.querySelectorAll('[data-field]:not([data-group="trackMix"]),[data-key-add],[data-key-delete],[data-key-property],.splice-key-value,[data-action="import-lut"],[data-action="remove-lut"],[data-grade-tools] input,[data-grade-tools] select,[data-grade-tools] button:not([data-grade-action="copy"]):not([data-grade-action="cube"]):not([data-curve-tab])')) input.disabled=true;
+    if(locked) for(const input of element.querySelectorAll('[data-field]:not([data-group="trackMix"]),[data-key-add],[data-key-delete],[data-key-property],.splice-key-value,[data-action="import-lut"],[data-action="remove-lut"],[data-action="unnest-clip"],[data-action="mc-angle"],[data-action="mc-flatten"],[data-action="remove-subclip-limits"],[data-grade-tools] input,[data-grade-tools] select,[data-grade-tools] button:not([data-grade-action="copy"]):not([data-grade-action="cube"]):not([data-curve-tab])')) input.disabled=true;
     document.querySelector('#monitor-frame')?.classList.toggle('show-safe-area', showSafeArea);
     element.querySelector('[data-safe-area]')?.addEventListener('change',event=>{
       showSafeArea=event.target.checked;
@@ -209,6 +238,8 @@
         try {
           if (group === 'trackMix') {
             editor.updateTrackMix(active.track, {[key]: value});
+          } else if (key === 'colorLabel' && window.SpliceBins) {
+            window.SpliceBins.setClipColorLabel(active.id, value);
           } else if (key==='speedPercent') {
             editor.setClipSpeed(active.id,value/100);
             render(editor.get(),element,editor);
@@ -222,6 +253,54 @@
         }
       });
     }
+    element.querySelector('[data-action="enter-nest"]')?.addEventListener('click', () => {
+      if (source) window.SpliceNested?.enter?.(source.id).catch(err => window.SpliceNotify?.(err.message));
+    });
+    element.querySelector('[data-action="unnest-clip"]')?.addEventListener('click', () => {
+      try {
+        const out = window.SpliceNested?.unnestClip?.(clip.id);
+        if (out) window.SpliceNotify?.(`Unnested ${out.length} clip${out.length === 1 ? '' : 's'} in place`);
+      } catch (err) { window.SpliceNotify?.(err.message); }
+    });
+    element.querySelector('[data-action="mc-angle"]')?.addEventListener('change', event => {
+      const idx = Number(event.target.value);
+      try {
+        editor.editProject(next => {
+          const target = next.clips.find(c => c.id === clip.id);
+          if (!target) return;
+          const mc = next.media.find(m => m.id === target.mediaId)?.multicam;
+          if (!mc?.angles[idx]) return;
+          const picture = editor.isPictureAngle(mc.angles[idx], next);
+          if (target.type === 'audio' && (!picture || Number.isInteger(target.multicamAudioAngle))) {
+            target.multicamAudioAngle = idx;
+            return;
+          }
+          if (!picture) return;
+          target.multicamAngle = idx;
+          if (target.linkGroup && mc.audioMode === 'follow') {
+            for (const other of next.clips) {
+              if (other.id !== target.id && other.linkGroup === target.linkGroup && other.mediaId === target.mediaId) other.multicamAngle = idx;
+            }
+          }
+        });
+      } catch (err) { window.SpliceNotify?.(err.message); }
+    });
+    element.querySelector('[data-action="mc-view"]')?.addEventListener('click', () => {
+      window.SpliceMulticam?.toggleMulticamView?.();
+      render(editor.get(), element, editor);
+    });
+    element.querySelector('[data-action="mc-flatten"]')?.addEventListener('click', () => {
+      try {
+        const out = window.SpliceMulticam?.flattenClips?.(clip.id);
+        if (out) window.SpliceNotify?.(`Flattened multicam into ${out.length} clip${out.length === 1 ? '' : 's'}`);
+      } catch (err) { window.SpliceNotify?.(err.message); }
+    });
+    element.querySelector('[data-action="remove-subclip-limits"]')?.addEventListener('click', () => {
+      try {
+        window.SpliceBins?.removeClipSubclipLimits?.(clip.id);
+        window.SpliceNotify?.('Removed subclip limits on clip');
+      } catch (err) { window.SpliceNotify?.(err.message); }
+    });
     const picker = element.querySelector('.splice-lut-input');
     element.querySelector('[data-action="import-lut"]')?.addEventListener('click', () => picker.click());
     element.querySelector('[data-action="remove-lut"]')?.addEventListener('click', () => {
@@ -269,7 +348,7 @@
       render(editor.get(),element,editor);
     });
     if (clip.type === 'video') {
-      if (source?.raw === true) window.SpliceRawUI?.bind(element, clip, editor, () => render(editor.get(), element, editor));
+      if (rawSource?.raw === true) window.SpliceRawUI?.bind(element, clip, editor, () => render(editor.get(), element, editor));
       window.SpliceColorUI?.bind(element, clip, editor, () => render(editor.get(), element, editor));
     }
     if (clip.type === 'audio' || clip.type === 'video' && clip.embeddedAudio !== false) mountAudioFx(element, clip, editor, locked, previousFx);

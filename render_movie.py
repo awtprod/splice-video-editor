@@ -105,7 +105,7 @@ def _disabled_stand_ins(clips, fps):
                                                (clip.get('track', 0), round((float(clip['start'])+float(clip['duration']))*fps)) in joined):
             stand_in = {key: value for key, value in clip.items() if key in
                         ('id', 'type', 'track', 'start', 'duration', 'transition', 'transitionBefore', 'transitionDuration',
-                         'transitionMatchName')}
+                         'transitionMatchName', 'transitionClock')}
             stand_in.update(mediaId=DISABLED_MEDIA, enabled=False)
             kept.append(stand_in)
     return kept
@@ -883,6 +883,32 @@ def _trim_audio(filters, label, index, streams, start, length, reverse, rates=No
     return result + ('areverse,' if reverse else '')
 
 
+def _audio_transition_gain(clip, expression):
+    return f'sin(PI*({expression})/2)' if clip.get('transitionMatchName')=='Constant Power' else expression
+
+
+def _fade_clock(clip, key):
+    clock = clip.get(key)
+    if not isinstance(clock, dict):
+        raise ValueError('Invalid retimed fade')
+    origin = _number(clock.get('origin'), 'fade origin', -MAX_TIMELINE_SECONDS, MAX_TIMELINE_SECONDS)
+    rate = _number(clock.get('rate'), 'fade rate', -16, 16)
+    duration = _number(clock.get('duration'), 'fade duration', .001, MAX_TIMELINE_SECONDS)
+    if not rate or (key == 'transitionClock' and rate != 1):
+        raise ValueError('Invalid fade rate')
+    return origin, rate, duration
+
+
+def _sample_clock(origin, rate):
+    first = round(origin*AUDIO_RATE) - (1 if rate < 0 else 0)
+    return lambda t: f'(({first}+{rate:.15g}*round({t}*{AUDIO_RATE}))/{AUDIO_RATE})'
+
+
+def _transition_envelope(clip, origin, rate, duration):
+    # Use the same integer sample clock in both directions, including the last
+    # sample before a reversed edit's exclusive out point.
+    clock = _sample_clock(origin, rate)
+    return lambda t: _audio_transition_gain(clip, f'min(1,max(0,{clock(t)}/{duration:.9f}))')
 def _horizontal_position(clip, width, overlay_width, clock):
     x = _number((clip.get('transform') or {}).get('x',0),'horizontal position',-100,100)
     keyframes = _keyframe_expr(clip,'x',x,-100,100,clock)
@@ -1016,18 +1042,25 @@ def _slice_keyframes(keyframes, offset, length):
         if any(not isinstance(point,dict) for point in points): raise ValueError('Invalid keyframes')
         earliest = -MAX_SOURCE_SECONDS if key in PRIMARY_COLOR_KEYS else 0
         ordered=sorted(({'time':_number(point.get('time'),'keyframe time',earliest,MAX_SOURCE_SECONDS),
-                         'value':_number(point.get('value'),'keyframe value',*bounds[key])} for point in points),key=lambda point:point['time'])
+                         'value':_number(point.get('value'),'keyframe value',*bounds[key]),
+                         **({'ease':True} if point.get('ease') is True else {})} for point in points),key=lambda point:point['time'])
         if any(right['time']<=left['time'] for left,right in zip(ordered,ordered[1:])): raise ValueError('Duplicate keyframes')
         def value_at(at):
-            if at<=ordered[0]['time']: return ordered[0]['value']
+            if at<=ordered[0]['time']: return ordered[0]['value'], False
             for left,right in zip(ordered,ordered[1:]):
                 if at<=right['time']:
                     fraction=(at-left['time'])/(right['time']-left['time'])
-                    return left['value']+(right['value']-left['value'])*fraction
-            return ordered[-1]['value']
-        sliced=[{'time':0,'value':value_at(offset)}]
-        sliced.extend({'time':point['time']-offset,'value':point['value']} for point in ordered if offset<point['time']<offset+length)
-        sliced.append({'time':length,'value':value_at(offset+length)})
+                    eased=bool(left.get('ease'))
+                    if eased:
+                        fraction=fraction*fraction*(3-2*fraction)
+                    return left['value']+(right['value']-left['value'])*fraction, eased
+            return ordered[-1]['value'], False
+        start_val, start_ease = value_at(offset)
+        end_val, _ = value_at(offset+length)
+        sliced=[{'time':0,'value':start_val,**({'ease':True} if start_ease else {})}]
+        sliced.extend({'time':point['time']-offset,'value':point['value'],**({'ease':True} if point.get('ease') else {})}
+                      for point in ordered if offset<point['time']<offset+length)
+        sliced.append({'time':length,'value':end_val})
         result[key]=sliced
     return result
 
@@ -1240,6 +1273,8 @@ def _check_clip(clip, media_by_id, probes, heartbeat=None):
     if required > item['_actualDuration'] + .05:
         raise ValueError(f"{item.get('name', 'Media')} ends before this clip's out point")
     if clip['type'] not in item['_kinds']:
+        if clip.get('_optionalAudio') and clip['type'] == 'audio':
+            return item
         raise ValueError(f"{item.get('name', 'Media')} lacks a {clip['type']} stream")
     return item
 
@@ -1516,19 +1551,30 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
         # timestamp directly so fractional cuts do not round to a whole frame.
         clock = f'(T+({first_frame/float(fps)-render_start:.12f}))'
         gains = []
-        if dip_head > 0:
+        if clip.get('pictureDip'):
+            dip_origin, dip_rate, dip_duration = _fade_clock(clip, 'pictureDip')
+            dip_origin += dip_rate * clip.get('_keyframeShift', 0)
+            if dip_rate < 0:
+                dip_origin -= 1/float(fps)
+            dip_clock = f'(T+({first_frame/float(fps)-start:.12f}))'
+            gains.append(f'clip(({dip_origin:.12f}+({dip_rate:.15g})*{dip_clock})/{dip_duration:.9f},0,1)')
+        elif dip_head > 0:
             gains.append(f'clip({clock}/{dip_head:.9f},0,1)')
         if following and following.get('transition') == 'fade':
             tail = float(following.get('transitionBefore', 0) or 0)
             if tail > 0:
                 gains.append(f'clip(({render_length:.9f}-{clock})/{tail:.9f},0,1)')
         if gains and not disabled:
-            gain = '*'.join(gains)
+            # geq truncates: snap the gain to a 1/65536 step so rounding noise in a rebased fade clock
+            # (a split or trimmed retimed dip) cannot drop a code value where the gain is exactly 1.
+            gain = f"(round(65536*{'*'.join(gains)})/65536)"
             scale = 1 << (depth - 8)
             black_y, mid_c = 16 * scale, 128 * scale
             chain += (f",geq=lum='{black_y}+(p(X,Y)-{black_y})*{gain}':cb='{mid_c}+(p(X,Y)-{mid_c})*{gain}':"
                       f"cr='{mid_c}+(p(X,Y)-{mid_c})*{gain}':a='alpha(X,Y)'")
         overlap_transition = previous is not None and clip.get('transition') in ('dissolve','wipe')
+        progress_origin, _, progress_duration = (_fade_clock(clip, 'transitionClock')
+            if clip.get('transitionClock') else (0, 1, transition_duration))
         if overlap_transition:
             prior_item = media_by_id[previous['mediaId']]
             prior_speed=_number(previous.get('speed',1),'speed',.1,16)
@@ -1580,14 +1626,18 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
                                  cut_frame, tail_frames, window_frames, base_format)
                 active = f'under{number}'
         elif clip.get('transition') == 'dissolve' and not disabled:
-            chain += f',fade=t=in:st=0:d={transition_duration:.6f}:alpha=1'
+            if clip.get('transitionClock'):
+                chain += _mask_alpha(f'min(1,(T+{progress_origin:.9f})/{progress_duration:.9f})', alpha_format, full_alpha)
+            else:
+                chain += f',fade=t=in:st=0:d={transition_duration:.6f}:alpha=1'
         if disabled:
             pass
         elif clip.get('transition') == 'wipe':
             left = _horizontal_position(clip,width,'W',_keyframe_clock(clip,fps,'T',before))
             # The frame at the wipe's end is fully revealed: T and the printed
             # duration can differ by rounding, so compare with 1 us of slack.
-            mask = f'if(gte(T,{transition_duration-1e-6:.9f}),1,lt(X+({left}),{width}*T/{transition_duration:.9f}))'
+            t = f'(T+{progress_origin:.9f})'
+            mask = f'if(gte({t},{progress_duration-1e-6:.9f}),1,lt(X+({left}),{width}*{t}/{progress_duration:.9f}))'
             chain += _mask_alpha(mask,alpha_format,full_alpha)
         elif clip.get('_wipeMask'):
             # Same format round trip as the window that holds the wipe.
@@ -1598,13 +1648,14 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
         if overlap_transition and clip.get('transition') == 'dissolve' or wipe_off:
             _composite_layer(filters, f'without{number}', f'clip{number}', f'incoming{number}', position, overlay,
                              first_frame, frames, window_frames, base_format)
-            end = render_start+transition_duration
-            progress = f'(T-{render_start:.9f})/{transition_duration:.9f}'
+            progress_start = render_start - progress_origin
+            end = progress_start + progress_duration
+            progress = f'(T-({progress_start:.9f}))/{progress_duration:.9f}'
             # A wipe to a disabled clip uncovers the layers beneath from the left.
             mix = f'if(lt(X,W*{progress}),B,A)' if wipe_off else f'A*(1-{progress})+B*{progress}'
             # (The wipe's last frame is fully uncovered: compare with 1 us of slack, as the wipe mask does.)
             finish = end-1e-6 if wipe_off else end
-            blend = f'if(lte(T,{render_start:.9f}),A,if(gte(T,{finish:.9f}),B,{mix}))'
+            blend = f'if(lte(T,{progress_start:.9f}),A,if(gte(T,{finish:.9f}),B,{mix}))'
             filters.append(f"[{active}][incoming{number}]blend=all_expr='{blend}'[base{number+1}]")
         else:
             _composite_layer(filters, active, f'clip{number}', f'base{number+1}', position, overlay,
@@ -1623,7 +1674,8 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
     command.extend([*_graph_args(';'.join(filters), directory, 'picture'), '-map', f'[{active}]', '-an',
                     '-t', f'{float(duration):.6f}', '-r', str(fps)])
     if spec['mode'] == 'stream':
-        # Raw frames in the delivery's pixel format for the one encoder (see _stream_picture).
+        # Raw frames in the delivery's pixel format for the one encoder (see _stream_picture);
+        # _delivery_tail has conformed them to the color space the encoder reads them as.
         command.extend(['-threads:v', '1', '-f', 'rawvideo', 'pipe:1'])
         return command
     output = Path(output_path)
@@ -1698,7 +1750,8 @@ def _sound_transition(clip, pictures, fps):
         return None
     duration = _number(source.get('transitionDuration', .5), 'transition duration', 1/float(fps))
     before = min(_number(source.get('transitionBefore', 0), 'transition lead'), duration)
-    return dict(kind=kind, duration=duration, before=before, power=source.get('transitionMatchName') == 'Constant Power')
+    clock = _fade_clock(source, 'transitionClock') if source.get('transitionClock') else None
+    return dict(kind=kind, duration=duration, before=before, power=source.get('transitionMatchName') == 'Constant Power', clock=clock)
 
 
 def _transition_curve(power, expression):
@@ -1789,7 +1842,7 @@ def track_plan(track_mix, track):
 
 
 def _audio_events(clips, media_by_id, fps, probes, track_mix, solo, span, heartbeat=None, *, layout='stereo', tracks=None,
-                  plans=None):
+                  plans=None, audio_stems=()):
     """Describe each audible clip as one timeline event: its body, any crossfade
     lead-in before its start and any crossfade tail after its end, rendered by
     one chain (one tempo filter), so a speed change never restarts at the cut.
@@ -1836,7 +1889,8 @@ def _audio_events(clips, media_by_id, fps, probes, track_mix, solo, span, heartb
         render_length = length+before
         following = upcoming.get((clip['type'], clip.get('track'), round((start+length)*fps)))
         if following and following[0] is clip: following = None
-        fade_out = min(length, _number(clip.get('fadeOut', 0), 'fade out', 0, MAX_TIMELINE_SECONDS))
+        origin, rate, fade_length = _fade_clock(clip, 'fadeClock') if clip.get('fadeClock') else (0, 1, length)
+        fade_out = min(fade_length, _number(clip.get('fadeOut', 0), 'fade out', 0, MAX_TIMELINE_SECONDS))
         after = 0.0
         if following:
             next_clip, next_sound = following
@@ -1846,7 +1900,7 @@ def _audio_events(clips, media_by_id, fps, probes, track_mix, solo, span, heartb
         if after < 1/fps: after = 0.0
         if start-before >= end or start+length+after <= begin:
             continue
-        _check_clip(clip, media_by_id, probes, heartbeat)
+        _check_clip({**clip, 'type':'audio'} if clip.get('mediaId') in audio_stems else clip, media_by_id, probes, heartbeat)
         if 'audio' not in item['_kinds']:
             continue
         clip_keys = _automation((clip.get('keyframes') or {}).get('volume'), 'volume', 0, 200, MAX_KEYFRAMES)
@@ -1873,6 +1927,18 @@ def _audio_events(clips, media_by_id, fps, probes, track_mix, solo, span, heartb
             if plan['mono']:
                 filters.append('pan=mono|c0=0.5*c0+0.5*c1')
             mapping_filter = ','.join(filters)
+        # Nested bus stages act on stereo after the child's own pan.
+        stages = mix.get('outputStages', [])
+        if not isinstance(stages, list) or len(stages) > 64:
+            raise ValueError('Invalid nested output mixer settings')
+        stage_panners = []
+        for stage in stages:
+            if not isinstance(stage, dict):
+                raise ValueError('Invalid nested output mixer stage')
+            static *= _number(stage.get('gain'), 'nested output gain', 0, 200)/100
+            output_pan = _number(stage.get('pan'), 'nested output pan', -100, 100)/100
+            if output_pan:
+                stage_panners.append(_stereo_pan(output_pan, 2))
         clip_pan = _number(clip.get('pan', 0), 'pan', -100, 100)
         fx = audio_dsp.normalize(clip.get('audioFx'), label='clip audio effects')
         processing = [*([mapping_filter] if mapping_filter else []),
@@ -1887,6 +1953,8 @@ def _audio_events(clips, media_by_id, fps, probes, track_mix, solo, span, heartb
         else:
             processing.append(_stereo_pan(max(-1, min(1, (clip_pan+plan['pan'])/100)), 1 if mono else 2))
         envelope = []
+        if clip.get('pictureDip'):
+            envelope.append(_transition_envelope(clip, *_fade_clock(clip, 'pictureDip')))
         if clip_keys:
             window = _curve_window(clip_keys, -before, length+after)
             envelope.append(lambda t, keys=window, before=before: f"({_curve_expr(keys, f'({t}-{before:.9f})', 100)})/100")
@@ -1894,30 +1962,48 @@ def _audio_events(clips, media_by_id, fps, probes, track_mix, solo, span, heartb
         if volume_keys:
             envelope.append(lambda t, keys=volume_keys, offset=timeline0: f"({_curve_expr(keys, f'({t}+{offset:.9f})', 100)})/100")
         if sound:
-            if sound['kind'] == 'crossfade':
-                incoming = min(sound['duration'], render_length)
+            if sound['clock']:
+                envelope.append(_transition_envelope(clip, *sound['clock']))
             else:
-                incoming = min(sound['duration']-sound['before'], length)
-            if incoming > 1e-9:
-                envelope.append(lambda t, power=sound['power'], incoming=incoming:
-                                _transition_curve(power, f'min(1,max(0,{t})/{incoming:.9f})'))
+                if sound['kind'] == 'crossfade':
+                    incoming = min(sound['duration'], render_length)
+                else:
+                    incoming = min(sound['duration']-sound['before'], length)
+                if incoming > 1e-9:
+                    # On the sample clock, as every retimed fade is: a nested render and its
+                    # decomposed clips then compute bit-identical gains.
+                    envelope.append(lambda t, power=sound['power'], incoming=incoming:
+                                    _transition_curve(power, f'min(1,max(0,{_sample_clock(0, 1)(t)})/{incoming:.9f})'))
         if following:
             next_clip, next_sound = following
             if next_sound['kind'] == 'crossfade':
-                fade_start = before+length-next_sound['before']
-                next_duration = min(next_sound['duration'], next_sound['before']+float(next_clip['duration']))
+                shift, _, next_duration = (next_sound['clock'] if next_sound['clock']
+                                           else (0, 1, min(next_sound['duration'], next_sound['before']+float(next_clip['duration']))))
+                fade_start = before+length-next_sound['before']-shift
                 envelope.append(lambda t, power=next_sound['power'], s=fade_start, d=next_duration:
-                                _transition_curve(power, f'max(0,min(1,1-({t}-{s:.9f})/{d:.9f}))'))
+                                _transition_curve(power, f'max(0,min(1,1-({t}-({s:.9f}))/{d:.9f}))'))
             elif next_sound['before'] > 1e-9:
                 cut, lead = before+length, next_sound['before']
                 envelope.append(lambda t, power=next_sound['power'], cut=cut, lead=lead:
                                 _transition_curve(power, f'max(0,min(1,({cut:.9f}-{t})/{lead:.9f}))'))
-        fade_in = min(length, _number(clip.get('fadeIn', 0), 'fade in', 0, MAX_TIMELINE_SECONDS))
+        fade_in = min(fade_length, _number(clip.get('fadeIn', 0), 'fade in', 0, MAX_TIMELINE_SECONDS))
         if fade_in or fade_out:
-            head = (lambda t, b=before, f=fade_in: f'max(0,({t}-{b:.9f})/{f:.9f})') if fade_in else (lambda t: '1')
-            tail = (lambda t, r=render_length, f=fade_out: f'max(0,({r:.9f}-{t})/{f:.9f})') if fade_out else (lambda t: '1')
-            envelope.append(lambda t, head=head, tail=tail: f'min(1,min({head(t)},{tail(t)}))')
-        post = []
+            if clip.get('fadeClock'):
+                head = (lambda t, f=fade_in: f'max(0,({t})/{f:.9f})') if fade_in else (lambda t: '1')
+                tail = (lambda t, r=fade_length, f=fade_out: f'max(0,({r:.9f}-({t}))/{f:.9f})') if fade_out else (lambda t: '1')
+                local = _sample_clock(origin, rate)
+                if before:
+                    envelope.append(lambda t, head=head, tail=tail, local=local, b=before:
+                                    f'min(1,min({head(local(f"({t}-{b:.9f})"))},{tail(local(f"({t}-{b:.9f})"))}))')
+                else:
+                    envelope.append(lambda t, head=head, tail=tail, local=local:
+                                    f'min(1,min({head(local(t))},{tail(local(t))}))')
+            else:
+                head = (lambda t, b=before, f=fade_in: f'max(0,({t}-{b:.9f})/{f:.9f})') if fade_in else (lambda t: '1')
+                tail = (lambda t, r=render_length, f=fade_out: f'max(0,({r:.9f}-{t})/{f:.9f})') if fade_out else (lambda t: '1')
+                local = _sample_clock(0, 1)
+                envelope.append(lambda t, head=head, tail=tail, local=local: f'min(1,min({head(local(t))},{tail(local(t))}))')
+        post = list(stage_panners)
         if not plan['dynamics']:
             post.extend(audio_dsp.ffmpeg_filters(plan['fx']))
         if layout != 'stereo':
@@ -2401,9 +2487,204 @@ def _materialize_raw_clips(project, directory, *, options=None, cancelled=None, 
     return prepared
 
 
+def _resolve_subclip(media_id, media_by_id):
+    """Walk parentMediaId links for a subclip, returning (root_media_id, total_in_offset)."""
+    total_in = 0.0
+    seen = set()
+    current_id = media_id
+    while True:
+        if current_id in seen:
+            raise ValueError('Circular subclip reference')
+        seen.add(current_id)
+        item = media_by_id.get(current_id)
+        if not isinstance(item, dict) or not item.get('parentMediaId'):
+            return current_id, total_in
+        sub_in = _number(item.get('subclipIn', 0), 'subclip in', 0, MAX_SOURCE_SECONDS)
+        if item.get('subclipOut') is not None:
+            sub_out = _number(item.get('subclipOut'), 'subclip out', 0, MAX_SOURCE_SECONDS)
+            if sub_out <= sub_in:
+                raise ValueError('Subclip out point must be after its in point')
+        parent_id = item.get('parentMediaId')
+        if not isinstance(parent_id, str) or parent_id not in media_by_id:
+            raise ValueError('Subclip references missing parent media')
+        total_in += sub_in
+        current_id = parent_id
+
+
+def _expand_editorial_clips(project):
+    """Expand un-flattened multicam clips and subclips into plain clips referencing underlying media.
+
+    Returns a new project dict when expansion is needed, or the original dict unchanged otherwise.
+    """
+    import copy
+    media = project.get('media')
+    clips = project.get('clips')
+    if not isinstance(media, list) or not isinstance(clips, list):
+        return project
+    has_special = any(
+        isinstance(item, dict) and (item.get('multicam') or item.get('parentMediaId'))
+        for item in media
+    )
+    if not has_special:
+        return project
+    prepared = copy.deepcopy(project)
+    media_by_id = {m['id']: m for m in prepared['media'] if isinstance(m, dict) and isinstance(m.get('id'), str)}
+
+    def angle_clip(base_clip, angle, kind, track, *, embedded_audio=None, suffix=''):
+        ang_media_id = angle.get('mediaId')
+        if not isinstance(ang_media_id, str) or ang_media_id not in media_by_id:
+            raise ValueError('Multicam angle references missing media')
+        ang_media = media_by_id[ang_media_id]
+        if ang_media.get('multicam'):
+            raise ValueError('Nested multicam clips inside multicam angles are unsupported')
+        offset = _number(angle.get('offset', 0), 'multicam angle offset', 0, MAX_SOURCE_SECONDS)
+        ang_in = _number(angle.get('in', 0), 'multicam angle in', 0, MAX_SOURCE_SECONDS)
+        raw_dur = angle.get('duration')
+        if raw_dur is None or raw_dur == 0:
+            raw_dur = ang_media.get('duration')
+        ang_dur = _number(raw_dur, 'multicam angle duration', 0.001, MAX_SOURCE_SECONDS) if raw_dur else math.inf
+        speed = _number(base_clip.get('speed', 1), 'speed', 0.1, 16)
+        mc_in = _number(base_clip.get('in', 0), 'source in', 0, MAX_SOURCE_SECONDS)
+        mc_dur = _number(base_clip.get('duration', 0), 'duration', 0.001, MAX_TIMELINE_SECONDS)
+        mc_start = _number(base_clip.get('start', 0), 'start', 0, MAX_TIMELINE_SECONDS)
+        mc_span = mc_dur * speed
+        ov_start = max(mc_in, offset)
+        ov_end = min(mc_in + mc_span, offset + ang_dur)
+        if ov_end <= ov_start + 1e-6:
+            return None
+        out = copy.deepcopy(base_clip)
+        out['id'] = f"{base_clip.get('id', 'mc')}{suffix}"
+        out['type'] = kind
+        out['track'] = track
+        out['mediaId'] = ang_media_id
+        if base_clip.get('reverse'):
+            out['start'] = mc_start + (mc_in + mc_span - ov_end) / speed
+        else:
+            out['start'] = mc_start + (ov_start - mc_in) / speed
+        out['duration'] = (ov_end - ov_start) / speed
+        head = out['start'] - mc_start
+        if head > 1e-6 or out['duration'] < mc_dur - 1e-6:
+            if base_clip.get('keyframes'):
+                out['keyframes'] = _slice_keyframes(base_clip['keyframes'], head, out['duration'])
+            for key in ('fadeClock', 'pictureDip'):
+                if base_clip.get(key):
+                    origin, rate, length = _fade_clock(base_clip, key)
+                    out[key] = dict(origin=origin + rate * head, rate=rate, duration=length)
+                elif key == 'fadeClock' and (base_clip.get('fadeIn') or base_clip.get('fadeOut')):
+                    out[key] = dict(origin=head, rate=1, duration=mc_dur)
+            transition = base_clip.get('transition')
+            if transition in ('fade', 'wipe', 'dissolve'):
+                before = _number(base_clip.get('transitionBefore', 0), 'transition lead')
+                span = min(mc_dur + before, _number(base_clip.get('transitionDuration', .5), 'transition duration'))
+                if head >= span - before or (transition == 'fade' and (head > 0 or out['duration'] < span - before)):
+                    if transition == 'fade' and head < span - before and not out.get('pictureDip'):
+                        out['pictureDip'] = (dict(origin=head + before, rate=1, duration=span) if kind == 'audio'
+                                             else dict(origin=head, rate=1, duration=span - before))
+                    out['transition'] = 'none'
+                    out.pop('transitionBefore', None)
+                    out.pop('transitionDuration', None)
+                    out.pop('transitionClock', None)
+                elif head > 0 or out['duration'] < span - before:
+                    lead = 0 if head > 0 else before
+                    origin, _, duration = (_fade_clock(base_clip, 'transitionClock')
+                                           if base_clip.get('transitionClock') else (0, 1, span))
+                    out['transitionBefore'] = lead
+                    out['transitionDuration'] = min(span - before - head, out['duration']) + lead
+                    out['transitionClock'] = dict(origin=origin + before + head - lead, rate=1, duration=duration)
+        out['in'] = ang_in + (ov_start - offset)
+        out.pop('multicamAngle', None)
+        out.pop('multicamAudioAngle', None)
+        if embedded_audio is not None:
+            out['embeddedAudio'] = embedded_audio
+        if kind == 'audio':
+            out['_optionalAudio'] = True
+        return out
+
+    # Step 1: expand un-flattened multicam clips.
+    after_mc = []
+    for clip in prepared['clips']:
+        if not isinstance(clip, dict) or clip.get('type') == 'title':
+            after_mc.append(clip)
+            continue
+        item = media_by_id.get(clip.get('mediaId'))
+        mc = item.get('multicam') if isinstance(item, dict) else None
+        if not mc:
+            after_mc.append(clip)
+            continue
+        if not isinstance(mc, dict) or not isinstance(mc.get('angles'), list) or not (1 <= len(mc['angles']) <= 9):
+            raise ValueError('Invalid multicam clip: must have between 1 and 9 angles')
+        angles = mc['angles']
+        if any(not isinstance(a, dict) for a in angles):
+            raise ValueError('Invalid multicam angle entry')
+        angle_idx = clip.get('multicamAngle', 0)
+        if type(angle_idx) is not int or not (0 <= angle_idx < len(angles)):
+            raise ValueError(f'Invalid multicam angle index: {angle_idx}')
+        audio_mode = mc.get('audioMode', 'camera1')
+        if audio_mode not in ('camera1', 'follow', 'all', 'fixed'):
+            raise ValueError(f'Invalid multicam audio mode: {audio_mode}')
+        audio_angle = mc.get('audioAngle', 0)
+        if type(audio_angle) is not int or not (0 <= audio_angle < len(angles)):
+            raise ValueError(f'Invalid multicam audio angle index: {audio_angle}')
+        clip_audio_override = clip.get('multicamAudioAngle')
+        if clip_audio_override is not None:
+            if type(clip_audio_override) is not int or not (0 <= clip_audio_override < len(angles)):
+                raise ValueError(f'Invalid multicam clip audio angle index: {clip_audio_override}')
+            audio_indices = [clip_audio_override]
+        elif audio_mode == 'follow':
+            audio_indices = [angle_idx]
+        elif audio_mode == 'camera1':
+            audio_indices = [0]
+        elif audio_mode == 'fixed':
+            audio_indices = [audio_angle]
+        else:
+            audio_indices = list(range(len(angles)))
+
+        if clip.get('type') == 'video':
+            if clip.get('embeddedAudio') is False:
+                v_clip = angle_clip(clip, angles[angle_idx], 'video', clip['track'], embedded_audio=False)
+                if v_clip:
+                    after_mc.append(v_clip)
+            elif audio_mode == 'follow' and clip_audio_override is None:
+                v_clip = angle_clip(clip, angles[angle_idx], 'video', clip['track'])
+                if v_clip:
+                    after_mc.append(v_clip)
+            else:
+                v_clip = angle_clip(clip, angles[angle_idx], 'video', clip['track'], embedded_audio=False)
+                if v_clip:
+                    after_mc.append(v_clip)
+                for idx in audio_indices:
+                    a_clip = angle_clip(clip, angles[idx], 'audio', -64, suffix=f'-mca{idx}')
+                    if a_clip:
+                        after_mc.append(a_clip)
+        elif clip.get('type') == 'audio':
+            for idx in audio_indices:
+                a_clip = angle_clip(clip, angles[idx], 'audio', clip['track'],
+                                    suffix=(f'-mca{idx}' if len(audio_indices) > 1 else ''))
+                if a_clip:
+                    after_mc.append(a_clip)
+        else:
+            after_mc.append(clip)
+
+    # Step 2: resolve subclips to their parent media + subclipIn offset.
+    prepared['clips'] = [resolve_subclip_source(clip, media_by_id) for clip in after_mc]
+    return prepared
+
+
+def resolve_subclip_source(clip, media_by_id):
+    """Translate a subclip's local In to the original media for file delivery."""
+    if not isinstance(clip, dict) or clip.get('type') == 'title':
+        return clip
+    mid = clip.get('mediaId')
+    if not (media_by_id.get(mid) or {}).get('parentMediaId'):
+        return clip
+    root, offset = _resolve_subclip(mid, media_by_id)
+    return {**clip, 'mediaId': root, 'in': _number(clip.get('in', 0), 'source in') + offset}
+
+
 def render_to_file(project, output_path, *, options=None, progress=None, cancelled=None, heartbeat=None,
-                   work_directory=None, report=None, _nested_depth=0, _lossless_intermediate=False):
-    """Resolve imported nested Premiere sequences, then render the parent timeline.
+                   work_directory=None, report=None, _nested_depth=0, _seen_sequences=frozenset(),
+                   _minimum_duration=0, _lossless_intermediate=False):
+    """Resolve multicam clips, subclips, and nested sequences, then render the parent timeline.
 
     ``heartbeat`` is called whenever FFmpeg makes progress, so a supervisor
     can tell a long render from a stuck one. ``work_directory`` is where the
@@ -2415,53 +2696,87 @@ def render_to_file(project, output_path, *, options=None, progress=None, cancell
     import copy
     if not isinstance(project,dict) or not isinstance(project.get('media'),list): raise ValueError('Invalid project')
     if options is not None and not isinstance(options, dict): raise ValueError('Invalid export options')
+    # Strip caller-supplied internal keys before editorial expansion adds _optionalAudio.
+    project = copy.deepcopy(project)
+    for section in ('media', 'clips'):
+        entries = project.get(section)
+        if isinstance(entries, list):
+            for entry in entries:
+                if isinstance(entry, dict):
+                    for key in [k for k in entry if isinstance(k, str) and k.startswith('_')]:
+                        del entry[key]
     # Keys with a leading underscore are internal to the renderer.
     options = {key: value for key, value in (options or {}).items() if isinstance(key, str) and not key.startswith('_')}
+    if _nested_depth>4: raise ValueError('Nested sequences exceed four levels')
+    expanded = _expand_editorial_clips(project)
+    if expanded is not project:
+        # Missing angle footage contributes black and silence through the original edit's Out.
+        _minimum_duration = _validate_timeline(project, _minimum_duration)
+        project = expanded
     if _lossless_intermediate:
         # Use the child's MOV/PCM settings but encode losslessly. ProRes accepts only 10-bit picture.
         spec = _delivery_spec(options)
         options['_spec'] = dict(spec, codec='ffv1', encoder='ffv1', depth=16,
                                 pix_fmt='yuva444p16le' if spec['alpha'] else 'yuv444p16le')
-    if _nested_depth>4: raise ValueError('Nested Premiere sequences exceed four levels')
     # Nested material used only by disabled clips is not rendered (it would contribute nothing).
     enabled_media = {clip.get('mediaId') for clip in project.get('clips') or [] if isinstance(clip, dict) and clip_enabled(clip)}
     has_nested = any(isinstance(item,dict) and item.get('nestedProject') for item in project['media'])
     has_raw = any(isinstance(item, dict) and item.get('id') in enabled_media and _is_raw_media_item(item) for item in project['media'])
     if not has_nested and not has_raw:
         return _render_prepared(project,output_path,options=options,progress=progress,cancelled=cancelled,heartbeat=heartbeat,
-                                work_directory=work_directory,report=report)
+                                work_directory=work_directory,report=report,minimum_duration=_minimum_duration)
     MEDIA_ROOT.mkdir(parents=True,exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='splice-nested-',dir=MEDIA_ROOT) as directory:
         prepared=copy.deepcopy(project)
         for index,item in enumerate(prepared['media']):
             child=item.get('nestedProject')
             if not child or item.get('id') not in enabled_media: continue
-            if _nested_depth>=4: raise ValueError('Nested Premiere sequences exceed four levels')
-            # Chroma detail lost in an intermediate cannot be recovered by the parent compositor.
+            seq_id = item.get('nestedSequence')
+            if type(seq_id) not in (int, str) or seq_id == '':
+                seq_id = None
+            if seq_id is not None and seq_id in _seen_sequences:
+                raise ValueError('Circular nested sequence reference')
+            if _nested_depth>=4: raise ValueError('Nested sequences exceed four levels')
+            next_seen = _seen_sequences | ({seq_id} if seq_id is not None else set())
             parent_spec = options.get('_spec') or _delivery_spec(options)
-            child_codec = 'prores' if parent_spec['high_depth'] or parent_spec['chroma'] != '420' else 'h264'
-            suffix='.mov' if child_codec=='prores' else '.mp4'
-            target=Path(directory)/f'nested-{index}{suffix}'
-            child_options={key:options[key] for key in ('limiter','limiterCeiling','aacPeakSafe','audioBitrate','subtitleLanguage',
-                                                         'captions','audioLayout') if key in options}
-            child_options['codec']=child_codec
-            if parent_spec['chroma'] == '444':
-                child_options.update(profile='4444', alpha=parent_spec['alpha'])
-            if child_codec=='prores' and options.get('colorSpace') in ('rec709','pq'):
-                child_options['colorSpace']=options['colorSpace']
-            if child_codec=='h264' and options.get('codec','h264')=='h264' and 'crf' in options and not options.get('rateControl'):
-                child_options['crf']=options['crf']
+            if parent_spec['kind'] == 'audio':
+                child_codec = 'wav'
+                suffix = '.wav'
+                child_options = {key: options[key] for key in ('limiter', 'limiterCeiling', 'audioLayout') if key in options}
+                child_options['codec'] = 'wav'
+                lossless = False
+            else:
+                # Chroma detail lost in an intermediate cannot be recovered by the parent compositor.
+                child_codec = 'prores' if parent_spec['high_depth'] or parent_spec['chroma'] != '420' else 'h264'
+                suffix = '.mov' if child_codec == 'prores' else '.mp4'
+                child_options = {key: options[key] for key in ('limiter', 'limiterCeiling', 'aacPeakSafe', 'audioBitrate', 'subtitleLanguage',
+                                                               'captions', 'audioLayout') if key in options}
+                child_options['codec'] = child_codec
+                if parent_spec['chroma'] == '444':
+                    child_options.update(profile='4444', alpha=parent_spec['alpha'])
+                if child_codec == 'prores' and options.get('colorSpace') in ('rec709', 'pq'):
+                    child_options['colorSpace'] = options['colorSpace']
+                if child_codec == 'h264' and options.get('codec', 'h264') == 'h264' and 'crf' in options and not options.get('rateControl'):
+                    child_options['crf'] = options['crf']
+                lossless = parent_spec['depth'] > 10
+            target = Path(directory)/f'nested-{index}{suffix}'
+            span = _number(item.get('duration', 0), 'nested media duration', 0, MAX_TIMELINE_SECONDS) if isinstance(seq_id, str) else 0
             render_to_file(child,target,options=child_options,cancelled=cancelled,heartbeat=heartbeat,work_directory=work_directory,
-                           _nested_depth=_nested_depth+1, _lossless_intermediate=parent_spec['depth'] > 10)
+                           _nested_depth=_nested_depth+1,_seen_sequences=next_seen,_minimum_duration=span,
+                           _lossless_intermediate=lossless)
             item['src']='/media/'+str(target.relative_to(MEDIA_ROOT))
-            item['duration']=max((float(c['start'])+float(c['duration']) for c in child['clips']),default=0)
+            item['duration']=max(span, max((float(c['start'])+float(c['duration']) for c in child['clips']),default=0))
             item.pop('nestedSequence',None)
             item.pop('nestedProject',None)
             for clip in prepared['clips']:
-                if clip.get('mediaId')==item['id']: clip.pop('nestedSequence',None)
+                if clip.get('mediaId') != item['id']:
+                    continue
+                clip.pop('nestedSequence', None)
+            if child_codec == 'wav':
+                options.setdefault('_audioStems', set()).add(item['id'])
         prepared = _materialize_raw_clips(prepared, directory, options=options, cancelled=cancelled, heartbeat=heartbeat)
         return _render_prepared(prepared,output_path,options=options,progress=progress,cancelled=cancelled,heartbeat=heartbeat,
-                                work_directory=work_directory,report=report)
+                                work_directory=work_directory,report=report,minimum_duration=_minimum_duration)
 
 
 def _track_hidden(track_state, kind, track):
@@ -2498,7 +2813,7 @@ def _export_settings(options, *, spec=None):
     return spec, color_space, limiter, language, peak_safe, layout, normalization, iso
 
 
-def _validate_timeline(project):
+def _validate_timeline(project, minimum_duration=0):
     """Shape and size checks over the whole project; cheap, no media access."""
     clips, media = project.get('clips'), project.get('media')
     if not isinstance(clips, list) or not isinstance(media, list):
@@ -2514,7 +2829,7 @@ def _validate_timeline(project):
     used = {clip.get('mediaId') for clip in clips if clip.get('type') != 'title'}
     if len(used) > MAX_MEDIA:
         raise ValueError(f'The timeline uses {len(used):,} media files; export supports at most {MAX_MEDIA:,}')
-    total = 0.0
+    total = _number(minimum_duration, 'nested media duration', 0, MAX_TIMELINE_SECONDS)
     for clip in clips:
         if clip.get('type') not in ('video', 'audio', 'title'):
             raise ValueError('Unsupported timeline item')
@@ -2572,7 +2887,7 @@ def _start_timecode(project, first, fps_fraction):
 
 
 def _render_prepared(project, output_path, *, options=None, progress=None, cancelled=None, heartbeat=None, work_directory=None,
-                     report=None):
+                     report=None, minimum_duration=0):
     """Render the picture (bounded windows), the audio (bounded chunks), then mux once."""
     import warnings
     options = dict(options or {})
@@ -2580,7 +2895,8 @@ def _render_prepared(project, output_path, *, options=None, progress=None, cance
     for attempt in range(2):
         try:
             return _render_delivery(project, output_path, options=dict(options), progress=progress, cancelled=cancelled,
-                                    heartbeat=heartbeat, work_directory=work_directory, report=report)
+                                    heartbeat=heartbeat, work_directory=work_directory, report=report,
+                                    minimum_duration=minimum_duration)
         except HardwareEncoderFailed as error:
             if attempt:
                 raise
@@ -2596,13 +2912,15 @@ class HardwareEncoderFailed(RuntimeError):
     """A hardware encoder stopped with an error: the export restarts in software."""
 
 
-def _render_delivery(project, output_path, *, options, progress, cancelled, heartbeat, work_directory, report):
+def _render_delivery(project, output_path, *, options, progress, cancelled, heartbeat, work_directory, report,
+                     minimum_duration=0):
     import copy
     spec, color_space, limiter, language, peak_safe, layout, normalization, iso = _export_settings(options, spec=options.get('_spec'))
     codec = spec['codec']
     audio_only = spec['kind'] == 'audio'
     # One private copy: probe results are cached on its media items.
-    # Strip any leading-underscore internal keys from caller-supplied entries.
+    # Strip any leading-underscore internal keys from caller-supplied entries
+    # (preserving _optionalAudio added internally by _expand_editorial_clips).
     project = copy.deepcopy(project)
     if isinstance(project, dict):
         for section in ('media', 'clips'):
@@ -2610,9 +2928,9 @@ def _render_delivery(project, output_path, *, options, progress, cancelled, hear
             if isinstance(entries, list):
                 for entry in entries:
                     if isinstance(entry, dict):
-                        for key in [k for k in entry if isinstance(k, str) and k.startswith('_')]:
+                        for key in [k for k in entry if isinstance(k, str) and k.startswith('_') and k != '_optionalAudio']:
                             del entry[key]
-    total = _validate_timeline(project)
+    total = _validate_timeline(project, minimum_duration)
     width, height = _frame_size(project) if not audio_only else (16, 16)
     fps_fraction = _sequence_fps(project)
     fps = float(fps_fraction)
@@ -2706,7 +3024,8 @@ def _render_delivery(project, output_path, *, options, progress, cancelled, hear
         events = []
     else:
         events = _audio_events(project['clips'], media_by_id, fps, probes, track_mix, solo,
-                               (max(0, out_start-AUDIO_PREROLL_SECONDS), out_end), heartbeat, layout=layout, plans=plans)
+                               (max(0, out_start-AUDIO_PREROLL_SECONDS), out_end), heartbeat, layout=layout, plans=plans,
+                               audio_stems=options.get('_audioStems', ()))
     channels = 2 if layout == 'stereo' else 6
     root = Path(work_directory) if work_directory else work_root()
     video_bytes, audio_bytes = _estimated_bytes(out_size['width'], out_size['height'], fps, out_duration, spec)
@@ -3103,7 +3422,9 @@ def _picture_windows(project, picture, first, stop, total_frames, fps, width, he
                 clip['duration']=overlap_end-overlap_start
                 clip['in']=float(clip.get('in',0)) + ((b-overlap_end) if clip.get('reverse') else (overlap_start-cut))*speed
                 clip['transitionBefore']=0
-                if overlap_start > cut+.5/fps: clip['transition']='none'
+                if overlap_start > cut+.5/fps:
+                    clip['transition']='none'
+                    clip.pop('transitionClock', None)
                 clip['_keyframeShift']=overlap_start-cut
             if id(original) in wipe_mask: clip['_wipeMask'] = True
             clips.append(clip)
@@ -3719,6 +4040,11 @@ def _delivery_tail(spec, width, height, fps, profile, burn, directory):
         if spec['kind'] == 'images':
             # zimg writes planar 16-bit RGB; FFmpeg repacks it into the file's pixel format.
             steps.append(_to_full_rgb(profile) + (',format=gbrap16le' if spec['alpha'] else ',format=gbrp16le'))
+        elif profile[2] == 'bt709':
+            # Streamed frames reach the encoder already labelled Rec. 709 (_encoder_command): conform
+            # an untagged (Rec. 601) composite here, before the delivery's bit depth. Tagged frames
+            # (graded pictures) pass unchanged.
+            steps.append('scale=out_color_matrix=bt709:out_range=tv')
         steps.append(f'format={spec["pix_fmt"]}')
     return ','.join(steps)
 

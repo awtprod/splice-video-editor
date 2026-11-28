@@ -50,7 +50,7 @@ PROJECT_FIELDS = {
     'captions': 'reported', 'dropFrame': 'reported', 'marks': 'reported', 'duration': 'derived',
     'startFrame': 'derived', 'resolveSource': 'meta', 'resolveTimeline': 'meta', 'resolveTimelineIds': 'meta',
     'resolveTimelines': 'meta', 'resolveTrackFlags': 'meta', 'compatibilityWarnings': 'meta',
-    'compatibilityDetails': 'meta', 'premiereSequences': 'meta', 'id': 'meta', 'version': 'meta',
+    'compatibilityDetails': 'meta', 'premiereSequences': 'meta', 'bins': 'meta', 'id': 'meta', 'version': 'meta',
     'savedAt': 'meta', 'revision': 'meta', 'masterFx': 'reported'}
 #: Clip fields (see :data:`PROJECT_FIELDS`).
 CLIP_FIELDS = {
@@ -59,9 +59,11 @@ CLIP_FIELDS = {
     'transform': 'written', 'transition': 'written', 'transitionDuration': 'written',
     'transitionBefore': 'written', 'transitionMatchName': 'written', 'speed': 'reported', 'reverse': 'reported',
     'keyframes': 'reported', 'color': 'reported', 'opacity': 'reported', 'fadeIn': 'reported',
-    'fadeOut': 'reported', 'pan': 'reported', 'title': 'reported', 'titleStyle': 'reported', 'text': 'reported',
+    'transitionClock': 'reported', 'fadeClock': 'reported', 'pictureDip': 'reported', 'fadeOut': 'reported', 'pan': 'reported', 'title': 'reported', 'titleStyle': 'reported', 'text': 'reported',
     'audioFx': 'reported', 'audioTransition': 'reported', 'channelMap': 'reported', 'rawSettings': 'reported',
     'markers': 'reported', 'embeddedAudio': 'reported', 'audioStream': 'reported',
+    'nestedSequence': 'reported', 'multicamAngle': 'reported', 'multicamAudioAngle': 'reported',
+    'colorLabel': 'reported',
     'nativeTimeRemap': 'reported', 'nativeUnsupported': 'written', 'resolveItemId': 'meta',
     'resolveFrames': 'meta', 'resolveFlags': 'meta', 'resolveTransitionId': 'meta', 'premiereTrack': 'meta',
     'premiereIndex': 'meta', 'premiereId': 'meta', 'nativeId': 'meta', 'locked': 'meta', 'selected': 'meta'}
@@ -72,14 +74,17 @@ TRANSFORM_FIELDS = {'x': 0, 'y': 0, 'scale': 100, 'rotation': 0}
 KEYFRAME_FIELDS = ('opacity', 'x', 'y', 'scale', 'rotation', 'volume',
                    'exposure', 'temperature', 'tint', 'brightness', 'contrast', 'saturation')
 TRACK_STATE_FIELDS = {'locked': 'written', 'hidden': 'written', 'syncLocked': 'reported'}
-TRACK_MIX_FIELDS = {'mute': 'written', 'gain': 'reported', 'pan': 'reported', 'solo': 'reported',
+TRACK_MIX_FIELDS = {'mute': 'written', 'gain': 'reported', 'pan': 'reported', 'solo': 'reported', 'outputStages': 'reported',
                     'channels': 'reported', 'fx': 'reported', 'keyframes': 'reported', 'route': 'reported', 'stem': 'reported'}
 #: Media fields the project format names: what the writer reads; ``name`` (a rename in Splice) is
 #: reported. Fields Splice adds when it measures or links a file are facts of the file, not edits.
 MEDIA_FIELDS = {
     'id': 'meta', 'name': 'reported', 'src': 'written', 'type': 'written', 'duration': 'meta', 'path': 'written',
     'offline': 'meta', 'bin': 'meta', 'thumb': 'meta', 'resolveMediaId': 'written', 'resolveAudioTracks': 'meta',
-    'nativeUnsupported': 'written', 'nestedSequence': 'reported', 'nestedProject': 'reported', 'audioChannels': 'meta',
+    'nativeUnsupported': 'written', 'nestedSequence': 'reported', 'nestedProject': 'reported',
+    'multicam': 'reported', 'parentMediaId': 'reported', 'subclipIn': 'reported', 'subclipOut': 'reported',
+    'subclipLimits': 'meta', 'scene': 'meta', 'shot': 'meta', 'camera': 'meta', 'take': 'meta', 'reel': 'meta', 'logNote': 'meta',
+    'colorLabel': 'meta', 'audioChannels': 'meta',
     'still': 'meta', 'width': 'meta', 'height': 'meta', 'fps': 'meta', 'size': 'meta', 'codec': 'meta',
     'audioStreams': 'meta', 'timecode': 'meta', 'proxy': 'meta', 'premiereId': 'meta', 'mediaKey': 'meta',
     'linked': 'meta', 'missing': 'meta', 'local': 'meta', 'file': 'meta', 'audio': 'meta', 'video': 'meta',
@@ -90,7 +95,8 @@ MEDIA_FIELDS = {
     'rawCapabilities': 'meta'}
 _DEFAULTS = {'speed': 1, 'reverse': False, 'opacity': 100, 'fadeIn': 0, 'fadeOut': 0, 'pan': 0, 'title': '',
              'markers': [], 'keyframes': {}, 'color': {}, 'audioStream': 0, 'nativeTimeRemap': None,
-             'titleStyle': None, 'text': None, 'embeddedAudio': None, 'rawSettings': None}
+             'titleStyle': None, 'text': None, 'embeddedAudio': None, 'colorLabel': '',
+             'nestedSequence': None, 'multicamAngle': None, 'multicamAudioAngle': None, 'rawSettings': None}
 
 
 def _same(a, b):
@@ -702,6 +708,33 @@ class Writer:
         if kind not in ('video', 'audio'):
             report.add(NOT_WRITTEN, 'Titles and other Splice-only clips (Resolve titles are Fusion compositions)', where)
             return None
+        if media.get('nestedProject') or media.get('nestedSequence') is not None or clip.get('nestedSequence') is not None:
+            report.add(NOT_WRITTEN, 'Nested sequences (decompose in place before saving to Resolve)', where)
+            return None
+        if media.get('multicam'):
+            report.add(NOT_WRITTEN, 'Un-flattened multicam clips (flatten multicam before saving to Resolve)', where)
+            return None
+        subclip_offset = 0.0
+        if media.get('parentMediaId'):
+            cur, seen = media, {media.get('id')}
+            while cur.get('parentMediaId'):
+                sub_in = cur.get('subclipIn', 0)
+                if isinstance(sub_in, (int, float)) and not isinstance(sub_in, bool) and math.isfinite(sub_in) and sub_in >= 0:
+                    subclip_offset += float(sub_in)
+                parent_id = cur.get('parentMediaId')
+                parent = self.current_media.get(parent_id)
+                if not isinstance(parent, dict) or parent_id in seen:
+                    report.add(NOT_WRITTEN, 'Subclips whose parent media is missing', where)
+                    return None
+                seen.add(parent_id)
+                cur = parent
+            media = cur
+            if media.get('nestedProject') or media.get('nestedSequence') is not None:
+                report.add(NOT_WRITTEN, 'Nested sequences (decompose in place before saving to Resolve)', where)
+                return None
+            if media.get('multicam'):
+                report.add(NOT_WRITTEN, 'Un-flattened multicam clips (flatten multicam before saving to Resolve)', where)
+                return None
         if type(track_number) is not int:
             report.add(NOT_WRITTEN, 'Clips without a track', where)
             return None
@@ -723,7 +756,7 @@ class Writer:
         rounded = set()
         rel = _frames(clip.get('start'), timeline.rate, 'start', where, rounded)
         duration = _frames(clip.get('duration'), timeline.rate, 'duration', where, rounded)
-        source_in = _frames(clip.get('in') or 0, timeline.rate, 'source in point', where, rounded)
+        source_in = _frames((clip.get('in') or 0) + subclip_offset, timeline.rate, 'source in point', where, rounded)
         if rel < 0 or duration < 1 or source_in < 0:
             report.add(NOT_WRITTEN, 'Clips before the timeline start or shorter than one frame', where)
             return None
@@ -876,9 +909,11 @@ class Writer:
         if color.get('lut') and not _same(color.get('lut'), before_color.get('lut')):
             report.add(NOT_WRITTEN, 'Splice LUTs (Resolve grades are not written)', where)
         for field, what in (('fadeIn', 'Clip fades (Resolve fade handles are not written)'),
+                            ('transitionClock', 'Cropped transition timing'), ('pictureDip', 'Retimed picture dip'), ('fadeClock', 'Retimed audio fade'),
                             ('fadeOut', 'Clip fades (Resolve fade handles are not written)'),
                             ('markers', 'Clip markers (not written: Resolve keeps the markers its clips have)'),
                             ('title', 'Clip names changed in Splice (Resolve keeps its item names)'),
+                            ('colorLabel', 'Clip color labels (Resolve keeps its own clip colors)'),
                             ('audioStream', 'Changes of the audio stream an existing clip plays')):
             if field == 'audioStream' and seed is None:
                 continue
@@ -970,7 +1005,7 @@ class Writer:
             for field in sorted(set(a) | set(b)):
                 if TRACK_MIX_FIELDS.get(field) == 'written':
                     continue
-                neutral = {'gain': 100, 'pan': 0, 'solo': False}.get(field)
+                neutral = {'gain': 100, 'pan': 0, 'solo': False, 'outputStages': []}.get(field)
                 if not _same(a.get(field, neutral), b.get(field, neutral)):
                     report.add(NOT_WRITTEN, 'Track mixer gain, pan and solo (the Fairlight mixer is not written)',
                                f'{name} · track {key} ({field})')

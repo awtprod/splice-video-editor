@@ -146,7 +146,7 @@ def export_timeline(project: dict, options: dict | None = None) -> dict:
         raise InterchangeError('Choose at least one timeline format')
     cut = build_cut(project, options)
     if not cut.events and not cut.markers:
-        raise InterchangeError('The timeline has nothing to export')
+        raise InterchangeError(' '.join(['The timeline has nothing to export.', *cut.report.general]))
     base = _safe(cut.name)
     files = []
     if 'fcpxml' in formats:

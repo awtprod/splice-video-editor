@@ -475,6 +475,11 @@ def _marker_frame(rgb: bytes, width: int) -> int | None:
     return bright[0] // 4 if bright else None
 
 
+# Python's own multiprocessing helpers (started by another test module in the same run, e.g. a
+# delivery test's process pool) live as long as the interpreter: they are not decoder children.
+_INTERPRETER_HELPERS = (b'multiprocessing.resource_tracker', b'multiprocessing.forkserver')
+
+
 def _children_of_this_process() -> list[int]:
     found = []
     for entry in os.listdir('/proc'):
@@ -482,9 +487,13 @@ def _children_of_this_process() -> list[int]:
             try:
                 with open(f'/proc/{entry}/stat', encoding='utf-8') as fh:
                     fields = fh.read().rsplit(')', 1)[1].split()
+                if int(fields[1]) != os.getpid() or fields[0] == 'Z':
+                    continue
+                with open(f'/proc/{entry}/cmdline', 'rb') as fh:
+                    cmdline = fh.read()
             except OSError:
                 continue
-            if int(fields[1]) == os.getpid() and fields[0] != 'Z':
+            if not any(helper in cmdline for helper in _INTERPRETER_HELPERS):
                 found.append(int(entry))
     return found
 

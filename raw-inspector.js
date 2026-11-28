@@ -311,7 +311,10 @@
     const currentSource = () => {
       const state = editor.get();
       const active = state.selected;
-      return active ? state.project.media.find(item => item.id === active.mediaId) : null;
+      if (!active) return null;
+      // A multicam clip decodes its active angle; a subclip decodes its original media.
+      return editor.resolveClipMedia ? editor.resolveClipMedia(active, state.project).item
+        : state.project.media.find(item => item.id === active.mediaId) || null;
     };
 
     if (locked) {
@@ -394,6 +397,8 @@
       btn.addEventListener('click', () => window.SpliceRawSettings?.open?.());
     }
 
+    // The proxy belongs to the RAW file itself, not to a multicam or subclip wrapper.
+    const sourceId = currentSource()?.id || clip.mediaId;
     const proxyInput = panel.querySelector('.raw-proxy-file');
     panel.querySelector('[data-raw-action="attach-proxy"]')?.addEventListener('click', () => proxyInput?.click());
     proxyInput?.addEventListener('change', async () => {
@@ -406,7 +411,7 @@
         // The RAW original stays the clip's source: the attached file only stands in for its
         // picture (preview: its edit proxy; export: the attached file itself) until a decoder exists.
         editor.editProject(project => {
-          const item = project.media.find(entry => entry.id === clip.mediaId);
+          const item = project.media.find(entry => entry.id === sourceId);
           if (item) {
             item.rawAttachedProxy = imported.originalSrc || imported.src;
             item.rawAttachedPreview = imported.src;
@@ -421,7 +426,7 @@
 
     panel.querySelector('[data-raw-action="detach-proxy"]')?.addEventListener('click', () => {
       editor.editProject(project => {
-        const item = project.media.find(entry => entry.id === clip.mediaId);
+        const item = project.media.find(entry => entry.id === sourceId);
         if (item) {
           delete item.rawAttachedProxy;
           delete item.rawAttachedPreview;
