@@ -300,6 +300,14 @@ window.SpliceBins = (() => {
     return `${parentName} Subclip`;
   }
 
+  // Camera RAW facts of a source file (format, decoder, defaults, estimated look) that a subclip shares.
+  const RAW_FACTS = ['raw', 'rawFormat', 'rawFormatLabel', 'rawDecoderAvailable', 'rawDecoderName', 'rawDecoderMessage',
+    'rawDefaults', 'rawMetadata', 'rawEstimated', 'rawCapabilities'];
+  function rawFacts(item) {
+    if (item?.raw !== true) return {};
+    return Object.fromEntries(RAW_FACTS.filter(key => item[key] !== undefined).map(key => [key, structuredClone(item[key])]));
+  }
+
   function createSubclip({ parentMediaId, name, subclipIn, subclipOut, bin }) {
     const editor = window.Editor;
     const project = editor.get().project;
@@ -345,6 +353,8 @@ window.SpliceBins = (() => {
       ...(rootParent.audioStreams !== undefined ? { audioStreams: rootParent.audioStreams } : {}),
       ...(rootParent.sourcePath ? { sourcePath: rootParent.sourcePath } : {}),
       ...(rootParent.reel ? { reel: rootParent.reel } : {}),
+      ...(rootParent.camera ? { camera: rootParent.camera } : {}),
+      ...rawFacts(rootParent),
       ...(directParent.colorLabel ? { colorLabel: directParent.colorLabel } : {}),
       ...(cleanBin ? { bin: cleanBin } : {}),
       timecode: shiftTimecode(directParent.timecode || rootParent.timecode, clampedIn, fps),

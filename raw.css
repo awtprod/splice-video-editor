@@ -1,0 +1,389 @@
+/* Camera RAW Inspector & RAW Decoders Settings dialog (Slice R). */
+.splice-raw {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0; /* a grid item in .splice-section: may shrink below its badges' text width */
+}
+
+.raw-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.raw-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  background: #232c24;
+  border: 1px solid #3c4d3e;
+  color: #dce8db;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.raw-badge-decoder {
+  white-space: normal; /* decoder names are long: wrap in a narrow Inspector instead of hiding */
+  background: #1d2e23;
+  border-color: #3a6b48;
+  color: #a6e3b7;
+}
+
+.raw-badge-warn {
+  background: #352919;
+  border-color: #7c5c2a;
+  color: #f0ca86;
+}
+
+.raw-camera-meta {
+  font-size: 11px;
+  color: #9aa898;
+  margin: 0;
+  line-height: 1.35;
+}
+
+.raw-est {
+  display: inline-block;
+  flex: none;
+  align-self: center;
+  white-space: nowrap;
+  height: 16px;
+  box-sizing: border-box;
+  margin-left: 4px;
+  padding: 0 5px;
+  border-radius: 999px;
+  border: 1px dashed #c79a4b;
+  color: #f0ca86;
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  line-height: 14px;
+  vertical-align: 1px;
+}
+
+.raw-estimated {
+  color: #e2c48e;
+}
+
+.splice-raw [data-raw-unsupported] {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.raw-status-banner {
+  background: #2b2318;
+  border: 1px solid #6b5228;
+  border-radius: 6px;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+  color: #eed4a2;
+  line-height: 1.4;
+}
+
+.raw-status-banner p {
+  margin: 0;
+}
+
+.raw-banner-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.raw-banner-actions button,
+.raw-actions button {
+  padding: 5px 9px;
+  font-size: 12px;
+  border-radius: 4px;
+  border: 1px solid #435142;
+  background: #242b24;
+  color: #e4ece4;
+  cursor: pointer;
+}
+
+.raw-banner-actions button:hover:not(:disabled),
+.raw-actions button:hover:not(:disabled) {
+  background: #313b31;
+  border-color: #5d705c;
+}
+
+.raw-banner-actions button:disabled,
+.raw-actions button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.raw-pending {
+  font-size: 11px;
+  color: #b7d7a8;
+  margin: 0;
+  min-height: 1.2em;
+}
+
+.raw-pending.raw-error {
+  color: #f3a4a4;
+}
+
+.raw-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.raw-actions button {
+  flex: 1 1 auto;
+}
+
+.raw-attached-proxy {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 5px 8px;
+  border-radius: 4px;
+  background: #1e2a22;
+  border: 1px solid #35503e;
+  font-size: 11px;
+  color: #bce4c7;
+}
+
+.raw-attached-proxy button {
+  padding: 2px 6px;
+  font-size: 11px;
+}
+
+/* File picker RAW item styling (overrides legacy muted color) */
+.splice-link .link-raw span {
+  color: #dce8db;
+}
+
+.splice-link .link-raw .raw-pill {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 600;
+  background: #243428;
+  border: 1px solid #416549;
+  color: #a9e4b8;
+  vertical-align: middle;
+}
+
+/* RAW Decoders Settings modal */
+.splice-raw-dialog {
+  width: min(760px, 94vw);
+  max-height: min(86vh, 720px);
+  padding: 16px 18px;
+  background: #191d19;
+  color: #e6eee6;
+  border: 1px solid #3c473b;
+  border-radius: 8px;
+  box-shadow: 0 20px 56px rgba(0, 0, 0, 0.6);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow: hidden;
+}
+
+.splice-raw-dialog::backdrop {
+  background: rgba(8, 10, 8, 0.7);
+}
+
+.splice-raw-dialog header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  flex: 0 0 auto;
+}
+
+.splice-raw-dialog h2 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.splice-raw-dialog .raw-dialog-sub {
+  margin: 0;
+  font-size: 12px;
+  color: #9aa898;
+  flex: 0 0 auto;
+}
+
+.raw-decoders-list {
+  flex: 1 1 auto;
+  min-height: 160px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-right: 4px;
+}
+
+.raw-decoder-row {
+  background: #202520;
+  border: 1px solid #323c32;
+  border-radius: 6px;
+  padding: 9px 11px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.raw-decoder-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.raw-decoder-title {
+  font-weight: 600;
+  font-size: 13px;
+  color: #eef5ee;
+}
+
+.raw-decoder-ext {
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  color: #99a998;
+}
+
+.raw-decoder-tier {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: #2a312a;
+  color: #b7c4b6;
+  border: 1px solid #3f4b3f;
+}
+
+.raw-decoder-state {
+  margin-left: auto;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: 999px;
+}
+
+.raw-decoder-state.available {
+  background: #1b3122;
+  border: 1px solid #3a6b48;
+  color: #9ee3b1;
+}
+
+.raw-decoder-state.missing {
+  background: #332718;
+  border: 1px solid #755829;
+  color: #ecc882;
+}
+
+.raw-decoder-meta {
+  font-size: 11px;
+  color: #9aa898;
+  margin: 0;
+  word-break: break-word;
+}
+
+.raw-decoder-meta code {
+  font-family: ui-monospace, monospace;
+  color: #cad8c9;
+  background: #161a16;
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+
+.raw-decoder-path-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  margin-top: 2px;
+}
+
+.raw-decoder-path-row input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 5px 8px;
+  font-size: 12px;
+  font-family: ui-monospace, monospace;
+  background: #141814;
+  color: #e6eee6;
+  border: 1px solid #3c483b;
+  border-radius: 4px;
+}
+
+.raw-decoder-path-row button {
+  flex: 0 0 auto;
+  padding: 5px 8px;
+  font-size: 11px;
+  background: #262e26;
+  color: #d6e2d6;
+  border: 1px solid #414e41;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.raw-dialog-message {
+  margin: 0;
+  min-height: 1.2em;
+  font-size: 12px;
+  color: #d7e3a8;
+  flex: 0 0 auto;
+}
+
+.raw-dialog-message.error {
+  color: #f3a4a4;
+}
+
+.splice-raw-dialog footer {
+  display: flex;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding-top: 6px;
+  border-top: 1px solid #2e372e;
+  flex: 0 0 auto;
+}
+
+.splice-raw-dialog footer button {
+  padding: 6px 12px;
+  font-size: 12px;
+  border-radius: 5px;
+  border: 1px solid #435142;
+  background: #242c24;
+  color: #e6eee6;
+  cursor: pointer;
+}
+
+.splice-raw-dialog footer button.primary {
+  background: #2f5e3e;
+  border-color: #4b8a5e;
+  color: #f4fbf5;
+  font-weight: 600;
+}
+
+@media (max-width: 1100px) {
+  .splice-raw-dialog {
+    width: 96vw;
+    max-height: 88vh;
+    padding: 12px 14px;
+  }
+  .raw-decoder-state {
+    margin-left: 0;
+  }
+}

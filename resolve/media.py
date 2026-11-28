@@ -8,7 +8,8 @@ import time
 from pathlib import Path
 
 import media_links
-from media_proxy import SCAN_LIMIT, _text_art, camera_raw_error
+from media_proxy import SCAN_LIMIT, _text_art
+import raw_decode
 
 PROBES = max(1, min(8, os.cpu_count() or 1))
 # Linking is bounded as a whole, not per file. 45 s leaves room for FFmpeg's own 25 s probe timeout
@@ -106,14 +107,17 @@ atexit.register(stop_probes)
 
 
 def _probe(path, deadline):
-    """None when FFmpeg can edit the file, else its offline result. The FFprobe child is ours:
+    """None when Splice can edit the file, else its offline result. The FFprobe child is ours:
     killed and reaped when the open's deadline passes (or the server exits), never orphaned. The
-    same check as media_proxy.decodable: camera RAW and text drawn as a picture are refused, and
-    a file needs a picture or sound stream FFmpeg decodes."""
+    same check as media_proxy.decodable: text drawn as a picture is refused, Camera RAW files are
+    probed via raw_decode, and regular files need a picture or sound stream FFmpeg decodes."""
     name = Path(path).name
-    message = camera_raw_error(name)
-    if message:
-        return _offline('not-media', message)
+    if raw_decode.is_raw_candidate(path, name):
+        try:
+            raw_decode.probe_raw(path)
+            return None
+        except (OSError, ValueError) as error:
+            return _offline('not-media', str(error))
     left = min(PROBE_SECONDS, deadline - time.monotonic())
     if left <= 0:
         return _offline('unchecked', 'time ran out before it was looked at')

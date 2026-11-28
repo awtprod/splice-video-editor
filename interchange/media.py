@@ -192,9 +192,41 @@ class ProbeBudget:
 
 
 def probe_file(path: Path, timeout: float = PROBE_TIMEOUT) -> Probe:
-    """ffprobe one local regular file. Raises ``ValueError`` when it is unreadable."""
+    """ffprobe or RAW-probe one local regular file. Raises ``ValueError`` when it is unreadable."""
     if not path.is_file():
         raise ValueError(f'{path.name} is not a readable file')
+    try:
+        import raw_decode
+    except ImportError:
+        raw_decode = None
+    if raw_decode is not None and raw_decode.is_raw_candidate(path, path.name):
+        try:
+            info = raw_decode.probe_raw(path)
+        except (OSError, ValueError, TypeError, IndexError, KeyError, ArithmeticError) as error:
+            raise ValueError(f'Could not probe RAW {path.name}: {error}') from None
+        fps_val = info.get('fps')
+        rate = snap_rate(parse_rate(fps_val)) if fps_val else None
+        dur_val = info.get('duration')
+        duration = Fraction(repr(float(dur_val))) if isinstance(dur_val, (int, float)) and dur_val > 0 else None
+        audio_streams = []
+        for idx, s in enumerate(info.get('audioStreamDetails') or []):
+            if isinstance(s, dict):
+                audio_streams.append({'index': s.get('index', idx), 'channels': int(s.get('channels') or 2),
+                                      'layout': s.get('layout') or 'stereo', 'codec': s.get('codec') or 'pcm'})
+        return Probe(
+            rate=rate,
+            raw_rate=str(fps_val) if fps_val else None,
+            vfr=False,
+            timecode=info.get('timecode') or None,
+            duration=duration,
+            width=info.get('width') or None,
+            height=info.get('height') or None,
+            has_video=True,
+            has_audio=bool(audio_streams),
+            audio_streams=audio_streams,
+            audio_rate=(info.get('audioSampleRate') or 48000) if audio_streams else None,
+            reel=info.get('reel') or None,
+        )
     try:
         result = subprocess.run(['ffprobe', '-v', 'error', '-protocol_whitelist', 'file',
                                  '-show_streams', '-show_format', '-of', 'json', 'file:' + str(path)],
@@ -244,6 +276,7 @@ class Source:
     adjustment: bool = False    # a Splice adjustment clip (a generator that grades the tracks beneath)
     input_lut: str | None = None  # title of the source's technical input LUT, for the loss report
     color_matrix: str | None = None  # untagged source matrix override ('bt709' or 'bt601'), for the loss report
+    raw_capabilities: dict | None = None  # camera RAW: the settings its decoder applies (raw_decode.decoder_capabilities)
     location: str = 'none'      # see Reference.kind
     original_path: str | None = None   # path on this machine, when export path mapping rewrote it
     path_rule: int | None = None        # index of the mapping rule that applied
@@ -390,6 +423,21 @@ def resolve_source(item: dict, sequence_rate: Fraction, budget: ProbeBudget) -> 
         source.input_lut = clean(str(item['inputLut'].get('title') or 'LUT'))[:120]
     if item.get('colorMatrix') in ('bt709', 'bt601'):
         source.color_matrix = item['colorMatrix']
+    if item.get('raw') is True:
+        guessed = [f for f in item.get('rawEstimated') or () if f in ('timecode', 'fps', 'duration', 'width', 'height')]
+        if guessed:
+            source.notes.append(f"camera RAW {', '.join(guessed)} could not be read from the file; Splice's placeholder was written")
+        look_names = {'iso': 'ISO', 'kelvin': 'white balance (Kelvin)', 'tint': 'tint', 'camera': 'camera model'}
+        look = [look_names[f] for f in look_names if f in (item.get('rawEstimated') or ())]
+        if look:
+            source.notes.append(f"camera RAW {', '.join(look)} not recorded in the file or a sidecar; "
+                                "Splice's decode used a placeholder (ISO 800, 5600 K, tint 0), not camera metadata")
+        if isinstance(item.get('rawCapabilities'), dict):
+            source.raw_capabilities = item['rawCapabilities']
+        if isinstance(item.get('rawMetadata'), dict) and item['rawMetadata'].get('isSequence'):
+            source.notes.append('camera RAW frame sequence: the timeline references its first frame')
+            if item['rawMetadata'].get('missingFrames'):
+                source.notes.append(f"camera RAW frame sequence has {item['rawMetadata']['missingFrames']} missing frame numbers")
     reference = media_reference(item)
     local = reference.local
     source.local, source.path, source.location = local, reference.path, reference.kind

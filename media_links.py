@@ -21,7 +21,10 @@ from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
 
 import premiere
+import raw_bayer
 from premiere import MEDIA_ROOT
+# Camera RAW formats: raw_decode.py reads their metadata and finds a decoder for their picture.
+from raw_decode import RAW_EXTENSIONS as CAMERA_RAW
 
 LINK_PREFIX = '/media/linked/'
 REGISTRY = MEDIA_ROOT.parent / 'linked-media.json'
@@ -39,15 +42,7 @@ MEDIA_EXTENSIONS = frozenset({
     '.wmv', '.flv', '.3gp', '.dv', '.wav', '.mp3', '.m4a', '.aac', '.ogg', '.oga', '.opus', '.flac',
     '.aif', '.aiff', '.caf', '.wma', '.ac3', '.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff', '.exr',
     '.dpx', '.webp'})
-# Vendor RAW formats FFmpeg cannot decode. Name the tool that can.
-CAMERA_RAW = {
-    '.braw': 'Blackmagic RAW (transcode it in DaVinci Resolve or Blackmagic RAW Player)',
-    '.r3d': 'REDCODE RAW (transcode it in REDCINE-X PRO)',
-    '.ari': 'ARRIRAW (transcode it in ARRI Reference Tool)',
-    '.arx': 'ARRIRAW (transcode it in ARRI Reference Tool)',
-    '.crm': 'Canon Cinema RAW Light (transcode it in Canon Cinema RAW Development)',
-    '.nev': 'Nikon N-RAW (transcode it in the camera vendor\'s RAW tool)',
-}
+SEQUENCE_RAW = frozenset({'.dng', '.ari', '.arx'})  # formats recorded as one file per frame
 
 # _lock guards _cache and is only ever held briefly: readers never wait on a registry writer.
 # _write_lock queues this process's writers before they take the cross-process file lock.
@@ -129,14 +124,6 @@ def _open_for_reading(path):
         kernel32.CloseHandle(handle)
         return open(path, 'rb')
     return open(descriptor, 'rb')
-
-
-def camera_raw_error(name):
-    kind = CAMERA_RAW.get(Path(str(name)).suffix.lower())
-    if not kind:
-        return None
-    return (f'{Path(str(name)).name} is {kind}. Splice edits through FFmpeg, which cannot decode this camera RAW '
-            'format: export a ProRes or DNxHR transcode or proxy from the camera vendor\'s tool and import that.')
 
 
 def fingerprint(path, size):
@@ -392,9 +379,6 @@ def _absolute_file(value):
 
 def _prepare(value, validate):
     path = _absolute_file(value)
-    message = camera_raw_error(path.name)
-    if message:
-        raise ValueError(message)
     if validate:
         validate(path, path.name)
     stat = path.stat()
@@ -420,6 +404,9 @@ def link_many(values, validate=None):
             prepared.append(_prepare(value, validate))
         except (ValueError, OSError) as error:
             prepared.append(error)
+        except Exception as error:  # One unreadable file must not fail the rest of the batch.
+            name = Path(str(value)).name if isinstance(value, (str, os.PathLike)) else 'This file'
+            prepared.append(ValueError(f'{name} could not be read ({type(error).__name__})'))
 
     def change(links):
         by_path = {entry['path']: key for key, entry in links.items()}
@@ -491,13 +478,23 @@ def folder_files(value):
     root = Path(value).resolve(strict=False)
     if not root.is_dir():
         raise ValueError('The chosen folder is unavailable')
+    allowed = MEDIA_EXTENSIONS | CAMERA_RAW
     found = []
     for directory, folders, files in os.walk(root):
         depth = len(Path(directory).relative_to(root).parts)
         folders[:] = sorted(f for f in folders if not f.startswith('.')) if depth < MAX_FOLDER_DEPTH else []
+        seen_sequences = set()
         for name in sorted(files):
-            if name.startswith('.') or Path(name).suffix.lower() not in MEDIA_EXTENSIONS:
+            suffix = Path(name).suffix.lower()
+            if name.startswith('.') or suffix not in allowed:
                 continue
+            if suffix in SEQUENCE_RAW:
+                pat = raw_bayer.sequence_pattern(name)
+                if pat is not None:
+                    seq_key = (pat[0], pat[2])
+                    if seq_key in seen_sequences:
+                        continue
+                    seen_sequences.add(seq_key)
             if len(found) >= MAX_FOLDER_FILES:
                 raise ValueError(f'The folder holds more than {MAX_FOLDER_FILES} media files. Choose a smaller folder.')
             path = Path(directory) / name
@@ -651,11 +648,20 @@ def browse(value=None):
     directory = Path(value).resolve(strict=False)
     if not directory.is_dir():
         raise ValueError('The folder is unavailable')
-    entries, truncated = [], False
+    entries, truncated, sequences = [], False, {}
     with os.scandir(directory) as listing:
         for item in listing:
             if item.name.startswith('.'):
                 continue
+            # A numbered camera RAW frame sequence (A001_000001.dng ...) is one clip: list its first frame.
+            pattern = raw_bayer.sequence_pattern(item.name) if Path(item.name).suffix.lower() in SEQUENCE_RAW else None
+            if pattern is not None and item.is_file():
+                entry = sequences.get((pattern[0], pattern[2]))
+                if entry is not None:
+                    entry['frames'] += 1
+                    if int(pattern[1]) < entry['_first']:
+                        entry.update(name=item.name, path=item.path, size=item.stat().st_size, _first=int(pattern[1]))
+                    continue
             if len(entries) >= MAX_LISTING:
                 truncated = True
                 break
@@ -671,6 +677,11 @@ def browse(value=None):
                                 size=None if folder else stat.st_size,
                                 kind='folder' if folder else 'raw' if suffix in CAMERA_RAW
                                 else 'media' if suffix in MEDIA_EXTENSIONS else 'other'))
+            if pattern is not None and not folder:
+                entries[-1].update(frames=1, _first=int(pattern[1]))
+                sequences[(pattern[0], pattern[2])] = entries[-1]
+    for entry in sequences.values():
+        entry.pop('_first')
     entries.sort(key=lambda e: (not e['folder'], e['name'].casefold()))
     parent = directory.parent
     return dict(path=str(directory), parent=None if parent == directory else str(parent), entries=entries,

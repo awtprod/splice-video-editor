@@ -60,7 +60,7 @@ CLIP_FIELDS = {
     'transitionBefore': 'written', 'transitionMatchName': 'written', 'speed': 'reported', 'reverse': 'reported',
     'keyframes': 'reported', 'color': 'reported', 'opacity': 'reported', 'fadeIn': 'reported',
     'transitionClock': 'reported', 'fadeClock': 'reported', 'pictureDip': 'reported', 'fadeOut': 'reported', 'pan': 'reported', 'title': 'reported', 'titleStyle': 'reported', 'text': 'reported',
-    'audioFx': 'reported', 'audioTransition': 'reported', 'channelMap': 'reported',
+    'audioFx': 'reported', 'audioTransition': 'reported', 'channelMap': 'reported', 'rawSettings': 'reported',
     'markers': 'reported', 'embeddedAudio': 'reported', 'audioStream': 'reported',
     'nestedSequence': 'reported', 'multicamAngle': 'reported', 'multicamAudioAngle': 'reported',
     'colorLabel': 'reported',
@@ -88,11 +88,15 @@ MEDIA_FIELDS = {
     'still': 'meta', 'width': 'meta', 'height': 'meta', 'fps': 'meta', 'size': 'meta', 'codec': 'meta',
     'audioStreams': 'meta', 'timecode': 'meta', 'proxy': 'meta', 'premiereId': 'meta', 'mediaKey': 'meta',
     'linked': 'meta', 'missing': 'meta', 'local': 'meta', 'file': 'meta', 'audio': 'meta', 'video': 'meta',
-    'adjustment': 'reported', 'colorMatrix': 'reported', 'inputLut': 'reported'}
+    'adjustment': 'reported', 'colorMatrix': 'reported', 'inputLut': 'reported',
+    'raw': 'meta', 'rawFormat': 'meta', 'rawFormatLabel': 'meta', 'rawDecoderAvailable': 'meta',
+    'rawDecoderName': 'meta', 'rawDecoderMessage': 'meta', 'rawDefaults': 'meta', 'rawMetadata': 'meta',
+    'rawAttachedProxy': 'reported', 'rawAttachedPreview': 'meta', 'rawAudioPath': 'meta', 'rawEstimated': 'meta',
+    'rawCapabilities': 'meta'}
 _DEFAULTS = {'speed': 1, 'reverse': False, 'opacity': 100, 'fadeIn': 0, 'fadeOut': 0, 'pan': 0, 'title': '',
              'markers': [], 'keyframes': {}, 'color': {}, 'audioStream': 0, 'nativeTimeRemap': None,
              'titleStyle': None, 'text': None, 'embeddedAudio': None, 'colorLabel': '',
-             'nestedSequence': None, 'multicamAngle': None, 'multicamAudioAngle': None}
+             'nestedSequence': None, 'multicamAngle': None, 'multicamAudioAngle': None, 'rawSettings': None}
 
 
 def _same(a, b):
@@ -939,6 +943,10 @@ class Writer:
                                       ('channelMap', 'stereo', 'Clip channel mapping')]:
             if changed(field, neutral):
                 report.add(NOT_WRITTEN, label, where)
+        raw_settings = clip.get('rawSettings')
+        if isinstance(raw_settings, dict) and raw_settings.get('decodeUsing') == 'clip' and changed('rawSettings'):
+            report.add(NOT_WRITTEN, 'Splice Camera RAW decode overrides (Resolve keeps its own Camera RAW settings)',
+                       where)
         if changed('pan'):
             report.add(NOT_WRITTEN, 'Clip pan', where)
         for field in clip:
@@ -1016,6 +1024,9 @@ class Writer:
                            f'{media.get("name") or "Media"} ({media.get("colorMatrix")})')
             if media.get('inputLut') and not _same(media.get('inputLut'), old.get('inputLut') if old else None):
                 report.add(NOT_WRITTEN, 'Source input LUTs (Resolve clip LUTs are not written)',
+                           media.get('name') or 'Media')
+            if media.get('rawAttachedProxy') and not (old and old.get('rawAttachedProxy')):
+                report.add(NOT_WRITTEN, 'Proxies attached to camera RAW in Splice (Resolve links the original RAW file)',
                            media.get('name') or 'Media')
             # Other media fields are what Splice measured or linked (path, fingerprint, rate, HDR
             # and the like): facts of the file, not edits; the file itself is what is written.
