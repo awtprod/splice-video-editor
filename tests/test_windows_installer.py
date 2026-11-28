@@ -585,6 +585,30 @@ class BundledFFmpegOnly(unittest.TestCase):
             self.assertIn('zscale', runtime_check.startup_problem())
 
 
+
+class DecoderOnUserPath(unittest.TestCase):
+    """The installed app keeps the user's PATH, so a RAW decoder there is found, also when the
+    PATH folder is written in Windows' short 8.3 form (C:\\Users\\RUNNER~1\\...)."""
+
+    @unittest.skipUnless(POSIX, 'a symlink stands in for an 8.3 short name')
+    def test_decoder_in_a_short_named_folder_is_found(self):
+        directory = Path(tempfile.mkdtemp(prefix='splice-userpath-'))
+        self.addCleanup(shutil.rmtree, directory, True)
+        long = directory / 'runneradmin tools'
+        long.mkdir()
+        decoder = long / 'braw-decode'
+        decoder.write_text('#!/bin/sh\nexit 9\n')
+        decoder.chmod(0o755)
+        short = directory / 'RUNNER~1'
+        short.symlink_to(long, target_is_directory=True)
+        env = {key: value for key, value in os.environ.items() if not key.startswith('SPLICE_')}
+        env.update(PATH=str(short) + os.pathsep + '/usr/bin:/bin', SPLICE_DATA_DIR=str(directory / 'data'))
+        with mock.patch.dict(os.environ, env, clear=True):
+            braw = next(entry for entry in raw_decode.decoder_status()['decoders'] if entry['id'] == 'braw')
+        self.assertTrue(braw['available'], braw)
+        self.assertEqual(braw['path'], str(decoder.resolve()))
+
+
 def _windows_os(system_root):
     """The os module as seen by code that branches on os.name == 'nt'."""
     fake = types.SimpleNamespace(**{name: getattr(os, name) for name in dir(os) if not name.startswith('__')})

@@ -446,7 +446,9 @@ def _resolve_backend(backend_id: str, cfg: dict | None = None, env_map: dict | N
                 'configuredPath': None, 'sdkPath': None,
                 'guidance': None if has_dec else 'Install FFmpeg 8 or later (its prores_raw decoder).'}
     candidates = [c for c in (configured, env_map.get(backend_id)) if c]
-    candidates += [found for found in (shutil.which(cli) for cli in spec['cliNames']) if found]
+    # A decoder found on PATH by its real path: a PATH folder may be written in Windows' short 8.3
+    # form (C:\PROGRA~1\...), whose '~' the shell-metacharacter check would refuse.
+    candidates += [str(Path(found).resolve()) for found in (shutil.which(cli) for cli in spec['cliNames']) if found]
     candidates += list(spec['standardPaths'])
     cli_path = sdk_path = None
     for candidate in candidates:
