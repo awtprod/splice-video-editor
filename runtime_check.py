@@ -20,7 +20,7 @@ REQUIRED_FILTERS = (
     'alphaextract', 'alphamerge', 'blend', 'color', 'colorchannelmixer', 'copy', 'crop', 'drawbox', 'drawtext', 'exposure',
     'extractplanes', 'fade', 'format', 'fps', 'geq', 'loop', 'lut1d', 'lut3d', 'lutrgb', 'lutyuv', 'maskedmerge',
     'mergeplanes', 'metadata', 'null', 'overlay', 'pad', 'reverse', 'rotate', 'scale', 'setparams', 'setpts',
-    'setsar', 'settb', 'signalstats', 'split', 'tonemap', 'tpad', 'trim', 'zscale',
+    'setsar', 'settb', 'showinfo', 'signalstats', 'split', 'tonemap', 'tpad', 'trim', 'zscale',
     # sound
     'acompressor', 'adelay', 'aeval', 'aformat', 'agate', 'ametadata', 'amix', 'amultiply', 'anull', 'anullsrc',
     'apad', 'aresample', 'areverse', 'asetpts', 'astats', 'atempo', 'atrim', 'biquad', 'ebur128', 'highpass',

@@ -507,7 +507,7 @@ def frame_codes(path):
     width, height = CODE_SIZE
     raw = subprocess.run(['ffmpeg', '-nostdin', '-v', 'error', '-i', str(path), '-vf',
                           f'scale={width}:{height},setparams=range=tv:colorspace=bt709:color_trc=bt709:color_primaries=bt709,'
-                          'zscale,format=gbrp', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-'],
+                          'zscale,format=gbrp', '-fps_mode', 'passthrough', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-'],
                          capture_output=True, check=True, timeout=180).stdout
     size = width*height*3
     out = []
@@ -600,6 +600,90 @@ class StabilizedFrames(Fixture):
                 expected = [max(k for k, t in enumerate(times) if t <= start+source_in+j/25+1e-6) for j in range(40)]
                 self.assertEqual(seen['plain'], expected, f'{name} in {source_in}: plain export')
                 self.assertEqual(seen['stabilized'], seen['plain'], f'{name} in {source_in}: stabilized export')
+
+
+
+def long_source(path, seconds, codec, extra=(), timing=''):
+    """Like coded_source, ``seconds`` long without sound, with any codec settings; the frame code
+    counts modulo 200. ``timing``: filters that retime the frames (variable frame rate)."""
+    width, height = CODE_SIZE
+    ffmpeg('-f', 'lavfi', '-i', f"color=c=black:s={width+160}x{height+96}:r={CODE_FPS},format=gbrp,"
+           "geq=r='20+20*mod(N,10)':g='128':b='20+12*floor(mod(N,200)/10)'", '-t', str(seconds),
+           '-vf', f"drawgrid=w=24:h=24:t=2:c=white@1,drawbox=x=100:y=60:w=40:h=40:c=yellow:t=fill,"
+           f"crop={width}:{height}:x='80+36*(random(1)-0.5)':y='48+24*(random(2)-0.5)'{timing},"
+           "scale=out_color_matrix=bt709:out_range=tv,format=yuv420p",
+           *codec, '-colorspace', 'bt709', '-an', *extra, path)
+
+
+class StabilizedTiming(Fixture):
+    """A phone's variable frame rate (a stabilized clip was one frame off: its intermediate was
+    retimed to a constant rate) and an MPEG-TS whose GOP is longer than the seek margin (the
+    analysis, the stabilized picture and the plain export all started up to a GOP late)."""
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        if not E.vidstab_available():
+            raise unittest.SkipTest('FFmpeg without vidstab')
+        # +-6 ms jitter, a frame dropped every 97, 90 kHz, B-frames.
+        long_source(cls.media/'phone.mp4', 7, ['-c:v', 'libx264', '-crf', '12', '-x264-params', 'keyint=60:bframes=2',
+                                                 '-fps_mode', 'passthrough', '-enc_time_base', '1:90000', '-video_track_timescale', '90000'],
+                    timing=",settb=1/90000,setpts='(N/30+0.006*sin(N*2.3)+floor(N/97)/30)/TB'")
+        # x264's default GOP (250 frames, 8.3 s) and a container start of 31.38 s.
+        long_source(cls.media/'long.ts', 12, ['-c:v', 'libx264', '-crf', '12', '-x264-params',
+                                              'keyint=250:min-keyint=250:bframes=3:scenecut=0'], ('-f', 'mpegts', '-output_ts_offset', '30'))
+
+    def analyze(self, name, low, high):
+        return StabilizedFrames.analyze(self, name, low, high)
+
+    def check(self, name, analysis, start, times, in_points, plain_only=()):
+        """Stabilized and plain exports at each in point show the frame on screen at each source time
+        (container clock); ``plain_only`` in points are checked without stabilization."""
+        width, height = CODE_SIZE
+        on_screen = lambda x: max(k for k, t in enumerate(times) if t <= start+x+1e-6) % 200  # noqa: E731
+        item = {'id': 'm', 'name': name, 'src': f'/media/{name}', 'type': 'video', 'duration': 12}
+        for source_in in (*in_points, *plain_only):
+            kinds = (('plain', {}),) if source_in in plain_only else (
+                ('plain', {}), ('stabilized', {'stabilize': {'analysis': analysis, 'smoothing': 15}}))
+            expected = [on_screen(source_in+j/25) for j in range(30)]
+            for label, effects in kinds:
+                clip = {'id': 'A', 'type': 'video', 'mediaId': 'm', 'track': 1, 'start': 0, 'duration': 1.2, 'in': source_in,
+                        'transition': 'none', 'effects': effects}
+                out = self.out(f'{name}-{source_in}-{label}.mov')
+                render_to_file({'name': 's', 'width': width, 'height': height, 'fps': 25, 'media': [item], 'clips': [clip]}, out,
+                               options={'codec': 'prores'})
+                self.assertEqual([code for code, _ in frame_codes(out)], expected, f'{name} in {source_in}: {label} export')
+
+    def check_preview(self, name, analysis, start, times, source_in):
+        """The monitor's stabilized proxy: every analyzed frame, at its own time from the first."""
+        status_first = max(k for k, t in enumerate(times) if t <= start+source_in+1e-6)
+        preview = self.out(f'{name}-preview.mp4')
+        E.render_stabilized(analysis, E._transform_settings({'smoothing': 15}), preview, preview=True)
+        codes = [code for code, _ in frame_codes(preview)]
+        self.assertEqual(codes, [k % 200 for k in range(status_first, status_first+len(codes))], f'{name}: preview frames')
+        _, shown = frame_times(preview)
+        worst = max(abs(t-(times[status_first+i]-times[status_first])) for i, t in enumerate(shown))
+        self.assertLess(worst, .0005, f'{name}: a preview frame is {worst*1000:.2f} ms from its source time')
+        return len(codes)
+
+    def test_a_variable_frame_rate_clip_keeps_every_frame_time(self):
+        start, times = frame_times(self.media/'phone.mp4')
+        status = self.analyze('phone.mp4', 1.1, 5.6)
+        self.assertEqual(self.check_preview('phone.mp4', status['analysis'], start, times, 1.1), status['frames'])
+        # 3.0337 s: just after a jittered frame boundary.
+        self.check('phone.mp4', status['analysis'], start, times, (1.1, 3.0337, 4.2))
+
+    def test_a_long_gop_transport_stream_stabilizes_the_range_asked_for(self):
+        start, times = frame_times(self.media/'long.ts')
+        self.assertGreater(start, 30, 'the stream starts at its offset')
+        status = self.analyze('long.ts', 3.1, 10.6)
+        first = max(k for k, t in enumerate(times) if t <= start+3.1+1e-6)
+        last = max(k for k, t in enumerate(times) if t < start+10.6-1e-6)
+        self.assertEqual(status['frames'], last-first+1, 'every frame of the range is analyzed')
+        self.assertAlmostEqual(status['offset'], times[first]-start, places=4)
+        self.check_preview('long.ts', status['analysis'], start, times, 3.1)
+        # The plain export of the same file follows its container clock too (it showed one frame
+        # held for the whole clip, or black).
+        self.check('long.ts', status['analysis'], start, times, (3.1, 7.77), plain_only=(1.2, 5.0, 9.0))
 
 
 if __name__ == '__main__':

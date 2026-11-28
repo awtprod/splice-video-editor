@@ -1391,6 +1391,7 @@ def _media_info(item, probes, heartbeat=None):
                 _videoStart=probe.get('video_start') if set(probe['format'].split(',')) & STREAM_FORMATS else None,
                 _sourceRange=probed_range if probed_range in ALLOWED_SOURCE_RANGES else 'tv',
                 _sourceAlpha=bool(probe.get('alpha')),
+                _streamSeek=bool(set(probe['format'].split(',')) & STREAM_FORMATS),
                 _seekMargin=SEEK_MARGIN_STREAM_SECONDS if set(probe['format'].split(',')) & STREAM_FORMATS else SEEK_MARGIN_SECONDS)
     return item
 
@@ -1435,6 +1436,43 @@ def _check_clip(clip, media_by_id, probes, heartbeat=None):
             return item
         raise ValueError(f"{item.get('name', 'Media')} lacks a {clip['type']} stream")
     return item
+
+
+@lru_cache(maxsize=512)
+def _first_decoded_frame(path, size, mtime_ns, seek):
+    """File timestamp of the first video frame FFmpeg decodes after input -ss ``seek``, or None
+    when none follows. (``size`` and ``mtime_ns`` key the cache to the file's contents.)"""
+    result = splice_platform.run(['ffmpeg', '-nostdin', '-hide_banner', '-v', 'info', '-noaccurate_seek', '-ss', f'{seek:.6f}',
+                                  '-copyts', '-protocol_whitelist', 'file', '-i', path, '-map', '0:v:0', '-frames:v', '1',
+                                  '-vf', 'showinfo=checksum=0', '-f', 'null', '-'], capture_output=True, text=True, timeout=60)
+    found = re.search(r'pts_time:\s*(-?[0-9.]+)', result.stderr)
+    return float(found.group(1)) if found else None
+
+
+def stream_seek(path, needed, margin, start):
+    """Input -ss (seconds from the container start) from which FFmpeg decodes the video frame on
+    screen at source time ``needed`` of an MPEG transport or program stream (.ts, .mts, .m2ts,
+    .mpg). These seek by timestamp to a byte position, and FFmpeg 8 decodes from the first keyframe
+    after it: up to a whole GOP late (x264's default GOP is 250 frames, 8-10 s). So the first frame
+    decoded after the seek is checked, and the seek moves back past it, as far as the container
+    start (no seek), until that frame is at or before the one needed. ``start`` is the container
+    start time; input -ss, the result and ``needed`` count from it."""
+    path = Path(path)
+    stat = path.stat()
+    seek = max(0.0, needed-margin)
+    for _ in range(16):
+        if seek <= 0:
+            return 0.0
+        try:
+            first = _first_decoded_frame(str(path), stat.st_size, stat.st_mtime_ns, round(seek, 6))
+        except subprocess.TimeoutExpired:
+            return 0.0   # reading from the start is always right
+        if first is not None and first-start <= needed+1e-6:
+            return seek
+        # Back past the frame FFmpeg started at, by at least twice the distance tried so far.
+        late = (first-start-needed) if first is not None else needed-seek
+        seek = needed-max(2*(needed-seek), 2*late+margin)
+    return 0.0
 
 
 def _input_time_shift(item, seek_us):
@@ -1622,8 +1660,12 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
         for run in runs:
             # Seek to the keyframe before the run without dropping earlier
             # frames: a frame that starts before the in point is still on screen.
-            margin = media_by_id[identity].get('_seekMargin', SEEK_MARGIN_SECONDS)
-            seek_us = math.floor(max(0, run['low']-margin)*1_000_000)
+            source = media_by_id[identity]
+            margin = source.get('_seekMargin', SEEK_MARGIN_SECONDS)
+            point = max(0, run['low']-margin)
+            if point > 0 and source.get('_streamSeek'):
+                point = stream_seek(source['_path'], run['low'], margin, float(source.get('_startTime') or 0))
+            seek_us = math.floor(point*1_000_000)
             index = len(inputs)
             seek = ['-noaccurate_seek', '-ss', f'{seek_us/1_000_000:.6f}'] if seek_us > 0 else []
             # No input -t: without accurate seek it counts from the keyframe,
