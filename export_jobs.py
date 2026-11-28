@@ -5,8 +5,11 @@ stay in that process group, and the whole group is killed on cancel, on a
 watchdog kill, when the worker ends (a process left holding FFmpeg's pipes
 dies with it) and at shutdown. A job leaves the *rendering* state only once
 every process of its group has exited and (unless it completed) its scratch
-folder is gone, so the next render never overlaps a stopped one. Windows has
-no process groups that can be killed this way: the worker's process tree is
+folder is gone, so the next render never overlaps a stopped one. A render of
+nested sequences or raw clips also writes a folder under the media directory
+(the renderer reads its sources by /media/ URL); its name starts with the job's
+own prefix, and the job removes it the same way, whatever ended the render.
+Windows has no process groups that can be killed this way: the worker's process tree is
 stopped with taskkill /T while it is alive, and the renderer stops each FFmpeg
 tree the same way.
 
@@ -44,8 +47,9 @@ def _orphan_guard():
     """End this worker and everything it started if the server process dies (killed, crashed).
 
     The worker runs in its own session, so nothing else would stop its FFmpeg children; the
-    parent's sentinel becomes ready when the parent is gone. The job's scratch folder is unlocked
-    by the exit and removed by reap_stale_work on the next start."""
+    parent's sentinel becomes ready when the parent is gone. The job's scratch folder (and any
+    nested-render folder under the media directory) is unlocked by the exit and removed by
+    reap_stale_work on the next start."""
     parent = multiprocessing.parent_process()
     if parent is None:
         return
@@ -61,14 +65,14 @@ def _orphan_guard():
     threading.Thread(target=watch, daemon=True, name='splice-orphan-guard').start()
 
 
-def _worker(project, options, output, progress, beat, cancelled, connection):
+def _worker(project, options, output, progress, beat, cancelled, connection, nested_prefix=None):
     # A cancelled render must stop its FFmpeg children as well as Python.
     if os.name != 'nt':
         os.setsid()
     _orphan_guard()
     connection.send(('ready', os.name != 'nt'))
     try:
-        from render_movie import render_to_file
+        from render_movie import NESTED_PREFIX, render_to_file
 
         def advance(fraction):
             progress.value = min(1, max(0, float(fraction)))
@@ -80,10 +84,11 @@ def _worker(project, options, output, progress, beat, cancelled, connection):
         report = {}
         with warnings.catch_warnings(record=True) as notices:
             warnings.simplefilter('once')
-            # Scratch files go inside the job's own folder, which the parent
-            # removes even when it has to kill this process.
+            # Scratch files go inside the job's own folder, and nested renders into media-directory
+            # folders named with the job's prefix; the parent removes both even when it has to kill
+            # this process.
             render_to_file(project, output, options=options, progress=advance, cancelled=cancelled, heartbeat=alive,
-                           work_directory=Path(output).parent, report=report)
+                           work_directory=Path(output).parent, report=report, nested_prefix=nested_prefix or NESTED_PREFIX)
         connection.send(('done', {'warnings': list(dict.fromkeys(str(note.message) for note in notices)), 'report': report}))
     except Exception as error:
         connection.send(('error', str(error)))
@@ -100,6 +105,20 @@ def _remove(directory, attempts=3):
         except OSError:
             if attempt + 1 < attempts:
                 time.sleep(.2)
+    return False
+
+
+def _remove_nested(prefix, attempts=3):
+    """Remove a job's nested-render folders under the media directory; retry briefly like _remove."""
+    from render_movie import remove_nested_work
+    for attempt in range(attempts):
+        try:
+            if remove_nested_work(prefix):
+                return True
+        except OSError:
+            pass
+        if attempt + 1 < attempts:
+            time.sleep(.2)
     return False
 
 
@@ -183,7 +202,8 @@ class ExportJobs:
             if any(job['state'] == 'rendering' for job in self.jobs.values()):
                 raise ValueError('An export is already running')
             identifier = uuid.uuid4().hex
-            from render_movie import WorkDirectory, _stall_seconds
+            from render_movie import NESTED_PREFIX, WorkDirectory, _stall_seconds
+            nested = f'{NESTED_PREFIX}{identifier}-'
             stall = _stall_seconds() + JOB_STALL_GRACE
             temp = WorkDirectory('splice-export-')
             out = Path(temp.name) / (folder_name if images else 'output.'+extension)
@@ -192,7 +212,7 @@ class ExportJobs:
             cancelled = self.context.Event()
             reader, writer = self.context.Pipe(duplex=False)
             process = self.context.Process(target=_worker, args=(
-                project, options, out, progress, beat, cancelled, writer))
+                project, options, out, progress, beat, cancelled, writer, nested))
             try:
                 process.start()
             except BaseException:
@@ -201,7 +221,7 @@ class ExportJobs:
                 raise
             finally:
                 writer.close()
-            job = dict(state='rendering', directory=temp, output=out, process=process, extension=extension or 'folder', mime=mime,
+            job = dict(state='rendering', directory=temp, nested=nested, output=out, process=process, extension=extension or 'folder', mime=mime,
                        previewable=previewable, images=images, started=time.monotonic(),
                        progress=progress, beat=beat, stall=stall, cancelled=cancelled, error='', warnings=[], report={}, finished=0,
                        group=None, settled=threading.Event())
@@ -269,8 +289,9 @@ class ExportJobs:
             reader.close()
             process.join()
             # The job stays *rendering* until nothing of it is left: no process of its
-            # group runs and, unless it completed, its scratch folder is removed. Only
-            # then can the next render start or a caller see the job as stopped.
+            # group runs, its nested-render folders are removed and, unless it completed, its
+            # scratch folder is removed. Only then can the next render start or a caller see
+            # the job as stopped.
             stopped = True
             if grouped:
                 # The worker has exited (or was killed); its session still holds anything
@@ -285,6 +306,10 @@ class ExportJobs:
                     notes.append('A process of this export did not exit when it was stopped')
                 if state != 'complete' and not _remove(job['directory']):
                     notes.append('Its scratch folder could not be removed now; Splice removes it when it starts again')
+                # A render that ran to its end removed its nested-render folders itself; a killed one
+                # could not, so they go here, before the job can show as finished.
+                if not _remove_nested(job['nested']):
+                    notes.append('Its nested-render folder could not be removed now; Splice removes it when it starts again')
             finally:
                 with self.lock:
                     job['state'] = state
