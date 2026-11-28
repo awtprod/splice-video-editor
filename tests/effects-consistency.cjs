@@ -1,7 +1,8 @@
 /* Effects the export refuses are refused in the editor too, with the export's own words: at load,
  * in an edit (updateClip) and on paste. A ramp on a multicam clip, stabilization of a nested or
  * multicam clip, and keyframes of a ninth mask. Also: the picture's "Ramp sound" choice reaches its
- * linked sound clip, and at 1024x640 the Effects groups use the inspector's width.
+ * linked sound clip, at 1024x640 the Effects groups use the inspector's width, and an analysis no
+ * clip uses any more (Reset, a deleted clip) stops on the server.
  */
 const assert = require('node:assert/strict');
 const path = require('node:path');
@@ -138,8 +139,45 @@ async function main() {
     assert.ok(fit.inset <= 20, `the Effects groups start at the inspector's padding (${fit.inset.toFixed(0)} px)`);
     for (const select of fit.selects) assert.ok(select.need <= select.room, `"${select.text}" fits: ${select.need.toFixed(0)} <= ${select.room.toFixed(0)} px`);
     assert.ok(fit.selects.some(select => select.text === 'Custom bezier'), JSON.stringify(fit.selects));
+
+    // ---- 6. An analysis no clip uses any more stops on the server: Reset, then a deleted clip.
+    if (await page.evaluate(async () => (await (await fetch('/api/effects/capabilities')).json()).vidstab)) {
+      const long = path.join(splice.temp, 'long.mp4');
+      ffmpeg(['-y', '-f', 'lavfi', '-i', 'testsrc2=s=1280x720:r=25', '-t', '30', '-pix_fmt', 'yuv420p', '-c:v', 'libx264', '-preset', 'ultrafast', '-g', '1', long]);
+      await page.locator('#media-input').setInputFiles([long]);
+      await page.waitForFunction(() => Editor.get().project.media.some(m => m.name === 'long.mp4' && m.duration));
+      await page.evaluate(() => {
+        const id = Editor.get().project.media.find(m => m.name === 'long.mp4').id;
+        Editor.editProject(p => { p.clips.push(
+          {id:'s1', type:'video', mediaId:id, track:3, start:0, duration:12, in:0, embeddedAudio:false, transition:'none', color:{}},
+          {id:'s2', type:'video', mediaId:id, track:4, start:0, duration:12, in:14, embeddedAudio:false, transition:'none', color:{}}); });
+      });
+      const serverState = id => page.evaluate(async id => (await (await fetch('/api/effects/stabilize?id='+id)).json()).state, id);
+      const analyze = id => page.evaluate(async id => {
+        await SpliceEffectsUI.analyze(Editor, Editor.get().project.clips.find(c => c.id === id), () => {});
+        return Editor.get().project.clips.find(c => c.id === id).effects.stabilize.analysis;
+      }, id);
+      const first = await analyze('s1');
+      assert.equal(await serverState(first), 'running');
+      await page.evaluate(() => Editor.select('s1'));
+      await settle(page);
+      const stab = page.locator('[data-fx-group="stabilize"]');
+      if (await stab.locator('.fx-body').evaluate(node => node.hidden)) await stab.locator('[data-fx-summary]').click();
+      await stab.locator('[data-fx-stabilize-reset]').click();
+      const waitCancelled = async id => {
+        const deadline = Date.now()+15000;
+        let state;
+        while (Date.now() < deadline && (state = await serverState(id)) !== 'cancelled') await page.waitForTimeout(200);
+        return state;
+      };
+      assert.equal(await waitCancelled(first), 'cancelled', 'Reset cancels the running analysis');
+      const second = await analyze('s2');
+      assert.equal(await serverState(second), 'running');
+      await page.evaluate(() => Editor.deleteClips(['s2']));
+      assert.equal(await waitCancelled(second), 'cancelled', 'deleting the clip cancels its analysis');
+    }
     assert.deepEqual(errors, []);
-    console.log('Effects consistency: load, edit and paste refuse what the export refuses; linked Ramp sound; 1024x640 layout.');
+    console.log('Effects consistency: load, edit and paste refuse what the export refuses; linked Ramp sound; 1024x640 layout; analyses cancelled.');
   } finally {
     await splice.stop();
   }
