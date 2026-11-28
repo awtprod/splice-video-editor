@@ -160,6 +160,70 @@ class Running(QueueCase):
             self.assertEqual(list(temporary.iterdir()), [], 'nothing left in the temporary folder')
             self.assertEqual(sorted(path.name for path in self.folder.iterdir()), ['after.mp4'])
 
+    def test_cancel_during_a_nested_render_leaves_no_nested_folder(self):
+        import threading
+        # A nested sequence renders into a folder under the media directory, outside the job's
+        # scratch; the worker is killed on cancel, so the job itself must remove that folder.
+        scratch = Path(tempfile.mkdtemp(prefix='queue-scratch-', dir=self.state))
+        temporary = Path(tempfile.mkdtemp(prefix='queue-tmp-', dir=self.state))
+        before = {path.name for path in MEDIA_ROOT.iterdir() if path.name.startswith(render_movie.NESTED_PREFIX)}
+
+        def nested_folders():
+            return sorted(path.name for path in MEDIA_ROOT.iterdir()
+                          if path.name.startswith(render_movie.NESTED_PREFIX) and path.name not in before)
+        with mock.patch.dict(os.environ, {'SPLICE_TEMP_DIR': str(scratch), 'TMPDIR': str(temporary)}):
+            queue = self.queue()
+            child = dict(self.project, captions=[],
+                         clips=[dict(type='video', mediaId='m', track=1, start=n * 2, duration=2, **{'in': 0}) for n in range(60)])
+            nested = dict(self.project, captions=[], media=[dict(id='n', type='video', duration=120, nestedSequence='seq', nestedProject=child)],
+                          clips=[dict(type='video', mediaId='n', track=1, start=0, duration=120, nestedSequence='seq', **{'in': 0})])
+            ids = queue.add(nested, [dict(options=dict(codec='prores', profile='hq'), name='nested')], folder=str(self.folder))
+            ids += queue.add(self.project, [dict(options=dict(codec='h264'), name='after')], folder=str(self.folder))
+            deadline = time.monotonic() + 60
+            while queue.list()['jobs'][0]['state'] != 'rendering' or not nested_folders():
+                self.assertLess(time.monotonic(), deadline, 'the nested render never started')
+                time.sleep(.05)
+            time.sleep(.5)
+            self.assertEqual(queue.list()['jobs'][0]['state'], 'rendering', 'cancelled while the nested render runs')
+            # From the cancel on, whenever no job shows as rendering no nested folder of it may exist.
+            seen, stop = [], threading.Event()
+
+            def watch():
+                while not stop.is_set():
+                    with queue.lock:
+                        states = [job['state'] for job in queue.jobs]
+                        left = [] if 'rendering' in states else nested_folders()
+                    if left:
+                        seen.append((states, left))
+                        return
+            watcher = threading.Thread(target=watch, daemon=True)
+            watcher.start()
+            queue.action(ids[0], 'cancel')
+            try:
+                jobs = self.wait(queue, ids)
+            finally:
+                stop.set()
+                watcher.join()
+            self.assertEqual((jobs[ids[0]]['state'], jobs[ids[1]]['state']), ('cancelled', 'complete'))
+            self.assertEqual(seen, [], 'a job showed as finished while its nested folder existed')
+            self.assertEqual(nested_folders(), [], 'no nested folder after cancel')
+            self.assertEqual(list(scratch.iterdir()), [], 'no scratch after cancel')
+            self.assertEqual(list(temporary.iterdir()), [], 'nothing left in the temporary folder')
+
+    def test_startup_removes_a_nested_folder_whose_owner_is_gone(self):
+        scratch = Path(tempfile.mkdtemp(prefix='queue-scratch-', dir=self.state))
+        with mock.patch.dict(os.environ, {'SPLICE_TEMP_DIR': str(scratch)}):
+            live = render_movie.WorkDirectory(render_movie.NESTED_PREFIX + 'live-', root=MEDIA_ROOT)
+            self.addCleanup(live.cleanup)
+            stale = render_movie.WorkDirectory(render_movie.NESTED_PREFIX + 'stale-', root=MEDIA_ROOT)
+            self.addCleanup(shutil.rmtree, stale.name, True)
+            (Path(stale.name) / 'nested-0.mov').write_bytes(b'partial')
+            stale._lock.close()  # its owner was killed
+            stale._lock = None
+            self.assertGreaterEqual(render_movie.reap_stale_work(), 1)
+            self.assertFalse(Path(stale.name).exists(), 'the next start removes a killed render\'s nested folder')
+            self.assertTrue(Path(live.name).is_dir(), 'a running render keeps its nested folder')
+
     def test_batch_of_presets_with_sidecars(self):
         queue = self.queue()
         ids = queue.add(self.project, [dict(options=dict(codec='h264', captionFiles=['vtt']), name='film - web', preset='Web'),
