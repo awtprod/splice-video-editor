@@ -1343,7 +1343,10 @@ def _alpha_bytes_per_pixel(spec):
     return 8 if spec['chroma'] == '444' else 6
 
 
-def _composite_layer(filters, base, layer, output, position, overlay, first, frames, window_frames, base_format):
+def _composite_layer(filters, base, layer, output, position, overlay, first, frames, window_frames, base_format,
+                     alpha_stream=None):
+    """``alpha_stream`` (16-bit composites): a gray16 stream with the layer's alpha, positioned and
+    timed like the layer, used instead of the layer's own alpha plane (effects_engine.blend_composite)."""
     if overlay:
         filters.append(f'[{base}][{layer}]overlay={position}:{overlay}[{output}]')
         return
@@ -1354,18 +1357,24 @@ def _composite_layer(filters, base, layer, output, position, overlay, first, fra
     if first < 0:
         timing = f'trim=start_frame={-first},' + timing
     # The positioned layer now occupies the square-pixel canvas, including its alpha mask.
-    filters.append(f'[{layer}]format=yuva444p16le,{position},setsar=1,{timing},split[{output}_fg][{output}_a]')
+    if alpha_stream:
+        filters.append(f'[{layer}]format=yuva444p16le,{position},setsar=1,{timing}[{output}_fg]')
+        filters.append(f'[{alpha_stream}]{position},setsar=1,{timing}[{output}_a]')
+        planes = ''
+    else:
+        filters.append(f'[{layer}]format=yuva444p16le,{position},setsar=1,{timing},split[{output}_fg][{output}_a]')
+        planes = 'extractplanes=a,'
     if alpha:
         # For straight alpha, weight foreground colour by As/Aout, where Aout = As + Ab*(1-As).
         # Use As itself on the alpha plane to blend Ab towards opaque.
         filters.append(f'[{base}]split[{output}_bg][{output}_ba];[{output}_ba]extractplanes=a[{output}_ab]')
-        filters.append(f'[{output}_a]extractplanes=a,split[{output}_as][{output}_opacity]')
+        filters.append(f'[{output}_a]{planes}split[{output}_as][{output}_opacity]')
         filters.append(f"[{output}_ab][{output}_as]blend=all_expr='if(B,round(65535*B/(B+A*(1-B/65535))),0)'[{output}_weight]")
         filters.append(f'[{output}_weight][{output}_opacity]mergeplanes=0x00000010:format={base_format}[{output}_mask]')
         filters.append(f'[{output}_fg]lutyuv=y=val:u=val:v=val:a=maxval[{output}_color]')
         base = f'{output}_bg'
     else:
-        filters.append(f'[{output}_a]extractplanes=a,mergeplanes=0:format={base_format}[{output}_mask]')
+        filters.append(f'[{output}_a]{planes}mergeplanes=0:format={base_format}[{output}_mask]')
         filters.append(f'[{output}_fg]format={base_format}[{output}_color]')
     filters.append(f'[{base}][{output}_color][{output}_mask]maskedmerge[{output}]')
 

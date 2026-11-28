@@ -1066,18 +1066,17 @@ def blend_composite(filters, base, layer, output, position, first, frames, windo
     # zscale quantizes to the composite's own depth: swscale's 16- to 10-bit step inside overlay
     # moves non-code-aligned chroma by about two 10-bit steps.
     if 'p16' in base_format:
-        # At 16 bits the alpha joins the blended colour in float RGB, and zscale quantizes both:
-        # alphamerge takes only 8-bit formats, so it rounded a 16-bit blend to 8 bits (a ProRes 4444
-        # alpha delivery composites at 16 bits). zscale writes alpha on the limited-range scale too
-        # (1.0 -> 60160); the lookup puts it back on the full scale, exact at 0 and 1.
-        filters.append(f'[{o}_a]alphaextract,format=grayf32le[{o}_alpha]')
-        filters.append(f'[{o}_m][{o}_alpha]mergeplanes=0x00010210:format=gbrapf32le,'
-                       f'zscale=m={ZSCALE_MATRIX[matrix]}:r=limited,format=yuva444p16le,'
-                       f"lutyuv=a='clip(round((val-4096)*65535/56064),0,65535)'[{o}_layer]")
-    else:
-        filters.append(f'[{o}_m]zscale=m={ZSCALE_MATRIX[matrix]}:r=limited,format=yuv444p10le[{o}_c]')
-        filters.append(f'[{o}_a]alphaextract,format=gray10le[{o}_alpha]')
-        filters.append(f'[{o}_c]format=yuva444p10le[{o}_ca];[{o}_ca][{o}_alpha]alphamerge[{o}_layer]')
+        # At 16 bits (a ProRes 4444 alpha delivery, 16-bit deliveries) the layer's own alpha plane
+        # goes to the compositor beside the colour: alphamerge takes only 8-bit formats, so attaching
+        # it rounded a 16-bit blend to 8 bits.
+        filters.append(f'[{o}_m]zscale=m={ZSCALE_MATRIX[matrix]}:r=limited,format=yuv444p16le[{o}_layer]')
+        filters.append(f'[{o}_a]extractplanes=a[{o}_alpha]')
+        _composite_layer(filters, f'{o}_bg', f'{o}_layer', o, 'null', None, 0, window_frames, window_frames, base_format,
+                         alpha_stream=f'{o}_alpha')
+        return
+    filters.append(f'[{o}_m]zscale=m={ZSCALE_MATRIX[matrix]}:r=limited,format=yuv444p10le[{o}_c]')
+    filters.append(f'[{o}_a]alphaextract,format=gray10le[{o}_alpha]')
+    filters.append(f'[{o}_c]format=yuva444p10le[{o}_ca];[{o}_ca][{o}_alpha]alphamerge[{o}_layer]')
     # The layer is already on the frame and timed: composite it in place.
     _composite_layer(filters, f'{o}_bg', f'{o}_layer', o, 'x=0:y=0' if overlay else 'null', overlay, 0, window_frames,
                      window_frames, base_format)
