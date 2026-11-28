@@ -336,7 +336,7 @@ def verify_on_windows(output):
     resources = output / "stage" / "payload" / "resources"
     manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
     env = {key: value for key, value in os.environ.items() if key.lower() != "path"}
-    env["Path"] = str(resources / "ffmpeg")
+    env["Path"] = env["SPLICE_FFMPEG_DIR"] = str(resources / "ffmpeg")  # as the launcher sets them
     python = str(resources / "python" / "python.exe")
     modules = ",".join(manifest["python_modules"]["required"])
     subprocess.run([python, "-I", "-c", f"import importlib\nfor m in '{modules}'.split(','): importlib.import_module(m)"],

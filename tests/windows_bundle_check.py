@@ -24,7 +24,7 @@ def _gate_without_ffmpeg(editor, data):
     empty = Path(data) / 'empty-path'
     empty.mkdir()
     env = {key: value for key, value in os.environ.items() if key.lower() != 'path'}
-    env['PATH' if os.name != 'nt' else 'Path'] = str(empty)
+    env['PATH' if os.name != 'nt' else 'Path'] = env['SPLICE_FFMPEG_DIR'] = str(empty)
     result = subprocess.run([sys.executable, '-B', str(editor / 'server.py'), '--port', '0', '--exit-with-stdin',
                              '--require-ffmpeg-features'], cwd=editor, env=env, stdin=subprocess.DEVNULL,
                             capture_output=True, text=True, timeout=120)

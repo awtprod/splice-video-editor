@@ -20,19 +20,51 @@ def _no_console(options):
     return options
 
 
+# The desktop app sets SPLICE_FFMPEG_DIR to its bundled FFmpeg folder. Then every "ffmpeg"
+# and "ffprobe" Splice runs or looks up is that folder's, by absolute path. A bare name is
+# not enough: Windows looks in the Python folder, the working folder and System32 before PATH,
+# and PATH also holds the user's folders (searched for camera RAW decoders).
+FFMPEG_TOOLS = ("ffmpeg", "ffprobe")
+
+
+def _bundled_tool(name):
+    folder = os.environ.get("SPLICE_FFMPEG_DIR")
+    if not folder:
+        return None
+    return str(Path(folder) / (name + (".exe" if sys.platform == "win32" else "")))
+
+
+def ffmpeg_tool(name):
+    """Path of ``ffmpeg`` or ``ffprobe``: the bundled one in the desktop app, else the one on
+    PATH. None when it is missing."""
+    bundled = _bundled_tool(name)
+    if bundled is not None:
+        return bundled if os.path.isfile(bundled) else None
+    return shutil.which(name)
+
+
+def _command(command):
+    if isinstance(command, (list, tuple)) and command and command[0] in FFMPEG_TOOLS:
+        bundled = _bundled_tool(command[0])
+        if bundled is not None:
+            # Even a missing bundled file is run by its path, so it fails rather than falling back.
+            return [bundled, *command[1:]]
+    return command
+
+
 def run(command, **options):
     """subprocess.run without a console window."""
-    return subprocess.run(command, **_no_console(options))
+    return subprocess.run(_command(command), **_no_console(options))
 
 
 def popen(command, **options):
     """subprocess.Popen without a console window."""
-    return subprocess.Popen(command, **_no_console(options))
+    return subprocess.Popen(_command(command), **_no_console(options))
 
 
 def check_output(command, **options):
     """subprocess.check_output without a console window."""
-    return subprocess.check_output(command, **_no_console(options))
+    return subprocess.check_output(_command(command), **_no_console(options))
 
 
 def data_directory(*, browser=False):

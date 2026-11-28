@@ -25,7 +25,6 @@ import math
 import os
 from pathlib import Path
 import re
-import shutil
 import subprocess
 import tempfile
 import threading
@@ -578,7 +577,7 @@ _cache = {}
 
 
 def _ffmpeg_identity():
-    path = shutil.which('ffmpeg')
+    path = splice_platform.ffmpeg_tool('ffmpeg')
     if not path:
         return None, None
     stat = Path(path).resolve().stat()

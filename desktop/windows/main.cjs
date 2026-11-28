@@ -1,6 +1,6 @@
 const { app, BrowserWindow, dialog, session } = require('electron')
 const { spawn } = require('node:child_process')
-const { join } = require('node:path')
+const { delimiter, join } = require('node:path')
 
 // The editor keeps drafts in the page's IndexedDB, which belongs to one origin,
 // so the port stays fixed across launches. SPLICE_PORT exists for test runs.
@@ -38,13 +38,48 @@ if (!app.commandLine.hasSwitch('user-data-dir')) {
   app.setPath('userData', join(process.env.SPLICE_DATA_DIR || join(local, 'Splice'), 'desktop'))
 }
 
+// The folders of a PATH value. Windows: ';' separates them, double quotes are dropped and may
+// enclose a ';', and blank entries are skipped.
+function pathEntries(value) {
+  if (!windows) return value.split(delimiter).filter(entry => entry !== '')
+  const entries = []
+  let entry = ''
+  let quoted = false
+  for (const character of value + ';') {
+    if (character === '"') quoted = !quoted
+    else if (character === ';' && !quoted) {
+      if (entry.trim()) entries.push(entry.trim())
+      entry = ''
+    } else entry += character
+  }
+  return entries
+}
+
+// The server's environment. PATH is the bundled FFmpeg folder first, then the user's own
+// PATH: camera RAW decoders (braw-decode, REDline, ...) are found there. SPLICE_FFMPEG_DIR
+// makes the server run and report the bundled FFmpeg by its path, so another FFmpeg on the
+// computer is never used. Windows names the variable in any case ("Path" usually); exactly
+// one is passed on.
+function serverEnvironment(root) {
+  const isPath = name => windows ? name.toLowerCase() === 'path' : name === 'PATH'
+  const env = {}
+  let inherited = ''
+  for (const [name, value] of Object.entries(process.env)) {
+    if (name.toLowerCase() !== 'path') env[name] = value
+    else if (isPath(name) && !inherited) inherited = value || ''
+  }
+  const ffmpeg = join(root, 'ffmpeg')
+  env[windows ? 'Path' : 'PATH'] = [ffmpeg, ...pathEntries(inherited)]
+    .map(entry => windows && entry.includes(';') ? `"${entry}"` : entry)
+    .join(windows ? ';' : delimiter)
+  env.SPLICE_FFMPEG_DIR = ffmpeg
+  return env
+}
+
 function startBackend() {
   const root = process.resourcesPath
   const source = join(root, 'splice')
-  // Only the bundled FFmpeg is on PATH, so a different FFmpeg installed on the
-  // machine can never be picked up by the editor.
-  const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => name.toLowerCase() !== 'path'))
-  env[windows ? 'Path' : 'PATH'] = join(root, 'ffmpeg')
+  const env = serverEnvironment(root)
   env.PYTHONDONTWRITEBYTECODE = '1'
   env.PYTHONUTF8 = '1'
   const child = spawn(join(root, 'python', windows ? 'python.exe' : 'python3'), [

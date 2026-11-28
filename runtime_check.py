@@ -6,7 +6,6 @@ a render. ``python runtime_check.py`` prints the same report; ``--strict``
 also fails on the optional features (the installer build check).
 """
 import re
-import shutil
 import subprocess
 import sys
 import time
@@ -97,8 +96,8 @@ def report(ffmpeg=None, ffprobe=None, timeout=None, total=None):
     (TOTAL_TIMEOUT)."""
     timeout = PROBE_TIMEOUT if timeout is None else timeout
     total = TOTAL_TIMEOUT if total is None else total
-    ffmpeg = ffmpeg or shutil.which('ffmpeg')
-    ffprobe = ffprobe or shutil.which('ffprobe')
+    ffmpeg = ffmpeg or splice_platform.ffmpeg_tool('ffmpeg')
+    ffprobe = ffprobe or splice_platform.ffmpeg_tool('ffprobe')
     if not ffmpeg:
         raise FFmpegUnavailable('ffmpeg was not found.')
     if not ffprobe:
