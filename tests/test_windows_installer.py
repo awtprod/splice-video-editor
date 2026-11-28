@@ -4,6 +4,7 @@ launcher's server mode and the installer staging (build.py --stage-only)."""
 import hashlib
 import io
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import re
@@ -261,9 +262,13 @@ class TaskkillBranches(unittest.TestCase):
         process.kill.assert_called_once_with()
 
     def test_orphan_guard_kills_the_worker_tree_when_the_server_dies(self):
-        read, write = os.pipe()
-        os.close(write)  # the "parent" is already gone: its sentinel is ready
-        self.addCleanup(os.close, read)
+        # A real process that has exited stands in for the dead server: its sentinel is
+        # ready, and it is a valid waitable on both POSIX (an fd) and Windows (a handle).
+        gone = multiprocessing.get_context('spawn').Process(target=int)
+        gone.start()
+        gone.join(30)
+        self.addCleanup(gone.close)
+        read = gone.sentinel
         called = threading.Event()
         calls = []
 
