@@ -1980,6 +1980,61 @@ def track_plan(track_mix, track):
                 pan_keys=_automation(keys.get('pan'), 'track pan', -100, 100, MAX_TRACK_KEYFRAMES))
 
 
+# Sound settings that must match for two pieces of a split clip to render as one sound.
+SOUND_JOIN_FIELDS = ('volume', 'pan', 'audioFx', 'channelMap', 'audioStream', 'embeddedAudio', 'audioTransition')
+
+
+def _sound_joins(clips, pictures, fps):
+    """Clips whose sound carries on the clip before them without a break: the pieces of one
+    speed-changed clip split at a cut (same media, track and sound settings, the source and the
+    speed curve continuing, no transition, fade or volume/pan automation at the cut). Tempo and
+    the ramp stretch carry state from sample to sample, so pieces rendered apart restart it at
+    the cut and click; joined, they render as one sound. Returns {id(first piece): [pieces]}."""
+    def sound(clip):
+        return (clip.get('_soundMedia') if clip.get('_soundMedia') is not None else clip.get('mediaId'),
+                float(clip.get('_soundIn') if clip.get('_soundMedia') is not None else clip.get('in', 0) or 0))
+
+    def curve(clip):
+        ramp = effects_engine.clip_ramp(clip)
+        return ramp if ramp else _number(clip.get('speed', 1), 'speed', .1, 16)
+
+    def automated(clip):
+        keys = clip.get('keyframes') or {}
+        return bool(keys.get('volume') or keys.get('pan'))
+    candidates = {}
+    for clip in clips:
+        if (isinstance(clip, dict) and clip.get('type') in ('audio', 'video') and clip_enabled(clip) and not clip.get('reverse')
+                and (effects_engine.clip_ramp(clip) or abs(float(clip.get('speed', 1) or 1)-1) > 1e-9)):
+            candidates.setdefault((clip['type'], clip.get('track')), []).append(clip)
+    joins = {}
+    for group in candidates.values():
+        group.sort(key=lambda clip: float(clip['start']))
+        chain = None
+        for a, b in zip(group, group[1:]):
+            a_curve, b_curve = curve(a), curve(b)
+            a_ramp, b_ramp = not isinstance(a_curve, float), not isinstance(b_curve, float)
+            a_media, a_in = sound(a)
+            b_media, b_in = sound(b)
+            length = float(a['duration'])
+            joined = (a_media == b_media and abs(float(a['start'])+length-float(b['start'])) < 1e-6
+                      and a_ramp == b_ramp and all(a.get(key) == b.get(key) for key in SOUND_JOIN_FIELDS)
+                      and not (a.get('fadeOut') or b.get('fadeIn') or a.get('fadeClock') or b.get('fadeClock') or b.get('pictureDip'))
+                      and not (automated(a) or automated(b)) and _sound_transition(b, pictures, fps) is None)
+            if joined and a_ramp:
+                modes = [(effects_engine.validate_effects(clip.get('effects')) or {}).get('speedAudio', 'pitch') for clip in (a, b)]
+                joined = (modes[0] == modes[1] and abs(a_in+a_curve.source(length)-b_in) < 1e-4
+                          and abs(a_curve.speed(length)-b_curve.speed(0)) <= 1e-3*max(1.0, b_curve.speed(0)))
+            elif joined:
+                joined = a_curve == b_curve and abs(a_in+length*a_curve-b_in) < 1e-4
+            if joined:
+                if chain is None:
+                    chain = joins[id(a)] = [a]
+                chain.append(b)
+            else:
+                chain = None
+    return joins
+
+
 def _audio_events(clips, media_by_id, fps, probes, track_mix, solo, span, heartbeat=None, *, layout='stereo', tracks=None,
                   plans=None, audio_stems=()):
     """Describe each audible clip as one timeline event: its body, any crossfade
@@ -2003,8 +2058,18 @@ def _audio_events(clips, media_by_id, fps, probes, track_mix, solo, span, heartb
                                     (candidate, sound))
     plans = {} if plans is None else plans
     events = []
+    joins = _sound_joins(clips, pictures, fps)
+    followers = {id(piece) for pieces in joins.values() for piece in pieces[1:]}
     for original in clips:
         clip = original
+        if id(original) in followers:
+            continue        # its sound is part of the first piece's (see _sound_joins)
+        pieces = joins.get(id(original), [original])
+        if len(pieces) > 1:
+            clip = {**original, 'duration': sum(float(piece['duration']) for piece in pieces), 'fadeOut': pieces[-1].get('fadeOut', 0),
+                    '_joinedRamp': effects_engine.JoinedRamp([(float(piece['duration']), effects_engine.clip_ramp(piece) or
+                                                              float(piece.get('speed', 1))) for piece in pieces])
+                                   if effects_engine.clip_ramp(original) else None}
         if clip.get('type') not in ('audio', 'video') or not clip_enabled(clip):
             # A disabled clip is silent (its embedded sound too). It stays in
             # `upcoming`, so a neighbour's crossfade still fades against it.
@@ -2026,7 +2091,7 @@ def _audio_events(clips, media_by_id, fps, probes, track_mix, solo, span, heartb
         source_in = float(clip.get('in', 0)); length = float(clip['duration']); start = float(clip['start'])
         speed = _number(clip.get('speed', 1), 'speed', .1, 16)
         reverse = bool(clip.get('reverse'))
-        ramp = None if item.get('_renderStill') else effects_engine.clip_ramp(clip)
+        ramp = None if item.get('_renderStill') else clip.get('_joinedRamp') or effects_engine.clip_ramp(clip)
         sound = _sound_transition(clip, pictures, fps)
         before = sound['before'] if sound and sound['kind'] == 'crossfade' else 0.0
         # A dip starts the incoming sound at the cut; only a crossfade pre-rolls it.
@@ -2044,7 +2109,10 @@ def _audio_events(clips, media_by_id, fps, probes, track_mix, solo, span, heartb
         if after < 1/fps: after = 0.0
         if start-before >= end or start+length+after <= begin:
             continue
-        _check_clip({**clip, 'type':'audio'} if clip.get('mediaId') in audio_stems else clip, media_by_id, probes, heartbeat)
+        for piece in pieces:
+            if piece.get('_soundMedia') is not None:
+                piece = {**piece, 'mediaId': piece['_soundMedia'], 'in': piece['_soundIn']}
+            _check_clip({**piece, 'type':'audio'} if piece.get('mediaId') in audio_stems else piece, media_by_id, probes, heartbeat)
         if 'audio' not in item['_kinds']:
             continue
         clip_keys = _automation((clip.get('keyframes') or {}).get('volume'), 'volume', 0, 200, MAX_KEYFRAMES)

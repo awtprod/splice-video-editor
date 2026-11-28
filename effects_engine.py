@@ -924,6 +924,47 @@ class Ramp:
         return ramp_speed(self.points, local+self.shift)
 
 
+class JoinedRamp:
+    """Speed curves of clips played back to back as one clock: the pieces of a clip split at a cut,
+    whose sound renders as one (render_movie._sound_joins). ``pieces``: (duration, curve) in order,
+    each curve a Ramp or a constant speed; before the first piece and after the last, their own
+    curves carry on."""
+    def __init__(self, pieces):
+        self.pieces = []
+        start = offset = 0.0
+        for duration, curve in pieces:
+            curve = curve if isinstance(curve, Ramp) else _ConstantSpeed(curve)
+            self.pieces.append((start, offset, curve))
+            start += duration
+            offset += curve.source(duration)
+
+    def _piece(self, local):
+        chosen = self.pieces[0]
+        for piece in self.pieces[1:]:
+            if local >= piece[0]:
+                chosen = piece
+        return chosen
+
+    def source(self, local):
+        start, offset, curve = self._piece(local)
+        return offset+curve.source(local-start)
+
+    def speed(self, local):
+        start, _, curve = self._piece(local)
+        return curve.speed(local-start)
+
+
+class _ConstantSpeed:
+    def __init__(self, speed):
+        self.value = float(speed)
+
+    def source(self, local):
+        return local*self.value
+
+    def speed(self, local):
+        return self.value
+
+
 def clip_ramp(clip):
     points = validate_ramp(clip)
     if not points:

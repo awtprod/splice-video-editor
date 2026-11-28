@@ -365,6 +365,45 @@ class RampSoundRenders(unittest.TestCase):
             self.assertLess(max(map(abs, samples[int(0.56*RATE):int(1.15*RATE)])), 1e-3, f'{mode}: a freeze is silent')
             self.assertGreater(min(map(abs, samples[int(1.26*RATE):int(1.95*RATE)])), 0.45, f'{mode}: the level plays again')
 
+    def test_a_clip_split_at_a_cut_sounds_as_it_did_whole(self):
+        # Rendered apart, each piece restarted its stretch (or atempo) at the cut: a step of 0.23
+        # (ramp) or 0.08 (constant speed) on a 0.25 tone. Joined, the split clip is the whole clip.
+        subprocess.run(['ffmpeg', '-nostdin', '-v', 'error', '-y', '-f', 'lavfi', '-i', f'color=c=gray:s=64x36:r={FPS}:d=8',
+                        '-f', 'lavfi', '-i', f'sine=f=220:r={RATE}:d=8', '-c:v', 'libx264', '-qp', '0', '-g', '1', '-pix_fmt', 'yuv420p',
+                        '-c:a', 'pcm_s16le', '-shortest', str(self.media/'tone.mov')], check=True, timeout=120)
+        tone = {'id': 'tone', 'name': 'tone.mov', 'src': '/media/tone.mov', 'type': 'video', 'duration': 8}
+        keys = [{'time': 0, 'value': 100, 'interp': 'easeInOut'}, {'time': 1, 'value': 40, 'interp': 'easeInOut'},
+                {'time': 2, 'value': 160, 'interp': 'easeInOut'}, {'time': 3, 'value': 100}]
+        cut, duration, source_in = 1.48, 3.0, 0.5
+        first, second = js(('windowPoints', keys, 0, cut), ('windowPoints', keys, cut, duration))
+        second_in = source_in+E.ramp_source(E.ordered_points(keys), cut)
+
+        def render(clips, name):
+            out = Path(self.temp.name)/f'{name}.mov'
+            render_movie.render_to_file({'name': 'r', 'width': 64, 'height': 36, 'fps': FPS, 'media': [tone], 'clips': clips},
+                                        out, options={'codec': 'prores'})
+            return pcm(out)
+        base = {'type': 'video', 'mediaId': 'tone', 'track': 1, 'transition': 'none'}
+        at = round(cut*RATE)
+        for mode in ('pitch', 'varispeed'):
+            whole = render([{**base, 'id': 'a', 'start': 0, 'duration': duration, 'in': source_in, 'keyframes': {'speed': keys},
+                             'effects': {'speedAudio': mode}}], f'whole-{mode}')
+            split = render([{**base, 'id': 'a', 'start': 0, 'duration': cut, 'in': source_in, 'keyframes': {'speed': first},
+                             'effects': {'speedAudio': mode}},
+                            {**base, 'id': 'b', 'start': cut, 'duration': duration-cut, 'in': second_in, 'keyframes': {'speed': second},
+                             'effects': {'speedAudio': mode}}], f'split-{mode}')
+            self.assertLess(max(abs(a-b) for a, b in zip(whole[at-4800:at+4800], split[at-4800:at+4800])), 1e-3, f'{mode}: the split clip differs')
+            self.assertLess(max(abs(split[j]-split[j-1]) for j in range(at-3, at+4)), 0.01, f'{mode}: a click at the cut')
+        constant = {**base, 'speed': 0.5}
+        whole = render([{**constant, 'id': 'a', 'start': 0, 'duration': duration, 'in': source_in}], 'whole-constant')
+        split = render([{**constant, 'id': 'a', 'start': 0, 'duration': cut, 'in': source_in},
+                        {**constant, 'id': 'b', 'start': cut, 'duration': duration-cut, 'in': source_in+cut*0.5}], 'split-constant')
+        self.assertLess(max(abs(a-b) for a, b in zip(whole[at-4800:at+4800], split[at-4800:at+4800])), 1e-3, 'constant speed: the split clip differs')
+        # A piece with its own level is its own sound.
+        louder = render([{**constant, 'id': 'a', 'start': 0, 'duration': cut, 'in': source_in},
+                         {**constant, 'id': 'b', 'start': cut, 'duration': duration-cut, 'in': source_in+cut*0.5, 'volume': 50}], 'split-level')
+        self.assertAlmostEqual(20*math.log10(rms(louder[at+4800:at+9600])/rms(louder[at-9600:at-4800])), -6.02, delta=0.3)
+
     def test_varispeed_whose_first_sample_precedes_the_source(self):
         # A 8.1 ms crossfade pre-roll from source 0 starts the read 389 samples before the file: the
         # first sample in range is not on a 1 ms gate block (an UnboundLocalError once).
