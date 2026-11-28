@@ -1093,142 +1093,371 @@ def adjustment_alpha(clip, clock, fps):
 
 
 # ---------------------------------------------------------------- export: ramp audio
-RAMP_AUDIO_GRID = 0.001     # varispeed positions are exact on this grid, linear between
+RAMP_AUDIO_GRID = 0.001     # the curve is read on this grid (seconds), linear between
 RAMP_HELD_SPEED = 0.1       # slower than this, sound is silent (a freeze has no sound)
-RAMP_GRAIN = 0.010          # pitch-preserving grain hop at normal speed (Hann grains, two hops long)
-RAMP_SEEK = 0.005           # the most a grain's read point moves off the curve to continue the waveform
+RAMP_GRAIN = 0.020          # pitch-preserving stretch: grain hop (Hann grains two hops long, 50 % overlap)
+RAMP_SEEK = 0.0125          # the most a grain's read point moves off the curve to continue the waveform
+RAMP_MIN_GRAIN = 0.004      # the shortest grain (between a transient and the curve)
+RAMP_LEAD = 0.001           # a transient's attack: read this much before its onset
+RAMP_HEAD = 0.006           # a transient plays at normal speed this long after its onset,
+RAMP_HEAD_FADE = 0.004      # then hands over to the stretched sound over this long
+RAMP_CHUNK = 2.0            # seconds of output finished (and held) at a time
+RAMP_SOURCE_WINDOW = 4.0    # seconds of source held in memory at a time (at least)
+SINC_ZEROS = 8              # varispeed: windowed-sinc half-width, in zero crossings
+SINC_PHASES = 256           # varispeed: sub-sample positions the kernel is tabulated at
+SINC_STEPS = 8              # varispeed: anti-alias cutoffs per octave of speed
 
 
-def _ramp_positions(ramp, origin, before, u0, count, rate):
-    """Source time (seconds) at each output sample n of event-local u0 + n/rate."""
-    step = max(1, round(RAMP_AUDIO_GRID*rate))
-    knots = [origin+ramp.source(u0+n/rate-before) for n in range(0, count+step, step)]
-    out = [0.0]*count
-    for n in range(count):
-        k, f = divmod(n, step)
-        a = knots[k]
-        out[n] = a+(knots[k+1]-a)*f/step
-    return out
+class _SourceReader:
+    """Interleaved float32 source frames, held a window at a time: from an array (in memory
+    already) or a raw f32 file (the export reads its source span to disk first), so a long
+    clip never sits in memory whole. Frames outside the source read as silence."""
+    def __init__(self, channels, frames, rate, data=None, path=None):
+        self.channels, self.frames, self.rate = channels, frames, rate
+        self.data = data
+        self.handle = open(path, 'rb') if path is not None else None
+        self.window = frames if data is not None else max(1, int(RAMP_SOURCE_WINDOW*rate))
+        self.lo = self.hi = 0
+        self.buf = self.mono = array.array('f')
+
+    def close(self):
+        if self.handle is not None:
+            self.handle.close()
+
+    def ensure(self, lo, hi):
+        """Hold source frames lo..hi (as far as the source has them)."""
+        lo, hi = max(0, int(lo)), min(self.frames, int(hi))
+        if hi <= lo or (lo >= self.lo and hi <= self.hi):
+            return
+        # A file is read from a little before the frames asked for (a grain's alignment looks back).
+        lo = 0 if self.data is not None else max(0, lo-self.window//4)
+        hi = min(self.frames, max(hi, lo+self.window))
+        ch = self.channels
+        if self.data is not None:
+            buf = self.data if (lo, hi) == (0, self.frames) and isinstance(self.data, array.array) else array.array('f', self.data[lo*ch:hi*ch])
+        else:
+            self.handle.seek(lo*ch*4)
+            buf = array.array('f')
+            buf.frombytes(self.handle.read((hi-lo)*ch*4))
+        if ch == 1:
+            mono = buf
+        else:
+            from operator import add
+            from functools import reduce
+            mono = array.array('f', map((1/ch).__mul__, reduce(lambda a, b: map(add, a, b), (buf[c::ch] for c in range(ch)))))
+        self.lo, self.hi, self.buf, self.mono = lo, lo+len(mono), buf, mono
+
+    def frames_at(self, start, length):
+        """Interleaved frames start..start+length (silence outside the source)."""
+        ch = self.channels
+        self.ensure(start, start+length)
+        first, last = max(start, self.lo), min(start+length, self.hi)
+        if first == start and last == start+length:
+            return self.buf[(start-self.lo)*ch:(last-self.lo)*ch]
+        out = array.array('f', bytes(4*length*ch))
+        if last > first:
+            out[(first-start)*ch:(last-start)*ch] = self.buf[(first-self.lo)*ch:(last-self.lo)*ch]
+        return out
+
+    def mono_at(self, start, length, step=1):
+        """Mono samples start, start+step, ... (length samples); None when not all inside the source."""
+        if start < 0 or start+length > self.frames:
+            return None
+        self.ensure(start, start+length)
+        return self.mono[start-self.lo:start-self.lo+length:step]
 
 
-def _transients(mono, frames, block):
-    """Sorted source sample indices where the sound jumps (a block much louder than the 20 ms before
-    it): the first sample of the jump that reaches half the block's peak."""
-    env = [max(map(abs, mono[i:i+block])) for i in range(0, frames, block)]
-    found = []
-    for b, level in enumerate(env):
-        back = env[max(0, b-20):max(0, b-2)]
-        if level > 4*(sum(back)/len(back) if back else 0.0)+0.01 and not (found and found[-1] >= (b-2)*block):
-            first = b*block
-            found.append(next(i for i in range(first, min(frames, first+block)) if abs(mono[i]) >= level/2))
+def _transients(reader):
+    """Sorted source frames where the sound jumps (a 1 ms block much louder than the 20 ms before
+    it), at most one per 10 ms: the first frame of the jump that reaches half the block's peak.
+    Read a window at a time."""
+    block = max(1, reader.rate//1000)
+    history, found = [], []
+    step = block*max(1, reader.window//block)
+    for start in range(0, reader.frames, step):
+        reader.ensure(start, min(reader.frames, start+step))
+        for first in range(start, min(reader.frames, start+step), block):
+            samples = reader.mono_at(first, min(block, reader.frames-first))
+            level = max(map(abs, samples))
+            back = history[-20:-2] if len(history) >= 3 else []
+            # One onset per 10 ms: a noisy attack keeps jumping for a few blocks.
+            if level > 4*(sum(back)/len(back) if back else 0.0)+0.01 and not (found and found[-1] >= first-10*block):
+                found.append(first+next(i for i, v in enumerate(samples) if abs(v) >= level/2))
+            history.append(level)
+            if len(history) > 40:
+                del history[:20]
     return found
 
 
-def _stretch_along(source, channels, frames, count, rate, place, speed, playing):
-    """Pitch-preserving playback along a speed curve (WSOLA). Output sample n of ``count`` plays the
-    source around sample ``place(n)`` (a non-decreasing float index into ``source``) at normal pitch.
-    Hann grains are read at the curve's position, each nudged by at most RAMP_SEEK so its waveform
-    continues the previous grain's. Near a transient a grain is instead read so that the transient
-    lands exactly where the curve puts it, or outside the grain, so every grain that plays it plays it
-    at the same instant (one click, on time, never an echo). Nothing is re-timed while running, so the result is
-    exactly ``count`` samples, and the window weights are normalised, so where ``playing(n)`` is false
-    (a freeze) the sound fades to silence."""
+def _hann(length, cache={}):
+    window = cache.get(length)
+    if window is None:
+        window = cache[length] = array.array('d', [0.5-0.5*math.cos(2*math.pi*(i+0.5)/length) for i in range(length)])
+    return window
+
+
+class _Accumulator:
+    """Overlap-add of weighted grains into output frames 0..count, finished a chunk at a time and
+    handed to ``write``. Stretched grains are normalised by their summed windows; transient grains
+    (``head``) are kept apart and duck them: where a transient's window is 1 only it sounds, and
+    over its fades the two cross."""
+    def __init__(self, channels, count, rate, write):
+        self.channels, self.count, self.write = channels, count, write
+        self.chunk = max(1, int(RAMP_CHUNK*rate))
+        self.size = 2*self.chunk
+        self.base = 0
+        self.out = [array.array('d', bytes(8*self.size*channels)) for _ in range(2)]
+        self.weight = [array.array('d', bytes(8*self.size)) for _ in range(2)]
+
+    def add(self, origin, frames, window, head=False):
+        """Add ``frames`` (interleaved, len(window) frames; None: silence) times ``window`` at
+        output frame ``origin``."""
+        from operator import add, mul
+        length = len(window)
+        first, last = max(origin, self.base, 0), min(origin+length, self.count)
+        if last <= first:
+            return
+        if last-self.base > self.size:
+            raise RuntimeError('A grain reached past the overlap-add window')
+        ch, out, weight = self.channels, self.out[head], self.weight[head]
+        part = window[first-origin:last-origin]
+        at = first-self.base
+        weight[at:at+len(part)] = array.array('d', map(add, weight[at:at+len(part)], part))
+        if frames is not None:
+            for c in range(ch):
+                to = slice(at*ch+c, (at+len(part))*ch, ch)
+                out[to] = array.array('d', map(add, out[to], map(mul, frames[(first-origin)*ch+c:(last-origin)*ch:ch], part)))
+
+    def finish(self, upto):
+        """Output frames before ``upto`` are final: write them (a chunk at a time). True when written."""
+        upto = min(upto, self.count)
+        if upto <= self.base or (upto-self.base < self.chunk and upto < self.count):
+            return False
+        done = upto-self.base
+        ch = self.channels
+        # Each frame: duck*heads/head weight + (1-duck)*grains/grain weight, duck = min(1, head weight).
+        grains, heads = self.weight
+        own = [(1-min(1.0, h))/g if g > 1e-3 else 0.0 for g, h in zip(grains[:done], heads[:done])]
+        lent = [min(1.0, h)/h if h > 1e-9 else 0.0 for h in heads[:done]]
+        block = array.array('f', bytes(4*done*ch))
+        for c in range(ch):
+            block[c::ch] = array.array('f', map(float.__add__, map(float.__mul__, self.out[0][c:done*ch:ch], own),
+                                                map(float.__mul__, self.out[1][c:done*ch:ch], lent)))
+        self.write(block)
+        for k in range(2):
+            self.out[k] = self.out[k][done*ch:]+array.array('d', bytes(8*done*ch))
+            self.weight[k] = self.weight[k][done:]+array.array('d', bytes(8*done))
+        self.base = upto
+        return True
+
+
+def _stretch_along(source, channels, frames, count, rate, place, speed, playing, *, sink=None, checkpoint=None):
+    """Pitch-preserving playback along a speed curve (WSOLA). Output frame n plays the source around
+    frame ``place(n)`` (a non-decreasing float index) at normal pitch; ``speed(n)`` is the curve's
+    speed there; where ``playing(n)`` is false (a freeze) the sound fades to silence.
+
+    Hann grains two hops long overlap by half (RAMP_GRAIN hops), each read on the curve and moved
+    by at most RAMP_SEEK so its waveform continues the previous grain's. A transient (an onset)
+    plays once, at normal speed, exactly where the curve reaches it: its own grain (RAMP_HEAD,
+    then a RAMP_HEAD_FADE hand-over) replaces the stretched sound beneath it, no stretched grain
+    reads across an onset (none plays it early, none plays it again later: no echo, no flam), and
+    a stretched grain beside one is shortened so it stays centred on the curve. The result is
+    exactly ``count`` frames. ``source``: an interleaved float array or a _SourceReader;
+    ``sink``: called with each finished block (interleaved float array), else the whole result is
+    returned. ``checkpoint`` is called between blocks (to cancel)."""
     import bisect
-    from operator import add, mul
-    base = max(32, int(round(RAMP_GRAIN*rate)))
-    reach = int(RAMP_SEEK*rate)
-    out = array.array('f', bytes(4*count*channels))
-    weight = array.array('d', bytes(8*count))
-    mono = source if channels == 1 else array.array(
-        'f', [sum(source[i*channels:(i+1)*channels])/channels for i in range(frames)])
-    transients = _transients(mono, frames, max(1, rate//1000))
-    windows = {}
-    previous = None     # (output start, source start) of the last grain that played
+    reader = source if isinstance(source, _SourceReader) else _SourceReader(channels, frames, rate, data=source)
+    blocks = []
+    accumulator = _Accumulator(channels, count, rate, sink or blocks.append)
+    hop = max(32, int(round(RAMP_GRAIN*rate)))
+    reach = int(round(RAMP_SEEK*rate))
+    minimum = max(16, int(round(RAMP_MIN_GRAIN*rate))) & ~1
+    lead, head, fade = (int(round(seconds*rate)) for seconds in (RAMP_LEAD, RAMP_HEAD, RAMP_HEAD_FADE))
+    last = count-1
 
-    def score(start, target, step):
-        """Normalised correlation of the source from ``start`` with ``target`` (every ``step``th sample)."""
-        length = len(target)*step
-        if start < 0 or start+length > frames:
-            return None
-        candidate = mono[start:start+length:step]
-        return sum(map(mul, target, candidate))/math.sqrt(sum(map(mul, candidate, candidate))+1e-12)
+    def at(n):
+        return place(min(max(n, 0), last))
 
-    def landing(target, low, high):
-        """The output sample (float) in low..high where place() reaches source sample ``target``."""
-        for _ in range(40):
+    def landing(target):
+        """The output frame (float) where place() reaches source frame ``target``."""
+        low, high = 0.0, float(last)
+        for _ in range(48):
             middle = (low+high)/2
-            if place(middle) < target:
+            if at(middle) < target:
                 low = middle
             else:
                 high = middle
-        return (low+high)/2
+        return high
 
-    centre = 0
-    while centre < count+base:
-        n = min(max(centre, 0), count-1)
-        rate_here = abs(speed(n))
-        hop = max(16, int(round(base/max(1.0, rate_here)*(0.4 if rate_here < 0.2 else 1.0))))
-        length = hop+max(hop, int(round(rate_here*hop)))
-        length += length % 2
-        window = windows.get(length)
-        if window is None:
-            window = windows[length] = [0.5-0.5*math.cos(2*math.pi*(i+0.5)/length) for i in range(length)]
-        origin = centre-length//2
-        low, high = max(0, -origin), min(length, count-origin)
-        if high > low:
-            weight[origin+low:origin+high] = array.array('d', map(add, weight[origin+low:origin+high], window[low:high]))
-        if not playing(n):
-            previous = None
-            centre += hop
+    transients = _transients(reader)
+    floors = [t+head+fade//2 for t in transients]       # stretched grains read no earlier than this after onset k
+    heads = []      # (output frame, source frame, frames after the onset, fade, transient index)
+    first_place, last_place = at(0), at(last)
+    marks = [(landing(t), t, k) for k, t in enumerate(transients) if first_place <= t <= last_place]
+    for number, (when, onset, k) in enumerate(marks):
+        if not playing(min(last, int(when))):
             continue
-        start = int(round(place(n)))-length//2
-        # A transient near this grain's read: the grain reads so that the transient plays exactly where
-        # the curve puts it (or, when that is outside the grain, not at all), so no grain repeats it early
-        # or late. The nearest transient to the curve's position decides.
-        lock = None
-        for k in range(bisect.bisect_left(transients, start-reach), bisect.bisect_left(transients, start+length+reach)):
-            at = landing(transients[k], 0, count-1)
-            if place(0) <= transients[k] <= place(count-1) and (lock is None or abs(at-centre) < abs(lock[0]-centre)):
-                lock = (at, transients[k])
-        if lock is not None:
-            start = int(round(lock[1]-(lock[0]-origin)))
-        elif previous is not None:
-            natural = previous[1]+(origin-previous[0])
-            span = min(length//2, 480)
-            if 0 <= natural and natural+span <= frames and sum(v*v for v in mono[natural:natural+span:2]) > 1e-9:
-                # Coarse (every 4th lag, every 8th sample), then the neighbouring lags at full rate.
-                coarse, fine = mono[natural:natural+span:8], mono[natural:natural+span]
-                best, shift = score(start, coarse, 8), 0
-                for d in range(-reach, reach+1, 4):
-                    value = score(start+d, coarse, 8)
-                    if value is not None and (best is None or value > best+1e-6 or (value > best-1e-6 and abs(d) < abs(shift))):
-                        best, shift = value, d
-                if shift:
-                    best = score(start+shift, fine, 1)
-                    for d in range(shift-2, shift+3):
-                        value = score(start+d, fine, 1)
-                        if value is not None and best is not None and value > best+1e-6:
-                            best, shift = value, d
-                    start += shift
-        previous = (origin, start)
-        first, last = max(low, -start), min(high, frames-start)
-        if last > first:
-            part = window[first:last]
-            for c in range(channels):
-                to = slice((origin+first)*channels+c, (origin+last)*channels, channels)
-                read = source[(start+first)*channels+c:(start+last)*channels:channels]
-                out[to] = array.array('f', map(add, out[to], map(mul, read, part)))
-        centre += hop
-    scale = [1/w if w > 1e-6 else 0.0 for w in weight]
-    for c in range(channels):
-        out[c::channels] = array.array('f', map(mul, out[c::channels], scale))
-    return out
+        after = head+fade
+        if number+1 < len(marks):
+            after = min(after, int(marks[number+1][0]-when)-lead)
+        if k+1 < len(transients):
+            after = min(after, transients[k+1]-lead-onset)
+        if after < 2:
+            continue
+        tail = min(fade, after//2)
+        heads.append((int(round(when)), onset, after, tail, k))
+        floors[k] = onset+after-tail//2
+
+    def score(start, target, step):
+        candidate = reader.mono_at(start, len(target)*step, step)
+        if candidate is None:
+            return None
+        return sum(map(float.__mul__, target, candidate))/math.sqrt(sum(map(float.__mul__, candidate, candidate))+1e-12)
+
+    def align(start, natural, span, low, high):
+        """``start`` moved within low..high (at most RAMP_SEEK) to best continue the source from ``natural``."""
+        coarse = reader.mono_at(natural, span, 8)
+        if coarse is None or sum(v*v for v in coarse) <= 1e-9:
+            return start
+        coarse = array.array('d', coarse)
+        best, shift = score(start, coarse, 8), 0
+        for d in range(max(-reach, low-start), min(reach, high-start)+1, 4):
+            value = score(start+d, coarse, 8)
+            if value is not None and (best is None or value > best+1e-6 or (value > best-1e-6 and abs(d) < abs(shift))):
+                best, shift = value, d
+        if shift:
+            fine = array.array('d', reader.mono_at(natural, span))
+            best = score(start+shift, fine, 1)
+            for d in range(max(shift-2, low-start), min(shift+2, high-start)+1):
+                value = score(start+d, fine, 1)
+                if value is not None and best is not None and value > best+1e-6:
+                    best, shift = value, d
+        return start+shift
+
+    next_head = 0
+    previous = None        # (output origin, source start, length) of the last grain that played
+    handover = None        # the last transient grain, which the next stretched grain continues
+    n = 0
+    while n < count+hop:
+        while next_head < len(heads) and heads[next_head][0]-lead < n+hop:
+            when, onset, after, tail, _ = heads[next_head]
+            length = lead+after
+            window = array.array('d', [1.0]*length)
+            for i in range(lead):
+                window[i] = 0.5-0.5*math.cos(math.pi*(i+0.5)/lead)
+            for i in range(tail):
+                window[length-tail+i] = 0.5+0.5*math.cos(math.pi*(i+0.5)/tail)
+            accumulator.add(when-lead, reader.frames_at(onset-lead, length), window, head=True)
+            handover = (when-lead, onset-lead, length, when)
+            next_head += 1
+        centre = at(n)
+        k = bisect.bisect_right(transients, centre)
+        floor = floors[k-1] if k else None
+        ceiling = transients[k]-lead if k < len(transients) else None
+        length = 2*hop
+        if floor is not None:
+            length = min(length, int(2*(centre-floor)))
+        if ceiling is not None:
+            length = min(length, int(2*(ceiling-centre)))
+        length = max(minimum, length) & ~1
+        origin = n-length//2
+        if not playing(min(max(n, 0), last)):
+            accumulator.add(origin, None, _hann(length))
+            previous = handover = None
+        else:
+            low = floor if floor is not None else -10**12
+            high = ceiling-length if ceiling is not None else 10**12
+            high = max(high, low)
+            start = min(max(int(round(centre))-length//2, low), high)
+            if handover is not None and n >= handover[3]:
+                previous, handover = handover[:3], None
+            if previous is not None:
+                overlap = previous[0]+previous[2]-origin
+                span = min(length//2, overlap, 480)
+                if span >= 16:
+                    start = align(start, previous[1]+(origin-previous[0]), span, low, high)
+            reader.ensure(start-reach, start+length+reach)
+            accumulator.add(origin, reader.frames_at(start, length), _hann(length))
+            previous = (origin, start, length)
+        n += max(1, length//2)
+        if accumulator.finish(n-2*hop-lead-head-fade) and checkpoint:
+            checkpoint()
+    accumulator.finish(count)
+    if accumulator.base < count:
+        raise RuntimeError('The stretch did not finish its output')
+    if sink is None:
+        out = array.array('f')
+        for block in blocks:
+            out.extend(block)
+        return out
+    return None
+
+
+_SINC = {}
+
+
+def _sinc_table(step):
+    """Windowed-sinc kernels (Blackman) for a cutoff of 0.95/2**(step/SINC_STEPS) of the source's
+    Nyquist frequency, at SINC_PHASES sub-sample positions: (half width, [taps per phase]). Each
+    kernel sums to 1."""
+    table = _SINC.get(step)
+    if table is None:
+        cutoff = 0.95/2**(step/SINC_STEPS)
+        half = int(math.ceil(SINC_ZEROS/cutoff))
+        kernels = []
+        for phase in range(SINC_PHASES):
+            fraction = phase/SINC_PHASES
+            taps = []
+            for j in range(-half+1, half+1):
+                x = j-fraction
+                window = 0.42+0.5*math.cos(math.pi*x/half)+0.08*math.cos(2*math.pi*x/half) if abs(x) < half else 0.0
+                taps.append(cutoff*(math.sin(math.pi*cutoff*x)/(math.pi*cutoff*x) if x else 1.0)*window)
+            total = sum(taps)
+            kernels.append(array.array('f', [t/total for t in taps]))
+        table = _SINC[step] = (half, kernels)
+    return table
+
+
+def _varispeed(reader, count, rate, place, speed, sink, checkpoint=None):
+    """Varispeed along the curve: output frame n is the source at frame ``place(n)`` (exact on a
+    RAMP_AUDIO_GRID grid, linear between), band-limited by a windowed sinc whose cutoff follows the
+    speed (a 9 kHz tone played at 4x is 36 kHz: removed, not folded back to 12 kHz). Below 5 %
+    speed the sound fades out (a freeze is silent), read every grid step."""
+    from operator import mul
+    ch = reader.channels
+    step = max(1, round(RAMP_AUDIO_GRID*rate))
+    chunk = max(step, int(RAMP_CHUNK*rate)//step*step)
+    for begin in range(0, count, chunk):
+        end = min(count, begin+chunk)
+        block = array.array('f', bytes(4*(end-begin)*ch))
+        for g in range(begin, end, step):
+            a, b = place(g), place(g+step)
+            gate = min(1.0, abs(speed(g))/0.05)
+            rise = abs(b-a)/step
+            octave = SINC_STEPS*math.log2(rise) if rise > 1 else 0.0
+            half, kernels = _sinc_table(max(0, math.ceil(octave-1e-9)))
+            reader.ensure(int(min(a, b))-half-2, int(max(a, b))+half+2)
+            for n in range(g, min(end, g+step)):
+                p = a+(b-a)*(n-g)/step
+                k0 = math.floor(p)
+                phase = int((p-k0)*SINC_PHASES)
+                if phase >= SINC_PHASES:
+                    k0, phase = k0+1, 0
+                taps = kernels[phase]
+                frames = reader.frames_at(k0-half+1, 2*half)
+                at = (n-begin)*ch
+                for c in range(ch):
+                    block[at+c] = sum(map(mul, taps, frames[c::ch]))*gate if gate else 0.0
+        sink(block)
+        if checkpoint:
+            checkpoint()
 
 
 def prerender_ramp(event, u0, u1, target, directory, cancelled, heartbeat, layout='stereo'):
     """Render event-local u0..u1 of a speed-ramped clip's sound: the source is read along the
-    same integral as the picture (ramp_source), then played as varispeed (resampled along the
-    curve), pitch-preserving (_stretch_along: grains read on the curve) or muted."""
+    same integral as the picture (ramp_source), then played as varispeed (_varispeed: resampled
+    along the curve), pitch-preserving (_stretch_along: grains read on the curve) or muted. The
+    source span goes to a file first and both are read and written a window at a time."""
     from pathlib import Path
     from render_movie import (AUDIO_RATE, _envelope_filter, _graph_args, _layout_channels, _layout_name,
                               _run_ffmpeg, _seek_offset, _trim_audio)
@@ -1246,6 +1475,16 @@ def prerender_ramp(event, u0, u1, target, directory, cancelled, heartbeat, layou
     margin = 0.05
     read_low = max(0.0, low-margin)
     offset = _seek_offset(read_low)
+
+    def checkpoint():
+        if cancelled and cancelled.is_set():
+            raise InterruptedError('Export cancelled')
+        if heartbeat:
+            heartbeat()
+
+    def local(n):
+        return u0+n/rate-before
+    reader = None
     try:
         silent = mode == 'mute' or high-low < 1/rate
         if not silent:
@@ -1257,33 +1496,28 @@ def prerender_ramp(event, u0, u1, target, directory, cancelled, heartbeat, layou
                          '-t', f'{high-offset+margin+.25:.6f}', '-protocol_whitelist', 'file', '-i', str(event['path']),
                          *_graph_args(';'.join(filters), directory, Path(target).stem+'-read'), '-map', '[aout]',
                          '-f', 'f32le', '-ac', str(channels_in), '-ar', str(rate), str(raw_source)], cancelled, heartbeat)
-            source = array.array('f', raw_source.read_bytes())
-            frames = len(source)//channels_in
-        out = array.array('f', bytes(4*count*channels_in))
-        if not silent and mode == 'varispeed':
-            positions = _ramp_positions(ramp, origin, before, u0, count, rate)
-            gate = 1.0
-            for n, position in enumerate(positions):
-                # A freeze holds no sound: fade it out below 5 % speed (the speed is read every 1 ms).
-                if n % 48 == 0:
-                    gate = min(1.0, ramp.speed(u0+n/rate-before)/0.05)
-                p = (position-read_low)*rate
-                i = int(math.floor(p))
-                if i < 0 or i+1 >= frames:
-                    continue
-                f = p-i
-                base, nxt = i*channels_in, (i+1)*channels_in
-                for c in range(channels_in):
-                    a = source[base+c]
-                    out[n*channels_in+c] = (a+(source[nxt+c]-a)*f)*gate
-        elif not silent:
-            def local(n):
-                return u0+n/rate-before
-            out = _stretch_along(source, channels_in, frames, count, rate,
-                                 lambda n: (origin+ramp.source(local(n))-read_low)*rate,
-                                 lambda n: ramp.speed(local(n)),
-                                 lambda n: ramp.speed(local(n)) >= RAMP_HELD_SPEED)
-        raw_warped.write_bytes(out.tobytes())
+            reader = _SourceReader(channels_in, raw_source.stat().st_size//(4*channels_in), rate, path=raw_source)
+        with open(raw_warped, 'wb') as warped:
+            def write(block):
+                warped.write(block.tobytes())
+
+            def place(n):
+                return (origin+ramp.source(local(n))-read_low)*rate
+
+            def speed(n):
+                return ramp.speed(local(n))
+            if silent:
+                for begin in range(0, count, rate):
+                    write(array.array('f', bytes(4*min(rate, count-begin)*channels_in)))
+            elif mode == 'varispeed':
+                _varispeed(reader, count, rate, place, speed, write, checkpoint)
+            else:
+                _stretch_along(reader, channels_in, reader.frames, count, rate, place, speed,
+                               lambda n: ramp.speed(local(n)) >= RAMP_HELD_SPEED, sink=write, checkpoint=checkpoint)
+        if reader is not None:
+            reader.close()
+            reader = None
+            raw_source.unlink(missing_ok=True)
         channels, name = _layout_channels(layout), _layout_name(layout)
         chain = (f"[0:a]{event['processing']},aformat=sample_fmts=flt:sample_rates={rate},apad,atrim=end_sample={count+2}"
                  + _envelope_filter(event, f'(t+{u0:.9f})' if u0 else 't'))
@@ -1295,6 +1529,8 @@ def prerender_ramp(event, u0, u1, target, directory, cancelled, heartbeat, layou
                      *_graph_args(';'.join(filters), directory, Path(target).stem), '-map', '[aout]',
                      '-c:a', 'pcm_f32le', '-ar', str(rate), '-ac', str(channels), str(target)], cancelled, heartbeat)
     finally:
+        if reader is not None:
+            reader.close()
         raw_source.unlink(missing_ok=True)
         raw_warped.unlink(missing_ok=True)
     return dict(path=Path(target), streams={0: channels}, rates={0: rate}, source=0.0, length=u1-u0, speed=1.0,

@@ -100,6 +100,188 @@ class StretchAlong(unittest.TestCase):
                                        msg=f'{speed}x: the tone dips at {start/RATE:.3f}s')
 
 
+def envelope(samples, start, width=48):
+    """Peak level of each ``width``-sample block from ``start`` (silence past the end)."""
+    return [max(map(abs, samples[i:i+width]), default=0.0) for i in range(start, len(samples), width)]
+
+
+def rms(samples):
+    return math.sqrt(sum(v*v for v in samples)/max(1, len(samples)))
+
+
+def frequency(samples):
+    """Mean frequency from the rising zero crossings (interpolated) of a steady tone."""
+    crossings = [i+a/(a-b) for i, (a, b) in enumerate(zip(samples, samples[1:])) if a < 0 <= b]
+    return (len(crossings)-1)*RATE/(crossings[-1]-crossings[0])
+
+
+def tone_snr(samples, f):
+    """Fundamental against everything else (dB): the median over 200 ms blocks of a least-squares
+    sine fit at ``f``."""
+    block = int(round(round(0.2*f)*RATE/f))
+    values = []
+    for start in range(0, len(samples)-block, block):
+        x = samples[start:start+block]
+        c = sum(v*math.cos(2*math.pi*f*i/RATE) for i, v in enumerate(x))*2/block
+        s = sum(v*math.sin(2*math.pi*f*i/RATE) for i, v in enumerate(x))*2/block
+        fundamental = (c*c+s*s)/2
+        values.append(10*math.log10(fundamental/max(sum(v*v for v in x)/block-fundamental, 1e-14)))
+    return sorted(values)[len(values)//2]
+
+
+class StretchQuality(unittest.TestCase):
+    """The pitch-preserving stretch keeps a transient single and its decay as loud as the curve
+    puts it at slow motion, keeps pitch down to 45 Hz, stays clean at fast speeds and plays
+    nothing of a click before it."""
+    def stretch(self, source, speed, count, offset=0.0):
+        return E._stretch_along(source, 1, len(source), count, RATE, lambda n: offset+n*speed, lambda n: speed, lambda n: True)
+
+    def fresh_onsets(self, samples, at, peak, span=0.040):
+        """Times (s) within ``span`` after ``at`` where the 1 ms envelope rises to half of ``peak``
+        again after falling below a quarter of it (a second attack after a gap)."""
+        found, gap = [], False
+        for k, level in enumerate(envelope(samples[:int((at+span)*RATE)], int(at*RATE))):
+            if level < peak/4:
+                gap = True
+            elif gap and level >= peak/2:
+                found.append(at+k/1000)
+                gap = False
+        return found
+
+    def test_slow_motion_plays_each_transient_once_and_keeps_its_decay(self):
+        import random
+        noise = random.Random(5)
+        # Decaying noise hits (1 ms attack, 40 ms decay) over a quiet noise bed, and clicks.
+        hits = array.array('f', [noise.uniform(-.09, .09) for _ in range(5*RATE)])
+        clicks = array.array('f', bytes(4*5*RATE))
+        onsets = [0.2+0.4*k for k in range(11)]
+        for at in onsets:
+            start = int(at*RATE)
+            for i in range(int(.25*RATE)):
+                hits[start+i] += noise.uniform(-1, 1)*min(1, i/RATE/.001)*math.exp(-i/RATE/.04)*.8
+            for i in range(96):
+                clicks[start+i] = 0.8*math.sin(2*math.pi*3000*i/RATE)
+        for speed in (0.1, 0.25):
+            count = int(min(4.4/speed, 9.0)*RATE)
+            played = [at/speed for at in onsets if at/speed+0.15 < count/RATE]
+            out = self.stretch(clicks, speed, count)
+            for at in played:
+                self.assertEqual(self.fresh_onsets(out, at+0.002, 0.8), [], f'{speed}x: a click plays again')
+            out = self.stretch(hits, speed, count)
+            for at in played:
+                start = next(i for i in range(int(at*RATE), count) if abs(out[i]) > 0.3)
+                self.assertLess(abs(start/RATE-at), 0.008, f'{speed}x: the hit lands at {start/RATE:.4f}s, the curve puts it at {at:.4f}s')
+                self.assertEqual(self.fresh_onsets(out, start/RATE+0.002, 0.8), [], f'{speed}x: a hit at {at:.3f}s plays again')
+                # 4 ms RMS of the output against the source around the curve's position, for 120 ms.
+                for k in range(1, 30):
+                    a = start+k*192
+                    level = rms(out[a:a+192])
+                    source = rms(hits[int(a*speed)-96:int((a+192)*speed)+96])
+                    self.assertGreater(20*math.log10(level/source), -6,
+                                       f'{speed}x: {k*4} ms after the hit at {at:.3f}s the sound is {20*math.log10(level/source):.1f} dB below the source')
+
+    def test_pitch_holds_from_45_to_440_hz(self):
+        for f in (45, 60, 110, 220, 440):
+            tone = array.array('f', [0.5*math.sin(2*math.pi*f*i/RATE) for i in range(int(13*RATE))])
+            for speed in (0.25, 0.5, 2, 4, 8):
+                out = self.stretch(tone, speed, int(1.5*RATE), offset=0.2*RATE)
+                found = frequency(out[int(.2*RATE):int(1.3*RATE)])
+                self.assertLess(abs(found-f), 2, f'{f} Hz at {speed}x plays at {found:.1f} Hz')
+                if speed >= 4 and f >= 110:
+                    snr = tone_snr(out[int(.15*RATE):int(1.35*RATE)], f)
+                    self.assertGreater(snr, 25, f'{f} Hz at {speed}x: the fundamental is only {snr:.1f} dB over the artefacts')
+
+    def test_nothing_of_a_click_plays_before_it(self):
+        clicks = array.array('f', bytes(4*7*RATE))
+        onsets = [0.2+0.4*k for k in range(16)]
+        for at in onsets:
+            for i in range(192):
+                clicks[int(at*RATE)+i] = 0.8*math.sin(2*math.pi*3000*i/RATE)
+        for speed in (3.0, 4.0, 8.0):
+            count = int(6.2/speed*RATE)
+            out = self.stretch(clicks, speed, count)
+            for at in onsets:
+                land = int(at/speed*RATE)
+                if land+RATE//100 > count:
+                    break
+                before = max(map(abs, out[land-RATE//200:land-RATE//4000]))
+                self.assertLess(20*math.log10(max(before, 1e-9)/.8), -30, f'{speed}x: sound {land/RATE:.4f}s before the click')
+                self.assertGreater(max(map(abs, out[land:land+RATE//1000])), 0.6, f'{speed}x: the click plays at full level')
+
+
+def amplitude(samples, f):
+    """Least-squares amplitude of a sine at ``f`` Hz."""
+    c = sum(v*math.cos(2*math.pi*f*i/RATE) for i, v in enumerate(samples))*2/len(samples)
+    s = sum(v*math.sin(2*math.pi*f*i/RATE) for i, v in enumerate(samples))*2/len(samples)
+    return math.hypot(c, s)
+
+
+class Varispeed(unittest.TestCase):
+    """Varispeed resamples along the curve band-limited to the new rate: content pushed above the
+    output's Nyquist frequency is removed, not folded back as an audible alias."""
+    def play(self, source, place, speed, count):
+        blocks = []
+        E._varispeed(E._SourceReader(1, len(source), RATE, data=source), count, RATE, place, speed, blocks.append)
+        out = array.array('f')
+        for block in blocks:
+            out.extend(block)
+        self.assertEqual(len(out), count)
+        return out
+
+    def test_a_speed_up_does_not_alias(self):
+        # 9 kHz at 4x is 36 kHz (above 24 kHz): linear interpolation folded it to a full-level 12 kHz.
+        source = array.array('f', [0.25*math.sin(2*math.pi*9000*i/RATE)+0.25*math.sin(2*math.pi*1000*i/RATE) for i in range(4*RATE)])
+        out = self.play(source, lambda n: 4*n, lambda n: 4.0, int(0.8*RATE))
+        window = out[RATE//10:RATE//10+RATE//2]
+        self.assertLess(20*math.log10(amplitude(window, 12000)/0.25), -60, 'the 9 kHz tone aliases to 12 kHz')
+        self.assertAlmostEqual(20*math.log10(amplitude(window, 4000)/0.25), 0, delta=0.5, msg='1 kHz plays as 4 kHz')
+        # A ramp from 1x to 6x: everything above the moving cutoff goes, in-band stays.
+        ramp = lambda n: n+2.5*n*n/RATE      # speed 1+5n/RATE over one second
+        out = self.play(source, ramp, lambda n: 1+5*n/RATE, RATE)
+        late = out[int(.7*RATE):int(.9*RATE)]   # 4.5x-5.5x: 9 kHz is 40-50 kHz, folding to 0-8 kHz
+        spectrum = rms(late)
+        tone = 0.25/math.sqrt(2)
+        self.assertLess(abs(20*math.log10(spectrum/tone)), 1.0, 'only the 1 kHz tone (now 4.5-5.5 kHz) is left')
+
+
+PEAK_SCRIPT = r"""
+import resource, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import effects_engine as E
+mode, seconds, media, work = sys.argv[2], float(sys.argv[3]), sys.argv[4], Path(sys.argv[5])
+points = [{'time': 0, 'value': 400}, {'time': 3600, 'value': 400}]
+event = {'ramp': {'ramp': E.Ramp({}, points), 'before': 0.0, 'origin': 0.0, 'mode': mode}, 'streams': {0: 2},
+         'rates': {0: 48000}, 'path': media, 'processing': 'anull', 'envelope': [], 'post': '', 'start': 0.0}
+base = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+done = E.prerender_ramp(event, 0.0, seconds, work/f'{mode}-{seconds:g}.wav', work, None, None)
+print((resource.getrusage(resource.RUSAGE_SELF).ru_maxrss-base)/1024, Path(done['path']).stat().st_size)
+"""
+
+
+class RampSoundMemory(unittest.TestCase):
+    """A ramp's sound is rendered a window at a time: peak memory does not grow with the clip
+    (a minute at 8x held 1.2 GB once)."""
+    def test_peak_memory_does_not_grow_with_the_clip(self):
+        with tempfile.TemporaryDirectory(prefix='splice-ramp-memory-') as temp:
+            media = Path(temp)/'long.wav'
+            subprocess.run(['ffmpeg', '-nostdin', '-v', 'error', '-y', '-f', 'lavfi', '-i', 'sine=f=220:r=48000:d=100',
+                            '-ac', '2', '-c:a', 'pcm_s16le', str(media)], check=True, timeout=120)
+            for mode, short, long in (('pitch', 5, 24), ('varispeed', 3, 12)):
+                peaks = []
+                for seconds in (short, long):
+                    result = subprocess.run([sys.executable, '-c', PEAK_SCRIPT, str(ROOT), mode, str(seconds), str(media), temp],
+                                            capture_output=True, text=True, timeout=300, check=True)
+                    growth, size = result.stdout.split()
+                    peaks.append(float(growth))
+                    # 32-bit float stereo of the whole span, as the mix reads it.
+                    self.assertGreater(int(size), seconds*48000*8)
+                # Holding the 96 s of source the long run reads would add 50 MB and more.
+                self.assertLess(peaks[1], peaks[0]+8, f'{mode}: peak memory grew from {peaks[0]:.0f} to {peaks[1]:.0f} MB')
+                self.assertLess(peaks[1], 64, f'{mode}: {peaks[1]:.0f} MB at peak')
+            self.assertEqual(sorted(path.name for path in Path(temp).iterdir() if path.suffix == '.f32'), [], 'scratch files are removed')
+
+
 class RampSoundRenders(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
