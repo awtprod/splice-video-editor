@@ -124,6 +124,14 @@ class SharedMaths(unittest.TestCase):
         print(f'\nEFFECTS bezier/ramp/window JS vs Python: max difference {worst:.2e}')
 
     def test_ramps_are_monotonic_and_presets_keep_the_source_span(self):
+        # Closed forms: a linear 100 -> 200 % ramp over 1 s plays 1.5 s of source; a symmetric
+        # ease from 0 to 100 % plays half a second; a 50 % hold plays half its length.
+        for keys, at, expected in (([{'time': 0, 'value': 100}, {'time': 1, 'value': 200}], 1, 1.5),
+                                   ([{'time': 0, 'value': 0, 'interp': 'easeInOut'}, {'time': 1, 'value': 100}], 1, .5),
+                                   ([{'time': 0, 'value': 0, 'ease': True}, {'time': 2, 'value': 100}], 2, 1.0),
+                                   ([{'time': 0, 'value': 50, 'interp': 'hold'}, {'time': 4, 'value': 300}], 4, 2.0)):
+            self.assertAlmostEqual(E.ramp_source(E.ordered_points(keys), at), expected, places=7)
+            self.assertAlmostEqual(js(('rampSource', keys, at))[0], expected, places=7)
         for points in self.curves():
             ramp = E.ordered_points([{**p, 'value': abs(p['value'])} for p in points])
             values = [E.ramp_source(ramp, t/50) for t in range(-10, 200)]
@@ -270,7 +278,7 @@ class EffectRenders(unittest.TestCase):
     def test_speed_ramp_samples_exact_source_frames_in_prores_and_h264(self):
         keys = [{'time': 0, 'value': 100, 'interp': 'easeInOut'}, {'time': .4, 'value': 30, 'interp': 'hold'},
                 {'time': .8, 'value': 30, 'interp': 'bezier', 'outHandle': [.2, .8]}, {'time': 1.2, 'value': 250, 'inHandle': [.5, 0]},
-                {'time': 1.5, 'value': 0, 'interp': 'hold'}, {'time': 1.7, 'value': 100}]
+                {'time': 1.5, 'value': 0, 'interp': 'hold'}, {'time': 1.7, 'value': 100}, {'time': 2.0, 'value': 220}]
         clip = self.clip('frames', duration=2.0, keyframes={'speed': keys}, **{'in': .4})
         points = E.ordered_points(keys)
         for codec, name in (('prores', 'ramp.mov'), ('h264', 'ramp.mp4')):
@@ -318,6 +326,7 @@ class EffectRenders(unittest.TestCase):
         frame = frames[12]
         self.assertLess(abs(patch_avg(frame, 80, 48, size)[0]-200), 4, 'inside the ellipse')
         self.assertLess(abs(patch_avg(frame, 150, 48, size)[0]-48), 4, 'outside both')
+        self.assertLess(abs(patch_avg(frame, 40, 48, size)[0]-48), 4, 'just outside the ellipse')
         self.assertLess(abs(patch_avg(frame, 6, 6, size)[0]-200), 6, 'the triangle reveals the corner (masks add up)')
         inverted = self.clip('top', track=2, effects={'masks': [{'shape': 'ellipse', 'x': 50, 'y': 50, 'width': 40, 'height': 50, 'invert': True}]})
         frame = frames_rgb(self.render([self.clip('bg'), inverted], 'inverted.mov'))[0][12]
@@ -347,9 +356,16 @@ class EffectRenders(unittest.TestCase):
         self.assertGreater(patch_avg(frame, 80, 48, size)[3], 252, 'the subject is opaque')
         spill = patch_avg(frame, 22, 20, size)
         self.assertTrue(8 < spill[3] < 250, 'the green-tinted patch is partly keyed')
-        plain = frames_rgb(self.render([self.clip('green')], 'green.mov'))[0][12]
-        self.assertLess(spill[1]-max(spill[0], spill[2]), patch_avg(plain, 22, 20)[1]-max(patch_avg(plain, 22, 20)[0], patch_avg(plain, 22, 20)[2])-10,
-                        'spill suppression pulls green out of the kept edge')
+        # Spill suppression pulls the kept edge's chroma toward neutral (read as stored, Y'CbCr).
+        def chroma(spill_amount):
+            target = Path(self.temp.name)/f'spill-{spill_amount}.mov'
+            render_to_file(self.project([self.clip('green', effects={'key': {**key['key'], 'spill': spill_amount}})]), target,
+                           options={'codec': 'prores', 'profile': '4444', 'alpha': True})
+            raw = subprocess.run(['ffmpeg', '-nostdin', '-v', 'error', '-i', str(target), '-vf', 'select=eq(n\\,12)', '-frames:v', '1',
+                                  '-f', 'rawvideo', '-pix_fmt', 'yuva444p', '-'], capture_output=True, check=True).stdout
+            at = 20*W+22
+            return math.hypot(raw[W*H+at]-128, raw[2*W*H+at]-128)
+        self.assertLess(chroma(90), chroma(0)*.5, 'spill suppression neutralizes the green fringe')
 
     def test_every_blend_mode_matches_the_shared_formula(self):
         bg = patch_avg(frames_rgb(self.render([self.clip('bg')], 'bg.mov'))[0][12], 80, 48)
