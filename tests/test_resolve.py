@@ -349,6 +349,11 @@ class MediaGuardTests(RegistryScratch):
     """Each check in resolve/media.py, shown to matter: every test fails when its check is removed."""
 
     def setUp(self):
+        # Registered first, so it runs last: after each test's own cleanups (release.set, the PATH patch).
+        # Every scratch folder can share one volume key (TMPDIR under /var/lib -> 'var/lib'), so a link worker
+        # still finishing a late probe would leave that key "unanswered" and the next test would see its
+        # files as unchecked.
+        self.addCleanup(self._drain_link_workers)
         super().setUp()
         import resolve.media as media
         self.media = media
@@ -361,6 +366,16 @@ class MediaGuardTests(RegistryScratch):
         patcher = mock.patch.object(media, '_probe', recording)
         patcher.start()
         self.addCleanup(patcher.stop)
+
+    def _drain_link_workers(self):
+        import threading
+        import time
+        import resolve.media as media
+        deadline = time.monotonic() + 15
+        for thread in threading.enumerate():
+            if thread.name == 'splice-resolve-link':
+                thread.join(max(0.0, deadline - time.monotonic()))
+        self.assertEqual(media._unanswered, {}, 'a link worker outlived its test')
 
     def test_bad_text_never_reaches_the_filesystem(self):
         clip = wav(self.dir / 'card' / 'A001.wav')

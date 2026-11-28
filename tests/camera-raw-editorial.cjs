@@ -282,6 +282,10 @@ async function main() {
     assert.equal(sub.reel, 'C001');
     await page.waitForSelector('[data-raw-panel]');
     assert.equal(await page.locator('[data-raw-field="kelvin"]').inputValue(), '7200', 'the subclip clip keeps rawSettings');
+    // The Inspector shows the subclip's own range (source frames 3..8), not the whole 12-frame original.
+    const subFacts = await page.locator('[data-raw-panel] .raw-camera-meta').textContent();
+    assert.ok(subFacts.includes('TC 01:00:00:03') && subFacts.includes('6 frames') && !subFacts.includes('12 frames'),
+      `subclip Inspector facts: ${subFacts}`);
     await decoded(page, 'subclip');
     const subPatches = await allPatches(page);
     report.subclip = {monitorVsPlain: worstDelta(subPatches, reference)};

@@ -83,7 +83,7 @@
       field('Speed (%)','speedPercent',Math.round(number(clip.speed,1)*10000)/100,10,800,.01) +
       `<label class="splice-safe-toggle"><input aria-label="Reverse clip" type="checkbox" data-field="reverse" ${clip.reverse?'checked':''}> Reverse clip</label>`);
     if (clip.type === 'video') {
-      if (window.SpliceRawUI && rawSource?.raw === true) html += window.SpliceRawUI.markup(clip, rawSource);
+      if (window.SpliceRawUI && rawSource?.raw === true) html += window.SpliceRawUI.markup(clip, rawSource, source?.parentMediaId ? source : null);
       const previous = state.project.clips.find(item => item.type==='video' && item.track===clip.track && item.id!==clip.id &&
         Math.round((item.start+item.duration)*fps)===Math.round(clip.start*fps));
       const previousMedia = previous && state.project.media.find(item=>item.id===previous.mediaId);

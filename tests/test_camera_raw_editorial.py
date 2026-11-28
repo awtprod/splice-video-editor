@@ -7,6 +7,7 @@ conform must leave them alone: an H.264 RAW export decodes to the same colours a
 """
 from __future__ import annotations
 
+import array
 import json
 import subprocess
 import unittest
@@ -14,6 +15,7 @@ from unittest import mock
 
 import media_links
 import media_proxy
+import raw_bayer
 import raw_decode
 import render_movie
 from tests import raw_fixtures
@@ -38,6 +40,17 @@ def _patches(path, frame=2):
     return [_sample_patch_rgb(width, height, rgb, col, row) for row in range(2) for col in range(3)]
 
 
+def _exact_patches(path, frame=2):
+    """Like _patches, but decoded to RGB with accurate rounding: the default conversion is up to ~2 codes
+    low on a 10-bit ProRes, too much slack for an absolute check against the reference develop."""
+    out = subprocess.run(['ffmpeg', '-nostdin', '-v', 'error', '-i', str(path), '-vf',
+                          f'select=eq(n\\,{frame}),scale=flags=bicubic+accurate_rnd+full_chroma_int',
+                          '-frames:v', '1', '-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1'],
+                         capture_output=True, check=True, stdin=subprocess.DEVNULL).stdout
+    assert len(out) == W * H * 3, f'{path}: expected a {W}x{H} frame'
+    return [_sample_patch_rgb(W, H, out, col, row) for row in range(2) for col in range(3)]
+
+
 def _delta(a, b):
     return max(abs(x - y) for pa, pb in zip(a, b) for x, y in zip(pa, pb))
 
@@ -59,6 +72,7 @@ class TestRawThroughEditorialStructures(_IsolatedDataDirMixin, unittest.TestCase
         info = media_proxy.describe(self.src)
         self.assertTrue(info['raw'])
         self.raw_item = {**info, 'id': 'raw1', 'name': first.name, 'src': self.src, 'type': 'video'}
+        self.first = first
         # A non-RAW second camera for the multicam.
         self.other = self.media_dir / 'cam-b.mp4'
         subprocess.run(['ffmpeg', '-nostdin', '-y', '-v', 'error', '-f', 'lavfi', '-i',
@@ -154,10 +168,27 @@ class TestRawThroughEditorialStructures(_IsolatedDataDirMixin, unittest.TestCase
             out = self._render(project, f'subclip-{kind}', options, suffix)
             self._assert_matches_reference(out, kind, options, suffix, 'subclip')
 
+    def _ground_truth(self, frame):
+        """Source ``frame`` developed straight from its DNG by the reference decoder, with SETTINGS."""
+        settings = raw_decode.normalize_raw_settings(SETTINGS, 'cinemadng', self.raw_item.get('rawDefaults'))
+        dng = self.first.with_name(f'B001_{frame + 1:06d}.dng')
+        width, height, rgb48 = raw_bayer.decode_dng_frame(dng, settings)
+        samples = array.array('H')
+        samples.frombytes(rgb48)
+        rgb = [value * 255 / 65535 for value in samples]
+        return [_sample_patch_rgb(width, height, rgb, col, row) for row in range(2) for col in range(3)]
+
     def test_h264_raw_export_is_not_conformed_twice(self):
         prores = self._reference('prores', DELIVERIES[0][1], '.mov')
         h264 = self._reference('h264', DELIVERIES[1][1], '.mp4')
         self.assertEqual(_tags(h264).get('color_space'), 'bt709')
+        # Each delivery is held to the reference decode of the same source frame (export frame 2 = source
+        # frame 5, as the clip starts at frame 3): a wrong intermediate tag shifts both deliveries together
+        # (~18 codes), which the H.264-vs-ProRes comparison below barely sees.
+        truth = self._ground_truth(5)
+        for kind, out, limit in (('ProRes', prores, 3.0), ('H.264', h264, 4.0)):
+            delta = _delta(_exact_patches(out), truth)
+            self.assertLessEqual(delta, limit, f'{kind} RAW export decodes {delta:.2f} codes off the reference develop')
         delta = _delta(_patches(h264), _patches(prores))
         # A second Rec. 601 -> 709 conform of the already-709 intermediate moves these patches ~10 codes.
         self.assertLessEqual(delta, 3.0, f'H.264 RAW export decodes {delta:.2f} codes off its ProRes master')
