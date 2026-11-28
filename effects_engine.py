@@ -26,6 +26,7 @@ Every keyframe may carry an interpolation for the segment that leaves it:
   next key's inHandle: [x, y]. Handles are in the segment's unit square (x: time, y: value).
   The legacy ``ease: true`` (smoothstep) still reads as it always has.
 """
+import array
 import math
 import re
 
@@ -52,6 +53,16 @@ STABILIZE_PROPS = {'smoothing': (1, 120, 15), 'maxShift': (-1, 500, -1), 'zoom':
 EFFECT_KEY_BOUNDS = {'speed': SPEED_RANGE, **{'crop.'+name: bounds[:2] for name, bounds in CROP_PROPS.items()},
                      **{f'mask.{index}.{name}': bounds[:2] for index in range(MAX_MASKS) for name, bounds in MASK_PROPS.items()}}
 ANALYSIS_ID = re.compile(r'^[0-9a-f]{32}$')
+# Refusals effects.js repeats word for word at load, in edits and on paste (MESSAGES there).
+MULTICAM_RAMP = 'Speed ramps on multicam clips are not supported. Flatten the multicam clip first.'
+STABILIZE_SOURCE = 'Stabilize the clips inside a nested or multicam clip, or a video clip'
+
+
+def effect_key_message(key):
+    if re.match(r'^mask\.\d+\.', key):
+        return f'Invalid keyframes: {key[:40]} (a clip has at most {MAX_MASKS} masks)'
+    return f'Invalid keyframes: {key[:40]}'
+
 HEX_COLOR = re.compile(r'^#[0-9a-fA-F]{6}$')
 
 
@@ -1066,8 +1077,9 @@ def adjustment_alpha(clip, clock, fps):
 
 # ---------------------------------------------------------------- export: ramp audio
 RAMP_AUDIO_GRID = 0.001     # varispeed positions are exact on this grid, linear between
-RAMP_TEMPO_STEP = 0.01      # pitch-preserving tempo changes this often (atempo commands)
 RAMP_HELD_SPEED = 0.1       # slower than this, sound is silent (a freeze has no sound)
+RAMP_GRAIN = 0.010          # pitch-preserving grain hop at normal speed (Hann grains, two hops long)
+RAMP_SEEK = 0.005           # the most a grain's read point moves off the curve to continue the waveform
 
 
 def _ramp_positions(ramp, origin, before, u0, count, rate):
@@ -1082,13 +1094,126 @@ def _ramp_positions(ramp, origin, before, u0, count, rate):
     return out
 
 
+def _transients(mono, frames, block):
+    """Sorted source sample indices where the sound jumps (a block much louder than the 20 ms before
+    it): the first sample of the jump that reaches half the block's peak."""
+    env = [max(map(abs, mono[i:i+block])) for i in range(0, frames, block)]
+    found = []
+    for b, level in enumerate(env):
+        back = env[max(0, b-20):max(0, b-2)]
+        if level > 4*(sum(back)/len(back) if back else 0.0)+0.01 and not (found and found[-1] >= (b-2)*block):
+            first = b*block
+            found.append(next(i for i in range(first, min(frames, first+block)) if abs(mono[i]) >= level/2))
+    return found
+
+
+def _stretch_along(source, channels, frames, count, rate, place, speed, playing):
+    """Pitch-preserving playback along a speed curve (WSOLA). Output sample n of ``count`` plays the
+    source around sample ``place(n)`` (a non-decreasing float index into ``source``) at normal pitch.
+    Hann grains are read at the curve's position, each nudged by at most RAMP_SEEK so its waveform
+    continues the previous grain's. Near a transient a grain is instead read so that the transient
+    lands exactly where the curve puts it, or outside the grain, so every grain that plays it plays it
+    at the same instant (one click, on time, never an echo). Nothing is re-timed while running, so the result is
+    exactly ``count`` samples, and the window weights are normalised, so where ``playing(n)`` is false
+    (a freeze) the sound fades to silence."""
+    import bisect
+    from operator import add, mul
+    base = max(32, int(round(RAMP_GRAIN*rate)))
+    reach = int(RAMP_SEEK*rate)
+    out = array.array('f', bytes(4*count*channels))
+    weight = array.array('d', bytes(8*count))
+    mono = source if channels == 1 else array.array(
+        'f', [sum(source[i*channels:(i+1)*channels])/channels for i in range(frames)])
+    transients = _transients(mono, frames, max(1, rate//1000))
+    windows = {}
+    previous = None     # (output start, source start) of the last grain that played
+
+    def score(start, target, step):
+        """Normalised correlation of the source from ``start`` with ``target`` (every ``step``th sample)."""
+        length = len(target)*step
+        if start < 0 or start+length > frames:
+            return None
+        candidate = mono[start:start+length:step]
+        return sum(map(mul, target, candidate))/math.sqrt(sum(map(mul, candidate, candidate))+1e-12)
+
+    def landing(target, low, high):
+        """The output sample (float) in low..high where place() reaches source sample ``target``."""
+        for _ in range(40):
+            middle = (low+high)/2
+            if place(middle) < target:
+                low = middle
+            else:
+                high = middle
+        return (low+high)/2
+
+    centre = 0
+    while centre < count+base:
+        n = min(max(centre, 0), count-1)
+        rate_here = abs(speed(n))
+        hop = max(16, int(round(base/max(1.0, rate_here)*(0.4 if rate_here < 0.2 else 1.0))))
+        length = hop+max(hop, int(round(rate_here*hop)))
+        length += length % 2
+        window = windows.get(length)
+        if window is None:
+            window = windows[length] = [0.5-0.5*math.cos(2*math.pi*(i+0.5)/length) for i in range(length)]
+        origin = centre-length//2
+        low, high = max(0, -origin), min(length, count-origin)
+        if high > low:
+            weight[origin+low:origin+high] = array.array('d', map(add, weight[origin+low:origin+high], window[low:high]))
+        if not playing(n):
+            previous = None
+            centre += hop
+            continue
+        start = int(round(place(n)))-length//2
+        # A transient near this grain's read: the grain reads so that the transient plays exactly where
+        # the curve puts it (or, when that is outside the grain, not at all), so no grain repeats it early
+        # or late. The nearest transient to the curve's position decides.
+        lock = None
+        for k in range(bisect.bisect_left(transients, start-reach), bisect.bisect_left(transients, start+length+reach)):
+            at = landing(transients[k], 0, count-1)
+            if place(0) <= transients[k] <= place(count-1) and (lock is None or abs(at-centre) < abs(lock[0]-centre)):
+                lock = (at, transients[k])
+        if lock is not None:
+            start = int(round(lock[1]-(lock[0]-origin)))
+        elif previous is not None:
+            natural = previous[1]+(origin-previous[0])
+            span = min(length//2, 480)
+            if 0 <= natural and natural+span <= frames and sum(v*v for v in mono[natural:natural+span:2]) > 1e-9:
+                # Coarse (every 4th lag, every 8th sample), then the neighbouring lags at full rate.
+                coarse, fine = mono[natural:natural+span:8], mono[natural:natural+span]
+                best, shift = score(start, coarse, 8), 0
+                for d in range(-reach, reach+1, 4):
+                    value = score(start+d, coarse, 8)
+                    if value is not None and (best is None or value > best+1e-6 or (value > best-1e-6 and abs(d) < abs(shift))):
+                        best, shift = value, d
+                if shift:
+                    best = score(start+shift, fine, 1)
+                    for d in range(shift-2, shift+3):
+                        value = score(start+d, fine, 1)
+                        if value is not None and best is not None and value > best+1e-6:
+                            best, shift = value, d
+                    start += shift
+        previous = (origin, start)
+        first, last = max(low, -start), min(high, frames-start)
+        if last > first:
+            part = window[first:last]
+            for c in range(channels):
+                to = slice((origin+first)*channels+c, (origin+last)*channels, channels)
+                read = source[(start+first)*channels+c:(start+last)*channels:channels]
+                out[to] = array.array('f', map(add, out[to], map(mul, read, part)))
+        centre += hop
+    scale = [1/w if w > 1e-6 else 0.0 for w in weight]
+    for c in range(channels):
+        out[c::channels] = array.array('f', map(mul, out[c::channels], scale))
+    return out
+
+
 def prerender_ramp(event, u0, u1, target, directory, cancelled, heartbeat, layout='stereo'):
     """Render event-local u0..u1 of a speed-ramped clip's sound: the source is read along the
     same integral as the picture (ramp_source), then played as varispeed (resampled along the
-    curve), pitch-preserving (atempo, its tempo commanded every 10 ms) or muted."""
-    import array
+    curve), pitch-preserving (_stretch_along: grains read on the curve) or muted."""
     from pathlib import Path
-    from render_movie import (AUDIO_RATE, _envelope_filter, _filter_path, _graph_args, _layout_channels, _layout_name,
+    from render_movie import (AUDIO_RATE, _envelope_filter, _graph_args, _layout_channels, _layout_name,
                               _run_ffmpeg, _seek_offset, _trim_audio)
     info = event['ramp']
     ramp, before, mode = info['ramp'], info['before'], info['mode']
@@ -1120,62 +1245,27 @@ def prerender_ramp(event, u0, u1, target, directory, cancelled, heartbeat, layou
         out = array.array('f', bytes(4*count*channels_in))
         if not silent and mode == 'varispeed':
             positions = _ramp_positions(ramp, origin, before, u0, count, rate)
+            gate = 1.0
             for n, position in enumerate(positions):
+                # A freeze holds no sound: fade it out below 5 % speed (the speed is read every 1 ms).
+                if n % 48 == 0:
+                    gate = min(1.0, ramp.speed(u0+n/rate-before)/0.05)
                 p = (position-read_low)*rate
                 i = int(math.floor(p))
                 if i < 0 or i+1 >= frames:
                     continue
                 f = p-i
-                # A freeze holds no sound: fade it out below 5 % speed.
-                gate = min(1.0, ramp.speed(u0+n/rate-before)/0.05) if n % 48 == 0 or n == 0 else gate
                 base, nxt = i*channels_in, (i+1)*channels_in
                 for c in range(channels_in):
                     a = source[base+c]
                     out[n*channels_in+c] = (a+(source[nxt+c]-a)*f)*gate
         elif not silent:
-            # Pieces that play (speed >= 10 %); held parts stay silent.
-            step = RAMP_TEMPO_STEP
-            grid = [u0+j*step for j in range(int(math.ceil((u1-u0)/step))+1)]
-            grid[-1] = min(grid[-1], u1)
-            pieces, current = [], None
-            for a, b in zip(grid, grid[1:]):
-                playing = ramp.speed((a+b)/2-before) >= RAMP_HELD_SPEED
-                if playing and current:
-                    current[1] = b
-                elif playing:
-                    current = [a, b]
-                    pieces.append(current)
-                else:
-                    current = None
-            for number, (a, b) in enumerate(pieces):
-                start_source = origin+ramp.source(a-before)
-                commands = []
-                times = [a+j*step for j in range(int(math.ceil((b-a)/step-1e-9))+1)]+[b]
-                for t0, t1 in zip(times, times[1:]):
-                    if t1 <= t0:
-                        continue
-                    s0, s1 = origin+ramp.source(t0-before), origin+ramp.source(t1-before)
-                    tempo = min(16.0, max(RAMP_HELD_SPEED, (s1-s0)/(t1-t0)))
-                    part = tempo**0.25
-                    commands.append(f'{max(0.0, s0-start_source):.6f} ' + ', '.join(f'atempo@r{k} tempo {part:.6f}' for k in range(4)))
-                script = Path(f'{stem}-tempo{number}.cmd')
-                script.write_text(';\n'.join(commands)+';\n')
-                first = commands[0].split(' ', 1)[1].split(',')[0].rsplit(' ', 1)[1] if commands else '1'
-                piece_low = int(round((start_source-read_low)*rate))
-                piece_high = int(round((origin+ramp.source(b-before)-read_low)*rate))+int(0.25*rate)
-                piece = Path(f'{stem}-piece{number}.f32')
-                piece.write_bytes(source[max(0, piece_low)*channels_in:min(frames, piece_high)*channels_in].tobytes())
-                stretched = Path(f'{stem}-stretched{number}.f32')
-                graph = (f"asendcmd=f={_filter_path(script)}," + ','.join(f'atempo@r{k}={first}' for k in range(4)) +
-                         f',aformat=sample_fmts=flt')
-                _run_ffmpeg(['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y', '-f', 'f32le', '-ar', str(rate),
-                             '-ac', str(channels_in), '-i', str(piece), '-af', graph, '-f', 'f32le', str(stretched)], cancelled, heartbeat)
-                played = array.array('f', stretched.read_bytes())
-                for path in (script, piece, stretched):
-                    path.unlink(missing_ok=True)
-                begin = int(round((a-u0)*rate))
-                length = min(int(round((b-a)*rate)), count-begin, len(played)//channels_in)
-                out[begin*channels_in:(begin+length)*channels_in] = played[:length*channels_in]
+            def local(n):
+                return u0+n/rate-before
+            out = _stretch_along(source, channels_in, frames, count, rate,
+                                 lambda n: (origin+ramp.source(local(n))-read_low)*rate,
+                                 lambda n: ramp.speed(local(n)),
+                                 lambda n: ramp.speed(local(n)) >= RAMP_HELD_SPEED)
         raw_warped.write_bytes(out.tobytes())
         channels, name = _layout_channels(layout), _layout_name(layout)
         chain = (f"[0:a]{event['processing']},aformat=sample_fmts=flt:sample_rates={rate},apad,atrim=end_sample={count+2}"
@@ -1253,6 +1343,8 @@ def _transform_settings(settings):
     out = {}
     for name, (low, high, default) in STABILIZE_PROPS.items():
         out[name] = _finite((settings or {}).get(name, default), 'stabilization '+name, low, high)
+    if out['autoZoom'] != int(out['autoZoom']):
+        raise ValueError('Invalid stabilization autoZoom')
     tripod = (settings or {}).get('tripod', False)
     if not isinstance(tripod, bool):
         raise ValueError('Invalid stabilization tripod')
@@ -1261,17 +1353,22 @@ def _transform_settings(settings):
 
 
 class Stabilizer:
-    """Background vidstab analyses (server.py): one job per source range, kept on disk."""
+    """Background vidstab analyses and monitor previews (server.py): one job per source range (or
+    per analysis and setting), kept on disk. An analysis can be cancelled (the editor cancels it
+    when no clip uses it any more: Reset, a deleted clip)."""
     def __init__(self):
         import threading
         self.lock = threading.Lock()
         self.jobs = {}
+        self.previews = {}
 
     def start(self, src, source_in, source_out):
         import hashlib, json, threading
         from premiere import _media_path
         if not vidstab_available():
             raise ValueError(VIDSTAB_MISSING)
+        if not isinstance(src, str) or not src:
+            raise ValueError('Invalid stabilization source')
         source_in = _finite(source_in, 'stabilization in point', 0, 48*3600)
         source_out = _finite(source_out, 'stabilization out point', 0, 48*3600)
         if source_out <= source_in or source_out-source_in > 3*3600:
@@ -1286,13 +1383,62 @@ class Stabilizer:
                 return self.status(analysis)
             if (directory/'analysis.json').exists():
                 return self.status(analysis)
-            job = self.jobs[analysis] = {'state': 'running', 'progress': 0.0, 'analysis': analysis}
+            job = self.jobs[analysis] = {'state': 'running', 'progress': 0.0, 'analysis': analysis,
+                                         '_cancel': threading.Event(), '_process': None}
         directory.mkdir(parents=True, exist_ok=True)
-        threading.Thread(target=self._detect, args=(analysis, path, source_in, source_out, directory), daemon=True).start()
+        threading.Thread(target=self._detect, args=(analysis, path, source_in, source_out, directory, job), daemon=True).start()
         return self.status(analysis)
 
-    def _detect(self, analysis, path, source_in, source_out, directory):
-        import json, subprocess
+    def cancel(self, analysis):
+        """Stop a running analysis and remove what it wrote. A finished analysis is kept."""
+        if not isinstance(analysis, str) or not ANALYSIS_ID.match(analysis):
+            raise ValueError('Invalid stabilization analysis id')
+        with self.lock:
+            job = self.jobs.get(analysis)
+            if not job or job['state'] != 'running':
+                return {'state': (job or {}).get('state', 'unknown'), 'analysis': analysis}
+            job['_cancel'].set()
+            process = job.get('_process')
+            self.jobs[analysis] = {'state': 'cancelled', 'analysis': analysis, 'error': 'Analysis cancelled: analyze the clip again'}
+        if process is not None and process.poll() is None:
+            process.terminate()
+        return {'state': 'cancelled', 'analysis': analysis}
+
+    def _run(self, job, command, progress=None):
+        """One vidstab pass, stoppable by cancel(): ``progress(seconds)`` receives FFmpeg's clock."""
+        import subprocess
+        with self.lock:
+            if job['_cancel'].is_set():
+                raise InterruptedError('cancelled')
+            process = job['_process'] = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                                         stderr=subprocess.PIPE, text=True)
+        errors = []
+        import threading
+        reader = threading.Thread(target=lambda: errors.append(process.stderr.read()), daemon=True)
+        reader.start()
+        try:
+            for line in process.stdout:
+                if progress and line.startswith('out_time_us='):
+                    try:
+                        progress(int(line.split('=', 1)[1])/1e6)
+                    except ValueError:
+                        continue
+            code = process.wait()
+            reader.join(5)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            process.stdout.close()
+            process.stderr.close()
+        if job['_cancel'].is_set():
+            raise InterruptedError('cancelled')
+        if code != 0:
+            raise RuntimeError('Motion analysis failed: '+''.join(errors).strip()[-400:])
+
+    def _detect(self, analysis, path, source_in, source_out, directory, job):
+        import json, os, uuid
+        trf = tripod = None
         try:
             times, start = _probe_frames(path, source_in+0, source_out+0)
             # Source times are measured from the container start, as the editor's are.
@@ -1308,44 +1454,51 @@ class Stabilizer:
             trim_end = (last+after[0])/2 if after else last+1e-3
             meta = {'version': STABILIZE_VERSION, 'path': str(path), 'start': start, 'first': first, 'frames': len(inside),
                     'trim': [trim_start, trim_end], 'source': [source_in, source_out], 'offset': first-start}
-            trf = directory/'analysis.trf'
+            # This job's own files, moved into place only when both passes finish: a cancelled job
+            # removes just its own, even when the clip is analyzed again meanwhile.
+            token = uuid.uuid4().hex[:12]
+            trf, tripod = directory/f'analysis-{token}.trf.part', directory/f'tripod-{token}.trf.part'
             seek = max(0.0, trim_start-2)
             command = ['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y', '-progress', 'pipe:1',
                        '-ss', f'{seek:.6f}', '-copyts', '-protocol_whitelist', 'file', '-i', str(path), '-map', '0:v:0',
                        '-vf', f"trim=start={trim_start:.9f}:end={trim_end:.9f},vidstabdetect=result={_vidstab_path(trf)}:{DETECT_OPTIONS}",
                        '-f', 'null', '-']
-            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             span = max(1e-6, trim_end-trim_start)
-            for line in process.stdout:
-                if line.startswith('out_time_us='):
-                    try:
-                        done = int(line.split('=', 1)[1])/1e6
-                    except ValueError:
-                        continue
-                    with self.lock:
-                        self.jobs[analysis]['progress'] = min(0.99, max(0.0, (done-(trim_start-seek))/span))
-            errors = process.stderr.read()
-            if process.wait() != 0 or not trf.exists():
-                raise RuntimeError('Motion analysis failed: '+errors.strip()[-400:])
+
+            def progress(done, share=0.5, base=0.0):
+                with self.lock:
+                    if self.jobs.get(analysis) is job:
+                        job['progress'] = min(0.99, max(0.0, base+share*(done-(trim_start-seek))/span))
+            self._run(job, command, progress)
+            if not trf.exists():
+                raise RuntimeError('Motion analysis failed: no motion data was written')
             # Tripod mode measures every frame against the first: a second pass of its own.
-            tripod = directory/'tripod.trf'
-            subprocess.run([*command[:command.index('-vf')+1],
+            self._run(job, [*command[:command.index('-vf')+1],
                             f"trim=start={trim_start:.9f}:end={trim_end:.9f},vidstabdetect=result={_vidstab_path(tripod)}:{DETECT_OPTIONS}:tripod=1",
-                            '-f', 'null', '-'], capture_output=True, text=True, check=True, timeout=7200)
+                            '-f', 'null', '-'], lambda done: progress(done, 0.5, 0.5))
             meta['shake'] = {'before': shake_metric(path, trim_start, trim_end, seek)}
+            if job['_cancel'].is_set() or not tripod.exists():
+                raise InterruptedError('cancelled') if job['_cancel'].is_set() else RuntimeError('Motion analysis failed')
+            os.replace(trf, directory/'analysis.trf')
+            os.replace(tripod, directory/'tripod.trf')
             (directory/'analysis.json').write_text(json.dumps(meta))
             with self.lock:
-                self.jobs[analysis] = {'state': 'done', 'analysis': analysis}
+                if self.jobs.get(analysis) is job:
+                    self.jobs[analysis] = {'state': 'done', 'analysis': analysis}
         except Exception as error:   # reported to the editor, which shows it on the clip
             with self.lock:
-                self.jobs[analysis] = {'state': 'failed', 'analysis': analysis, 'error': str(error)}
+                if self.jobs.get(analysis) is job:
+                    self.jobs[analysis] = {'state': 'failed', 'analysis': analysis, 'error': str(error)}
+        finally:
+            for name in (trf, tripod) if trf else ():
+                name.unlink(missing_ok=True)
 
     def status(self, analysis):
         import json
         directory = _analysis_dir(analysis)
         with self.lock:
-            job = dict(self.jobs.get(analysis) or {})
-        if job.get('state') in ('running', 'failed'):
+            job = {key: value for key, value in (self.jobs.get(analysis) or {}).items() if not key.startswith('_')}
+        if job.get('state') in ('running', 'failed', 'cancelled'):
             return job
         meta_file = directory/'analysis.json'
         if not meta_file.exists():
@@ -1357,14 +1510,36 @@ class Stabilizer:
                 'shake': meta.get('shake'), 'offset': meta['offset']}
 
     def preview(self, analysis, settings):
-        """A monitor proxy of the stabilized range (the same analysis and transform as the export)."""
+        """A monitor proxy of the stabilized range (the same analysis and transform as the export),
+        rendered in the background: {'state': 'running'} until it is ready, then {'state': 'done',
+        'src', 'offset'}. The editor asks again until it is done."""
+        import threading
         from premiere import MEDIA_ROOT
         settings = _transform_settings(settings)
         meta = analysis_meta(analysis)
         target = _analysis_dir(analysis)/f'preview-{_settings_key(settings)}.mp4'
-        if not target.exists():
-            render_stabilized(analysis, settings, target, preview=True)
-        return {'src': '/media/'+str(target.relative_to(MEDIA_ROOT)), 'offset': meta['offset']}
+        if target.exists():
+            return {'state': 'done', 'src': '/media/'+str(target.relative_to(MEDIA_ROOT)), 'offset': meta['offset']}
+        key = (analysis, _settings_key(settings))
+        with self.lock:
+            job = self.previews.get(key)
+            if job and job['state'] == 'running':
+                return {'state': 'running'}
+            if job and job['state'] == 'failed':
+                del self.previews[key]       # reported once; asking again retries
+                return {'state': 'failed', 'error': job['error']}
+            job = self.previews[key] = {'state': 'running'}
+
+        def render():
+            try:
+                render_stabilized(analysis, settings, target, preview=True)
+                with self.lock:
+                    self.previews.pop(key, None)
+            except Exception as error:   # reported to the editor on its next request
+                with self.lock:
+                    self.previews[key] = {'state': 'failed', 'error': str(error)}
+        threading.Thread(target=render, daemon=True).start()
+        return {'state': 'running'}
 
 
 def _vidstab_path(path):
@@ -1397,7 +1572,10 @@ def render_stabilized(analysis, settings, target, *, preview=False, cancelled=No
     trim_start, trim_end = meta['trim']
     seek = max(0.0, trim_start-2)
     picture = (f"trim=start={trim_start:.9f}:end={trim_end:.9f},{stabilize_transform_args(settings, trf)},setpts=PTS-STARTPTS")
-    partial = Path(str(target)+'.part'+Path(target).suffix)
+    # Each render writes its own partial file (two exports of one clip may run at once); the
+    # finished file replaces the target atomically, and a cancelled or failed render removes it.
+    import threading, uuid
+    partial = Path(f'{target}.{os.getpid()}-{threading.get_ident()}-{uuid.uuid4().hex[:8]}.part{Path(target).suffix}')
     if preview:
         picture += ",scale='min(1280,iw)':-2:flags=bicubic,format=yuv420p"
         sound = ['-map', '0:a:0?', '-af', f'atrim=start={trim_start:.9f}:end={trim_end:.9f},asetpts=PTS-STARTPTS', '-c:a', 'aac', '-b:a', '160k']
@@ -1408,8 +1586,11 @@ def render_stabilized(analysis, settings, target, *, preview=False, cancelled=No
     command = ['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y', '-ss', f'{seek:.6f}', '-copyts',
                '-protocol_whitelist', 'file', '-i', meta['path'], '-map', '0:v:0', '-vf', picture, *codec, *sound,
                '-map_metadata', '-1', '-avoid_negative_ts', 'make_zero', str(partial)]
-    _run_ffmpeg(command, cancelled, heartbeat)
-    os.replace(partial, target)
+    try:
+        _run_ffmpeg(command, cancelled, heartbeat)
+        os.replace(partial, target)
+    finally:
+        partial.unlink(missing_ok=True)
     return target
 
 
@@ -1465,12 +1646,20 @@ def mean_motion(frames, width, height, radius=8, step=3):
 
 def apply_stabilization(project, cancelled=None, heartbeat=None):
     """Point every stabilized video clip's picture at its stabilized intermediate (a new media
-    item whose time 0 is the first analyzed frame); its sound stays on the original media as a
-    separate clip. Returns the project (a copy when anything changed)."""
+    item whose time 0 is the first analyzed frame); the same clip's sound still reads the original
+    media (``_soundMedia``/``_soundIn``, read by render_movie._audio_events). Returns the project
+    (a copy when anything changed)."""
     import copy
     clips = project.get('clips')
     if not isinstance(clips, list) or not any(isinstance(clip, dict) and clip.get('type') == 'video' and clip.get('effects') for clip in clips):
         return project
+    # Refused whether live, bypassed or disabled, as the editor refuses it at load (effects.js).
+    items = {item.get('id'): item for item in project.get('media') or [] if isinstance(item, dict)}
+    for clip in clips:
+        if isinstance(clip, dict) and clip.get('type') == 'video' and isinstance(clip.get('effects'), dict) and clip['effects'].get('stabilize'):
+            item = items.get(clip.get('mediaId')) or {}
+            if item.get('nestedProject') or item.get('multicam') or item.get('nativeGenerator') is not None:
+                raise ValueError(STABILIZE_SOURCE)
     prepared = None
     for index, clip in enumerate(clips):
         if not isinstance(clip, dict) or clip.get('type') != 'video' or clip.get('enabled') is False or clip.get('disabled'):
@@ -1485,7 +1674,7 @@ def apply_stabilization(project, cancelled=None, heartbeat=None):
         target = prepared['clips'][index]
         item = media_by_id.get(target.get('mediaId'))
         if item is None or item.get('nestedProject') or item.get('multicam') or item.get('nativeGenerator') is not None:
-            raise ValueError('Stabilize the clips inside a nested or multicam clip, or a video clip')
+            raise ValueError(STABILIZE_SOURCE)
         path, meta = stabilized_media(stabilize['analysis'], stabilize, cancelled, heartbeat)
         source_in = float(target.get('in', 0) or 0)
         span = source_delta(target, 0, float(target['duration']))
@@ -1500,13 +1689,9 @@ def apply_stabilization(project, cancelled=None, heartbeat=None):
                               duration=meta['trim'][1]-meta['trim'][0], audioChannels=0)
             prepared['media'].append(stabilized)
             media_by_id[media_id] = stabilized
-        if target.get('embeddedAudio') is not False:
-            sound = {**copy.deepcopy(target), 'id': f"{target.get('id', 'clip')}#sound", 'type': 'audio'}
-            sound.pop('effects', None)
-            sound['effects'] = {'speedAudio': (target.get('effects') or {}).get('speedAudio', 'pitch')}
-            sound['_optionalAudio'] = True
-            prepared['clips'].append(sound)
-            target['embeddedAudio'] = False
+        # The clip keeps its own sound (same clip, so its crossfades and dips still find their
+        # neighbours); only the picture reads the stabilized media.
+        target['_soundMedia'], target['_soundIn'] = target.get('mediaId'), source_in
         target['mediaId'] = media_id
         target['in'] = source_in-meta['offset']
         target['effects'] = {key: value for key, value in (target.get('effects') or {}).items() if key != 'stabilize'}

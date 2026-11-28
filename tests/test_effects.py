@@ -558,8 +558,16 @@ class StabilizeServer(unittest.TestCase):
             self.assertIn(status, (400, 404, 422), (bad, body))
         status, body = server.json('POST', '/api/effects/stabilize/preview', {'id': '../../x', 'settings': {}})
         self.assertEqual(status, 400, body)
+        for bad in ('../x', 5, None):
+            status, body = server.json('POST', '/api/effects/stabilize/cancel', {'id': bad})
+            self.assertEqual(status, 400, (bad, body))
+        status, _ = server.json('POST', '/api/effects/stabilize/cancel', {'id': '0'*32}, token=False)
+        self.assertEqual(status, 403, 'cancelling needs the page token too')
         if not body.get('error') or not E.vidstab_available():
             return
+        for bad in (5, ['x'], {'a': 1}, ''):
+            status, body = server.json('POST', '/api/effects/stabilize', {'src': bad, 'in': 0, 'out': 1})
+            self.assertEqual(status, 400, (bad, body))
         status, body = server.json('POST', '/api/effects/stabilize', {'src': '/media/abc/clip.mp4', 'in': .2, 'out': 1.6})
         self.assertEqual(status, 200, body)
         deadline = time.monotonic()+60
@@ -567,8 +575,19 @@ class StabilizeServer(unittest.TestCase):
             time.sleep(.2)
             status, body = server.json('GET', '/api/effects/stabilize?id='+body['analysis'])
         self.assertEqual(body['state'], 'done', body)
+        status, preview = server.json('POST', '/api/effects/stabilize/preview', {'id': body['analysis'], 'settings': {'autoZoom': 1.5}})
+        self.assertEqual(status, 400, preview)
+        # The preview renders as a job: the request returns at once, the editor asks until it is done.
+        started = time.monotonic()
         status, preview = server.json('POST', '/api/effects/stabilize/preview', {'id': body['analysis'], 'settings': {'smoothing': 10}})
-        self.assertEqual(status, 200, preview)
+        self.assertEqual((status, preview['state']), (200, 'running'), preview)
+        self.assertLess(time.monotonic()-started, 2)
+        while preview['state'] == 'running' and time.monotonic() < deadline+60:
+            time.sleep(.2)
+            status, preview = server.json('POST', '/api/effects/stabilize/preview', {'id': body['analysis'], 'settings': {'smoothing': 10}})
+        self.assertEqual(preview['state'], 'done', preview)
+        status, done = server.json('POST', '/api/effects/stabilize/cancel', {'id': body['analysis']})
+        self.assertEqual((status, done['state']), (200, 'done'), 'a finished analysis is kept')
         status, _, data = server.request('GET', preview['src'])
         self.assertEqual(status, 200)
         self.assertGreater(len(data), 1000)

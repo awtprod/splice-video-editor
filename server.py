@@ -154,6 +154,13 @@ def effects_stabilize_status(handler, query):
         handler._json(404, {'error': str(error.args[0])})
 
 
+@post('/api/effects/stabilize/cancel', limit=MAX_SMALL_BODY)
+def effects_stabilize_cancel(handler, body):
+    """Stop an analysis no clip uses any more (the editor asks on Reset and when clips are deleted)."""
+    payload = _json_body(body)
+    handler._json(200, STABILIZER.cancel(payload.get('id')))
+
+
 @post('/api/effects/stabilize/preview', limit=MAX_SMALL_BODY)
 def effects_stabilize_preview(handler, body):
     payload = _json_body(body)

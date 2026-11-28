@@ -1050,6 +1050,8 @@ def _slice_keyframes(keyframes, offset, length):
                 'exposure':(-4,4),'temperature':(-100,100),'tint':(-100,100),'brightness':(0,200),'contrast':(0,200),'saturation':(0,200),
                 # Speed ramps, crop and masks (effects_engine).
                 **effects_engine.EFFECT_KEY_BOUNDS}
+        if key not in bounds and isinstance(key, str) and key.startswith(('mask.', 'crop.')):
+            raise ValueError(effects_engine.effect_key_message(key))
         if key not in bounds or not isinstance(points,list): raise ValueError('Invalid keyframes')
         if len(points)>MAX_KEYFRAMES: raise ValueError(f'A clip has more than {MAX_KEYFRAMES} {key} keyframes, the export limit')
         if not points: continue
@@ -1396,7 +1398,10 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
     # Composite at mastering precision (at least 10-bit 4:2:2); quantize and subsample once on delivery.
     # Composite in 4:4:4 for 4:4:4 and RGB deliveries, with an alpha base when alpha is delivered.
     chroma = '444' if spec['chroma'] == '444' else '422'
-    wide = spec['depth'] > 10
+    # An alpha base composites at 16 bits through the straight-alpha maskedmerge path: FFmpeg's
+    # overlay un-premultiplies a >8-bit main with alpha using 8-bit constants (a 10-bit transparent
+    # base weighs the layer's colour by ~255/1023), pulling semi-transparent colour toward black.
+    wide = spec['depth'] > 10 or bool(spec['alpha'])
     depth = 16 if wide else 10
     depth_suffix = f'p{depth}le'
     alpha_format = f'yuva{chroma}{depth_suffix}'
@@ -1933,11 +1938,15 @@ def _audio_events(clips, media_by_id, fps, probes, track_mix, solo, span, heartb
                                     (candidate, sound))
     plans = {} if plans is None else plans
     events = []
-    for clip in clips:
+    for original in clips:
+        clip = original
         if clip.get('type') not in ('audio', 'video') or not clip_enabled(clip):
             # A disabled clip is silent (its embedded sound too). It stays in
             # `upcoming`, so a neighbour's crossfade still fades against it.
             continue
+        if clip.get('_soundMedia') is not None:
+            # A stabilized clip: its picture reads the stabilized media, its sound the original.
+            clip = {**clip, 'mediaId': clip['_soundMedia'], 'in': clip['_soundIn']}
         item = media_by_id.get(clip.get('mediaId'))
         if item is None:
             raise ValueError('A clip references missing media')
@@ -1958,7 +1967,7 @@ def _audio_events(clips, media_by_id, fps, probes, track_mix, solo, span, heartb
         # A dip starts the incoming sound at the cut; only a crossfade pre-rolls it.
         render_length = length+before
         following = upcoming.get((clip['type'], clip.get('track'), round((start+length)*fps)))
-        if following and following[0] is clip: following = None
+        if following and following[0] is original: following = None
         origin, rate, fade_length = _fade_clock(clip, 'fadeClock') if clip.get('fadeClock') else (0, 1, length)
         fade_out = min(fade_length, _number(clip.get('fadeOut', 0), 'fade out', 0, MAX_TIMELINE_SECONDS))
         after = 0.0
@@ -2513,7 +2522,7 @@ def _expand_editorial_clips(project):
         ang_dur = _number(raw_dur, 'multicam angle duration', 0.001, MAX_SOURCE_SECONDS) if raw_dur else math.inf
         speed = _number(base_clip.get('speed', 1), 'speed', 0.1, 16)
         if (base_clip.get('keyframes') or {}).get('speed'):
-            raise ValueError('Speed ramps on multicam clips are not supported. Flatten the multicam clip first.')
+            raise ValueError(effects_engine.MULTICAM_RAMP)
         mc_in = _number(base_clip.get('in', 0), 'source in', 0, MAX_SOURCE_SECONDS)
         mc_dur = _number(base_clip.get('duration', 0), 'duration', 0.001, MAX_TIMELINE_SECONDS)
         mc_start = _number(base_clip.get('start', 0), 'start', 0, MAX_TIMELINE_SECONDS)
@@ -2855,6 +2864,9 @@ def _start_timecode(project, first, fps_fraction):
     return start + first, drop
 
 
+RENDER_KEYS = frozenset({'_optionalAudio', '_soundMedia', '_soundIn'})
+
+
 def _render_prepared(project, output_path, *, options=None, progress=None, cancelled=None, heartbeat=None, work_directory=None,
                      report=None, minimum_duration=0):
     """Render the picture (bounded windows), the audio (bounded chunks), then mux once."""
@@ -2889,7 +2901,9 @@ def _render_delivery(project, output_path, *, options, progress, cancelled, hear
     audio_only = spec['kind'] == 'audio'
     # One private copy: probe results are cached on its media items.
     # Strip any leading-underscore internal keys from caller-supplied entries
-    # (preserving _optionalAudio added internally by _expand_editorial_clips).
+    # (preserving RENDER_KEYS: _optionalAudio added by _expand_editorial_clips, and the sound source
+    # of a stabilized clip added by effects_engine.apply_stabilization; render_to_file already
+    # stripped every caller-supplied underscore key before either ran).
     project = copy.deepcopy(project)
     if isinstance(project, dict):
         for section in ('media', 'clips'):
@@ -2897,7 +2911,7 @@ def _render_delivery(project, output_path, *, options, progress, cancelled, hear
             if isinstance(entries, list):
                 for entry in entries:
                     if isinstance(entry, dict):
-                        for key in [k for k in entry if isinstance(k, str) and k.startswith('_') and k != '_optionalAudio']:
+                        for key in [k for k in entry if isinstance(k, str) and k.startswith('_') and k not in RENDER_KEYS]:
                             del entry[key]
     total = _validate_timeline(project, minimum_duration)
     width, height = _frame_size(project) if not audio_only else (16, 16)
