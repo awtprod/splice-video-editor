@@ -1381,7 +1381,7 @@
     const element=videoFor(clip);
     if (!(element instanceof HTMLVideoElement) || element.readyState<2 || !element.videoWidth || !element.videoHeight) return false;
     if (Math.abs(element.videoWidth/element.videoHeight-canvas.width/canvas.height)>.01) return false;
-    if (window.SpliceEffects.live(clip.effects)) return false;
+    if (window.SpliceEffects.live(clip.effects, clip.keyframes)) return false;
     const opacity=animated(clip,"opacity",Number(clip.opacity??100));
     const scale=animated(clip,"scale",Number(clip.transform?.scale??100));
     const x=animated(clip,"x",Number(clip.transform?.x??0)), y=animated(clip,"y",Number(clip.transform?.y??0));

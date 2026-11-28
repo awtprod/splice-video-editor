@@ -378,9 +378,10 @@
 
   // ---------------------------------------------------------------- per-frame state for the monitor
   // What renders: bypassed and disabled effects are kept in the project and skipped here.
-  function live(effects) {
+  function live(effects, keyframes = null) {
     if (!effects || effects.bypass) return null;
-    const crop = effects.crop && effects.crop.enabled !== false && ['left', 'right', 'top', 'bottom'].some(k => effects.crop[k]) ? effects.crop : null;
+    const cropKeyed = keyframes && ['left', 'right', 'top', 'bottom'].some(k => keyframes['crop.'+k]?.length);
+    const crop = effects.crop && effects.crop.enabled !== false && (cropKeyed || ['left', 'right', 'top', 'bottom'].some(k => effects.crop[k])) ? effects.crop : null;
     const masks = (effects.masks || []).map((mask, index) => [index, mask]).filter(([, mask]) => mask.enabled !== false);
     const key = effects.key && effects.key.enabled !== false ? effects.key : null;
     const blend = effects.blend && effects.blend !== 'normal' ? effects.blend : null;
@@ -398,7 +399,7 @@
   // The prepared effects of one layer at clip-local time `local` (null when nothing applies).
   // `matrix` is the source's Y'CbCr matrix name (the key colour is converted with it).
   function layerFx(clip, local, matrix, alphaView = false) {
-    const fx = live(clip.effects);
+    const fx = live(clip.effects, clip.keyframes);
     if (!fx && !alphaView) return null;
     const out = {blend:fx?.blend || null, alphaView};
     if (fx?.crop) out.crop = cropParams(fx.crop, animatedValues(clip, 'crop.', Object.keys(CROP_PROPS), local));

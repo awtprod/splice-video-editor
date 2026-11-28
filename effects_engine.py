@@ -410,12 +410,13 @@ def validate_effects(effects):
     return out
 
 
-def active(effects):
+def active(effects, keyframes=None):
     """The effects that render: bypassed and disabled ones are kept in the project but skipped."""
     if not effects or effects.get('bypass'):
         return {'blend': 'normal', 'masks': []}
     crop = effects.get('crop')
-    crop = crop if crop and crop.get('enabled', True) and any(crop[name] for name in ('left', 'right', 'top', 'bottom')) else None
+    keyed = isinstance(keyframes, dict) and any(keyframes.get('crop.'+name) for name in ('left', 'right', 'top', 'bottom'))
+    crop = crop if crop and crop.get('enabled', True) and (keyed or any(crop[name] for name in ('left', 'right', 'top', 'bottom'))) else None
     masks = [mask for mask in effects.get('masks') or [] if mask.get('enabled', True)]
     key = effects.get('key')
     key = key if key and key.get('enabled', True) else None
@@ -899,7 +900,7 @@ def effects_for(clip):
     checked = validate_effects(clip.get('effects'))
     if not checked:
         return None
-    live = active(checked)
+    live = active(checked, clip.get('keyframes'))
     numbers = [number for number, mask in enumerate(checked.get('masks') or []) if mask.get('enabled', True)]
     live['masks'] = [checked['masks'][number] for number in numbers]
     live['_maskIndex'] = numbers
@@ -940,24 +941,28 @@ def blend_composite(filters, base, layer, output, position, first, frames, windo
     if first < 0:
         timing = f'trim=start_frame={-first},' + timing
     to_rgb = f'setparams=colorspace={SETPARAMS_MATRIX[matrix]}:range=tv,zscale,format={WORKING_FORMAT}'
+    layer_rgb = to_rgb
     alpha = base_format.startswith('yuva')
     o = output
     filters.append(f'[{layer}]format=yuva444p16le,{position},setsar=1,{timing},split[{o}_fg][{o}_a]')
     filters.append(f'[{base}]split[{o}_bg][{o}_b]')
     if alpha:
-        filters.append(f'[{o}_fg]{to_rgb},split[{o}_s][{o}_own]')
+        filters.append(f'[{o}_fg]{layer_rgb},split[{o}_s][{o}_own]')
         filters.append(f'[{o}_b]split[{o}_b1][{o}_b2]')
         filters.append(f'[{o}_b1]{to_rgb}[{o}_d]')
         filters.append(f"[{o}_s][{o}_d]blend=all_expr='{blend_expr(mode)}'[{o}_m0]")
         filters.append(f'[{o}_b2]extractplanes=a,format={WORKING_FORMAT}[{o}_bm]')
         filters.append(f'[{o}_own][{o}_m0][{o}_bm]maskedmerge[{o}_m]')
     else:
-        filters.append(f'[{o}_fg]{to_rgb}[{o}_s]')
+        filters.append(f'[{o}_fg]{layer_rgb}[{o}_s]')
         filters.append(f'[{o}_b]{to_rgb}[{o}_d]')
         filters.append(f"[{o}_s][{o}_d]blend=all_expr='{blend_expr(mode)}'[{o}_m]")
-    filters.append(f'[{o}_m]zscale=m={ZSCALE_MATRIX[matrix]}:r=limited,format=yuv444p16le[{o}_c]')
-    filters.append(f'[{o}_a]alphaextract[{o}_alpha]')
-    filters.append(f'[{o}_c][{o}_alpha]alphamerge[{o}_layer]')
+    # zscale quantizes to the composite's own depth: swscale's 16- to 10-bit step inside overlay
+    # moves non-code-aligned chroma by about two 10-bit steps.
+    depth = '16' if 'p16' in base_format else '10'
+    filters.append(f'[{o}_m]zscale=m={ZSCALE_MATRIX[matrix]}:r=limited,format=yuv444p{depth}le[{o}_c]')
+    filters.append(f'[{o}_a]alphaextract,format=gray{depth}le[{o}_alpha]')
+    filters.append(f'[{o}_c]format=yuva444p{depth}le[{o}_ca];[{o}_ca][{o}_alpha]alphamerge[{o}_layer]')
     # The layer is already on the frame and timed: composite it in place.
     _composite_layer(filters, f'{o}_bg', f'{o}_layer', o, 'x=0:y=0' if overlay else 'null', overlay, 0, window_frames,
                      window_frames, base_format)
