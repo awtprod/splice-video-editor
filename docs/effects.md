@@ -1,8 +1,12 @@
 # Effects
 
-> **Status: not merged yet.** Everything on this page comes from [PR #18](https://github.com/awtprod/splice-video-editor/pull/18), which was open and under review when this page was written (head `f58c84f`). None of it is on the `dev` branch until that PR merges, and details may change in review. If PR #18 changes, update this page to match.
+Effects live in **Inspector → Effects**. All of them are undoable, saved with the working project, and rendered the same way in the monitor and in exports (ProRes 422 HQ, ProRes 4444 with alpha, H.264 and 16-bit image sequences). The monitor and the exporter use twin implementations of the same maths, and the test suite compares them.
 
-Effects live in **Inspector → Effects**. All of them are undoable, saved with the working project, and rendered the same way in the monitor and in exports (ProRes 422 HQ, ProRes 4444 with alpha, and H.264). The monitor and the exporter use twin implementations of the same maths, and the test suite compares them.
+## Colour
+
+- An effect never changes a clip's colour. A graded clip with a crop, mask or key shows the same colour as the same clip graded without them. This holds for untagged, Rec. 601, Rec. 709, 16-bit and HDR (PQ, HLG) sources, in 8-bit, 10-bit and 16-bit deliveries.
+- An untagged source is read as Rec. 601, as in the monitor. That includes blend modes and image-sequence (TIFF, PNG, DPX, EXR) exports.
+- A clip with alpha (ProRes 4444, PNG) keeps its alpha at 16 bits when it is graded, with or without effects.
 
 ## Speed ramps
 
@@ -41,6 +45,7 @@ Normal, multiply, screen, overlay, add, darken, lighten, soft light, hard light 
 
 - Two-pass FFmpeg `vidstabdetect` / `vidstabtransform`. **Analyze** runs in the background and stops if you reset stabilization or delete the clip. Controls: smoothing, max shift, zoom, auto zoom and tripod.
 - The monitor shows the stabilized picture through an H.264 proxy made from the same analysis and transform. Export uses a lossless intermediate from the same analysis.
+- Every stabilized frame is the frame the plain clip shows at that time. That includes variable-frame-rate phone video, and MPEG-TS and AVCHD (`.ts`, `.mts`, `.m2ts`) files with long GOPs (x264's default is 250 frames).
 - The clip keeps its own sound from the original media, so its crossfades and dips are unchanged.
 - **Stabilization needs an FFmpeg built with libvidstab** (`--enable-libvidstab`). The bundled Windows FFmpeg has it. Without it, the Inspector says so and names the build flag. `python3 runtime_check.py` lists it among the optional features.
 
@@ -64,12 +69,14 @@ FCPXML, FCP 7 XML, EDL and OTIO do not carry these effects. The export report li
 
 ## Known issues
 
-From PR #18's own list:
+- **Keep pitch at 0.25× and slower, right after a transient** (a click or hit). Low sustained tones beside it are heavily distorted for a short time: the distortion is nearly as loud as the tone (about −4 dB below it on a 110 Hz tone). The tone's level is unaffected. Measured with a tone plus a 1 ms click, from 12 ms after the click:
+  - at 0.1×: about 70 ms on a 110 Hz tone, and about 200 ms on a 60 Hz tone;
+  - at 0.25×: about 30 ms.
 
-- **Slow motion right after a transient.** Until the curve passes the transient's own grain (about 8 ms of source, so 80 ms of output at 0.1×), the stretched sound beside it is a little rough in low tones.
+  The hit's own decay masks part of it in real material.
 - **A split whose pieces have different sound settings** (volume, effect, mode, a fade, automation, or a transition at the cut) keeps a hard cut, as any cut between two different sounds does. Pieces with the same settings play as one sound.
 - **MPEG-TS whose sound starts after its picture.** For clip In points under about 1.25 s, that sound can play early by the gap between the streams.
-- **Stabilization analyses made before this PR's fixes** report "outdated: analyze the clip again".
+- **Stabilization analyses made by earlier test builds** report "outdated: analyze the clip again".
+- **HDR (PQ, HLG) 4:2:0 or 4:2:2 sources tone-mapped to an image sequence.** A graded clip with a crop, mask or key can differ from the same clip without them by up to 20 8-bit codes at isolated pixels (mean under 1). Effects upsample chroma before the tone map, and the steep PQ and HLG curves magnify the difference. 4:4:4 sources match exactly.
 - **16-bit RGBA stills in ProRes 422 HQ** keep 87 levels of a 4096-step ramp. This is the same on `dev` and is not caused by effects.
-- **The Easing select shows "Ease in and"** (truncated) at 1440 × 900 and 1180 × 780; the full label is in the menu.
 - No blend modes on adjustment clips. No motion tracking: masks are positioned by hand and keyframed.

@@ -64,7 +64,8 @@ The turnover package can include a rendered reference movie with sequence timeco
 
 ## Correctness
 
-- Export pictures match the monitor, including variable-frame-rate, mixed-frame-rate and reversed footage, and sources with coarse time bases (phones, MKV, AVCHD/MPEG-TS).
+- Export pictures match the monitor, including variable-frame-rate, mixed-frame-rate and reversed footage, sources with coarse time bases (phones, MKV, AVCHD/MPEG-TS), and MPEG-TS/AVCHD files with long GOPs (FFmpeg starts a seek in those at the next keyframe; Splice checks and seeks earlier).
+- Image sequences read an untagged source as Rec. 601, as the monitor and the video deliveries do.
 - Disabled clips are left out, picture and sound. Hidden video and title tracks are left out; a hidden video track's camera sound still plays.
 - SDR exports are tagged Rec. 709.
 - Long H.264 timelines are rendered in bounded windows. On the delivery PR's test machine a 10-minute, 150-cut 1080p24 H.264 timeline took about 150 s with about 1.3 GiB peak memory, and a 100-minute timeline about 30 minutes. These are single measurements on one shared Linux machine.

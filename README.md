@@ -56,7 +56,7 @@ The existing v0.1.0 release (portable ZIPs for Windows, macOS and Linux) predate
   - **Encoders:** libx264 / libx264rgb, libx265 (8-, 10- and 12-bit), prores_ks, dnxhd, ffv1, libvpx-vp9, PNG, TIFF, DPX, EXR, AAC, PCM and mov_text.
   - **Filters:** among others zscale and tonemap (colour and HDR conversion), drawtext, lut1d and lut3d, geq, signalstats, ebur128, astats, acompressor, agate, biquad, atempo and join.
   - **Bitstream filters:** `h264_metadata`, `prores_metadata`. **Muxers and demuxers:** MP4, MOV, MXF, WAV, WebM, `ipod` (.m4a), Matroska, image2, lavfi, concat and the raw formats.
-  - **Optional:** `vidstabdetect` / `vidstabtransform` (stabilization, PR #18), `libsvtav1` (AV1 export), and the `prores_raw` decoder (Apple ProRes RAW; FFmpeg 8 or later).
+  - **Optional:** `vidstabdetect` / `vidstabtransform` (stabilization), `libsvtav1` (AV1 export), and the `prores_raw` decoder (Apple ProRes RAW; FFmpeg 8 or later).
 
   Ubuntu's packaged FFmpeg 8.0.1 passes the strict check. Other builds may lack zscale (libzimg) or vid.stab; run the check.
 - **The Windows installer bundles** gyan.dev's FFmpeg 9.1 "full_build-shared" (GPL v3, with vid.stab, Rubber Band, zimg, x264, x265, SVT-AV1 and the `prores_raw` decoder), embeddable Python 3.14.10 and Electron 45.5.0, each pinned by SHA-256. The app uses only its bundled FFmpeg and refuses to start, with a message, if that FFmpeg lacks a required feature. Versions and licences: [`desktop/windows/Third-party.txt`](desktop/windows/Third-party.txt).
@@ -82,7 +82,7 @@ The existing v0.1.0 release (portable ZIPs for Windows, macOS and Linux) predate
 | Audio | EQ, compressor, gate, de-noise; volume and pan automation; waveform and timecode sync; BS.1770 loudness targets; 4× oversampled true-peak limiter; 5.1; stems and isos | [Audio finishing](docs/audio.md) |
 | Delivery | Presets for web, HDR10, festival and broadcast masters, archive and proxies; ProRes, DNxHR, H.264, HEVC, AV1, image sequences; render queue; feature-length timelines | [Delivery and the render queue](docs/delivery.md) |
 | Camera RAW | CinemaDNG and ProRes RAW built in; BRAW, R3D, ARRIRAW and others through vendor decoders (**verified only with mock decoders**) | [Camera RAW](docs/camera-raw.md) |
-| Effects (**not merged**, PR #18) | Speed ramps, bezier easing, crop and masks, chroma key, blend modes, stabilization | [Effects](docs/effects.md) |
+| Effects | Speed ramps, bezier easing, crop and masks, chroma key, blend modes, stabilization | [Effects](docs/effects.md) |
 | Interchange | Premiere, FCPXML, FCP 7 XML, EDL, OTIO, Resolve read and write, with loss reports | [Interchange and Resolve round-trip](docs/interchange.md) |
 | Windows | Installer, data locations, troubleshooting | [Windows](docs/windows.md) |
 
@@ -126,7 +126,6 @@ Not yet as your only NLE. Splice can cut, grade, mix and deliver a short, docume
 
 **Missing or limited**
 
-- Effects (speed ramps, masks, keys, blend modes, stabilization) are in PR #18, not merged. [Effects](docs/effects.md)
 - Colour: no secondaries or qualifiers, tracking, video noise reduction or ACES; HDR is previewed tone-mapped on an SDR display; scopes read the 8-bit preview.
 - Audio: live monitoring is stereo only; stems are taken before master dynamics and may not null against a limited mix.
 - Delivery: no DCP, IMF, Dolby Vision or embedded CEA-608/708 captions. MP4 AAC can overshoot the true-peak ceiling after encoding by default (reported; opt-in protection available).
@@ -160,7 +159,7 @@ DM Sans and IBM Plex Mono are distributed under the SIL Open Font License; their
 - [Audio finishing](docs/audio.md): effects, automation, sync, LUFS, true peak, 5.1, stems
 - [Delivery and the render queue](docs/delivery.md): formats, presets, cancel behaviour, limits
 - [Camera RAW](docs/camera-raw.md): built-in formats, vendor decoders, what is verified
-- [Effects](docs/effects.md) (PR #18, not merged)
+- [Effects](docs/effects.md)
 - [Interchange and the Resolve round-trip](docs/interchange.md), including the loss reports
 - [Windows: install and troubleshooting](docs/windows.md)
 - [Can it replace Premiere, Resolve or Final Cut Pro?](docs/can-it-replace-commercial-nles.md)

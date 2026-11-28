@@ -100,7 +100,7 @@ FCPXML, FCP 7 XML, EDL and OTIO keep the original RAW path, reel and timecode. O
 ## Known limits
 
 - **Vendor decoders and real camera files are untested** (see the note at the top).
-- RAW clips cannot be stabilized yet (effects PR #18): export a copy and stabilize that.
+- RAW clips cannot be stabilized yet: export a copy and stabilize that.
 - The pure-Python CinemaDNG developer is slow.
 - ProRes RAW primaries stay camera-native.
 - A CinemaDNG sequence with missing frame numbers plays later frames early; the Inspector says how many are missing.
