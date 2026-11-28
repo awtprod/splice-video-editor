@@ -22,12 +22,14 @@ async function main() {
   const splice = await startSplice('splice-effects-controls-');
   const proof = process.env.SPLICE_PROOF_DIR, screens = proof && path.join(proof, 'screens');
   if (screens) fs.mkdirSync(screens, {recursive:true});
+  let pageErrors = [];
   try {
     const files = {bg:path.join(splice.temp, 'bg.mp4'), green:path.join(splice.temp, 'green.mp4'), shaky:path.join(splice.temp, 'shaky.mp4')};
     source(files.bg, `testsrc2=s=${W}x${H}:r=25`);
     source(files.green, `color=c=0x20c040:s=${W}x${H}:r=25,drawbox=x=240:y=110:w=160:h=140:c=0xc04060:t=fill`);
     source(files.shaky, "testsrc2=s=960x540:r=25,crop=640:360:x='160+60*(random(1)-0.5)':y='90+40*(random(2)-0.5)'", 5);
     const {page, errors} = await openPage(splice, {width:1440, height:900});
+    pageErrors = errors;
     page.setDefaultTimeout(60000);
     await page.evaluate(({W, H}) => SpliceSession.newProject({name:'Effects controls', width:W, height:H, fps:25}), {W, H});
     await page.locator('#media-input').setInputFiles(Object.values(files));
@@ -39,7 +41,7 @@ async function main() {
           {id:'bg', type:'video', mediaId:id('bg'), track:1, start:0, duration:3, in:0, embeddedAudio:false, transition:'none', color:{}},
           {id:'key', type:'video', mediaId:id('green'), track:2, start:0, duration:3, in:0, embeddedAudio:false, transition:'none', color:{}},
           {id:'ramp', type:'video', mediaId:id('bg'), track:1, start:4, duration:2, in:.5, embeddedAudio:false, transition:'none', color:{}},
-          {id:'shaky', type:'video', mediaId:id('shaky'), track:1, start:8, duration:3, in:1, embeddedAudio:false, transition:'none', color:{}}];
+          {id:'shaky', type:'video', mediaId:id('shaky'), track:1, start:14, duration:3, in:1, embeddedAudio:false, transition:'none', color:{}}];
       });
     });
     const inspector = page.locator('#inspector-content, .inspector-content').first();
@@ -92,19 +94,27 @@ async function main() {
     await page.waitForFunction(() => Editor.get().project.clips.find(c => c.id === 'key').keyframes?.['crop.left']?.length === 2);
     await openGroup('easing');
     await page.selectOption('[data-fx-ease-key]', 'crop.left');
+    await page.locator('[data-fx-ease]').waitFor({timeout:5000}).catch(async error => {
+      console.error('easing group:', await page.evaluate(() => document.querySelector('[data-fx-group="easing"]')?.outerHTML.slice(0, 600)),
+        JSON.stringify(await page.evaluate(() => Editor.get().project.clips.find(c => c.id === 'key').keyframes)));
+      throw error;
+    });
     await page.selectOption('[data-fx-ease]', 'bezier');
     await page.waitForFunction(() => Editor.get().project.clips.find(c => c.id === 'key').keyframes['crop.left'][0].interp === 'bezier');
+    const beforeDrag = JSON.stringify((await clipById(page, 'key')).keyframes['crop.left']);
     const handle = page.locator('.fx-handle.live[data-fx-handle="out"]');
+    await handle.scrollIntoViewIfNeeded();
     const box = await handle.boundingBox();
     await page.mouse.move(box.x+box.width/2, box.y+box.height/2);
-    await page.mouse.down(); await page.mouse.move(box.x-10, box.y+30, {steps:4}); await page.mouse.up();
+    // Up and to the right: a fast start (the default ease-in-out handle is at 0.42, 0).
+    await page.mouse.down(); await page.mouse.move(box.x+box.width/2+12, box.y+box.height/2-40, {steps:5}); await page.mouse.up();
     const eased = (await clipById(page, 'key')).keyframes['crop.left'][0];
-    assert.ok(eased.outHandle[1] < .3, 'dragging the handle down eases the start: '+JSON.stringify(eased));
+    assert.ok(eased.outHandle[1] > .2 && eased.outHandle[0] > .42, 'dragging the handle reshapes the curve: '+JSON.stringify(eased));
     if (screens) await page.locator('[data-fx-group="easing"]').screenshot({path:path.join(screens, 'curve-editor-1440x900.png')});
     const mid = await page.evaluate(() => { const c = Editor.get().project.clips.find(c => c.id === 'key'); return SpliceEffects.curveValue(c.keyframes['crop.left'], 1.25, 0); });
-    assert.ok(mid < 25, 'the eased curve stays low at the middle: '+mid);
+    assert.ok(mid > 26, 'the reshaped curve rises early: '+mid);
     await page.evaluate(() => Editor.undo());   // the drag is one undo step
-    assert.ok((await clipById(page, 'key')).keyframes['crop.left'][0].outHandle[1] > .3 || true);
+    assert.equal(JSON.stringify((await clipById(page, 'key')).keyframes['crop.left']), beforeDrag, 'one undo reverts the whole drag');
     console.log('Easing: keyframe from the crop control, Custom bezier, handle drag in the curve editor, one undo step.');
 
     // ---- 3. Masks: add, handles on the monitor, drag the centre, undo.
@@ -158,13 +168,14 @@ async function main() {
     console.log('Chroma key: eyedropper from the clip under the click, alpha matte view (monitor only), blend mode.');
 
     // ---- 5. Stabilization: analyze in the background, then the monitor plays the stabilized preview.
-    await select('shaky', 9);
+    await select('shaky', 15);
     await openGroup('stabilize');
     await page.waitForFunction(() => SpliceEffectsUI.capabilities.checked);
     const vidstab = await page.evaluate(() => SpliceEffectsUI.capabilities.vidstab);
     if (vidstab) {
       await page.locator('[data-fx-analyze]').click();
-      await page.waitForFunction(() => { const s = Editor.get().project.clips.find(c => c.id === 'shaky').effects?.stabilize; return s && SpliceEffectsUI.jobs.get(s.analysis)?.state === 'done'; }, null, {timeout:120000});
+      await page.waitForFunction(() => { const s = Editor.get().project.clips.find(c => c.id === 'shaky').effects?.stabilize; return s && SpliceEffectsUI.jobs.get(s.analysis)?.state === 'done'; }, null, {timeout:120000})
+        .catch(async error => { console.error('stabilize:', await page.evaluate(() => JSON.stringify([...SpliceEffectsUI.jobs], null, 0)+' '+JSON.stringify(Editor.get().project.clips.find(c => c.id === 'shaky').effects))); throw error; });
       await page.waitForFunction(() => /shake/.test(document.querySelector('[data-fx-group="stabilize"]').textContent));
       await page.waitForFunction(() => /\/media\/\.effects\/stabilize\//.test(Editor.get().video?.currentSrc || ''), null, {timeout:120000});
       const smoothing = page.locator('input[data-fx="stabilize.smoothing"]');
@@ -229,7 +240,8 @@ async function main() {
       await page.setViewportSize({width, height});
       await select('key', 1);
       await page.evaluate(() => Editor.updateClip('key', {effects:{...Editor.get().project.clips.find(c => c.id === 'key').effects,
-        masks:[{shape:'polygon', x:50, y:50, width:100, height:100, points:[[-30, -30], [30, -25], [25, 30], [-28, 25]]}]}}));
+        masks:[{shape:'polygon', x:50, y:50, width:100, height:100, points:[[-30, -30], [30, -25], [25, 30], [-28, 25]]}]},
+        keyframes:{opacity:[{time:0, value:20, interp:'bezier', outHandle:[.25, .9]}, {time:2, value:100, inHandle:[.7, .4]}]}}));
       for (const group of ['crop', 'masks', 'key', 'blend', 'easing', 'stabilize']) await openGroup(group).catch(() => {});
       await settle(page);
       const overflow = await page.evaluate(() => {
@@ -240,23 +252,26 @@ async function main() {
         }
         return out;
       });
-      assert.deepEqual(overflow, [], `nothing in the Effects panel spills out of it at ${width}x${height}`);
+      assert.deepEqual(overflow, [], `nothing in the Effects panel spills out of it at ${width}x${height}: ${overflow.join(" | ")}`);
       if (screens) {
-        await page.screenshot({path:path.join(screens, `effects-inspector-${width}x${height}.png`)});
-        await page.locator('[data-fx-tools]').screenshot({path:path.join(screens, `effects-panel-${width}x${height}.png`)});
-        await select('ramp', 4.5); await openGroup('speed'); await settle(page);
-        await page.screenshot({path:path.join(screens, `speed-ramp-${width}x${height}.png`)});
-        await select('key', 1); await openGroup('masks'); await settle(page);
-        await page.locator('#monitor-frame').screenshot({path:path.join(screens, `mask-overlay-${width}x${height}.png`)});
-        await openGroup('easing'); await settle(page);
-        await page.locator('[data-fx-group="easing"]').screenshot({path:path.join(screens, `curve-editor-${width}x${height}.png`)});
-        await page.locator('[data-fx-group="key"]').screenshot({path:path.join(screens, `chroma-key-${width}x${height}.png`)});
-        await select('shaky', 9); await openGroup('stabilize'); await settle(page);
-        await page.locator('[data-fx-group="stabilize"]').screenshot({path:path.join(screens, `stabilization-${width}x${height}.png`)});
+        // Each group scrolled into the inspector's view, with the monitor beside it.
+        const shot = async (id, time, group, name) => {
+          await select(id, time); const node = await openGroup(group); await node.scrollIntoViewIfNeeded(); await settle(page);
+          await page.screenshot({path:path.join(screens, `${name}-${width}x${height}.png`)});
+        };
+        await shot('ramp', 4.5, 'speed', 'speed-ramp');
+        await shot('key', 1, 'masks', 'mask-overlay');
+        await shot('key', 1, 'easing', 'curve-editor');
+        await shot('key', 1, 'key', 'chroma-key');
+        await shot('key', 1, 'blend', 'effects-inspector');
+        await shot('shaky', 15, 'stabilize', 'stabilization');
       }
     }
     assert.deepEqual(errors, []);
     console.log('Effects controls: all flows pass at 1440x900, 1180x780 and 1024x640.');
+  } catch (error) {
+    if (pageErrors.length) console.error('Page errors:', pageErrors);
+    throw error;
   } finally {
     await splice.stop();
   }

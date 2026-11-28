@@ -24,19 +24,21 @@
 .fx-speed-curve .fx-unity{stroke:#4b5a49;stroke-dasharray:3 3}
 .fx-speed-curve .fx-playhead{stroke:#f5d76e;stroke-width:1}
 .fx-knots{display:grid;gap:4px}
-.fx-knot{display:grid;grid-template-columns:52px minmax(48px,64px) minmax(0,1fr) 26px;gap:4px;align-items:center}
+.fx-knot{display:grid;grid-template-columns:56px minmax(48px,1fr) 28px;gap:4px;align-items:center;padding-bottom:4px;border-bottom:1px solid #262d26}
+.fx-knot select{grid-column:1/-1;grid-row:2}
 .fx-knot input,.fx-knot select,.fx-handle-numbers input{background:#252d25;color:#e7eee7;border:1px solid #465346;border-radius:4px;padding:4px 5px;font:11px 'DM Sans',sans-serif;min-width:0;width:100%;box-sizing:border-box}
 .fx-segments{display:flex;flex-wrap:wrap;gap:4px}
-.fx-curve-editor{display:grid;grid-template-columns:132px minmax(0,1fr);gap:8px;align-items:start}
+.fx-curve-editor{display:grid;grid-template-columns:minmax(0,1fr);gap:8px;justify-items:start}
 .fx-curve-editor svg{width:132px;height:132px;background:#0c110d;border:1px solid #3c483b;border-radius:4px;touch-action:none}
+.fx-curve-editor svg:focus-visible{outline:2px solid #c4ee78}
 .fx-curve-editor polyline{fill:none;stroke:#c4ee78;stroke-width:1.8}
 .fx-curve-editor .fx-frame{fill:none;stroke:#2f382e}
 .fx-curve-editor .fx-arm{stroke:#7f8f7c;stroke-width:1}
 .fx-curve-editor .fx-handle{fill:#202820;stroke:#7f8f7c;stroke-width:1.5}
 .fx-curve-editor .fx-handle.live{fill:#c4ee78;stroke:#11160f;cursor:grab}
-.fx-curve-editor .splice-handle{grid-column:2;margin:0}
-.fx-handle-numbers{display:grid;grid-template-columns:1fr 1fr;gap:4px}
-.fx-handle-numbers label{display:grid;gap:2px;font-size:10px;color:#9fb09c}
+.fx-curve-editor .splice-handle{margin:0}
+.fx-handle-numbers{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:4px;width:100%}
+.fx-handle-numbers label{display:grid;gap:2px;font-size:10px;color:#9fb09c;min-width:0}
 .fx-mask{border-top:1px solid #2b322b;padding-top:6px;display:grid;gap:8px}
 .fx-mask-head{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:11px;color:#b9c8b9}
 .fx-mask-head label{display:flex;align-items:center;gap:3px}

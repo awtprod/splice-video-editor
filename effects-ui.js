@@ -93,7 +93,7 @@
     const [name, x1, y1, x2, y2] = kind;
     const handles = name === 'bezier' || name === 'linear' ? `<line class="fx-arm" x1="${x(0)}" y1="${y(0)}" x2="${x(x1)}" y2="${y(y1)}"/><line class="fx-arm" x1="${x(1)}" y1="${y(1)}" x2="${x(x2)}" y2="${y(y2)}"/>` +
       `<circle class="fx-handle ${editable ? 'live' : ''}" data-fx-handle="out" cx="${x(x1)}" cy="${y(y1)}" r="6"/><circle class="fx-handle ${editable ? 'live' : ''}" data-fx-handle="in" cx="${x(x2)}" cy="${y(y2)}" r="6"/>` : '';
-    return `<div class="fx-curve-editor"><svg viewBox="0 0 ${size} ${size}" data-fx-curve role="img" aria-label="Easing curve: time across, value up${editable ? '. Drag the handles to shape it.' : ''}">` +
+    return `<div class="fx-curve-editor"><svg viewBox="0 0 ${size} ${size}" data-fx-curve tabindex="0" role="img" aria-label="Easing curve: time across, value up${editable ? '. Drag the handles to shape it.' : ''}">` +
       `<rect class="fx-frame" x="${pad}" y="${pad}" width="${size-2*pad}" height="${size-2*pad}"/><polyline points="${curve.join(' ')}"/>${handles}</svg>` +
       (editable ? `<div class="fx-handle-numbers">${[['out', 0, x1], ['out', 1, y1], ['in', 0, x2], ['in', 1, y2]].map(([handle, axis, value]) =>
         `<label><span>${handle === 'out' ? 'Out' : 'In'} ${axis ? 'y' : 'x'}</span><input type="number" data-fx-handle-number="${handle}" data-axis="${axis}" min="${axis ? -2 : 0}" max="${axis ? 3 : 1}" step=".01" value="${Math.round(value*100)/100}" aria-label="${handle === 'out' ? 'Outgoing' : 'Incoming'} handle ${axis ? 'value' : 'time'}"></label>`).join('')}</div>` :
@@ -154,7 +154,7 @@
       (s ? `<label><input type="checkbox" data-fx-toggle="stabilize" ${s.enabled !== false ? 'checked' : ''}> On</label><button type="button" data-fx-stabilize-reset>Reset</button>` : '') + '</div>';
     if (status?.state === 'running') body += `<p class="splice-handle" role="status">Analyzing motion… ${Math.round((status.progress || 0)*100)}%</p>`;
     else if (status?.state === 'failed') body += `<p class="splice-compat" role="alert">${esc(status.error)}</p>`;
-    else if (s?.analysis && status?.state === 'done') body += `<p class="splice-handle" role="status">Analyzed ${status.frames} frames${status.shake ? ` · shake ${status.shake.before.toFixed(2)} → ${status.shake.after.toFixed(2)} px/frame` : ''}.</p>`;
+    else if (s?.analysis && status?.state === 'done') body += `<p class="splice-handle" role="status">Analyzed ${status.frames} frames${Number.isFinite(status.shake?.before) ? ` · measured shake ${status.shake.before.toFixed(1)} px/frame` : ''}.</p>`;
     if (s) body += Object.entries(E.STABILIZE_PROPS).filter(([name]) => name !== 'autoZoom').map(([name, [low, high, base]]) =>
       slider({smoothing:'Smoothing (frames)', maxShift:'Max shift (px, -1 any)', zoom:'Zoom'}[name], 'stabilize.'+name, s[name] ?? base, low, high, 1, name === 'zoom' ? '%' : '', false, null)).join('') +
       `<label class="splice-number"><span>Auto zoom</span><select aria-label="Stabilization auto zoom" data-fx-stabilize-zoom>${[['0', 'Off'], ['1', 'Fill (static)'], ['2', 'Adaptive']].map(([value, name]) => `<option value="${value}" ${String(s.autoZoom ?? 1) === value ? 'selected' : ''}>${name}</option>`).join('')}</select></label>` +
@@ -226,7 +226,11 @@
     const current = () => editor.get().project.clips.find(c => c.id === clip.id) || clip;
     const locked = !!editor.isTrackLocked?.(clip.track, clip.type);
     if (locked) for (const input of box.querySelectorAll('input,select,button')) input.disabled = true;
-    for (const group of box.querySelectorAll('[data-fx-group]')) group.addEventListener('toggle', () => { group.open ? open.add(group.dataset.fxGroup) : open.delete(group.dataset.fxGroup); });
+    // Remember open groups at the click (a toggle event can arrive after the inspector re-renders).
+    for (const group of box.querySelectorAll('[data-fx-group]')) group.querySelector('summary').addEventListener('click', () => {
+      if (group.open) open.delete(group.dataset.fxGroup); else open.add(group.dataset.fxGroup);
+      if (group.dataset.fxGroup === 'masks') requestAnimationFrame(() => overlay.refresh());
+    });
     box.querySelector('[data-fx-bypass]')?.addEventListener('change', event => update(editor, current(), {effects:{...effectsOf(current()), bypass:event.target.checked}}));
     box.querySelector('[data-fx-reset]')?.addEventListener('click', () => {
       const keys = Object.fromEntries(Object.entries(current().keyframes || {}).filter(([key]) => !E.isEffectKey(key) || key === 'speed'));
@@ -324,15 +328,16 @@
       event.preventDefault();
       const which = handle.dataset.fxHandle, rect = curve.getBoundingClientRect(), size = 132, pad = 14;
       editor.beginGesture();
-      handle.setPointerCapture(event.pointerId);
+      // Focus inside the inspector keeps it from re-rendering under the drag (as the colour wheels do).
+      curve.focus({preventScroll:true});
       const move = moveEvent => {
         const u = clamp(((moveEvent.clientX-rect.left)/rect.width*size-pad)/(size-2*pad), 0, 1);
         const v = clamp((size-pad-(moveEvent.clientY-rect.top)/rect.height*size)/(size-2*pad), -2, 3);
         setSegment((a, b) => { if (which === 'out') a.outHandle = [Math.round(u*1000)/1000, Math.round(v*1000)/1000]; else b.inHandle = [Math.round(u*1000)/1000, Math.round(v*1000)/1000]; }, true);
         handle.setAttribute('cx', pad+u*(size-2*pad)); handle.setAttribute('cy', size-pad-v*(size-2*pad));
       };
-      const up = () => { handle.removeEventListener('pointermove', move); handle.removeEventListener('pointerup', up); handle.removeEventListener('pointercancel', up); editor.endGesture(); rerender(); };
-      handle.addEventListener('pointermove', move); handle.addEventListener('pointerup', up); handle.addEventListener('pointercancel', up);
+      const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); window.removeEventListener('pointercancel', up); editor.endGesture(); rerender(); };
+      window.addEventListener('pointermove', move); window.addEventListener('pointerup', up); window.addEventListener('pointercancel', up);
     });
     // ---- masks
     for (const button of box.querySelectorAll('[data-fx-mask-add]')) button.addEventListener('click', () => {
@@ -414,13 +419,13 @@
   }
   function poll(id, editor, rerender) {
     const step = async () => {
-      try {
-        const status = await api('/api/effects/stabilize?id='+encodeURIComponent(id));
-        jobs.set(id, status);
-        rerender();
-        if (status.state === 'running') setTimeout(step, 500);
-        else if (status.state === 'done') editor.refreshMedia();
-      } catch (error) { jobs.set(id, {state:'failed', error:error.message}); rerender(); }
+      let status;
+      try { status = await api('/api/effects/stabilize?id='+encodeURIComponent(id)); }
+      catch (error) { jobs.set(id, {state:'failed', error:error.message}); rerender(); return; }
+      jobs.set(id, status);
+      if (status.state === 'running') setTimeout(step, 500);
+      else if (status.state === 'done') editor.refreshMedia();
+      rerender();
     };
     step();
   }
@@ -507,7 +512,7 @@
       const read = name => valueAt(start(clip), `mask.${index}.${name}`, base[name] ?? E.MASK_PROPS[name][2], t);
       const x0 = read('x'), y0 = read('y'), rot0 = read('rotation');
       editor.beginGesture();
-      handle.setPointerCapture(event.pointerId);
+      // The overlay redraws as the mask moves: follow the pointer on the window, not the handle.
       const write = (values, extra) => {
         let live = start(clip);
         const effects = structuredClone(live.effects);
@@ -539,28 +544,29 @@
           });
         }
       };
-      const up = () => { handle.removeEventListener('pointermove', move); handle.removeEventListener('pointerup', up); handle.removeEventListener('pointercancel', up); editor.endGesture(); };
-      handle.addEventListener('pointermove', move); handle.addEventListener('pointerup', up); handle.addEventListener('pointercancel', up);
+      const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); window.removeEventListener('pointercancel', up); editor.endGesture(); };
+      window.addEventListener('pointermove', move); window.addEventListener('pointerup', up); window.addEventListener('pointercancel', up);
     }
-    // Eyedropper: the colour of the clip's own decoded picture under the click (not the keyed composite).
+    // Eyedropper: the clip's own picture under the click, decoded exactly as the monitor and the
+    // export decode it (the clip drawn alone, without its grade or effects), not the keyed composite.
     function pick(event) {
       if (!picking) return;
       event.preventDefault(); event.stopPropagation();
       picking = false;
       const editor = window.Editor, state = editor.get(), clip = state.selected, canvas = event.currentTarget;
-      const frame = document.getElementById('monitor-frame').getBoundingClientRect();
-      if (!clip) return;
-      const g = geometry(state, clip, canvas);
-      const [u, v] = g.toUv(event.clientX-frame.left, event.clientY-frame.top);
+      if (!clip) return refresh();
       const plan = editor.framePlan(canvas), op = plan.ops.flatMap(o => [o, o.outgoing, o.incoming]).find(o => o?.clip?.id === clip.id);
-      const element = op?.element;
-      if (!element || u < 0 || u > 1 || v < 0 || v > 1) { notify('Click inside the selected clip to sample its colour.'); return refresh(); }
-      const probe = document.createElement('canvas'), sw = element.videoWidth || element.width, sh = element.videoHeight || element.height;
-      probe.width = 1; probe.height = 1;
-      const ctx = probe.getContext('2d', {willReadFrequently:true});
-      ctx.drawImage(element, clamp(Math.floor(u*sw)-1, 0, sw-3), clamp(Math.floor(v*sh)-1, 0, sh-3), 3, 3, 0, 0, 1, 1);
-      const [r, gg, b] = ctx.getImageData(0, 0, 1, 1).data;
-      const color = '#'+[r, gg, b].map(value => value.toString(16).padStart(2, '0')).join('');
+      const rect = canvas.getBoundingClientRect();
+      const x = Math.floor((event.clientX-rect.left)*canvas.width/rect.width), y = Math.floor((event.clientY-rect.top)*canvas.height/rect.height);
+      if (!op || op.type !== 'video') { notify('Move the playhead over the selected clip to sample its colour.'); return refresh(); }
+      const probe = document.createElement('canvas');
+      probe.width = canvas.width; probe.height = canvas.height;
+      window.SplicePicture.render(probe, {width:canvas.width, height:canvas.height, view:'normal',
+        ops:[{...op, fx:null, grade:null, alpha:1, brightness:1, wipe:null, wipeOut:null}]});
+      const data = probe.getContext('2d').getImageData(Math.max(0, x-1), Math.max(0, y-1), 3, 3).data, sum = [0, 0, 0, 0];
+      for (let i = 0; i < data.length; i += 4) for (let c = 0; c < 4; c++) sum[c] += data[i+c];
+      if (sum[3] < 9*128) { notify('Click inside the selected clip to sample its colour.'); return refresh(); }
+      const color = '#'+sum.slice(0, 3).map(value => Math.round(value/9).toString(16).padStart(2, '0')).join('');
       const effects = structuredClone(clip.effects || {});
       effects.key = {similarity:20, smoothness:10, spill:50, ...(effects.key || {}), color, enabled:true};
       try { editor.updateClip(clip.id, {effects}); } catch (error) { notify(error.message); }
