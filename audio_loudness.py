@@ -27,6 +27,8 @@ import sys
 import threading
 import time
 
+import splice_platform
+
 RATE = 48000
 OVERSAMPLE = 4
 # Envelope resolution: one gain value per WINDOW input samples (0.25 ms).
@@ -150,8 +152,8 @@ class _Stream:
         self.stop_tree = _stop_tree
         self.stall = _stall_seconds()
         self.cancelled, self.heartbeat = cancelled, heartbeat
-        self.process = subprocess.Popen(command, stdin=subprocess.PIPE if stdin else subprocess.DEVNULL,
-                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.process = splice_platform.popen(command, stdin=subprocess.PIPE if stdin else subprocess.DEVNULL,
+                                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.errors = []
         self.last = time.monotonic()
         self.done = threading.Event()

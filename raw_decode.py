@@ -366,11 +366,11 @@ def ffmpeg_has_prores_raw() -> tuple[bool, str | None]:
     if not ffmpeg:
         return False, None
     try:
-        dec = subprocess.run([ffmpeg, '-hide_banner', '-decoders'], capture_output=True, text=True, timeout=8,
-                             stdin=subprocess.DEVNULL)
+        dec = splice_platform.run([ffmpeg, '-hide_banner', '-decoders'], capture_output=True, text=True, timeout=8,
+                                  stdin=subprocess.DEVNULL)
         has_dec = 'prores_raw' in dec.stdout
-        ver_out = subprocess.run([ffmpeg, '-version'], capture_output=True, text=True, timeout=8,
-                                 stdin=subprocess.DEVNULL).stdout.splitlines()
+        ver_out = splice_platform.run([ffmpeg, '-version'], capture_output=True, text=True, timeout=8,
+                                      stdin=subprocess.DEVNULL).stdout.splitlines()
         match = re.match(r'ffmpeg version (\S+)', ver_out[0]) if ver_out else None
         version = f'FFmpeg {match.group(1)}' if match else 'FFmpeg'
         return has_dec, version
@@ -854,7 +854,7 @@ def _ffprobe_optional(path: Path) -> dict | None:
     if not ffprobe:
         return None
     try:
-        res = subprocess.run(
+        res = splice_platform.run(
             [ffprobe, '-v', 'error', '-protocol_whitelist', 'file', '-show_streams', '-show_format',
              '-of', 'json', str(path)],
             capture_output=True, timeout=15, stdin=subprocess.DEVNULL,
@@ -1486,7 +1486,7 @@ def _ffmpeg_pipe_encode(frames_iter, width: int, height: int, fps: Fraction, out
            *_output_args(is_intermediate, seek_optimized, audio_map is not None, audio_map or '', fps),
            '-t', f'{float(frame_total / fps):.6f}', str(out_path)]
     errors = tempfile.TemporaryFile()
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=errors)
+    proc = splice_platform.popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=errors)
     try:
         written = 0
         for frame in frames_iter:
@@ -1519,9 +1519,9 @@ def _ffmpeg_bayer_plane(path: Path, meta: dict):
     """Unpack a compressed (lossless-JPEG) DNG frame with FFmpeg's tiff decoder. FFmpeg subtracts
     the black level and scales to 16 bits but applies no colour, so the plane goes through the
     same white balance / matrix / transfer as uncompressed frames."""
-    pix = subprocess.run(['ffprobe', '-v', 'error', '-protocol_whitelist', 'file', '-select_streams', 'v:0',
+    pix = splice_platform.run(['ffprobe', '-v', 'error', '-protocol_whitelist', 'file', '-select_streams', 'v:0',
                           '-show_entries', 'stream=pix_fmt,width,height', '-of', 'json', 'file:' + str(path)],
-                         capture_output=True, timeout=30, stdin=subprocess.DEVNULL)
+                              capture_output=True, timeout=30, stdin=subprocess.DEVNULL)
     try:
         stream = json.loads(pix.stdout)['streams'][0]
     except (ValueError, KeyError, IndexError, TypeError):
@@ -1531,9 +1531,9 @@ def _ffmpeg_bayer_plane(path: Path, meta: dict):
     if not match or (stream.get('width'), stream.get('height')) != (meta['width'], meta['height']):
         raise RawError(f'FFmpeg decodes {path.name} as {fmt or "an unknown format"}, not a {meta["width"]}x'
                        f'{meta["height"]} Bayer plane. Install LibRaw (File > RAW Decoders…) for this DNG.')
-    out = subprocess.run(['ffmpeg', '-nostdin', '-v', 'error', '-protocol_whitelist', 'file', '-i', 'file:' + str(path),
+    out = splice_platform.run(['ffmpeg', '-nostdin', '-v', 'error', '-protocol_whitelist', 'file', '-i', 'file:' + str(path),
                           '-frames:v', '1', '-f', 'rawvideo', '-pix_fmt', fmt, 'pipe:1'],
-                         capture_output=True, timeout=120, stdin=subprocess.DEVNULL)
+                              capture_output=True, timeout=120, stdin=subprocess.DEVNULL)
     need = meta['width'] * meta['height'] * 2
     if out.returncode or len(out.stdout) != need:
         raise RawError(f'FFmpeg could not unpack {path.name}: ' + out.stderr.decode('utf-8', 'replace')[-300:])
@@ -1675,7 +1675,7 @@ def _spawn(argv: list[str]):
     fill a pipe and stall while Splice is reading frames from its stdout."""
     errors = tempfile.TemporaryFile()
     try:
-        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=errors)
+        proc = splice_platform.popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=errors)
     except OSError as error:
         errors.close()
         raise RawError(f'Could not start {Path(argv[0]).name}: {error.strerror or error}') from None
@@ -1844,8 +1844,8 @@ def _run_tool(argv: list[str], job: _Job, label: str, timeout: float):
     tool and everything it started within about 0.1 s, and leaves no process behind."""
     errors = tempfile.TemporaryFile()
     try:
-        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=errors,
-                                start_new_session=os.name != 'nt')
+        proc = splice_platform.popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=errors,
+                                     start_new_session=os.name != 'nt')
     except OSError as error:
         errors.close()
         raise RawError(f'Could not start {label}: {error.strerror or error}') from None
@@ -2099,7 +2099,7 @@ def _generate_missing_decoder_proxy(path: Path, out_path: Path, info: dict, audi
     stream = audio_stream if isinstance(audio_stream, int) and 0 <= audio_stream < 16 else 0
     cmd += ['-map', f'1:a:{stream}?', '-c:a', 'aac', '-b:a', '160k', '-ac', '2'] if sound else ['-an']
     cmd += ['-t', f'{duration:.6f}', '-movflags', '+faststart', str(out_path)]
-    result = subprocess.run(cmd, capture_output=True, timeout=600, stdin=subprocess.DEVNULL)
+    result = splice_platform.run(cmd, capture_output=True, timeout=600, stdin=subprocess.DEVNULL)
     if result.returncode:
         raise RawError('Could not create the RAW slate proxy: ' + result.stderr.decode('utf-8', 'replace')[-300:])
 

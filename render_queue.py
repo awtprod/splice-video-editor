@@ -28,6 +28,7 @@ import time
 import uuid
 
 import delivery
+import splice_platform
 from render_movie import _export_settings
 
 MAX_JOBS = 500
@@ -461,8 +462,8 @@ class RenderQueue:
             else:
                 command = ['xdg-open', str(path if path.is_dir() else path.parent)]
             if shutil.which(command[0]):
-                subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                 start_new_session=os.name != 'nt')
+                splice_platform.popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                      start_new_session=os.name != 'nt')
         return str(path)
 
     def _find(self, identifier):

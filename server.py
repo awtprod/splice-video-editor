@@ -24,6 +24,7 @@ import re
 import secrets
 import shutil
 import signal
+import socket
 import sys
 from export_jobs import ExportJobs
 import json
@@ -706,6 +707,20 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class StudioServer(ThreadingHTTPServer):
+    # On Windows SO_REUSEADDR lets a second socket bind the same address and port, even from
+    # another user account, and connections then go to either one. Splice's desktop port is
+    # fixed, so it binds exclusively there: another program on the port makes Splice exit with
+    # its message, and nothing can bind beside Splice later. POSIX SO_REUSEADDR only skips
+    # TIME_WAIT and never allows two listeners, so it stays on there.
+    @property
+    def allow_reuse_address(self):
+        return os.name != 'nt'
+
+    def server_bind(self):
+        if os.name == 'nt':
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
     def __init__(self, *args, launch_token):
         self.jobs = ExportJobs()
         self.closing = False
@@ -848,17 +863,52 @@ def offer_relaunch(server, console=None, poll=BACKGROUND_POLL_SECONDS):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8765)
+    parser.add_argument('--exit-with-stdin', action='store_true',
+                        help='Stop the server when the desktop launcher closes its input pipe.')
+    parser.add_argument('--require-ffmpeg-features', action='store_true',
+                        help='Refuse to start, with a message, if FFmpeg lacks a filter or codec Splice needs.')
     args = parser.parse_args()
-    server = create_server(args.port)
+    if args.require_ffmpeg_features:
+        import runtime_check
+        problem = runtime_check.startup_problem()
+        if problem:
+            print(problem, file=sys.stderr, flush=True)
+            sys.exit(3)
+    try:
+        server = create_server(args.port)
+    except OSError as error:
+        print(f'Splice could not listen on 127.0.0.1:{args.port} ({error.strerror or error}). '
+              'Close the program using that port, or the other Splice window, and try again.', file=sys.stderr, flush=True)
+        sys.exit(4)
     resolve_http.clean_staging_at_start()
     with server:
         signal.signal(signal.SIGTERM,_exit_on_terminate)
-        # The first stdout line is the one-time launch link (tests read it).
-        print(server.launch_url(), flush=True)
-        print('Open the link above in your browser to start Splice. It works once. '
-              f'http://127.0.0.1:{server.server_port}/ alone is refused.', file=sys.stderr, flush=True)
-        offer_relaunch(server)
-        print(RELAUNCH_HINT.format(pid=os.getpid()), file=sys.stderr, flush=True)
+        if args.exit_with_stdin:
+            # Watch the launcher pipe without exposing it as the standard
+            # input of child processes created by the render server.
+            parent_pipe = os.dup(sys.stdin.fileno())
+            with open(os.devnull, "rb") as null:
+                os.dup2(null.fileno(), sys.stdin.fileno())
+            if os.name == "nt":
+                import ctypes
+                import msvcrt
+                ctypes.windll.kernel32.SetStdHandle(-10, ctypes.c_void_p(msvcrt.get_osfhandle(sys.stdin.fileno())))
+
+            def stop_on_parent_exit():
+                with os.fdopen(parent_pipe, "rb", buffering=0) as pipe:
+                    pipe.read(1)
+                server.shutdown()
+
+            threading.Thread(target=stop_on_parent_exit, daemon=True).start()
+            # The launcher reads the one-time launch link from the first line.
+            print(server.launch_url(), flush=True)
+        else:
+            # The first stdout line is the one-time launch link (tests read it).
+            print(server.launch_url(), flush=True)
+            print('Open the link above in your browser to start Splice. It works once. '
+                  f'http://127.0.0.1:{server.server_port}/ alone is refused.', file=sys.stderr, flush=True)
+            offer_relaunch(server)
+            print(RELAUNCH_HINT.format(pid=os.getpid()), file=sys.stderr, flush=True)
         try:
             server.serve_forever()
         except KeyboardInterrupt:

@@ -28,6 +28,8 @@ import time
 import uuid
 import warnings
 
+import splice_platform
+
 
 # Seconds beyond the renderer's own FFmpeg stall limit before the job itself is
 # declared stuck (covers time spent outside FFmpeg, such as probing media).
@@ -59,13 +61,16 @@ def _orphan_guard():
         wait([parent.sentinel])
         if os.name == 'nt':
             taskkill = Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32' / 'taskkill.exe'
-            subprocess.run([str(taskkill), '/PID', str(os.getpid()), '/T', '/F'], capture_output=True, timeout=10)
+            splice_platform.run([str(taskkill), '/PID', str(os.getpid()), '/T', '/F'], capture_output=True, timeout=10)
         else:
             os.killpg(0, signal.SIGKILL)
     threading.Thread(target=watch, daemon=True, name='splice-orphan-guard').start()
 
 
 def _worker(project, options, output, progress, beat, cancelled, connection, nested_prefix=None):
+    if os.environ.get('SPLICE_TEST_TRACE'):
+        import faulthandler
+        faulthandler.dump_traceback_later(10)
     # A cancelled render must stop its FFmpeg children as well as Python.
     if os.name != 'nt':
         os.setsid()
@@ -267,8 +272,8 @@ class ExportJobs:
                             if process.is_alive():
                                 taskkill = Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32' / 'taskkill.exe'
                                 try:
-                                    subprocess.run([str(taskkill), '/PID', str(process.pid), '/T', '/F'],
-                                                   capture_output=True, timeout=4, check=True)
+                                    splice_platform.run([str(taskkill), '/PID', str(process.pid), '/T', '/F'],
+                                                        capture_output=True, timeout=4, check=True)
                                 except (OSError, subprocess.SubprocessError):
                                     process.kill()
                         elif grouped:

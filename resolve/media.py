@@ -10,6 +10,7 @@ from pathlib import Path
 import media_links
 from media_proxy import SCAN_LIMIT, _text_art
 import raw_decode
+import splice_platform
 
 PROBES = max(1, min(8, os.cpu_count() or 1))
 # Linking is bounded as a whole, not per file. 45 s leaves room for FFmpeg's own 25 s probe timeout
@@ -122,9 +123,9 @@ def _probe(path, deadline):
     if left <= 0:
         return _offline('unchecked', 'time ran out before it was looked at')
     try:
-        process = subprocess.Popen(['ffprobe', '-v', 'error', '-protocol_whitelist', 'file', '-show_entries',
+        process = splice_platform.popen(['ffprobe', '-v', 'error', '-protocol_whitelist', 'file', '-show_entries',
                                     'stream=codec_type,codec_name:format=format_name', '-of', 'json', 'file:' + str(path)],
-                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                                        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     except OSError as error:
         return _offline('not-media', f'FFprobe could not run ({error.strerror or error})')
     with _children_lock:
