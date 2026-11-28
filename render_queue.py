@@ -514,7 +514,7 @@ class RenderQueue:
             return
         with self.lock:
             self.current = identifier
-        saved = 0
+        saved, outcome = 0, None
         try:
             while True:
                 if self.closing.is_set():
@@ -544,21 +544,24 @@ class RenderQueue:
                 with _destination(job['folder']) as folder:
                     paths, notes = publish(job, identifier, spec, folder)
                     outputs = [str(Path(job['folder']) / Path(path).name) for path in paths]
-                with self.lock:
-                    job.update(state='complete', progress=1, outputs=outputs, warnings=job['warnings'] + notes)
+                outcome = dict(state='complete', progress=1, outputs=outputs, warnings=job['warnings'] + notes)
+            elif status['state'] == 'cancelled' and not job.get('cancelRequested'):
+                # Stopped by the server shutting down, not by the user.
+                outcome = dict(state='interrupted', error='Splice stopped while this job was rendering. Retry it to render again.')
             else:
-                with self.lock:
-                    if status['state'] == 'cancelled' and not job.get('cancelRequested'):
-                        # Stopped by the server shutting down, not by the user.
-                        job.update(state='interrupted', error='Splice stopped while this job was rendering. Retry it to render again.')
-                    else:
-                        job.update(state=status['state'], error=status['error'] if status['state'] == 'failed' else '')
+                outcome = dict(state=status['state'], error=status['error'] if status['state'] == 'failed' else '')
         finally:
-            with self.lock:
-                self.current = None
-                self._save()
-            self.exports.release(identifier)
-            self.wake.set()
+            # The export's scratch folder goes before the job shows as finished: a finished
+            # job holds no files, and the next job starts only after this.
+            try:
+                self.exports.release(identifier)
+            finally:
+                with self.lock:
+                    if outcome:
+                        job.update(outcome)
+                    self.current = None
+                    self._save()
+                self.wake.set()
 
     def _deliver(self, job, identifier, spec, folder):
         """Move the finished output and sidecars into the chosen folder; never replace unconfirmed."""

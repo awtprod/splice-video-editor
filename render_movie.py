@@ -247,20 +247,32 @@ def _ensure_space(directory, needed, purpose):
                          'to a folder on a larger drive.')
 
 
-@lru_cache(maxsize=1)
-def _graph_file_option():
-    """FFmpeg 7+ reads any option from a file with -/option; older builds use -filter_complex_script."""
-    with tempfile.TemporaryDirectory(prefix='splice-render-probe-') as directory:
-        script = Path(directory) / 'graph.txt'
+_GRAPH_FILE_OPTION = []
+_GRAPH_FILE_OPTION_LOCK = threading.Lock()
+
+
+def _graph_file_option(directory):
+    """FFmpeg 7+ reads any option from a file with -/option; older builds use -filter_complex_script.
+
+    Probed once per process. The probe's file is written in the render's own work directory, so a
+    render killed during the probe (a cancel) leaves nothing outside the folder its owner removes."""
+    with _GRAPH_FILE_OPTION_LOCK:
+        if _GRAPH_FILE_OPTION:
+            return _GRAPH_FILE_OPTION[0]
+        script = Path(directory) / f'graph-probe-{os.getpid()}.txt'
         script.write_text('anullsrc=d=0.01[a]', encoding='utf-8')
-        for option in ('-/filter_complex', '-filter_complex_script'):
-            try:
-                result = subprocess.run(['ffmpeg', '-nostdin', '-v', 'error', option, str(script), '-map', '[a]', '-f', 'null', '-'],
-                                        capture_output=True, timeout=30)
-            except subprocess.TimeoutExpired:
-                continue
-            if result.returncode == 0:
-                return option
+        try:
+            for option in ('-/filter_complex', '-filter_complex_script'):
+                try:
+                    result = subprocess.run(['ffmpeg', '-nostdin', '-v', 'error', option, str(script), '-map', '[a]', '-f', 'null', '-'],
+                                            capture_output=True, timeout=30)
+                except subprocess.TimeoutExpired:
+                    continue
+                if result.returncode == 0:
+                    _GRAPH_FILE_OPTION.append(option)
+                    return option
+        finally:
+            script.unlink(missing_ok=True)
     raise ValueError('This FFmpeg cannot read filter graphs from a file; install FFmpeg 4 or newer')
 
 
@@ -268,7 +280,7 @@ def _graph_args(graph, directory, name):
     """Pass a filter graph through a file: command lines cannot hold feature-length graphs."""
     script = Path(directory) / f'{name}.filtergraph'
     script.write_text(graph, encoding='utf-8')
-    return [_graph_file_option(), str(script)]
+    return [_graph_file_option(directory), str(script)]
 
 
 def _stop_tree(process, force=True):
