@@ -367,6 +367,24 @@ class StabilizeJobs(Fixture):
             E.stabilized_media(analysis, {'smoothing': 26}, stop)
         self.assertEqual(self.leftovers(analysis), [])
         self.assertFalse(list((E.stabilize_store()/analysis).glob('export-26*')))
+        # Inside an export, the partial file lives in the export's own nested folder (named with the
+        # job's prefix), so the job's owner cleanup and startup reaping remove it.
+        seen = []
+        def in_job_folder(command, cancelled=None, heartbeat=None):
+            partial = Path(command[-1])
+            seen.append(partial.parent.name)
+            partial.write_bytes(b'partial')
+            raise InterruptedError('Export cancelled')
+        project = {'name': 's', 'width': 320, 'height': 192, 'fps': 25,
+                   'media': [{'id': 'shaky', 'name': 'shaky.mp4', 'src': '/media/shaky.mp4', 'type': 'video', 'duration': 6}],
+                   'clips': [{'id': 's', 'type': 'video', 'mediaId': 'shaky', 'track': 1, 'start': 0, 'duration': 2.0, 'in': 1.0,
+                              'embeddedAudio': False, 'transition': 'none', 'effects': {'stabilize': {'analysis': analysis, 'smoothing': 27}}}]}
+        with mock.patch.object(render_movie, '_run_ffmpeg', in_job_folder), self.assertRaises(InterruptedError):
+            render_to_file(project, self.out('stopped.mov'), options={'codec': 'prores'}, nested_prefix='splice-nested-testjob-')
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(seen[0].startswith('splice-nested-testjob-'), seen)
+        self.assertEqual([path.name for path in self.media.iterdir() if path.name.startswith('splice-nested-')], [])
+        self.assertEqual(self.leftovers(analysis), [])
         # Two exports of the same clip at once each write their own partial file; both succeed.
         results, errors = [], []
         def export():

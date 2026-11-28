@@ -60,15 +60,16 @@ class ExtendedEffectsRoundTrip(unittest.TestCase):
         project = {'name':'Title', 'fps':25, 'media':[], 'clips':[{
             'type':'title','track':2,'title':'Card','start':0,'duration':2,
         }]}
-        with tempfile.NamedTemporaryFile(suffix='.prproj') as file:
-            file.write(save_project(project))
-            file.flush()
-            app = py_premiere.parse(file.name)
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'title.prproj'
+            source.write_bytes(save_project(project))
+            app = py_premiere.parse(str(source))
             clip = app.project.sequences[0].video_tracks[1].clips[0]
             premiere_effects.apply_extended(clip, {'titleStyle':{
                 'x':42,'y':68,'fontFamily':'DM Sans','fontSize':10,
             }})
-            saved_path = file.name + '.prproj'
+            # Project.save refuses to overwrite, so the edit goes to a second file in the same folder.
+            saved_path = str(Path(directory) / 'saved.prproj')
             app.project.save(saved_path)
             reopened = py_premiere.parse(saved_path)
             clip = reopened.project.sequences[0].video_tracks[1].clips[0]

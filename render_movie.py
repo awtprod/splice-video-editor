@@ -76,7 +76,11 @@ AAC_PEAK_STEP_DB = .5
 # A disabled clip next to a transition is kept as a transparent stand-in with
 # this media id, so its neighbour's transition runs against nothing.
 DISABLED_MEDIA = '\x00disabled'
-WORK_PREFIXES = ('splice-export-', 'splice-segments-', 'splice-audio-', 'splice-lut-', 'splice-render-')
+# Nested sequences and raw clips are rendered to a folder under the media directory (the renderer
+# reads its sources by /media/ URL). An export job names it NESTED_PREFIX + its id, so it can remove
+# the folder itself after killing the render; reap_stale_work removes any left by an unclean exit.
+NESTED_PREFIX = 'splice-nested-'
+WORK_PREFIXES = ('splice-export-', 'splice-segments-', 'splice-audio-', 'splice-lut-', 'splice-render-', NESTED_PREFIX)
 LOCK_NAME = '.splice-owner.lock'
 
 
@@ -197,11 +201,38 @@ class WorkDirectory:
 
 
 def reap_stale_work(root=None, *, unlocked_grace=600):
-    """Delete render scratch directories whose owning process is gone. Returns the count removed."""
-    root = Path(root) if root else work_root()
+    """Delete render scratch directories whose owning process is gone. Returns the count removed.
+
+    Without ``root``: the render scratch folder (work_root()) and the nested-render folders under
+    the media directory."""
+    if root:
+        return _reap(Path(root), WORK_PREFIXES, unlocked_grace)
+    removed = _reap(work_root(), WORK_PREFIXES, unlocked_grace)
+    if MEDIA_ROOT.is_dir():
+        removed += _reap(MEDIA_ROOT, (NESTED_PREFIX,), unlocked_grace)
+    return removed
+
+
+def remove_nested_work(prefix):
+    """Remove the nested-render folders under the media directory whose names start with ``prefix``
+    (an export job's own, once its processes are gone). Returns whether none is left."""
+    if not prefix.startswith(NESTED_PREFIX) or prefix == NESTED_PREFIX or '/' in prefix or os.sep in prefix:
+        raise ValueError('Unknown nested render folder')
+    if not MEDIA_ROOT.is_dir():
+        return True
+    left = False
+    for entry in MEDIA_ROOT.iterdir():
+        if not entry.name.startswith(prefix) or entry.is_symlink() or not entry.is_dir():
+            continue
+        shutil.rmtree(entry, ignore_errors=True)
+        left = left or entry.exists()
+    return not left
+
+
+def _reap(root, prefixes, unlocked_grace):
     removed = 0
     for entry in root.iterdir():
-        if not entry.name.startswith(WORK_PREFIXES) or entry.is_symlink() or not entry.is_dir():
+        if not entry.name.startswith(prefixes) or entry.is_symlink() or not entry.is_dir():
             continue
         lock_path = entry / LOCK_NAME
         try:
@@ -248,20 +279,32 @@ def _ensure_space(directory, needed, purpose):
                          'to a folder on a larger drive.')
 
 
-@lru_cache(maxsize=1)
-def _graph_file_option():
-    """FFmpeg 7+ reads any option from a file with -/option; older builds use -filter_complex_script."""
-    with tempfile.TemporaryDirectory(prefix='splice-render-probe-') as directory:
-        script = Path(directory) / 'graph.txt'
+_GRAPH_FILE_OPTION = []
+_GRAPH_FILE_OPTION_LOCK = threading.Lock()
+
+
+def _graph_file_option(directory):
+    """FFmpeg 7+ reads any option from a file with -/option; older builds use -filter_complex_script.
+
+    Probed once per process. The probe's file is written in the render's own work directory, so a
+    render killed during the probe (a cancel) leaves nothing outside the folder its owner removes."""
+    with _GRAPH_FILE_OPTION_LOCK:
+        if _GRAPH_FILE_OPTION:
+            return _GRAPH_FILE_OPTION[0]
+        script = Path(directory) / f'graph-probe-{os.getpid()}.txt'
         script.write_text('anullsrc=d=0.01[a]', encoding='utf-8')
-        for option in ('-/filter_complex', '-filter_complex_script'):
-            try:
-                result = subprocess.run(['ffmpeg', '-nostdin', '-v', 'error', option, str(script), '-map', '[a]', '-f', 'null', '-'],
-                                        capture_output=True, timeout=30)
-            except subprocess.TimeoutExpired:
-                continue
-            if result.returncode == 0:
-                return option
+        try:
+            for option in ('-/filter_complex', '-filter_complex_script'):
+                try:
+                    result = subprocess.run(['ffmpeg', '-nostdin', '-v', 'error', option, str(script), '-map', '[a]', '-f', 'null', '-'],
+                                            capture_output=True, timeout=30)
+                except subprocess.TimeoutExpired:
+                    continue
+                if result.returncode == 0:
+                    _GRAPH_FILE_OPTION.append(option)
+                    return option
+        finally:
+            script.unlink(missing_ok=True)
     raise ValueError('This FFmpeg cannot read filter graphs from a file; install FFmpeg 4 or newer')
 
 
@@ -269,7 +312,7 @@ def _graph_args(graph, directory, name):
     """Pass a filter graph through a file: command lines cannot hold feature-length graphs."""
     script = Path(directory) / f'{name}.filtergraph'
     script.write_text(graph, encoding='utf-8')
-    return [_graph_file_option(), str(script)]
+    return [_graph_file_option(directory), str(script)]
 
 
 def _stop_tree(process, force=True):
@@ -2814,7 +2857,7 @@ def resolve_subclip_source(clip, media_by_id):
 
 def render_to_file(project, output_path, *, options=None, progress=None, cancelled=None, heartbeat=None,
                    work_directory=None, report=None, _nested_depth=0, _seen_sequences=frozenset(),
-                   _minimum_duration=0, _lossless_intermediate=False):
+                   _minimum_duration=0, _lossless_intermediate=False, nested_prefix=NESTED_PREFIX):
     """Resolve multicam clips, subclips, and nested sequences, then render the parent timeline.
 
     ``heartbeat`` is called whenever FFmpeg makes progress, so a supervisor
@@ -2823,8 +2866,13 @@ def render_to_file(project, output_path, *, options=None, progress=None, cancell
     passes its own folder so killing the job leaves nothing elsewhere.
     ``report``, when a dict, receives measurements of the delivered file
     (``report['audio']``: decoded AAC true peak, loudness, any gain applied).
+    Nested sequences and raw clips are rendered into a folder under the media directory whose
+    name starts with ``nested_prefix``; an export job passes a prefix of its own so it can remove
+    that folder after killing the render (see remove_nested_work).
     """
     import copy
+    if not isinstance(nested_prefix, str) or not nested_prefix.startswith(NESTED_PREFIX) or '/' in nested_prefix or os.sep in nested_prefix:
+        raise ValueError('Invalid nested render folder prefix')
     if not isinstance(project,dict) or not isinstance(project.get('media'),list): raise ValueError('Invalid project')
     if options is not None and not isinstance(options, dict): raise ValueError('Invalid export options')
     # Strip caller-supplied internal keys before editorial expansion adds _optionalAudio.
@@ -2840,7 +2888,13 @@ def render_to_file(project, output_path, *, options=None, progress=None, cancell
     options = {key: value for key, value in (options or {}).items() if isinstance(key, str) and not key.startswith('_')}
     if _nested_depth>4: raise ValueError('Nested sequences exceed four levels')
     # Stabilized clips read their analysis' stabilized picture (effects_engine).
-    project = effects_engine.apply_stabilization(project, cancelled, heartbeat)
+    if effects_engine.needs_stabilization(project):
+        # Stabilized pictures are rendered once into the stabilize store; their partial files are
+        # written in this render's own nested folder, so a stopped export's owner cleanup and
+        # startup reaping remove them (remove_nested_work, reap_stale_work).
+        MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
+        with WorkDirectory(nested_prefix, root=MEDIA_ROOT) as scratch:
+            project = effects_engine.apply_stabilization(project, cancelled, heartbeat, scratch=scratch)
     expanded = _expand_editorial_clips(project)
     if expanded is not project:
         # Missing angle footage contributes black and silence through the original edit's Out.
@@ -2859,7 +2913,8 @@ def render_to_file(project, output_path, *, options=None, progress=None, cancell
         return _render_prepared(project,output_path,options=options,progress=progress,cancelled=cancelled,heartbeat=heartbeat,
                                 work_directory=work_directory,report=report,minimum_duration=_minimum_duration)
     MEDIA_ROOT.mkdir(parents=True,exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix='splice-nested-',dir=MEDIA_ROOT) as directory:
+    # Locked while this render runs, so reap_stale_work leaves it alone until its owner is gone.
+    with WorkDirectory(nested_prefix, root=MEDIA_ROOT) as directory:
         prepared=copy.deepcopy(project)
         for index,item in enumerate(prepared['media']):
             child=item.get('nestedProject')
@@ -2896,7 +2951,7 @@ def render_to_file(project, output_path, *, options=None, progress=None, cancell
             span = _number(item.get('duration', 0), 'nested media duration', 0, MAX_TIMELINE_SECONDS) if isinstance(seq_id, str) else 0
             render_to_file(child,target,options=child_options,cancelled=cancelled,heartbeat=heartbeat,work_directory=work_directory,
                            _nested_depth=_nested_depth+1,_seen_sequences=next_seen,_minimum_duration=span,
-                           _lossless_intermediate=lossless)
+                           _lossless_intermediate=lossless, nested_prefix=nested_prefix)
             item['src']='/media/'+str(target.relative_to(MEDIA_ROOT))
             item['duration']=max(span, max((float(c['start'])+float(c['duration']) for c in child['clips']),default=0))
             item.pop('nestedSequence',None)

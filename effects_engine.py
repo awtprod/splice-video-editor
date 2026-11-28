@@ -1591,7 +1591,7 @@ def analysis_meta(analysis):
     return meta
 
 
-def render_stabilized(analysis, settings, target, *, preview=False, cancelled=None, heartbeat=None):
+def render_stabilized(analysis, settings, target, *, preview=False, cancelled=None, heartbeat=None, scratch=None):
     """Apply the analysis to exactly the analyzed frames. The export reads a lossless FFV1 file
     whose time 0 is the first analyzed frame; the monitor reads an H.264 proxy (with the sound)."""
     import os, subprocess
@@ -1608,7 +1608,8 @@ def render_stabilized(analysis, settings, target, *, preview=False, cancelled=No
     # Each render writes its own partial file (two exports of one clip may run at once); the
     # finished file replaces the target atomically, and a cancelled or failed render removes it.
     import threading, uuid
-    partial = Path(f'{target}.{os.getpid()}-{threading.get_ident()}-{uuid.uuid4().hex[:8]}.part{Path(target).suffix}')
+    unique = f'{os.getpid()}-{threading.get_ident()}-{uuid.uuid4().hex[:8]}.part{Path(target).suffix}'
+    partial = Path(scratch)/f'{Path(target).stem}.{unique}' if scratch else Path(f'{target}.{unique}')
     if preview:
         picture += ",scale='min(1280,iw)':-2:flags=bicubic,format=yuv420p"
         sound = ['-map', '0:a:0?', '-af', f'atrim=start={trim_start:.9f}:end={trim_end:.9f},asetpts=PTS-STARTPTS', '-c:a', 'aac', '-b:a', '160k']
@@ -1627,12 +1628,13 @@ def render_stabilized(analysis, settings, target, *, preview=False, cancelled=No
     return target
 
 
-def stabilized_media(analysis, settings, cancelled=None, heartbeat=None):
-    """The export's stabilized picture for an analysis (rendered once per setting, then kept)."""
+def stabilized_media(analysis, settings, cancelled=None, heartbeat=None, scratch=None):
+    """The export's stabilized picture for an analysis (rendered once per setting, then kept).
+    ``scratch``: the export's own work folder for the partial file."""
     settings = _transform_settings(settings)
     target = _analysis_dir(analysis)/f'export-{_settings_key(settings)}.mkv'
     if not target.exists():
-        render_stabilized(analysis, settings, target, cancelled=cancelled, heartbeat=heartbeat)
+        render_stabilized(analysis, settings, target, cancelled=cancelled, heartbeat=heartbeat, scratch=scratch)
     return target, analysis_meta(analysis)
 
 
@@ -1677,7 +1679,14 @@ def mean_motion(frames, width, height, radius=8, step=3):
     return total/(len(frames)-1)
 
 
-def apply_stabilization(project, cancelled=None, heartbeat=None):
+def needs_stabilization(project):
+    """Whether any video clip of ``project`` names stabilization (live, bypassed or disabled)."""
+    clips = project.get('clips') if isinstance(project, dict) else None
+    return isinstance(clips, list) and any(isinstance(clip, dict) and clip.get('type') == 'video' and isinstance(clip.get('effects'), dict)
+                                           and clip['effects'].get('stabilize') for clip in clips)
+
+
+def apply_stabilization(project, cancelled=None, heartbeat=None, scratch=None):
     """Point every stabilized video clip's picture at its stabilized intermediate (a new media
     item whose time 0 is the first analyzed frame); the same clip's sound still reads the original
     media (``_soundMedia``/``_soundIn``, read by render_movie._audio_events). Returns the project
@@ -1710,7 +1719,7 @@ def apply_stabilization(project, cancelled=None, heartbeat=None):
         item = media_by_id.get(target.get('mediaId'))
         if item is None or item.get('nestedProject') or item.get('multicam') or item.get('nativeGenerator') is not None:
             raise ValueError(STABILIZE_SOURCE)
-        path, meta = stabilized_media(stabilize['analysis'], stabilize, cancelled, heartbeat)
+        path, meta = stabilized_media(stabilize['analysis'], stabilize, cancelled, heartbeat, scratch=scratch)
         source_in = float(target.get('in', 0) or 0)
         span = source_delta(target, 0, float(target['duration']))
         low, high = meta['source']
