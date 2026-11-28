@@ -638,7 +638,7 @@ def _fit_picture(width, height, color, lut, alpha_format, depth, profile=None, r
                  graded=None, animate_still=False, effects='', effects_label='fx'):
     """``graded``: the table-based grade (color_grade) for this clip, which replaces the CSS-style
     filters and the LUT. ``effects``: effects_engine.fit_effects, applied before the grade; a
-    grade drops alpha, so the matte is split off and merged back after it."""
+    grade drops alpha, so the matte is split off and merged back after it, at 16 bits."""
     wide_yuv = f'format=yuv444p{max(10,depth)}le'
     if high_depth is None:
         high_depth = depth > 8
@@ -664,8 +664,11 @@ def _fit_picture(width, height, color, lut, alpha_format, depth, profile=None, r
                       'zscale=t=smpte2084:m=bt2020nc:r=limited:npl=203,'+wide_yuv)
     if effects:
         label = '_'+effects_label.replace('-', '_')
-        grade = (f'{effects},split[{label}_c][{label}_a];[{label}_a]alphaextract[{label}_m];'
-                 f'[{label}_c]null{grade},format=yuva444p16le[{label}_g];[{label}_g][{label}_m]alphamerge') if grade else effects
+        # The graded colour takes the alpha plane of the effects' own frame: blend's normal mode at
+        # opacity 1 keeps the colour and its tags, at 0 the alpha. alphamerge took only 8-bit formats
+        # (a 16-bit delivery kept 138 levels), and mergeplanes moved a gray matte to limited range.
+        grade = (f'{effects},split[{label}_c][{label}_a];'
+                 f'[{label}_c]null{grade},format=yuva444p16le[{label}_g];[{label}_g][{label}_a]blend=c3_opacity=0') if grade else effects
     repeat = f',loop=loop={still_frames-1}:size=1:start=0,setpts=N' if still_frames>1 else ''
     if animate_still:
         # The grade and its alpha branch need a frame at each sequence timestamp.

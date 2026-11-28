@@ -9,6 +9,7 @@
   container clock whether or not its input is seeked;
 - asking for an analysis again (running or done) answers, and cancel waits for the analysis thread.
 """
+import array
 import json
 import math
 import subprocess
@@ -195,6 +196,27 @@ class AlphaDelivery(Fixture):
                 self.assertAlmostEqual(planes[plane][at], source[plane*W*H+at], delta=3,
                                        msg=f'x {x}, alpha {alpha}: plane {plane} {planes[plane][at]} vs source {source[plane*W*H+at]}')
         self.assertGreaterEqual(partial, 4, 'the key has a soft edge')
+
+
+class SixteenBitDelivery(Fixture):
+    """A 16-bit delivery of a clip with a grade and effects keeps 16-bit precision (the matte was
+    re-attached with alphamerge, which rounded the graded colour to 8 bits)."""
+    def test_grade_and_effects_keep_sixteen_bits(self):
+        width, height = 256, 64
+        ffmpeg('-f', 'lavfi', '-i', f"nullsrc=s={width}x{height}:r=25,format=yuv444p16le,"
+               f"geq=lum='4096+8*mod(X+Y*{width},4096)':cb=32768:cr=32768", '-frames:v', '4', '-c:v', 'ffv1', self.media/'ramp16.mkv')
+        item = {'id': 'r', 'name': 'ramp16.mkv', 'src': '/media/ramp16.mkv', 'type': 'video', 'duration': 4/25}
+        for name, extra in (('grade', {'color': {'exposure': 0.1}}), ('grade and crop', {'color': {'exposure': 0.1}, 'effects': {'crop': {'left': 1}}})):
+            clip = {'id': 'c', 'type': 'video', 'mediaId': 'r', 'track': 1, 'start': 0, 'duration': 4/25, 'in': 0, 'opacity': 75,
+                    'transition': 'none', **extra}
+            out = self.out(f"{name.replace(' ', '-')}.tif")
+            render_to_file({'name': 'd', 'width': width, 'height': height, 'fps': 25, 'media': [item], 'clips': [clip]}, out,
+                           options={'codec': 'tiff'})
+            frame = sorted(out.glob('*.tif'))[1]      # a TIFF delivery is a folder of frames
+            raw = subprocess.run(['ffmpeg', '-nostdin', '-v', 'error', '-i', str(frame), '-vf', 'format=gray16le', '-frames:v', '1',
+                                  '-f', 'rawvideo', '-'], capture_output=True, check=True, timeout=60).stdout
+            codes = len(set(array.array('H', raw)))
+            self.assertGreater(codes, 2000, f'{name}: {codes} distinct levels of a 4096-step ramp')
 
 
 class WindowsAndKeys(Fixture):
