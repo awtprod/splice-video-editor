@@ -40,7 +40,10 @@
     (keyName ? `<button type="button" class="fx-key ${keyed ? 'on' : ''}" data-fx-key="${keyName}" data-fx-base="${path}" title="${keyed ? 'Add or update a keyframe at the playhead' : 'Animate: add a keyframe at the playhead'}" aria-label="Keyframe ${esc(label)}">◆</button>` +
       (keyed ? `<button type="button" class="fx-key-clear" data-fx-unkey="${keyName}" title="Remove the animation" aria-label="Stop animating ${esc(label)}">✕</button>` : '') : '') +
     `</span><input type="range" aria-label="${esc(label)}" data-fx="${path}" ${keyName ? `data-fx-keyname="${keyName}"` : ''} min="${low}" max="${high}" step="${step}" value="${value}"></label>`;
-  const details = (id, title, body, extra = '') => `<details class="fx-group" data-fx-group="${id}" ${open.has(id) ? 'open' : ''}><summary>${title}${extra}</summary>${body}</details>`;
+  // A disclosure group: a button and a body that is hidden (not merely collapsed) while closed.
+  const details = (id, title, body, extra = '') => `<div class="fx-group" data-fx-group="${id}" ${open.has(id) ? 'data-open' : ''}>` +
+    `<button type="button" class="fx-summary" data-fx-summary aria-expanded="${open.has(id)}" aria-controls="fx-body-${id}">${title}${extra}</button>` +
+    `<div class="fx-body" id="fx-body-${id}" ${open.has(id) ? '' : 'hidden'}>${body}</div></div>`;
 
   // ---------------------------------------------------------------- markup
   function speedMarkup(clip, source, state) {
@@ -227,9 +230,11 @@
     const locked = !!editor.isTrackLocked?.(clip.track, clip.type);
     if (locked) for (const input of box.querySelectorAll('input,select,button')) input.disabled = true;
     // Remember open groups at the click (a toggle event can arrive after the inspector re-renders).
-    for (const group of box.querySelectorAll('[data-fx-group]')) group.querySelector('summary').addEventListener('click', () => {
-      if (group.open) open.delete(group.dataset.fxGroup); else open.add(group.dataset.fxGroup);
-      if (group.dataset.fxGroup === 'masks') requestAnimationFrame(() => overlay.refresh());
+    for (const group of box.querySelectorAll('[data-fx-group]')) group.querySelector('[data-fx-summary]').addEventListener('click', event => {
+      const id = group.dataset.fxGroup, body = group.querySelector('.fx-body'), opening = body.hidden;
+      if (opening) open.add(id); else open.delete(id);
+      body.hidden = !opening; event.currentTarget.setAttribute('aria-expanded', String(opening)); group.toggleAttribute('data-open', opening);
+      if (id === 'masks') requestAnimationFrame(() => overlay.refresh());
     });
     box.querySelector('[data-fx-bypass]')?.addEventListener('change', event => update(editor, current(), {effects:{...effectsOf(current()), bypass:event.target.checked}}));
     box.querySelector('[data-fx-reset]')?.addEventListener('click', () => {

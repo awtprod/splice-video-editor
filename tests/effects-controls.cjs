@@ -47,7 +47,7 @@ async function main() {
     const inspector = page.locator('#inspector-content, .inspector-content').first();
     const openGroup = async name => {
       const group = page.locator(`[data-fx-group="${name}"]`);
-      if (!(await group.evaluate(node => node.open))) await group.locator('summary').click();
+      if (await group.locator('.fx-body').evaluate(node => node.hidden)) await group.locator('[data-fx-summary]').click();
       return group;
     };
     const select = async (id, time) => { await page.evaluate(({id, time}) => { Editor.select(id); if (time != null) Editor.seek(time); }, {id, time}); await settle(page); };
