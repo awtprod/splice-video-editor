@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import multiprocessing
 import os
 import re
 import resource
@@ -599,6 +600,48 @@ class TestVendorDecodersByName(_IsolatedDataDirMixin, unittest.TestCase):
         self.assertEqual(raw_decode.unapplied_settings(settings, info['rawCapabilities']), ['exposure'])
         self.assertEqual(raw_decode.unapplied_settings({'colorSpace': 'arri_wide_gamut_4', 'gamma': 'rec709'},
                                                        info['rawCapabilities']), ['colorSpace', 'gamma'])
+
+    def test_settings_the_decoder_cannot_take_are_named_in_the_export_warnings(self):
+        """A project from a machine with another decoder: art-cmd takes neither the log3g10 gamma, nor
+        exposure, nor highlight recovery. The export says so, once per clip, in the job's result."""
+        import export_jobs
+        folder = self.tmp / 'ARRI'
+        for frame in range(24):
+            raw_fixtures.write_synthetic_ari(folder / f'A001C002_{frame:06d}.ari', width=64, height=48)
+        raw_decode.save_decoder_config({'arriraw': str(self.bin / 'art-cmd')})
+        foreign = {'decodeUsing': 'clip', 'iso': 1280, 'kelvin': 4300, 'colorSpace': 'rec2020', 'gamma': 'log3g10',
+                   'exposure': 2.0, 'highlightRecovery': True}
+        _, project = self._project(folder / 'A001C002_000000.ari', settings=foreign)
+        project['clips'][0]['name'] = 'A001_C002'
+        second = dict(project['clips'][0], id='c2', name='A001_C002 pickup', start=0.25,
+                      rawSettings={'decodeUsing': 'clip', 'iso': 1280, 'colorSpace': 'rec709', 'gamma': 'rec709',
+                                   'exposure': 0, 'highlightRecovery': False})
+        third = dict(project['clips'][0], id='c3', name='A001_C002 camera', start=0.5, rawSettings=foreign | {'decodeUsing': 'camera'})
+        project['clips'] += [second, third]
+
+        class Connection:
+            def __init__(self):
+                self.sent = []
+
+            def send(self, message):
+                self.sent.append(message)
+
+            def close(self):
+                pass
+        connection = Connection()
+        output = self.tmp / 'job' / 'out.mov'
+        output.parent.mkdir()
+        # The export job's own worker, in this process (so the decoder config above applies); its setsid would
+        # move the test runner into a new session.
+        with mock.patch.object(export_jobs.os, 'setsid'):
+            export_jobs._worker(project, {'codec': 'prores', 'profile': 'hq', 'limiter': False}, str(output),
+                                multiprocessing.Value('d', 0.0), multiprocessing.Value('i', 0), threading.Event(), connection)
+        self.assertEqual([kind for kind, _ in connection.sent], ['ready', 'done'], connection.sent)
+        raw = [w for w in connection.sent[-1][1]['warnings'] if "can't apply" in w]
+        self.assertEqual(raw, ["A001_C002: art-cmd can't apply exposure, gamma, highlight recovery — exported with camera values"])
+        self.assertTrue(output.is_file())
+        # The settings it could take still reached art-cmd.
+        self.assertEqual(self.calls('art-cmd')[0]['parameters']['exposureIndexOverride'], 1280)
 
     def test_dcraw_emu_develops_each_frame_of_a_compressed_dng_window(self):
         first = raw_fixtures.write_cinemadng_sequence(self.tmp / 'C001', prefix='C001_', frames=24, width=64, height=48,

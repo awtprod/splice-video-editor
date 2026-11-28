@@ -2415,6 +2415,30 @@ def _raw_source_window(clips, info, transition_seconds=0.0):
     return first, max(1, min(total, math.ceil(high * fps)) - first)
 
 
+_RAW_SETTING_NAMES = {'iso': 'ISO', 'exposure': 'exposure', 'kelvin': 'color temperature', 'tint': 'tint',
+                      'colorSpace': 'color space', 'gamma': 'gamma', 'highlightRecovery': 'highlight recovery',
+                      'debayer': 'debayer quality'}
+
+
+def _warn_unapplied_raw_settings(clip, item, info):
+    """Warn, once per clip, about the clip's rawSettings its decoder here cannot apply (a project made on
+    a machine with another decoder, or sent through the API): the export uses the camera values for them."""
+    import warnings
+    import raw_decode
+    settings = clip.get('rawSettings')
+    if not isinstance(settings, dict):
+        return
+    # Values that change nothing (no exposure offset, no tint, recovery off) lose nothing when skipped.
+    neutral = {'exposure': 0, 'tint': 0, 'highlightRecovery': False}
+    ignored = [key for key in raw_decode.unapplied_settings(settings, info.get('rawCapabilities'))
+               if not (key in neutral and settings.get(key) in (neutral[key], None))]
+    if ignored:
+        tool = (info.get('rawCapabilities') or {}).get('tool') or 'The decoder'
+        name = clip.get('name') or Path(str(item.get('name') or 'A camera RAW clip')).stem
+        names = ', '.join(_RAW_SETTING_NAMES.get(key, key) for key in ignored)
+        warnings.warn(f"{name}: {tool} can't apply {names} — exported with camera values", stacklevel=2)
+
+
 def _materialize_raw_clips(project, directory, *, options=None, cancelled=None, heartbeat=None):
     """Develop every enabled camera RAW clip at full resolution in 16-bit RGB with its own
     rawSettings (lossless FFV1 QuickTime intermediate) before grading, LUTs and delivery. Only the source
@@ -2448,6 +2472,8 @@ def _materialize_raw_clips(project, directory, *, options=None, cancelled=None, 
             else:
                 settings = raw_decode.normalize_raw_settings(clip.get('rawSettings'), info['rawFormat'], info.get('rawDefaults'))
                 key = raw_decode.raw_settings_key(settings)
+                if settings['decodeUsing'] == 'clip' and info.get('rawDecoderAvailable'):
+                    _warn_unapplied_raw_settings(clip, item, info)
             groups.setdefault(key, []).append(clip)
         for key, clips in groups.items():
             if cancelled is not None and cancelled.is_set():

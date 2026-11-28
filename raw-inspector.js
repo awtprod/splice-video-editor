@@ -215,7 +215,23 @@
     return new Set(['iso', 'kelvin', 'tint', 'camera'].filter(key => list.includes(key)));
   }
 
-  function markup(clip, source) {
+  // A subclip plays a range of its original: its own start TC and length, not the whole file's.
+  function rangeFacts(source, subclip) {
+    const meta = source.rawMetadata || {};
+    if (!subclip?.parentMediaId) return {timecode: source.timecode, frames: meta.frameCount};
+    const fps = Number(subclip.fps || source.fps) || 25;
+    const start = Number(subclip.subclipIn) || 0;
+    const end = Number(subclip.subclipOut);
+    const length = Number.isFinite(end) && end > start ? end - start : Number(subclip.duration) || 0;
+    let timecode = subclip.timecode;
+    if (!timecode && source.timecode) {
+      const base = window.SpliceMulticam?.parseTimecodeSeconds?.(source.timecode, fps);
+      timecode = base == null ? null : window.Editor?.formatTimecode?.(base + start, fps);
+    }
+    return {timecode, frames: Math.round(length * fps)};
+  }
+
+  function markup(clip, source, subclip = null) {
     if (!source || source.raw !== true || clip?.type !== 'video') return '';
     const fmt = source.rawFormat || 'default';
     const settings = effectiveSettings(clip, source);
@@ -234,8 +250,9 @@
     const metaParts = [];
     if (meta.camera) metaParts.push(estimated.has('camera') ? `${meta.camera} (model not in the file)` : meta.camera);
     if (source.reel) metaParts.push('Reel ' + source.reel);
-    if (source.timecode) metaParts.push('TC ' + source.timecode);
-    if (meta.frameCount > 1) metaParts.push(`${meta.frameCount} frames`);
+    const range = rangeFacts(source, subclip);
+    if (range.timecode) metaParts.push('TC ' + range.timecode);
+    if (range.frames > 1) metaParts.push(`${range.frames} frames`);
     if (meta.missingFrames > 0) metaParts.push(`${meta.missingFrames} frame numbers missing: later frames play early`);
     const names = {timecode: 'timecode', fps: 'frame rate', duration: 'duration', width: 'frame size',
       iso: 'ISO', kelvin: 'white balance', tint: 'tint', camera: 'camera model'};
