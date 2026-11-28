@@ -117,8 +117,11 @@ class Running(QueueCase):
             queue.action(ids[1], 'up')
 
     def test_cancel_a_running_job_leaves_no_scratch_and_the_next_job_runs(self):
+        import threading
         scratch = Path(tempfile.mkdtemp(prefix='queue-scratch-', dir=self.state))
-        with mock.patch.dict(os.environ, {'SPLICE_TEMP_DIR': str(scratch)}):
+        # The workers' own temporary folder: a render killed by the cancel must leave nothing there either.
+        temporary = Path(tempfile.mkdtemp(prefix='queue-tmp-', dir=self.state))
+        with mock.patch.dict(os.environ, {'SPLICE_TEMP_DIR': str(scratch), 'TMPDIR': str(temporary)}):
             queue = self.queue()
             long = dict(self.project, clips=[dict(c, duration=60) for c in self.project['clips']])
             long['clips'] = [dict(type='video', mediaId='m', track=1, start=n * 2, duration=2, **{'in': 0}) for n in range(30)]
@@ -129,10 +132,32 @@ class Running(QueueCase):
                 self.assertLess(time.monotonic(), deadline)
                 time.sleep(.05)
             time.sleep(.5)
+            # From the cancel on, whenever no job shows as rendering the scratch folder must be empty:
+            # a job that shows as finished (cancelled, or done) holds no files. The queue's lock is
+            # held while looking, so the next job cannot start in between. Checked continuously,
+            # not only at the end, so a job published as finished before its cleanup is caught.
+            seen, stop = [], threading.Event()
+
+            def watch():
+                while not stop.is_set():
+                    with queue.lock:
+                        states = [job['state'] for job in queue.jobs]
+                        left = [] if 'rendering' in states else sorted(path.name for path in scratch.iterdir())
+                    if left:
+                        seen.append((states, left))
+                        return
+            watcher = threading.Thread(target=watch, daemon=True)
+            watcher.start()
             queue.action(ids[0], 'cancel')
-            jobs = self.wait(queue, ids)
+            try:
+                jobs = self.wait(queue, ids)
+            finally:
+                stop.set()
+                watcher.join()
             self.assertEqual((jobs[ids[0]]['state'], jobs[ids[1]]['state']), ('cancelled', 'complete'))
+            self.assertEqual(seen, [], 'a job showed as finished while it still had scratch files')
             self.assertEqual(list(scratch.iterdir()), [], 'no scratch after cancel')
+            self.assertEqual(list(temporary.iterdir()), [], 'nothing left in the temporary folder')
             self.assertEqual(sorted(path.name for path in self.folder.iterdir()), ['after.mp4'])
 
     def test_batch_of_presets_with_sidecars(self):

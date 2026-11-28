@@ -3,9 +3,12 @@
 POSIX: the worker starts its own session; FFmpeg and anything FFmpeg starts
 stay in that process group, and the whole group is killed on cancel, on a
 watchdog kill, when the worker ends (a process left holding FFmpeg's pipes
-dies with it) and at shutdown. Windows has no process groups that can be
-killed this way: the worker's process tree is stopped with taskkill /T while
-it is alive, and the renderer stops each FFmpeg tree the same way.
+dies with it) and at shutdown. A job leaves the *rendering* state only once
+every process of its group has exited and (unless it completed) its scratch
+folder is gone, so the next render never overlaps a stopped one. Windows has
+no process groups that can be killed this way: the worker's process tree is
+stopped with taskkill /T while it is alive, and the renderer stops each FFmpeg
+tree the same way.
 
 Renders have no wall-clock deadline: a feature-length master can take hours.
 A job fails only when it stops making progress (see JOB_STALL_GRACE) or the
@@ -26,6 +29,11 @@ import warnings
 # Seconds beyond the renderer's own FFmpeg stall limit before the job itself is
 # declared stuck (covers time spent outside FFmpeg, such as probing media).
 JOB_STALL_GRACE = 120
+
+# How long a stopped job waits for its killed processes to exit before it lets
+# go anyway. SIGKILL is normally acted on within milliseconds; only a process
+# stuck in the kernel (a hung network drive) takes longer.
+GROUP_EXIT_SECONDS = 10
 
 # Outputs a browser can play back in the export dialog.
 PREVIEWABLE = {('h264', 'mp4'), ('wav', 'wav')}
@@ -83,12 +91,63 @@ def _worker(project, options, output, progress, beat, cancelled, connection):
         connection.close()
 
 
+def _remove(directory, attempts=3):
+    """Remove a job's scratch folder; retry briefly (a file still closing, an antivirus scan on Windows)."""
+    for attempt in range(attempts):
+        try:
+            directory.cleanup()
+            return True
+        except OSError:
+            if attempt + 1 < attempts:
+                time.sleep(.2)
+    return False
+
+
 def _kill_group(group):
     """Kill every process left in a job's process group (POSIX)."""
     try:
         os.killpg(group, signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
         pass
+
+
+def _group_running(group):
+    """Whether a process of the group still runs. Exited processes not yet reaped (zombies) hold no files."""
+    try:
+        os.killpg(group, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    proc = Path('/proc')
+    if not proc.is_dir():
+        return True  # No process table to read: wait until the group is reaped.
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / 'stat').read_text()
+        except OSError:
+            continue
+        fields = stat[stat.rfind(')') + 2:].split()
+        if len(fields) > 2 and fields[2] == str(group) and fields[0] not in ('Z', 'X'):
+            return True
+    return False
+
+
+def _stop_group(group, timeout=GROUP_EXIT_SECONDS):
+    """Kill a job's process group and wait until none of its processes runs; returns whether they all exited.
+
+    Joining the worker is not enough: FFmpeg processes killed with it are orphans that can still be
+    exiting, with their files open, after the worker has been reaped."""
+    end = time.monotonic() + timeout
+    while True:
+        _kill_group(group)
+        if not _group_running(group):
+            return True
+        if time.monotonic() >= end:
+            return False
+        time.sleep(.01)
 
 
 class ExportJobs:
@@ -209,19 +268,31 @@ class ExportJobs:
         finally:
             reader.close()
             process.join()
+            # The job stays *rendering* until nothing of it is left: no process of its
+            # group runs and, unless it completed, its scratch folder is removed. Only
+            # then can the next render start or a caller see the job as stopped.
+            stopped = True
             if grouped:
-                # The worker has exited (or was killed); its session still holds
-                # anything FFmpeg left running, such as a process holding its pipes.
-                _kill_group(process.pid)
-            with self.lock:
-                job['state'] = ('cancelled' if job['cancelled'].is_set() else
-                                'complete' if done and process.exitcode == 0 else 'failed')
-                job['error'] = error or ('' if done else 'Export stopped before completion')
-                job['finished'] = time.monotonic()
-                if job['state'] != 'complete':
-                    job['directory'].cleanup()
-                process.close()
-                job['settled'].set()
+                # The worker has exited (or was killed); its session still holds anything
+                # FFmpeg left running (such as a process holding its pipes) and FFmpeg
+                # processes that were killed but are still exiting.
+                stopped = _stop_group(process.pid)
+            state = ('cancelled' if job['cancelled'].is_set() else
+                     'complete' if done and process.exitcode == 0 else 'failed')
+            notes = []
+            try:
+                if not stopped:
+                    notes.append('A process of this export did not exit when it was stopped')
+                if state != 'complete' and not _remove(job['directory']):
+                    notes.append('Its scratch folder could not be removed now; Splice removes it when it starts again')
+            finally:
+                with self.lock:
+                    job['state'] = state
+                    job['error'] = error or ('' if done else 'Export stopped before completion')
+                    job['warnings'] = job['warnings'] + notes
+                    job['finished'] = time.monotonic()
+                    process.close()
+                    job['settled'].set()
 
     def reap(self):
         for identifier, job in list(self.jobs.items()):
@@ -266,13 +337,13 @@ class ExportJobs:
             return output, [path for path in sidecars if path.is_file()]
 
     def release(self, identifier):
-        """Forget a settled job and remove its scratch folder now."""
+        """Forget a settled job and remove its scratch folder now (if that fails, reap_stale_work does on a later start)."""
         with self.lock:
             job = self.jobs.get(identifier)
             if job is None or not job['settled'].is_set():
                 return
             del self.jobs[identifier]
-        job['directory'].cleanup()
+        _remove(job['directory'])
 
     def running(self):
         with self.lock:
