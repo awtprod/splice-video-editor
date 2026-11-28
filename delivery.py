@@ -30,6 +30,8 @@ import subprocess
 import tempfile
 import threading
 
+import splice_platform
+
 # ---------------------------------------------------------------------------------------------
 # Codec table. ``pix`` is (pixel format without alpha, with alpha or None); ``depth`` is bits per
 # component; ``chroma`` is the working subsampling the renderer composites in.
@@ -602,7 +604,7 @@ def _test_encode(spec):
                    *(['-vf', hw_filter] if hw_filter else []),
                    *encoder_args(spec, 24, tags, light_levels=(1000, 400) if spec.get('hdr') else None), *target, str(output)]
         try:
-            result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+            result = splice_platform.run(command, capture_output=True, text=True, timeout=30)
         except subprocess.TimeoutExpired:
             return 'the test encode did not finish in 30 seconds'
         except OSError as error:
@@ -627,7 +629,7 @@ def _failure_reason(spec, stderr, code):
 
 def _lists():
     def names(flag, pattern):
-        result = subprocess.run(['ffmpeg', '-hide_banner', flag], capture_output=True, text=True, timeout=30)
+        result = splice_platform.run(['ffmpeg', '-hide_banner', flag], capture_output=True, text=True, timeout=30)
         return set(re.findall(pattern, result.stdout, re.M))
     return names('-encoders', r'^\s*[VAS][A-Z.]{5}\s+(\S+)'), names('-muxers', r'^\s*D?E\s+(\S+)')
 

@@ -9,7 +9,7 @@ import sys
 import threading
 
 from media_exec import run_bounded
-from splice_platform import HIDE_CONSOLE
+import splice_platform
 from media_links import resolve_media as _media_path
 
 _workers = ThreadPoolExecutor(max_workers=2, thread_name_prefix='waveform')
@@ -47,7 +47,7 @@ def _compute(path, size, modified, stream):
     cmd = ['ffmpeg','-nostdin','-loglevel','error','-threads','1','-protocol_whitelist','file',
            '-i',path,'-map',f'0:a:{stream}','-vn','-ac','1','-ar',str(SAMPLE_RATE),'-t',str(duration),
            '-f','s16le','pipe:1']
-    with subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,creationflags=HIDE_CONSOLE) as process:
+    with splice_platform.popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL) as process:
         timer = threading.Timer(180,process.kill)
         timer.start()
         try:

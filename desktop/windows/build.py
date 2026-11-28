@@ -1,11 +1,15 @@
 """Assemble the Windows x64 installer using pinned upstream distributions.
 
 ``python desktop/windows/build.py OUTPUT`` downloads the pinned runtimes, stages
-the application and compiles ``OUTPUT/Splice-Setup-x64.exe`` with NSIS.
-``--stage-only`` stops after staging (it runs on any OS) and ``--cache`` keeps the
-verified downloads for the next build. Every build writes ``manifest.json``
-with the bundled versions, checksums and the standard-library modules Splice
-imports, checked against the bundled Python.
+the application, turns off the Electron fuses that would let Splice.exe run as
+plain Node.js (``fuses.mjs``; run ``npm ci`` in this folder first) and compiles
+``OUTPUT/Splice-Setup-x64.exe`` with the pinned NSIS (``--nsis PATH`` uses
+another). ``--stage-only`` stops after staging (it runs on any OS) and ``--cache``
+keeps the verified downloads for the next build. Every build writes
+``manifest.json`` with the bundled versions, checksums and the standard-library
+modules Splice imports, checked against the bundled Python.
+``--source-archive`` instead collects the bundled FFmpeg's corresponding source
+(as far as it is published) in ``OUTPUT/source``.
 """
 import argparse
 import ast
@@ -13,6 +17,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -42,6 +47,25 @@ RUNTIMES = {
     ),
 }
 FFMPEG_FILES = ("ffmpeg.exe", "ffprobe.exe")
+# Used to build the installer, not installed. NSIS's own stub is part of the setup EXE,
+# so it is pinned like the runtimes rather than taken from whatever is installed.
+BUILD_TOOLS = {
+    "nsis": dict(
+        version="3.11", license="zlib/libpng (NSIS, including the installer stub)",
+        url="https://downloads.sourceforge.net/project/nsis/NSIS%203/3.11/nsis-3.11.zip",
+        sha256="c7d27f780ddb6cffb4730138cd1591e841f4b7edb155856901cdf5f214394fa1",
+    ),
+}
+# The source of the bundled FFmpeg, for --source-archive. The 9.1 release tarball is the
+# n9.1 tag, which is the commit gyan.dev's README names (FFmpeg signs it: ffmpeg-9.1.tar.xz.asc).
+SOURCES = {
+    "ffmpeg-source": dict(
+        version="9.1", commit="74e4393595cf2b5857f0da925c4e0dd74ea306e5",
+        url="https://ffmpeg.org/releases/ffmpeg-9.1.tar.xz",
+        signature="https://ffmpeg.org/releases/ffmpeg-9.1.tar.xz.asc",
+        sha256="1a4d394ae63d190a526cd052eb4415c156b5c5e2df37efab41a7de0b8fde2433",
+    ),
+}
 
 # Standard-library modules that exist only on POSIX; Splice imports them only
 # when os.name != 'nt'.
@@ -58,8 +82,9 @@ WINDOWS_BUILTINS = frozenset({
 
 
 def fetch(name, cache):
-    """The verified archive for ``name``, downloaded unless ``cache`` holds it."""
-    spec = RUNTIMES[name]
+    """The verified archive for ``name``, downloaded unless ``cache`` holds it. A cached
+    copy is re-hashed every time and downloaded again if it does not match."""
+    spec = {**RUNTIMES, **BUILD_TOOLS, **SOURCES}[name]
     archive = cache / spec["url"].rsplit("/", 1)[1]
     if archive.is_file() and _sha256(archive) == spec["sha256"]:
         return archive
@@ -220,10 +245,90 @@ def stage(output, cache):
         files=sum(1 for path in payload.rglob("*") if path.is_file()),
         bytes=sum(path.stat().st_size for path in payload.rglob("*") if path.is_file()),
     )
-    text = json.dumps(manifest, indent=2) + "\n"
-    for destination in (stage_root, payload, output):  # payload: the installed app carries it too
-        (destination / "manifest.json").write_text(text, encoding="utf-8")
+    _write_manifest(output, manifest)
     return manifest
+
+
+def _write_manifest(output, manifest):
+    text = json.dumps(manifest, indent=2) + "\n"
+    stage_root = output / "stage"
+    for destination in (stage_root, stage_root / "payload", output):  # payload: the installed app carries it too
+        (destination / "manifest.json").write_text(text, encoding="utf-8")
+
+
+def harden_electron(executable):
+    """Turn off the RunAsNode, NODE_OPTIONS and --inspect fuses of ``executable``; return their states."""
+    node = shutil.which("node")
+    if not node:
+        raise SystemExit("Setting the Electron fuses needs Node.js on PATH.")
+    if not (HERE / "node_modules" / "@electron" / "fuses").is_dir():
+        raise SystemExit('Run "npm ci" in desktop/windows first: it installs the pinned @electron/fuses.')
+    result = subprocess.run([node, str(HERE / "fuses.mjs"), "harden", str(executable)], cwd=HERE,
+                            capture_output=True, text=True, timeout=300)
+    if result.returncode:
+        raise SystemExit("Setting the Electron fuses failed: " + (result.stderr or result.stdout).strip())
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def nsis_compiler(output, cache):
+    """makensis.exe from the pinned, verified NSIS zip, unpacked in ``output``."""
+    folder = output / "nsis"
+    if folder.exists():
+        shutil.rmtree(folder)
+    _extract(fetch("nsis", cache), folder)
+    compiler, = folder.glob("nsis-*/makensis.exe")
+    return compiler
+
+
+def source_archive(output, cache):
+    """Collect what is published of the bundled FFmpeg's corresponding source in ``output/source``:
+    the signed FFmpeg release tarball for the commit gyan.dev built, and SOURCES.txt/sources.json
+    listing every external library with the version gyan.dev reports. gyan.dev publishes neither the
+    libraries' sources nor its build scripts, so those are listed, not collected."""
+    folder = output / "source"
+    folder.mkdir(parents=True, exist_ok=True)
+    spec = SOURCES["ffmpeg-source"]
+    tarball = fetch("ffmpeg-source", cache)
+    shutil.copy2(tarball, folder / tarball.name)
+    with ZipFile(fetch("ffmpeg", cache)) as package:
+        readme, = (name for name in package.namelist() if name.count("/") == 1 and name.endswith("/README.txt"))
+        text = package.read(readme).decode("utf-8", "replace")
+    link = re.search(r"^Source Code:\s*(\S+)", text, re.M)
+    if not link or not spec["commit"].startswith(link.group(1).rsplit("/", 1)[-1]):
+        raise ValueError("The FFmpeg build names a different source commit than " + spec["commit"])
+    _, _, table = text.partition("external libraries' versions:")
+    libraries = []
+    for line in table.strip().splitlines():
+        name, _, version = line.strip().partition(" ")
+        if name and version.strip():
+            version = version.strip()
+            revision = re.search(r"-g([0-9a-f]{7,})$", version)
+            libraries.append(dict(name=name, version=version, git_revision=revision.group(1) if revision else None))
+    if not libraries:
+        raise ValueError("The FFmpeg build's README lists no library versions")
+    report = dict(
+        ffmpeg=dict(version=spec["version"], commit=spec["commit"], tarball=tarball.name, url=spec["url"],
+                    signature=spec["signature"], sha256=spec["sha256"], build=RUNTIMES["ffmpeg"]["url"],
+                    build_source_link=link.group(1)),
+        libraries=libraries,
+        known_gaps=["gyan.dev publishes no source archives for the external libraries and no build scripts; "
+                    "only the versions below. Their sources are not collected here.",
+                    "Library versions ending in -g<hash> name a git revision of that project; the others are "
+                    "release versions."],
+    )
+    (folder / "sources.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    lines = [f"Corresponding source for FFmpeg {spec['version']} in the Splice Windows installer",
+             "",
+             f"FFmpeg: {tarball.name} (SHA-256 {spec['sha256']})",
+             f"  from {spec['url']}, signed by FFmpeg: {spec['signature']}",
+             f"  the n{spec['version']} release, commit {spec['commit']}; gyan.dev's build names {link.group(1)}",
+             "",
+             "KNOWN GAP: gyan.dev publishes no source for the libraries below and no build scripts, only",
+             "these versions. They are not collected here.",
+             ""]
+    lines += [f"  {item['name']:<20} {item['version']}" for item in libraries]
+    (folder / "SOURCES.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return report
 
 
 def verify_on_windows(output):
@@ -244,26 +349,43 @@ def build(output, nsis, cache, stage_only=False):
     output.mkdir(parents=True, exist_ok=True)
     cache.mkdir(parents=True, exist_ok=True)
     manifest = stage(output, cache)
+    manifest["electron_fuses"] = harden_electron(output / "stage" / "payload" / "Splice.exe")
+    _write_manifest(output, manifest)
     print(f"Staged {manifest['files']} files ({manifest['bytes'] / 1e6:.0f} MB) in {output / 'stage'}", flush=True)
     if stage_only:
         return
     if sys.platform != "win32":
         raise SystemExit("Compiling the installer needs Windows (the bundled runtime is checked by running it); "
                          "use --stage-only elsewhere.")
+    if nsis == "pinned":
+        nsis = nsis_compiler(output, cache)
+        manifest["nsis"] = {key: BUILD_TOOLS["nsis"][key] for key in ("version", "url", "sha256")}
+        _write_manifest(output, manifest)
     verify_on_windows(output)
     shutil.copy2(HERE / "installer.nsi", output / "stage")
     subprocess.run([nsis, f"/DVERSION={manifest['version']}", "installer.nsi"], cwd=output / "stage", check=True,
                    timeout=1200)
     shutil.move(output / "stage" / "Splice-Setup-x64.exe", output / "Splice-Setup-x64.exe")
     shutil.rmtree(output / "stage")
+    if (output / "nsis").exists():
+        shutil.rmtree(output / "nsis")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("output", type=Path)
-    parser.add_argument("--nsis", default="makensis", help="Path to the NSIS compiler.")
+    parser.add_argument("--nsis", default="pinned",
+                        help='Path to the NSIS compiler; "pinned" (the default) downloads and verifies NSIS 3.11.')
     parser.add_argument("--cache", type=Path, help="Folder that keeps verified downloads (default: OUTPUT/downloads).")
     parser.add_argument("--stage-only", action="store_true", help="Stage the payload and manifest without NSIS.")
+    parser.add_argument("--source-archive", action="store_true",
+                        help="Only collect the bundled FFmpeg's corresponding source in OUTPUT/source.")
     args = parser.parse_args()
     output = args.output.resolve()
-    build(output, args.nsis, (args.cache or output / "downloads").resolve(), args.stage_only)
+    cache = (args.cache or output / "downloads").resolve()
+    if args.source_archive:
+        output.mkdir(parents=True, exist_ok=True)
+        cache.mkdir(parents=True, exist_ok=True)
+        print(json.dumps(source_archive(output, cache)["ffmpeg"], indent=2))
+    else:
+        build(output, args.nsis, cache, args.stage_only)

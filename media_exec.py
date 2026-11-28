@@ -2,7 +2,7 @@
 import subprocess
 import threading
 
-from splice_platform import HIDE_CONSOLE
+import splice_platform
 
 MAX_STDERR = 16 * 1024
 
@@ -15,8 +15,7 @@ def run_bounded(cmd, *, timeout, max_output, check=False):
     """Like subprocess.run(capture_output=True) but never buffers more than
     ``max_output`` bytes of stdout (the child is killed instead) and keeps
     only the last MAX_STDERR bytes of stderr."""
-    process = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               creationflags=HIDE_CONSOLE)
+    process = splice_platform.popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     output, errors = bytearray(), bytearray()
     expired = threading.Event()
 

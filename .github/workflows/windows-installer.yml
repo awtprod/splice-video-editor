@@ -21,6 +21,14 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: '22'
+      - name: Install the test and build tools
+        shell: pwsh
+        run: |
+          # playwright-core for the app test; @electron/fuses (build time only) for build.py.
+          npm ci
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          npm ci --prefix desktop/windows
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Windows platform unit tests
         shell: pwsh
         run: |
@@ -29,14 +37,10 @@ jobs:
       - name: Build installer
         shell: pwsh
         run: |
-          # build.py also runs the bundled Python against the bundled FFmpeg
+          # build.py downloads NSIS 3.11 and checks its SHA-256 like the bundled runtimes, turns
+          # off the Electron fuses, and runs the bundled Python against the bundled FFmpeg
           # (stdlib imports and runtime_check.py --strict) before compiling.
-          $nsis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
-          if (!(Test-Path $nsis)) {
-            choco install nsis --version=3.11 --yes --no-progress
-            if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          }
-          python desktop/windows/build.py artifacts/installer --nsis "$nsis" --cache "$env:RUNNER_TEMP\splice-downloads"
+          python desktop/windows/build.py artifacts/installer --cache "$env:RUNNER_TEMP\splice-downloads"
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           Get-Item artifacts/installer/Splice-Setup-x64.exe | Select-Object Name, Length
       - name: Install
@@ -51,32 +55,134 @@ jobs:
                    'resources\splice\server.py', 'resources\splice\runtime_check.py') {
             if (!(Test-Path (Join-Path $app $file))) { throw "The installer did not install $file" }
           }
+          if (!(Test-Path (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Splice\Splice.lnk'))) {
+            throw 'The installer did not create the Start menu shortcut.'
+          }
+          if (!(Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Splice')) {
+            throw 'The installer did not register its uninstaller.'
+          }
       - name: Check the installed runtimes
         shell: pwsh
         run: |
           # Bundled Python and FFmpeg only: modules, filters, codecs, test encodes, startup gate.
           $app = Join-Path $env:LOCALAPPDATA 'Programs\Splice\Application'
+          node desktop/windows/fuses.mjs check (Join-Path $app 'Splice.exe')
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $python = Join-Path $app 'resources\python\python.exe'
           $env:Path = Join-Path $app 'resources\ffmpeg'
           & $python -B tests\windows_bundle_check.py (Join-Path $app 'resources') artifacts\installer-proof\bundle-check.json
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Run the installed app
         shell: pwsh
+        timeout-minutes: 10
         run: |
-          npm ci
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          node tests/windows-installer.cjs
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          # Playwright drives Electron through the Node inspector, which the shipped Splice.exe
+          # refuses (its fuses are off). It drives a copy beside it with only that fuse back on,
+          # so the installed resources, Python, FFmpeg and launcher script are the ones tested.
+          $app = Join-Path $env:LOCALAPPDATA 'Programs\Splice\Application'
+          $copy = Join-Path $app 'Splice-under-test.exe'
+          Copy-Item (Join-Path $app 'Splice.exe') $copy
+          try {
+            node desktop/windows/fuses.mjs test-copy $copy
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            $env:SPLICE_EXECUTABLE = $copy
+            node tests/windows-installer.cjs
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          } finally {
+            Remove-Item $copy -ErrorAction SilentlyContinue
+          }
+      - name: Run the shipped Splice.exe with its default profile
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          $root = Join-Path $env:LOCALAPPDATA 'Programs\Splice'
+          $app = Join-Path $root 'Application'
+          $exe = Join-Path $app 'Splice.exe'
+          $profileDir = Join-Path $env:LOCALAPPDATA 'Splice\desktop'
+          if (Test-Path $profileDir) { throw "$profileDir exists before the first default launch." }
+          # As a user starts it: no --user-data-dir, no SPLICE_DATA_DIR, the fixed port.
+          $splice = Start-Process $exe -PassThru
+          try {
+            $up = $false
+            for ($i = 0; $i -lt 90 -and !$up; $i++) {
+              Start-Sleep -Seconds 1
+              try { $client = [Net.Sockets.TcpClient]::new('127.0.0.1', 47834); $client.Close(); $up = $true } catch {}
+            }
+            if (!$up) { throw 'The editor server never listened on 127.0.0.1:47834.' }
+            for ($i = 0; $i -lt 30 -and !(Test-Path (Join-Path $profileDir 'Local State')); $i++) { Start-Sleep -Seconds 1 }
+            if (!(Test-Path (Join-Path $profileDir 'Local State'))) { throw "No browser profile in $profileDir." }
+            Write-Host "Default profile in use: $profileDir"
+
+            # Nothing can bind beside Splice, even with SO_REUSEADDR (SO_EXCLUSIVEADDRUSE).
+            python tests/windows_port_probe.py 47834
+            if ($LASTEXITCODE) { throw 'Another socket could bind beside Splice on its port.' }
+
+            # The RunAsNode fuse is off: with ELECTRON_RUN_AS_NODE, Splice.exe starts as Splice (a
+            # second one, which hands over to the running one and exits) instead of running the script.
+            # (NODE_OPTIONS --require is ignored by every packaged Electron app, so it is not probed.)
+            $marker = Join-Path $env:RUNNER_TEMP 'ran-as-node.txt'
+            $hook = Join-Path $env:RUNNER_TEMP 'node-hook.cjs'
+            Set-Content $hook "require('fs').writeFileSync($($marker | ConvertTo-Json), 'ran as node')"
+            $env:ELECTRON_RUN_AS_NODE = '1'
+            $probe = Start-Process $exe -ArgumentList $hook -PassThru
+            if (!$probe.WaitForExit(30000)) { $probe.Kill(); throw 'Splice.exe with ELECTRON_RUN_AS_NODE did not exit.' }
+            Remove-Item Env:ELECTRON_RUN_AS_NODE
+            if (Test-Path $marker) { throw 'Splice.exe ran a script as Node.js.' }
+            Write-Host 'ELECTRON_RUN_AS_NODE was ignored.'
+
+            # Upgrading or uninstalling while Splice runs is refused (silent mode answers Cancel).
+            $setup = Resolve-Path artifacts/installer/Splice-Setup-x64.exe
+            $result = Start-Process $setup -ArgumentList '/S' -Wait -PassThru
+            if ($result.ExitCode -eq 0) { throw 'The installer replaced Splice while it was running.' }
+            # _?= runs the uninstaller in place, so its exit code is the real one.
+            $result = Start-Process (Join-Path $root 'Uninstall.exe') -ArgumentList '/S', "_?=$root" -Wait -PassThru
+            if ($result.ExitCode -eq 0) { throw 'The uninstaller removed Splice while it was running.' }
+            if (!(Test-Path $exe) -or $splice.HasExited) { throw 'Splice was damaged or stopped by the refused upgrade.' }
+            Write-Host 'Upgrade and uninstall were refused while Splice ran.'
+          } finally {
+            # Close it as a user would (WM_CLOSE), so the server stops through its pipe.
+            taskkill /PID $splice.Id /T | Out-Host
+            if (!$splice.WaitForExit(30000)) {
+              Write-Host '::warning::Splice did not close within 30 seconds; stopping it.'
+              taskkill /PID $splice.Id /T /F | Out-Host
+              $splice.WaitForExit(10000) | Out-Null
+            }
+          }
+          for ($i = 0; $i -lt 30; $i++) {
+            try { $client = [Net.Sockets.TcpClient]::new('127.0.0.1', 47834); $client.Close(); Start-Sleep -Seconds 1 } catch { break }
+          }
+          $left = Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($app) }
+          if ($left) { $left | Select-Object Name, ProcessId | Out-Host; throw 'Splice processes were left running.' }
+          exit 0  # taskkill's exit code is not the result of this step
       - name: Uninstall
         shell: pwsh
         run: |
           $root = Join-Path $env:LOCALAPPDATA 'Programs\Splice'
+          $data = Join-Path $env:LOCALAPPDATA 'Splice'
+          # The user's work: an export in the default export folder, a project in Documents
+          # and the browser profile (drafts) from the default launch.
+          $export = Join-Path $data 'Exports\Kept export.mp4'
+          $project = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'Splice CI\Kept project.prproj'
+          New-Item -ItemType Directory -Force (Split-Path $export), (Split-Path $project) | Out-Null
+          Set-Content $export 'export' ; Set-Content $project 'project'
           $result = Start-Process (Join-Path $root 'Uninstall.exe') -ArgumentList '/S' -Wait -PassThru
           if ($result.ExitCode) { exit $result.ExitCode }
           # The uninstaller copies itself to TEMP and returns before it finishes.
-          for ($i = 0; $i -lt 60 -and (Test-Path (Join-Path $root 'Application\Splice.exe')); $i++) { Start-Sleep -Seconds 1 }
-          if (Test-Path (Join-Path $root 'Application\Splice.exe')) { throw 'Uninstall left Splice.exe behind.' }
+          for ($i = 0; $i -lt 60 -and (Test-Path $root); $i++) { Start-Sleep -Seconds 1 }
+          if (Test-Path $root) { Get-ChildItem -Recurse $root | Select-Object -First 20 FullName | Out-Host; throw "Uninstall left $root behind." }
+          $menu = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Splice'
+          if (Test-Path $menu) { throw "Uninstall left the Start menu folder $menu." }
+          if (Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Splice') {
+            throw 'Uninstall left its registry key.'
+          }
+          foreach ($kept in $export, $project, (Join-Path $data 'desktop\Local State')) {
+            if (!(Test-Path $kept)) { throw "Uninstall removed the user's $kept" }
+          }
+          Write-Host 'Program, shortcut and registration removed; exports, projects and the profile kept.'
+      # Same-repository PRs and manual runs only: a fork's PR controls build.py, and anyone
+      # signed in can download a public repository's artifacts.
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         with:
           name: Splice-Windows-x64
           path: artifacts/installer/Splice-Setup-x64.exe

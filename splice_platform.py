@@ -7,9 +7,32 @@ import sys
 
 
 # Windows: start console programs (FFmpeg, taskkill) without a console window.
-# The desktop launcher also gives the server a hidden console that every other
-# child inherits. 0 elsewhere, the only creationflags value POSIX accepts.
+# 0 elsewhere, the only creationflags value POSIX accepts.
 HIDE_CONSOLE = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+# Every child process Splice starts (FFmpeg, ffprobe, taskkill, ...) goes through
+# these, so none opens a console window on Windows however the server itself was
+# started. tests/test_windows_installer.py fails if a shipped module calls
+# subprocess directly.
+def _no_console(options):
+    options["creationflags"] = options.get("creationflags", 0) | HIDE_CONSOLE
+    return options
+
+
+def run(command, **options):
+    """subprocess.run without a console window."""
+    return subprocess.run(command, **_no_console(options))
+
+
+def popen(command, **options):
+    """subprocess.Popen without a console window."""
+    return subprocess.Popen(command, **_no_console(options))
+
+
+def check_output(command, **options):
+    """subprocess.check_output without a console window."""
+    return subprocess.check_output(command, **_no_console(options))
 
 
 def data_directory(*, browser=False):

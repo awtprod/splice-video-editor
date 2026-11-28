@@ -6,11 +6,13 @@ const path = require('node:path')
 const { _electron: electron } = require('playwright-core')
 
 // Checks the installed Windows app. SPLICE_INSTALLED_APP points it at another
-// staged copy (a Linux Electron build of the same shell, for local runs).
+// staged copy (a Linux Electron build of the same shell, for local runs), and
+// SPLICE_EXECUTABLE at the Electron binary to drive (CI: a copy of Splice.exe
+// whose inspector fuse is back on, since Playwright needs it).
 const windows = process.platform === 'win32'
 const installed = process.env.SPLICE_INSTALLED_APP ||
   path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Splice', 'Application')
-const executable = path.join(installed, windows ? 'Splice.exe' : 'Splice')
+const executable = process.env.SPLICE_EXECUTABLE || path.join(installed, windows ? 'Splice.exe' : 'Splice')
 const ffprobe = path.join(installed, 'resources', 'ffmpeg', windows ? 'ffprobe.exe' : 'ffprobe')
 const proof = path.resolve(process.env.SPLICE_INSTALLER_PROOF || 'artifacts/installer-proof')
 const workspace = mkdtempSync(path.join(tmpdir(), 'splice-installer-'))
@@ -27,20 +29,33 @@ async function windowForEditor() {
     env: { ...env, ...systemPath, SPLICE_DATA_DIR: path.join(workspace, 'media'), SPLICE_TEST_TRACE: '1' },
     timeout: 30000
   })
-  app.on('console', message => { if (message.type() === 'error') console.error(message.text()) })
-  const page = await app.firstWindow()
-  page.setDefaultTimeout(20000)
-  await page.waitForFunction(() => !!window.SpliceSession)
-  await page.evaluate(() => SpliceSession.ready)
-  page.on('pageerror', error => console.error(error))
-  await app.evaluate(({session}, directory) => {
-    const { join } = process.getBuiltinModule('path')
-    session.defaultSession.on('will-download', (event, item) => {
-      const ext = item.getFilename().endsWith('.prproj') ? 'prproj' : 'mp4'
-      item.setSavePath(join(directory, `Windows Installer.${ext}`))
-    })
-  }, proof)
-  await page.evaluate(() => { window.showSaveFilePicker = undefined })
+  // Anything failing before the window is handed back closes the app here, so the
+  // run ends with the error instead of waiting on an Electron left open.
+  let page
+  try {
+    app.on('console', message => { if (message.type() === 'error') console.error(message.text()) })
+    page = await app.firstWindow()
+    page.setDefaultTimeout(20000)
+    // The server refuses a window that did not arrive through the one-time launch link,
+    // so a launcher that loses the token fails here at once, not on a timeout.
+    const refusal = 'Open Splice from its launch link'
+    await page.waitForFunction(text => !!window.SpliceSession || document.body?.textContent.includes(text), refusal)
+    const refused = await page.evaluate(text => !window.SpliceSession && document.body.textContent.includes(text), refusal)
+    assert.ok(!refused, `The editor server refused the launcher's window (${page.url()}): the launch link did not reach it.`)
+    await page.evaluate(() => SpliceSession.ready)
+    page.on('pageerror', error => console.error(error))
+    await app.evaluate(({session}, directory) => {
+      const { join } = process.getBuiltinModule('path')
+      session.defaultSession.on('will-download', (event, item) => {
+        const ext = item.getFilename().endsWith('.prproj') ? 'prproj' : 'mp4'
+        item.setSavePath(join(directory, `Windows Installer.${ext}`))
+      })
+    }, proof)
+    await page.evaluate(() => { window.showSaveFilePicker = undefined })
+  } catch (error) {
+    await app.close().catch(() => {})
+    throw error
+  }
   return { app, page }
 }
 

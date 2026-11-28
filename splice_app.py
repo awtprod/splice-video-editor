@@ -5,13 +5,13 @@ import os
 from pathlib import Path
 import re
 import shutil
-import subprocess
 import sys
 import tempfile
 import threading
 import time
 
 from server import create_server
+import splice_platform
 from splice_platform import browser_executable, data_directory
 
 
@@ -41,7 +41,7 @@ def main():
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            return subprocess.run([
+            return splice_platform.run([
                 browser, f"--app={launcher.as_uri()}",
                 f"--user-data-dir={profile}", "--no-first-run", "--disable-sync",
                 "--window-size=1480,960", *flags,

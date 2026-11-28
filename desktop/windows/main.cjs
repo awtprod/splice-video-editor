@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog } = require('electron')
+const { app, BrowserWindow, dialog, session } = require('electron')
 const { spawn } = require('node:child_process')
 const { join } = require('node:path')
 
@@ -10,6 +10,25 @@ const windows = process.platform === 'win32'
 let editor
 let backend
 let shuttingDown = false
+
+// What the editor's own pages may use; everything else (camera, microphone, screen
+// capture, clipboard, geolocation, MIDI, HID, USB, ...) is refused, and nothing is
+// granted to any other origin. Splice uses fullscreen for the program monitor,
+// notifications when a queued render finishes, and the File System Access API
+// (readwrite on a project file the user picked).
+const PERMISSIONS = new Set(['fullscreen', 'notifications', 'fileSystem'])
+
+function fromEditor(address) {
+  try { return new URL(address).origin === origin } catch { return false }
+}
+
+function guardPermissions(target) {
+  target.setPermissionRequestHandler((contents, permission, callback, details) => {
+    callback(PERMISSIONS.has(permission) && fromEditor(details?.requestingUrl || contents?.getURL()))
+  })
+  target.setPermissionCheckHandler((contents, permission, requestingOrigin) =>
+    PERMISSIONS.has(permission) && fromEditor(requestingOrigin))
+}
 
 // Chromium's profile and caches are per machine, so they live under
 // %LOCALAPPDATA%\Splice (next to the media cache), not in the roaming profile
@@ -107,7 +126,11 @@ if (!app.requestSingleInstanceLock()) {
     })
     child.stdin.end()
   })
+  app.on('web-contents-created', (event, contents) => {
+    contents.on('will-attach-webview', attaching => attaching.preventDefault())
+  })
   app.whenReady().then(async () => {
+    guardPermissions(session.defaultSession)
     const launch = await startBackend()
     editor = new BrowserWindow({
       width: 1480,

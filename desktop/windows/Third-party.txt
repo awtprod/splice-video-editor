@@ -31,6 +31,14 @@ source for the FFmpeg files in this installer on request, for at least three
 years after this version was last distributed; ask through the project's
 issue tracker.
 
+`python desktop/windows/build.py OUT --source-archive` collects that source
+as far as it is published: the FFmpeg 9.1 release tarball (signed by FFmpeg;
+the n9.1 tag is commit 74e4393595) and OUT/source/SOURCES.txt, which lists
+every library in this build with the version gyan.dev reports.
+Known gap: gyan.dev publishes no source archives for those libraries and no
+build scripts, only their versions, so the library sources are not collected
+and would have to be fetched from each project at the listed revision.
+
 Libraries Splice depends on in this build, with the versions gyan.dev reports:
   x264 0.165.3223 (GPL-2.0+)          x265 4.3 (GPL-2.0+)
   SVT-AV1 4.3.0 (BSD-3-Clause-Clear)  zimg 3.0.6 (WTFPL)

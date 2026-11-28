@@ -3,5 +3,8 @@
   "productName": "Splice",
   "version": "0.3.0-preview.1",
   "private": true,
-  "main": "main.cjs"
+  "main": "main.cjs",
+  "devDependencies": {
+    "@electron/fuses": "2.1.3"
+  }
 }

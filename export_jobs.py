@@ -28,7 +28,7 @@ import time
 import uuid
 import warnings
 
-from splice_platform import HIDE_CONSOLE
+import splice_platform
 
 
 # Seconds beyond the renderer's own FFmpeg stall limit before the job itself is
@@ -61,8 +61,7 @@ def _orphan_guard():
         wait([parent.sentinel])
         if os.name == 'nt':
             taskkill = Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32' / 'taskkill.exe'
-            subprocess.run([str(taskkill), '/PID', str(os.getpid()), '/T', '/F'], capture_output=True, timeout=10,
-                           creationflags=HIDE_CONSOLE)
+            splice_platform.run([str(taskkill), '/PID', str(os.getpid()), '/T', '/F'], capture_output=True, timeout=10)
         else:
             os.killpg(0, signal.SIGKILL)
     threading.Thread(target=watch, daemon=True, name='splice-orphan-guard').start()
@@ -273,8 +272,8 @@ class ExportJobs:
                             if process.is_alive():
                                 taskkill = Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32' / 'taskkill.exe'
                                 try:
-                                    subprocess.run([str(taskkill), '/PID', str(process.pid), '/T', '/F'],
-                                                   capture_output=True, timeout=4, check=True, creationflags=HIDE_CONSOLE)
+                                    splice_platform.run([str(taskkill), '/PID', str(process.pid), '/T', '/F'],
+                                                        capture_output=True, timeout=4, check=True)
                                 except (OSError, subprocess.SubprocessError):
                                     process.kill()
                         elif grouped:

@@ -24,6 +24,7 @@ import re
 import secrets
 import shutil
 import signal
+import socket
 import sys
 from export_jobs import ExportJobs
 import json
@@ -706,6 +707,20 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class StudioServer(ThreadingHTTPServer):
+    # On Windows SO_REUSEADDR lets a second socket bind the same address and port, even from
+    # another user account, and connections then go to either one. Splice's desktop port is
+    # fixed, so it binds exclusively there: another program on the port makes Splice exit with
+    # its message, and nothing can bind beside Splice later. POSIX SO_REUSEADDR only skips
+    # TIME_WAIT and never allows two listeners, so it stays on there.
+    @property
+    def allow_reuse_address(self):
+        return os.name != 'nt'
+
+    def server_bind(self):
+        if os.name == 'nt':
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
     def __init__(self, *args, launch_token):
         self.jobs = ExportJobs()
         self.closing = False
