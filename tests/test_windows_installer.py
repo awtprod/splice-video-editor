@@ -132,7 +132,7 @@ class FFmpegFeatureGate(unittest.TestCase):
         empty.write_text('#!/bin/sh\nexit 0\n')
         empty.chmod(0o755)
         self.assertIn('printed no filters', runtime_check.startup_problem(str(empty), probe))
-        with mock.patch('runtime_check.shutil.which', return_value=None):
+        with mock.patch('splice_platform.shutil.which', return_value=None):
             self.assertIn('ffmpeg was not found', runtime_check.startup_problem())
 
     def test_server_refuses_to_start_with_a_clear_message(self):
@@ -514,6 +514,95 @@ class NoConsoleWindows(unittest.TestCase):
         for module in ('render_movie.py', 'raw_decode.py', 'delivery.py', 'audio_loudness.py', 'resolve/media.py',
                        'interchange/media.py', 'media_exec.py', 'runtime_check.py'):
             self.assertRegex((ROOT / module).read_text(encoding='utf-8'), r'splice_platform\.(run|popen|check_output)\(')
+
+
+class BundledFFmpegOnly(unittest.TestCase):
+    """The desktop app's server inherits the user's PATH (after the bundled FFmpeg folder) and
+    SPLICE_FFMPEG_DIR: every ffmpeg/ffprobe it runs or reports is the bundled one, by path."""
+    EXE = '.exe' if sys.platform == 'win32' else ''
+
+    def setUp(self):
+        self.directory = Path(tempfile.mkdtemp(prefix='splice-bundled-'))
+        self.addCleanup(shutil.rmtree, self.directory, True)
+        self.bundled = self.directory / 'bundled'
+        self.user = self.directory / 'user'
+        self.bundled.mkdir()
+        self.user.mkdir()
+
+    def environment(self, **values):
+        env = {key: value for key, value in os.environ.items() if key != 'SPLICE_FFMPEG_DIR'}
+        env.update(values)
+        return mock.patch.dict(os.environ, env, clear=True)
+
+    def test_bare_names_run_the_bundled_tools(self):
+        for name in ('run', 'popen', 'check_output'):
+            target = {'popen': 'Popen'}.get(name, name)
+            with self.subTest(name), self.environment(SPLICE_FFMPEG_DIR=str(self.bundled)), \
+                 mock.patch.object(splice_platform.subprocess, target) as call:
+                getattr(splice_platform, name)(['ffmpeg', '-version'])
+                getattr(splice_platform, name)(('ffprobe', '-v', 'error'))
+                getattr(splice_platform, name)(['taskkill', '/T'])
+                getattr(splice_platform, name)([str(self.user / 'ffmpeg'), '-version'])  # an explicit path is kept
+                commands = [entry.args[0] for entry in call.call_args_list]
+                self.assertEqual(commands, [[str(self.bundled / ('ffmpeg' + self.EXE)), '-version'],
+                                            [str(self.bundled / ('ffprobe' + self.EXE)), '-v', 'error'],
+                                            ['taskkill', '/T'], [str(self.user / 'ffmpeg'), '-version']])
+        with self.environment(), mock.patch.object(splice_platform.subprocess, 'run') as call:
+            splice_platform.run(['ffmpeg', '-version'])  # outside the desktop app: PATH decides, as before
+            self.assertEqual(call.call_args.args[0], ['ffmpeg', '-version'])
+
+    def test_lookups_never_fall_back_to_the_users_ffmpeg(self):
+        for name in ('ffmpeg', 'ffprobe'):
+            (self.user / (name + self.EXE)).write_text('')
+            (self.user / (name + self.EXE)).chmod(0o755)
+        path = str(self.user) + os.pathsep + os.environ.get('PATH', '')
+        with self.environment(SPLICE_FFMPEG_DIR=str(self.bundled), PATH=path):
+            # The bundled files are missing: nothing is found, rather than the user's copy.
+            self.assertIsNone(splice_platform.ffmpeg_tool('ffmpeg'))
+            for name in ('ffmpeg', 'ffprobe'):
+                (self.bundled / (name + self.EXE)).write_text('')
+            self.assertEqual(splice_platform.ffmpeg_tool('ffmpeg'), str(self.bundled / ('ffmpeg' + self.EXE)))
+            self.assertEqual(splice_platform.ffmpeg_tool('ffprobe'), str(self.bundled / ('ffprobe' + self.EXE)))
+            self.assertEqual(delivery._ffmpeg_identity()[0], str(self.bundled / ('ffmpeg' + self.EXE)))
+        with self.environment(PATH=path):
+            self.assertEqual(Path(splice_platform.ffmpeg_tool('ffmpeg')).parent, self.user)
+
+    @unittest.skipUnless(POSIX, 'fake FFmpeg scripts are POSIX shell')
+    def test_startup_check_examines_the_bundled_ffmpeg(self):
+        # The user's FFmpeg comes first on PATH and lacks a required filter; the bundled one is complete.
+        bundled, _ = fake_ffmpeg(self.bundled)
+        fake_ffmpeg(self.user, drop=('zscale',))
+        path = str(self.user) + os.pathsep + '/usr/bin:/bin'
+        with self.environment(SPLICE_FFMPEG_DIR=str(self.bundled), PATH=path):
+            result = runtime_check.report()
+        self.assertEqual(result['ffmpeg'], bundled)
+        self.assertEqual(result['missing'], {})
+        with self.environment(PATH=path):
+            self.assertIn('zscale', runtime_check.startup_problem())
+
+
+
+class DecoderOnUserPath(unittest.TestCase):
+    """The installed app keeps the user's PATH, so a RAW decoder there is found, also when the
+    PATH folder is written in Windows' short 8.3 form (C:\\Users\\RUNNER~1\\...)."""
+
+    @unittest.skipUnless(POSIX, 'a symlink stands in for an 8.3 short name')
+    def test_decoder_in_a_short_named_folder_is_found(self):
+        directory = Path(tempfile.mkdtemp(prefix='splice-userpath-'))
+        self.addCleanup(shutil.rmtree, directory, True)
+        long = directory / 'runneradmin tools'
+        long.mkdir()
+        decoder = long / 'braw-decode'
+        decoder.write_text('#!/bin/sh\nexit 9\n')
+        decoder.chmod(0o755)
+        short = directory / 'RUNNER~1'
+        short.symlink_to(long, target_is_directory=True)
+        env = {key: value for key, value in os.environ.items() if not key.startswith('SPLICE_')}
+        env.update(PATH=str(short) + os.pathsep + '/usr/bin:/bin', SPLICE_DATA_DIR=str(directory / 'data'))
+        with mock.patch.dict(os.environ, env, clear=True):
+            braw = next(entry for entry in raw_decode.decoder_status()['decoders'] if entry['id'] == 'braw')
+        self.assertTrue(braw['available'], braw)
+        self.assertEqual(braw['path'], str(decoder.resolve()))
 
 
 def _windows_os(system_root):

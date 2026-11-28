@@ -91,6 +91,26 @@ jobs:
           } finally {
             Remove-Item $copy -ErrorAction SilentlyContinue
           }
+      - name: Find a RAW decoder on the user's PATH
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          # The installed app launched with a temp folder on the user's PATH (quoted, then a blank
+          # entry) holding braw-decode.cmd, ffmpeg.cmd and ffprobe.cmd stubs: /api/raw/decoders must
+          # report the braw-decode stub found, and prores_raw, delivery and every FFmpeg run must
+          # still use the bundled resources\ffmpeg\ffmpeg.exe (the ffmpeg stubs log if they run).
+          $app = Join-Path $env:LOCALAPPDATA 'Programs\Splice\Application'
+          $copy = Join-Path $app 'Splice-under-test.exe'
+          Copy-Item (Join-Path $app 'Splice.exe') $copy
+          try {
+            node desktop/windows/fuses.mjs test-copy $copy
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            $env:SPLICE_EXECUTABLE = $copy
+            node tests/windows-installer.cjs --user-path
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          } finally {
+            Remove-Item $copy -ErrorAction SilentlyContinue
+          }
       - name: Run the shipped Splice.exe with its default profile
         shell: pwsh
         timeout-minutes: 10
