@@ -404,7 +404,7 @@ def _run_ffmpeg(command, cancelled=None, heartbeat=None):
 def _probe(path):
     from media_proxy import MAX_AUDIO_STREAMS
     result = subprocess.run(['ffprobe', '-v', 'error', '-protocol_whitelist', 'file', '-show_entries',
-                            'stream=codec_type,channels,sample_rate,width,height,color_primaries,color_transfer,color_space,color_range,time_base'
+                            'stream=codec_type,channels,sample_rate,width,height,color_primaries,color_transfer,color_space,color_range,time_base,start_time'
                             ':format=duration,start_time,format_name', '-of', 'json', str(path)],
                             capture_output=True, text=True, timeout=30, check=True)
     data = json.loads(result.stdout)
@@ -435,11 +435,15 @@ def _probe(path):
         if time_base <= 0: raise ValueError
     except (TypeError, ValueError, ZeroDivisionError):
         time_base = None
+    try:
+        video_start = Fraction(str(video.get('start_time')))
+    except (TypeError, ValueError, ZeroDivisionError):
+        video_start = None
     return {'kinds': {stream.get('codec_type') for stream in streams}, 'duration': duration, 'audio': audio,
             'width': int(video.get('width') or 0), 'height': int(video.get('height') or 0),
             'profile': tuple(video.get(key) for key in ('color_primaries', 'color_transfer', 'color_space')),
             'range': 'pc' if video.get('color_range') in ('pc', 'jpeg') else 'tv',
-            'start': start, 'time_base': time_base, 'rates': rates,
+            'start': start, 'time_base': time_base, 'rates': rates, 'video_start': video_start,
             'format': str(data.get('format', {}).get('format_name') or '')}
 
 
@@ -1301,6 +1305,7 @@ def _media_info(item, probes, heartbeat=None):
     probed_range = probe.get('range', 'tv')
     item.update(_kinds=probe['kinds'], _actualDuration=probe['duration'], _audioStreams=probe['audio'], _audioRates=probe['rates'],
                 _sourceProfile=probe['profile'], _startTime=probe['start'], _videoTimeBase=probe['time_base'],
+                _videoStart=probe.get('video_start') if set(probe['format'].split(',')) & STREAM_FORMATS else None,
                 _sourceRange=probed_range if probed_range in ALLOWED_SOURCE_RANGES else 'tv',
                 _seekMargin=SEEK_MARGIN_STREAM_SECONDS if set(probe['format'].split(',')) & STREAM_FORMATS else SEEK_MARGIN_SECONDS)
     return item
@@ -1359,6 +1364,12 @@ def _input_time_shift(item, seek_us):
     start = item.get('_startTime') or Fraction(0)
     time_base = item.get('_videoTimeBase')
     total = Fraction(seek_us, 1_000_000) + Fraction(round(start*1_000_000), 1_000_000)
+    # MPEG-TS/PS (timestamp-discontinuous formats): when the seek point lies before the
+    # picture's first frame, FFmpeg 8 starts a picture-only input at that frame instead
+    # (an MPEG-TS whose sound starts first: no seek, or one into the first moments).
+    video_start = item.get('_videoStart')
+    if video_start is not None and video_start > total:
+        return float(video_start - start)
     if time_base:
         ticks = total/time_base
         # av_rescale_q rounds to nearest, halves away from zero.

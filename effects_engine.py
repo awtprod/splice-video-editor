@@ -1304,7 +1304,7 @@ def prerender_ramp(event, u0, u1, target, directory, cancelled, heartbeat, layou
 # Analyses live in the media store, named by a hash of the source file and its trimmed range: a
 # project names only the 32-hex analysis id, never a path, so nothing a project holds reaches a
 # filtergraph but numbers this module formats itself.
-STABILIZE_VERSION = 'vidstab-2'
+STABILIZE_VERSION = 'vidstab-3'
 DETECT_OPTIONS = 'shakiness=6:accuracy=15:stepsize=6:mincontrast=0.2'
 _vidstab = None
 
@@ -1337,17 +1337,29 @@ def _analysis_dir(analysis):
 
 
 def _probe_frames(path, low, high):
-    """Presentation times (seconds, container clock) of the video frames around low..high."""
-    import subprocess
-    result = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-read_intervals', f'{max(0.0, low-3):.6f}%{high+1:.6f}',
-                             '-show_entries', 'frame=pts_time,best_effort_timestamp_time:stream=start_time', '-of', 'json', str(path)],
+    """Presentation times (seconds, file timestamps) of the video frames around source low..high,
+    and the container start time. Source times count from the container start, as the export
+    counts them (render_movie._probe, _input_time_shift) and as FFmpeg's input -ss does: on an
+    MPEG-TS file whose sound starts first, the picture starts a little after source time 0."""
+    import json, subprocess
+    probe = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'format=start_time', '-of', 'json', str(path)],
+                           capture_output=True, text=True, timeout=60, check=True)
+    start = json.loads(probe.stdout).get('format', {}).get('start_time')
+    try:
+        start = float(start) if start not in (None, 'N/A') else 0.0
+    except ValueError:
+        start = 0.0
+    if not math.isfinite(start):
+        start = 0.0
+    # -read_intervals takes file timestamps, not source times.
+    result = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                             '-read_intervals', f'{max(0.0, start+low-3):.6f}%{start+high+1:.6f}',
+                             '-show_entries', 'frame=pts_time,best_effort_timestamp_time', '-of', 'json', str(path)],
                             capture_output=True, text=True, timeout=600, check=True)
-    import json
     data = json.loads(result.stdout)
     times = sorted({float(frame.get('pts_time', frame.get('best_effort_timestamp_time'))) for frame in data.get('frames', [])
                     if frame.get('pts_time', frame.get('best_effort_timestamp_time')) not in (None, 'N/A')})
-    start = data.get('streams', [{}])[0].get('start_time')
-    return times, float(start) if start not in (None, 'N/A') else 0.0
+    return times, start
 
 
 def _settings_key(settings):
@@ -1394,18 +1406,18 @@ class Stabilizer:
         stat = path.stat()
         analysis = hashlib.sha256(f'{STABILIZE_VERSION}|{path}|{stat.st_size}|{stat.st_mtime_ns}|{source_in:.6f}|{source_out:.6f}'.encode()).hexdigest()[:32]
         directory = _analysis_dir(analysis)
+        # Decide under the lock; status() takes the lock itself (it is not re-entrant), so it is
+        # asked only once the lock is released.
         with self.lock:
             job = self.jobs.get(analysis)
-            if job and job['state'] in ('running', 'done'):
-                return self.status(analysis)
-            if (directory/'analysis.json').exists():
-                return self.status(analysis)
-            job = self.jobs[analysis] = {'state': 'running', 'progress': 0.0, 'analysis': analysis,
-                                         '_cancel': threading.Event(), '_process': None}
-            directory.mkdir(parents=True, exist_ok=True)
-            job['_thread'] = threading.Thread(target=self._detect, args=(analysis, path, source_in, source_out, directory, job),
-                                              daemon=True)
-            job['_thread'].start()
+            known = (job and job['state'] in ('running', 'done')) or (directory/'analysis.json').exists()
+            if not known:
+                job = self.jobs[analysis] = {'state': 'running', 'progress': 0.0, 'analysis': analysis,
+                                             '_cancel': threading.Event(), '_process': None}
+                directory.mkdir(parents=True, exist_ok=True)
+                job['_thread'] = threading.Thread(target=self._detect, args=(analysis, path, source_in, source_out, directory, job),
+                                                  daemon=True)
+                job['_thread'].start()
         return self.status(analysis)
 
     def cancel(self, analysis):
@@ -1437,7 +1449,7 @@ class Stabilizer:
         return {'state': state, 'analysis': analysis}
 
     def _run(self, job, command, progress=None):
-        """One vidstab pass, stoppable by cancel(): ``progress(seconds)`` receives FFmpeg's clock."""
+        """One vidstab pass, stoppable by cancel(): ``progress(line)`` reads FFmpeg's -progress lines."""
         import subprocess
         with self.lock:
             if job['_cancel'].is_set():
@@ -1450,9 +1462,9 @@ class Stabilizer:
         reader.start()
         try:
             for line in process.stdout:
-                if progress and line.startswith('out_time_us='):
+                if progress:
                     try:
-                        progress(int(line.split('=', 1)[1])/1e6)
+                        progress(line.strip())
                     except ValueError:
                         continue
             code = process.wait()
@@ -1475,7 +1487,10 @@ class Stabilizer:
             times, start = _probe_frames(path, source_in+0, source_out+0)
             # Source times are measured from the container start, as the editor's are.
             low, high = source_in+start, source_out+start
-            inside = [t for t in times if low-1e-6 <= t < high-1e-6]
+            # From the frame on screen at the in point (it may start before it: an in point between
+            # frames, or a picture that starts after the container) to the last one before the out.
+            showing = [t for t in times if t <= low+1e-9]
+            inside = [t for t in times if (showing[-1] if showing else low) <= t < high-1e-6]
             if len(inside) < 2:
                 raise ValueError('The stabilized range holds fewer than two frames')
             first, last = inside[0], inside[-1]
@@ -1490,25 +1505,24 @@ class Stabilizer:
             # removes just its own, even when the clip is analyzed again meanwhile.
             token = uuid.uuid4().hex[:12]
             trf, tripod = directory/f'analysis-{token}.trf.part', directory/f'tripod-{token}.trf.part'
-            seek = max(0.0, trim_start-2)
+            # Both passes read exactly the analyzed frames: see _range_input.
+            inputs, leading = _range_input(meta)
             command = ['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y', '-progress', 'pipe:1',
-                       '-ss', f'{seek:.6f}', '-copyts', '-protocol_whitelist', 'file', '-i', str(path), '-map', '0:v:0',
-                       '-vf', f"trim=start={trim_start:.9f}:end={trim_end:.9f},vidstabdetect=result={_vidstab_path(trf)}:{DETECT_OPTIONS}",
-                       '-f', 'null', '-']
-            span = max(1e-6, trim_end-trim_start)
+                       *inputs, '-map', '0:v:0',
+                       '-vf', f"{leading}vidstabdetect=result={_vidstab_path(trf)}:{DETECT_OPTIONS}", '-f', 'null', '-']
 
             def progress(done, share=0.5, base=0.0):
                 with self.lock:
                     if self.jobs.get(analysis) is job:
-                        job['progress'] = min(0.99, max(0.0, base+share*(done-(trim_start-seek))/span))
-            self._run(job, command, progress)
+                        job['progress'] = min(0.99, max(0.0, base+share*done/len(inside)))
+            self._run(job, command, _frames_progress(progress))
             if not trf.exists():
                 raise RuntimeError('Motion analysis failed: no motion data was written')
             # Tripod mode measures every frame against the first: a second pass of its own.
             self._run(job, [*command[:command.index('-vf')+1],
-                            f"trim=start={trim_start:.9f}:end={trim_end:.9f},vidstabdetect=result={_vidstab_path(tripod)}:{DETECT_OPTIONS}:tripod=1",
-                            '-f', 'null', '-'], lambda done: progress(done, 0.5, 0.5))
-            meta['shake'] = {'before': shake_metric(path, trim_start, trim_end, seek)}
+                            f"{leading}vidstabdetect=result={_vidstab_path(tripod)}:{DETECT_OPTIONS}:tripod=1",
+                            '-f', 'null', '-'], _frames_progress(lambda done: progress(done, 0.5, 0.5)))
+            meta['shake'] = {'before': shake_metric(path, trim_start, trim_end, max(0.0, trim_start-start-RANGE_SEEK_MARGIN))}
             if job['_cancel'].is_set() or not tripod.exists():
                 raise InterruptedError('cancelled') if job['_cancel'].is_set() else RuntimeError('Motion analysis failed')
             os.replace(trf, directory/'analysis.trf')
@@ -1580,6 +1594,32 @@ def _vidstab_path(path):
     return _filter_path(path)
 
 
+RANGE_SEEK_MARGIN = 2.0     # an MPEG-TS seek can land up to a GOP after the point asked for
+
+
+def _range_input(meta):
+    """FFmpeg input arguments and the leading filters that pass exactly the analyzed frames, in
+    order. The input is seeked well before the range (input -ss counts from the container start,
+    as meta['start'] does; timestamps stay the file's own), the trim cuts the range on the file's
+    timestamps, and ``copy`` gives every frame its own buffer: vidstabtransform writes into the
+    frame it receives, and when that is the decoder's buffer (once leading frames have been dropped
+    by a trim or a seek, FFmpeg 8 hands it writable decoded frames) later frames decode from the
+    written picture, so whole frames from other source times and double exposures came out."""
+    trim_start, trim_end = meta['trim']
+    arguments = ['-ss', f"{max(0.0, trim_start-meta['start']-RANGE_SEEK_MARGIN):.6f}", '-copyts',
+                 '-protocol_whitelist', 'file', '-i', meta['path'], '-frames:v', str(int(meta['frames']))]
+    return arguments, f'trim=start={trim_start:.9f}:end={trim_end:.9f},copy,'
+
+
+def _frames_progress(callback):
+    """A ``progress`` reader for _run: FFmpeg's ``frame=`` count (its output clock is not
+    usable with -copyts)."""
+    def read(line):
+        if line.startswith('frame='):
+            callback(int(line.split('=', 1)[1]))
+    return read
+
+
 def analysis_meta(analysis):
     import json
     meta_file = _analysis_dir(analysis)/'analysis.json'
@@ -1603,8 +1643,8 @@ def render_stabilized(analysis, settings, target, *, preview=False, cancelled=No
     directory = _analysis_dir(analysis)
     trf = directory/('tripod.trf' if settings.get('tripod') else 'analysis.trf')
     trim_start, trim_end = meta['trim']
-    seek = max(0.0, trim_start-2)
-    picture = (f"trim=start={trim_start:.9f}:end={trim_end:.9f},{stabilize_transform_args(settings, trf)},setpts=PTS-STARTPTS")
+    inputs, leading = _range_input(meta)
+    picture = f"{leading}{stabilize_transform_args(settings, trf)},setpts=PTS-STARTPTS"
     # Each render writes its own partial file (two exports of one clip may run at once); the
     # finished file replaces the target atomically, and a cancelled or failed render removes it.
     import threading, uuid
@@ -1612,14 +1652,20 @@ def render_stabilized(analysis, settings, target, *, preview=False, cancelled=No
     partial = Path(scratch)/f'{Path(target).stem}.{unique}' if scratch else Path(f'{target}.{unique}')
     if preview:
         picture += ",scale='min(1280,iw)':-2:flags=bicubic,format=yuv420p"
-        sound = ['-map', '0:a:0?', '-af', f'atrim=start={trim_start:.9f}:end={trim_end:.9f},asetpts=PTS-STARTPTS', '-c:a', 'aac', '-b:a', '160k']
+        # The sound starts at the first analyzed frame, as the picture does.
+        sound = ['-map', '0:a:0?', '-af', f"atrim=start={meta['first']:.9f}:end={trim_end:.9f},asetpts=PTS-STARTPTS",
+                 '-c:a', 'aac', '-b:a', '160k']
         codec = ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '16', '-g', '12', '-movflags', '+faststart']
     else:
         sound = ['-an']
-        codec = ['-c:v', 'ffv1', '-level', '3', '-g', '1', '-slicecrc', '0']
-    command = ['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y', '-ss', f'{seek:.6f}', '-copyts',
-               '-protocol_whitelist', 'file', '-i', meta['path'], '-map', '0:v:0', '-vf', picture, *codec, *sound,
-               '-map_metadata', '-1', '-avoid_negative_ts', 'make_zero', str(partial)]
+        # write_colr keeps the source's colour tags (MOV drops a matrix it cannot pair with
+        # primaries and transfer); FFV1 stores limited range, which an untagged file reads as.
+        codec = ['-c:v', 'ffv1', '-level', '3', '-g', '1', '-slicecrc', '0', '-movflags', '+write_colr']
+    command = ['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y', *inputs,
+               '-map', '0:v:0', '-vf', picture, *codec, *sound,
+               # Each stream starts at 0 (the MP4 muxer's edit lists; make_zero would shift both
+               # streams by the B-frame delay instead).
+               '-map_metadata', '-1', str(partial)]
     try:
         _run_ffmpeg(command, cancelled, heartbeat)
         os.replace(partial, target)
@@ -1632,7 +1678,9 @@ def stabilized_media(analysis, settings, cancelled=None, heartbeat=None, scratch
     """The export's stabilized picture for an analysis (rendered once per setting, then kept).
     ``scratch``: the export's own work folder for the partial file."""
     settings = _transform_settings(settings)
-    target = _analysis_dir(analysis)/f'export-{_settings_key(settings)}.mkv'
+    # MOV keeps the source's frame times exactly (Matroska rounds them to 1 ms, which moves an
+    # in point just before a frame boundary onto the next frame).
+    target = _analysis_dir(analysis)/f'export-{_settings_key(settings)}.mov'
     if not target.exists():
         render_stabilized(analysis, settings, target, cancelled=cancelled, heartbeat=heartbeat, scratch=scratch)
     return target, analysis_meta(analysis)
@@ -1737,6 +1785,6 @@ def apply_stabilization(project, cancelled=None, heartbeat=None, scratch=None):
         # neighbours); only the picture reads the stabilized media.
         target['_soundMedia'], target['_soundIn'] = target.get('mediaId'), source_in
         target['mediaId'] = media_id
-        target['in'] = source_in-meta['offset']
+        target['in'] = max(0.0, source_in-meta['offset'])
         target['effects'] = {key: value for key, value in (target.get('effects') or {}).items() if key != 'stabilize'}
     return prepared or project

@@ -3,8 +3,13 @@
 - a stabilized clip's sound crossfades and dips out exactly as the same clip unstabilized;
 - ProRes 4444 with alpha stores the source colour at partial alpha (opacity, soft key edges);
 - an export window that starts inside a speed ramp shows the curve's frames;
-- the export honours the key's choke, and a mask that is switched off draws nothing.
+- the export honours the key's choke, and a mask that is switched off draws nothing;
+- every stabilized frame (export and monitor preview) is the source frame the plain export shows
+  at that time, on MP4, MOV and MPEG-TS, and the plain export of an MPEG-TS file follows its
+  container clock whether or not its input is seeked;
+- asking for an analysis again (running or done) answers, and cancel waits for the analysis thread.
 """
+import json
 import math
 import subprocess
 import sys
@@ -347,6 +352,54 @@ class StabilizeJobs(Fixture):
         self.assertEqual(stabilizer.start('/media/long.mp4', 0, 39)['state'], 'running')
         stabilizer.cancel(analysis)
 
+    def test_asking_again_answers_while_running_and_when_done(self):
+        import threading
+        stabilizer = E.Stabilizer()
+
+        def answers(call, *arguments):
+            result = []
+            thread = threading.Thread(target=lambda: result.append(call(*arguments)), daemon=True)
+            thread.start()
+            thread.join(10)
+            self.assertFalse(thread.is_alive(), f'{call.__name__} did not answer')
+            return result[0]
+        status = answers(stabilizer.start, '/media/long.mp4', 0, 39)
+        # Cancelled in a thread of its own: a deadlocked service must fail this test, not hang it.
+        self.addCleanup(lambda: threading.Thread(target=stabilizer.cancel, args=(status['analysis'],), daemon=True).start())
+        self.assertEqual(status['state'], 'running')
+        again = answers(stabilizer.start, '/media/long.mp4', 0, 39)
+        self.assertEqual((again['state'], again['analysis']), ('running', status['analysis']))
+        self.assertEqual(answers(stabilizer.status, status['analysis'])['state'], 'running')
+        self.assertEqual(answers(stabilizer.cancel, status['analysis'])['state'], 'cancelled')
+        done = self.wait(stabilizer, answers(stabilizer.start, '/media/shaky.mp4', .5, 4.5))
+        self.assertEqual(done['state'], 'done', done)
+        self.assertEqual(answers(stabilizer.start, '/media/shaky.mp4', .5, 4.5)['state'], 'done')
+        # A new service (a restart) finds the finished analysis on disk.
+        self.assertEqual(answers(E.Stabilizer().start, '/media/shaky.mp4', .5, 4.5)['state'], 'done')
+        self.assertEqual(answers(stabilizer.status, done['analysis'])['state'], 'done')
+
+    def test_cancel_waits_for_the_analysis_thread(self):
+        import threading
+        released, finished = threading.Event(), threading.Event()
+
+        class Slow(E.Stabilizer):
+            def _detect(self, *arguments):
+                try:
+                    super()._detect(*arguments)
+                finally:
+                    released.wait(30)       # the thread is still cleaning up
+                    finished.set()
+        stabilizer = Slow()
+        analysis = stabilizer.start('/media/long.mp4', 0, 39)['analysis']
+        deadline = time.monotonic()+60
+        while stabilizer.jobs[analysis].get('_process') is None and time.monotonic() < deadline:
+            time.sleep(.05)
+        timer = threading.Timer(.8, released.set)
+        timer.start()
+        self.addCleanup(timer.cancel)
+        self.assertEqual(stabilizer.cancel(analysis)['state'], 'cancelled')
+        self.assertTrue(finished.is_set(), 'cancel returned before the analysis thread ended')
+
     def test_renders_leave_no_partial_files_and_may_run_together(self):
         import threading
         stabilizer = E.Stabilizer()
@@ -414,6 +467,117 @@ class StabilizeJobs(Fixture):
         self.assertEqual(result['state'], 'done', result)
         self.assertTrue(result['src'].startswith('/media/'))
         self.assertEqual(self.leftovers(analysis), [])
+
+
+# Frame-coded source: frame N is a flat colour (red steps 20 a frame, blue 12 every ten frames)
+# under a white grid and a yellow box, cropped with random jitter (shaky).
+CODE_SIZE = (320, 192)
+CODE_FPS = 30
+
+
+def frame_code(r, b):
+    return round((r-20)/20) % 10+10*round((b-20)/12)
+
+
+def frame_codes(path):
+    """(code, distance from the code's nominal colour) of every frame: the median red and blue of
+    the pixels showing the flat colour (green near 128: not grid, box or black border)."""
+    width, height = CODE_SIZE
+    raw = subprocess.run(['ffmpeg', '-nostdin', '-v', 'error', '-i', str(path), '-vf',
+                          f'scale={width}:{height},setparams=range=tv:colorspace=bt709:color_trc=bt709:color_primaries=bt709,'
+                          'zscale,format=gbrp', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-'],
+                         capture_output=True, check=True, timeout=180).stdout
+    size = width*height*3
+    out = []
+    for i in range(0, len(raw)-size+1, size):
+        frame = raw[i:i+size]
+        flat = [(frame[j], frame[j+2]) for j in range(0, size, 3*5) if 110 < frame[j+1] < 146]
+        if not flat:
+            out.append((-1, 999))
+            continue
+        r = sorted(v[0] for v in flat)[len(flat)//2]
+        b = sorted(v[1] for v in flat)[len(flat)//2]
+        code = frame_code(r, b)
+        out.append((code, max(abs(r-(20+20*(code % 10))), abs(b-(20+12*(code//10))))))
+    return out
+
+
+def coded_source(path, extra=()):
+    """Six seconds, shaky, long-GOP H.264 (one keyframe a second, B-frames) with AAC sound."""
+    width, height = CODE_SIZE
+    ffmpeg('-f', 'lavfi', '-i', f"color=c=black:s={width+160}x{height+96}:r={CODE_FPS},format=gbrp,"
+           "geq=r='20+20*mod(N,10)':g='128':b='20+12*floor(N/10)'",
+           '-f', 'lavfi', '-i', 'sine=f=440:r=48000', '-t', '6',
+           '-vf', f"drawgrid=w=24:h=24:t=2:c=white@1,drawbox=x=100:y=60:w=40:h=40:c=yellow:t=fill,"
+           f"crop={width}:{height}:x='80+36*(random(1)-0.5)':y='48+24*(random(2)-0.5)',"
+           "scale=out_color_matrix=bt709:out_range=tv,format=yuv420p",
+           '-c:v', 'libx264', '-crf', '12', '-g', '30', '-bf', '2', '-sc_threshold', '0', '-colorspace', 'bt709',
+           '-c:a', 'aac', '-b:a', '128k', *extra, path)
+
+
+def frame_times(path):
+    """Container start and every video frame's presentation time (file timestamps)."""
+    data = json.loads(subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries',
+                                      'frame=pts_time:format=start_time', '-of', 'json', str(path)],
+                                     capture_output=True, text=True, check=True, timeout=120).stdout)
+    return float(data['format']['start_time']), sorted(float(f['pts_time']) for f in data['frames'])
+
+
+class StabilizedFrames(Fixture):
+    """vidstab after a trim filter that drops leading frames mixed other source times into the
+    result (whole wrong frames, double exposures); the stabilized clip must show, frame for frame,
+    what the plain clip shows."""
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        if not E.vidstab_available():
+            raise unittest.SkipTest('FFmpeg without vidstab')
+        for name, extra in (('shaky.mp4', ()), ('shaky.mov', ()), ('shaky.ts', ('-f', 'mpegts'))):
+            coded_source(cls.media/name, extra)
+
+    def analyze(self, name, low, high):
+        stabilizer = E.Stabilizer()
+        status = stabilizer.start(f'/media/{name}', low, high)
+        deadline = time.monotonic()+180
+        while status['state'] == 'running' and time.monotonic() < deadline:
+            time.sleep(.1)
+            status = stabilizer.status(status['analysis'])
+        self.assertEqual(status['state'], 'done', status)
+        return status
+
+    def test_every_stabilized_frame_is_the_next_source_frame(self):
+        status = self.analyze('shaky.mp4', 0.5, 5.5)
+        self.assertEqual(status['frames'], 150)
+        settings = E._transform_settings({'smoothing': 15})
+        for preview, name in ((False, 'frames.mov'), (True, 'frames.mp4')):
+            target = self.out(name)
+            E.render_stabilized(status['analysis'], settings, target, preview=preview)
+            codes = frame_codes(target)
+            label = 'preview' if preview else 'export'
+            self.assertEqual([code for code, _ in codes], list(range(15, 165)), f'{label}: frames out of order')
+            worst = max(distance for _, distance in codes)
+            self.assertLessEqual(worst, 8, f'{label}: a frame is a mix of two source frames ({worst} codes off)')
+
+    def test_the_stabilized_clip_shows_the_plain_clips_frames(self):
+        width, height = CODE_SIZE
+        for name in ('shaky.mp4', 'shaky.mov', 'shaky.ts'):
+            status = self.analyze(name, 0.3, 5.0)
+            start, times = frame_times(self.media/name)
+            item = {'id': 'm', 'name': name, 'src': f'/media/{name}', 'type': 'video', 'duration': 6}
+            # 0.3 s: an MPEG-TS input is not seeked; 1.033 s: 0.3 ms before a frame boundary.
+            for source_in in (0.3, 1.033):
+                seen = {}
+                for label, effects in (('plain', {}), ('stabilized', {'stabilize': {'analysis': status['analysis'], 'smoothing': 15}})):
+                    clip = {'id': 'A', 'type': 'video', 'mediaId': 'm', 'track': 1, 'start': 0, 'duration': 1.6, 'in': source_in,
+                            'transition': 'none', 'effects': effects}
+                    out = self.out(f'{name}-{source_in}-{label}.mov')
+                    render_to_file({'name': 's', 'width': width, 'height': height, 'fps': 25, 'media': [item], 'clips': [clip]}, out,
+                                   options={'codec': 'prores'})
+                    seen[label] = [code for code, _ in frame_codes(out)]
+                # The plain clip shows the frame on screen at each source time, on the container's clock.
+                expected = [max(k for k, t in enumerate(times) if t <= start+source_in+j/25+1e-6) for j in range(40)]
+                self.assertEqual(seen['plain'], expected, f'{name} in {source_in}: plain export')
+                self.assertEqual(seen['stabilized'], seen['plain'], f'{name} in {source_in}: stabilized export')
 
 
 if __name__ == '__main__':
