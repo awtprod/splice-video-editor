@@ -32,6 +32,16 @@ MEDIA_ROOT = data_directory() / 'media'
 
 
 def _media_path(src):
+    """Every media URL a project names, linked originals included: a thin alias for
+    ``media_links.resolve_media``, the one public resolver (imported here, at call time, because
+    media_links imports this module)."""
+    import media_links
+    return media_links.resolve_media(src)
+
+
+def managed_media_path(src):
+    """A managed copy or proxy (``/media/<id>/<name>``) or a bundled asset (``/assets/...``) as a
+    local path. Linked originals are media_links' to resolve; call _media_path for any source."""
     path = unquote(urlparse(src).path)
     if path.startswith('assets/'):
         path = '/' + path
@@ -242,6 +252,50 @@ def _read_transition(track, item, clip_data):
     clip_data['transitionMatchName'] = matching.match_name
 
 
+# MZ.Sequence.VideoTimeDisplayFormat values for the NTSC rates, drop-frame and not
+# (py-premiere's TIMECODE_FORMATS, as Adobe's projects store them).
+DROP_FRAME_DISPLAY = {8475667200: (102, 103), 4237833600: (106, 107)}
+
+
+def _sequence_timecode(sequence):
+    """Splice's startTimecode (frames) and dropFrame from the sequence's zero point and display format."""
+    result = {}
+    if sequence.timebase:
+        frames = round(sequence.zero_point.ticks / sequence.timebase)
+        if frames > 0:
+            result['startTimecode'] = frames
+    formats = DROP_FRAME_DISPLAY.get(sequence.timebase)
+    display = sequence.video_display_format
+    if formats and display in formats:
+        result['dropFrame'] = display == formats[0]
+    return result
+
+
+def _write_sequence_timecode(sequence, data):
+    """Store Splice's start timecode and drop-frame choice in the sequence (zero point, display format)."""
+    start = data.get('startTimecode') or 0
+    if isinstance(start, str):
+        # A start written as text by an earlier build ("01:00:00:00"): read it as a label.
+        from fractions import Fraction
+        from interchange.timecode import DROP_FRAME_RATES, timecode_frames
+        rate = Fraction(data.get('fps') or 25).limit_denominator(1001)
+        drop = rate in DROP_FRAME_RATES and (';' in start if data.get('dropFrame') is None else data.get('dropFrame') is True)
+        try:
+            start = timecode_frames(start.replace(';', ':'), rate, drop)
+        except ValueError:
+            raise ValueError('Invalid sequence start timecode') from None
+    if not isinstance(start, int) or isinstance(start, bool) or start < 0:
+        raise ValueError('Invalid sequence start timecode')
+    if sequence.zero_point.ticks != start * sequence.timebase:
+        sequence.zero_point = py_premiere.Time(start * sequence.timebase)
+    formats = DROP_FRAME_DISPLAY.get(sequence.timebase)
+    if formats:
+        # Splice shows drop-frame at these rates unless the project turns it off.
+        wanted = formats[0] if data.get('dropFrame') is not False else formats[1]
+        if sequence.video_display_format != wanted:
+            sequence.video_display_format = wanted
+
+
 def open_project(data, index=0, _seen=()):
     _check_size(data)
     if index in _seen:
@@ -370,7 +424,11 @@ def open_project(data, index=0, _seen=()):
             kind = 'audio' if clip_data['type'] == 'audio' else 'video'
             tracks = sequence.audio_tracks if kind == 'audio' else sequence.video_tracks
             number, position = clip_data['premiereTrack'], clip_data['premiereIndex']
-            native_clip_ids[tracks[number].clips[position]._element.get('ObjectID')] = clip_data
+            native_item = tracks[number].clips[position]
+            native_clip_ids[native_item._element.get('ObjectID')] = clip_data
+            # Premiere's Clip > Enable off: the clip keeps everything but plays and renders nothing.
+            if native_item.is_disabled:
+                clip_data['enabled'] = False
         for link_ref in sequence._element.findall('PersistentGroupContainer/LinkContainer/Links/Link'):
             link = project._document.resolve(link_ref)
             members = [native_clip_ids.get(ref.get('ObjectRef'))
@@ -417,15 +475,20 @@ def open_project(data, index=0, _seen=()):
                 item['nestedProject'] = child
         width, height = sequence.frame_size or (1920, 1080)
         fps = py_premiere.TICKS_PER_SECOND / sequence.timebase if sequence.timebase else 30
+        timecode = _sequence_timecode(sequence)
         track_mix = {}
         track_state = {}
         for kind, tracks in (('video', sequence.video_tracks), ('audio', sequence.audio_tracks)):
             for number, track in enumerate(tracks):
                 key = f'{kind}:{number + 1 if kind == "video" else -number - 1}'
-                if track.is_locked or not track.is_sync_locked:
+                # Premiere's track output toggle on a video track is its mute flag; Splice calls it hidden.
+                hidden = kind == 'video' and track.is_muted
+                if track.is_locked or not track.is_sync_locked or hidden:
                     track_state[key] = {'locked': track.is_locked, 'syncLocked': track.is_sync_locked}
-                if kind == 'video' and number == 3 and (track.is_locked or not track.is_sync_locked):
-                    track_state['title:4'] = {'locked': track.is_locked, 'syncLocked': track.is_sync_locked}
+                    if hidden:
+                        track_state[key]['hidden'] = True
+                if kind == 'video' and number == 3 and key in track_state:
+                    track_state['title:4'] = dict(track_state[key])
         for number, track in enumerate(sequence.audio_tracks):
             volume = _static_audio_value(_audio_track_param(track, 'Volume'), 1)
             balance = _static_audio_value(_audio_track_param(track, 'Balance'), .5)
@@ -456,7 +519,7 @@ def open_project(data, index=0, _seen=()):
                 warnings.append(f"{label} at {clip['start']:.2f}s: Premiere volume keys outside the source trim are preserved; preview and export use the clip's static volume.")
             if source_media is not None and source_media.get('nativeGenerator') is not None:
                 warnings.append(f"{source_media['name']} is a native Premiere generator; preview and export are unavailable.")
-        return {'name': sequence.name, 'width': width, 'height': height, 'fps': fps,
+        return {'name': sequence.name, 'width': width, 'height': height, 'fps': fps, **timecode,
                 'premiereSequences': [item.name for item in project.sequences], 'premiereSequence': index,
                 'media': media, 'clips': clips, 'captions': captions,
                 'trackState': track_state,
@@ -468,9 +531,94 @@ def open_project(data, index=0, _seen=()):
                 'markers': [{'id': marker.guid, 'name': marker.name, 'time': marker.start.seconds} for marker in sequence.markers]}
 
 
+def _merged_track_states(states):
+    """Fold title-lane states into their video track: Premiere has one track for both.
+
+    Locked or hidden if either lane was; sync-locked only if both were.
+    """
+    merged = {}
+    for key, state in states.items():
+        if not isinstance(key, str) or not isinstance(state, dict):
+            raise ValueError('Invalid Premiere track state target')
+        target = 'video:' + key[6:] if key.startswith('title:') else key
+        current = merged.get(target)
+        if current is None:
+            merged[target] = dict(state)
+            continue
+        merged[target] = {
+            'locked': bool(current.get('locked')) or bool(state.get('locked')),
+            'syncLocked': current.get('syncLocked', True) is not False and state.get('syncLocked', True) is not False,
+            'hidden': bool(current.get('hidden')) or bool(state.get('hidden')),
+        }
+    return merged
+
+
+def _native_fade_keys(item, clips, fps, has_sound):
+    """Map a decomposed clip's local clock to Premiere's linear automation."""
+    from render_movie import AUDIO_RATE, _fade_clock
+    keys = dict(item.get('keyframes') or {})
+    length = float(item['duration'])
+    dip = item.get('pictureDip')
+    fades = item.get('fadeIn', 0) or item.get('fadeOut', 0)
+
+    def envelope(key, clock, frequency, head, tail):
+        origin, rate, duration = clock
+        if frequency == AUDIO_RATE:
+            origin = round(origin * frequency) / frequency
+        if rate < 0:
+            origin -= 1 / frequency
+        if not all(isinstance(fade, (int, float)) and math.isfinite(fade) and fade >= 0 for fade in (head, tail)):
+            raise ValueError('Invalid audio fade')
+        head, tail = min(head, duration), min(tail, duration)
+        if keys.get(key):
+            raise ValueError(f'Premiere cannot combine retimed fades and existing {key} automation.')
+        knots = [0, head, duration-tail, duration]
+        if head + tail > duration:
+            knots.append(duration * head / (head + tail))
+        times = {0, length, *(max(0, min(length, (k-origin)/rate)) for k in knots)}
+        base = float(item.get(key, 100))
+        # The native writer rounds local times. An endpoint wins its bucket so
+        # its gain is evaluated at the actual clip boundary.
+        native_times = {round(t, 5): t for t in sorted(times)}
+        for endpoint in (0, length):
+            native_times[round(endpoint, 5)] = endpoint
+        points = []
+        for time in native_times.values():
+            t = origin + time * rate
+            gain = max(0, min(1, t/head if head else 1, (duration-t)/tail if tail else 1))
+            points.append({'time': time, 'value': base*gain})
+        keys[key] = points
+
+    if fps <= 0:
+        raise ValueError('Invalid sequence frame rate')
+    if dip:
+        clock = _fade_clock(item, 'pictureDip')
+        if item['type'] != 'audio':
+            if any(c['type'] != 'audio' and c.get('enabled', True) and c['track'] < item['track']
+                   and c['start'] < item['start'] + length and c['start'] + c['duration'] > item['start']
+                   for c in clips):
+                raise ValueError('Premiere opacity automation cannot preserve a retimed dip over a lower layer.')
+            envelope('opacity', clock, fps, clock[2], 0)
+        if has_sound:
+            if fades or item.get('transitionMatchName') == 'Constant Power':
+                raise ValueError('Premiere cannot preserve this combined or constant-power retimed audio fade.')
+            envelope('volume', clock, AUDIO_RATE, clock[2], 0)
+    if has_sound and item.get('fadeClock') and fades:
+        envelope('volume', _fade_clock(item, 'fadeClock'), AUDIO_RATE,
+                 item.get('fadeIn', 0), item.get('fadeOut', 0))
+    return {**item, 'keyframes': keys, 'fadeIn': 0, 'fadeOut': 0}
+
+
 def save_project(data):
     if not isinstance(data, dict):
         raise ValueError('Invalid project')
+    media_by_id = {item.get('id'): item for item in data.get('media', [])}
+    if any(item.get('parentMediaId') for item in media_by_id.values()):
+        from render_movie import resolve_subclip_source
+        data = {**data, 'clips': [resolve_subclip_source(clip, media_by_id) for clip in data['clips']]}
+    if any(media_by_id.get(c.get('mediaId'), {}).get('multicam') for c in data['clips']):
+        raise ValueError('Flatten multicam clips on the timeline before saving to Premiere. '
+                         'Save a Splice project to keep the editable angles.')
     lanes = {}
     for item in data.get('clips', []):
         lane = ('audio' if item.get('type') == 'audio' else 'video', int(item.get('track', 1)))
@@ -481,10 +629,17 @@ def save_project(data):
             if float(current['start']) < float(previous['start']) + float(previous['duration']) - .001:
                 raise ValueError(f'Premiere track {lane[1]} contains overlapping clips')
     for clip in data.get('clips', []):
+        if clip.get('transitionClock'):
+            raise ValueError('Premiere cannot write a partially cropped transition. Save a Splice project or replace the transition.')
         if (clip.get('color') or {}).get('lut'):
             raise ValueError('Premiere export cannot write imported LUTs; save a Splice project or remove the LUT')
     if any(mix.get('solo', False) for mix in (data.get('trackMix') or {}).values()):
         raise ValueError('Premiere export cannot write track solo; save a Splice project or disable solo')
+    used_audio_tracks = {str(c.get('track')) for c in data['clips']
+                         if c.get('type') == 'audio' or (c.get('type') == 'video' and c.get('embeddedAudio', True))}
+    if any(str(track) in used_audio_tracks and mix.get('outputStages')
+           for track, mix in (data.get('trackMix') or {}).items()):
+        raise ValueError('Premiere cannot write the cascaded nested track mix. Export the audio mix or save a Splice project.')
     original = data.get('premiereOriginal')
     if original and len(original) > 70 * 1024 * 1024:
         raise ValueError('Original Premiere project is too large')
@@ -525,16 +680,15 @@ def save_project(data):
             raise ValueError('Unsupported video track number')
         custom = base._replace(frame_rate=chosen[0], width=width, height=height, time_display=chosen[1], video_tracks=highest_video)
         sequence = project.add_sequence(str(data.get('name') or 'Untitled')[:120], sequence_format=custom)
-    track_states = data.get('trackState') or {}
+    _write_sequence_timecode(sequence, data)
+    track_states = _merged_track_states(data.get('trackState') or {})
     for key, state in track_states.items():
         try:
             kind, raw_track = key.split(':', 1)
             number = int(raw_track)
         except (ValueError, AttributeError) as exc:
             raise ValueError('Invalid Premiere track state target') from exc
-        tracks = sequence.audio_tracks if kind == 'audio' else sequence.video_tracks if kind in ('video', 'title') else None
-        if kind == 'title' and f'video:{number}' in track_states and track_states[f'video:{number}'] != state:
-            raise ValueError(f'Title and video track {number} share one native Premiere lock state')
+        tracks = sequence.audio_tracks if kind == 'audio' else sequence.video_tracks if kind == 'video' else None
         if tracks is None:
             raise ValueError('Invalid Premiere track state target')
         index = -number - 1 if kind == 'audio' else number - 1
@@ -545,6 +699,8 @@ def save_project(data):
             track.is_locked = bool(state['locked'])
         if bool(state.get('syncLocked', True)) != track.is_sync_locked:
             track.is_sync_locked = bool(state['syncLocked'])
+        if kind != 'audio' and bool(state.get('hidden', False)) != track.is_muted:
+            track.is_muted = bool(state.get('hidden', False))
     camera_mix = {}
     for key, mix in (data.get('trackMix') or {}).items():
         number = int(key)
@@ -651,6 +807,7 @@ def save_project(data):
             if identity not in retained_markers:
                 sequence.remove_marker(marker)
     original_clips = {}
+    intact_links = set()
     if original:
         for kind, tracks in (('video', sequence.video_tracks), ('audio', sequence.audio_tracks)):
             for track_index, track in enumerate(tracks):
@@ -668,19 +825,16 @@ def save_project(data):
             if any(key is None for key in keys):
                 continue
             present = [incoming_by_key.get(key) for key in keys]
-            if not any(present):
-                remove_child(links, link_ref)
-                project._document.remove_object(link)
+            group = present[0].get('linkGroup') if all(present) else None
+            members = [item for item in data.get('clips', []) if group and item.get('linkGroup') == group]
+            # Keep the native link only while Splice still links exactly these clips. Linked clips may
+            # drift out of sync (J- and L-cuts), as they can in Premiere; an unlink or a partial delete
+            # removes the link, and any regrouped clips are linked again after placement.
+            if group and len(members) == len(present) and all(item.get('linkGroup') == group for item in present):
+                intact_links.add(group)
                 continue
-            if not all(present):
-                raise ValueError('Linked Premiere audio and video must be deleted together')
-            offsets = [(float(item['start']) - original_clips[key].start.seconds,
-                        float(item['duration']) - original_clips[key].duration.seconds,
-                        float(item['in']) - original_clips[key].in_point.seconds)
-                       for key, item in zip(keys, present)]
-            if any(any(abs(value - offsets[0][position]) > .001 for position, value in enumerate(values))
-                   for values in offsets[1:]):
-                raise ValueError('Linked Premiere audio and video must stay aligned')
+            remove_child(links, link_ref)
+            project._document.remove_object(link)
     available = {}
     existing = {}
     existing_uid = {}
@@ -695,6 +849,8 @@ def save_project(data):
         collect(project.root_item)
     bin_cache = {}
     for item in data.get('media', []):
+        if item.get('multicam'):
+            continue  # The virtual pool item has no single source file.
         src = item.get('src', '')
         if original and item.get('premiereItemUID') in existing_uid:
             available[item['id']] = existing_uid[item['premiereItemUID']]
@@ -721,7 +877,6 @@ def save_project(data):
         available[item['id']] = project.import_files([path])[0]
         if item.get('bin'):
             available[item['id']].move_to(_ensure_bin(project, item['bin'], bin_cache))
-    media_by_id = {item.get('id'): item for item in data.get('media',[])}
     generated_audio = {}
 
     def source_audio(clip):
@@ -749,26 +904,26 @@ def save_project(data):
         sequence._link([picture,sound])
         return picture,sound
 
-    new_link_groups = {}
+    placed_clips = {}
+    # A new, in-sync picture/sound pair is placed the way Premiere places a linked clip.
+    # Other new link groups (J- and L-cuts, merged clips) are placed clip by clip and linked after.
+    group_members = {}
     for item in data.get('clips', []):
-        if item.get('linkGroup') and 'premiereIndex' not in item:
-            new_link_groups.setdefault(item['linkGroup'], []).append(item)
+        if item.get('linkGroup'):
+            group_members.setdefault(item['linkGroup'], []).append(item)
+    linked_pairs = {}
+    for group, members in group_members.items():
+        video = next((item for item in members if item.get('type') == 'video'), None)
+        audio = next((item for item in members if item.get('type') == 'audio'), None)
+        if (len(members) == 2 and video and audio and not any('premiereIndex' in item for item in members) and
+                all(abs(float(video[key]) - float(audio[key])) <= .001 for key in ('start', 'duration', 'in'))):
+            video_track, audio_track = int(video['track']) - 1, -int(audio['track']) - 1
+            if not 0 <= video_track < len(sequence.video_tracks) or not 0 <= audio_track < len(sequence.audio_tracks):
+                raise ValueError('Native linked placement track is unavailable')
+            if available.get(video.get('mediaId')) is None or available.get(audio.get('mediaId')) is None:
+                raise ValueError('Relink both sources before saving linked audio and video to Premiere')
+            linked_pairs[group] = (video, audio)
     linked_placements = {}
-    for group in new_link_groups.values():
-        video = next((item for item in group if item.get('type') == 'video'), None)
-        audio = next((item for item in group if item.get('type') == 'audio'), None)
-        if len(group) != 2 or video is None or audio is None:
-            raise ValueError('A native linked placement needs one video and one audio clip')
-        source = available.get(video.get('mediaId'))
-        if source is None or available.get(audio.get('mediaId')) is None:
-            raise ValueError('Relink both sources before saving linked audio and video to Premiere')
-        if any(abs(float(video[key]) - float(audio[key])) > .001 for key in ('start', 'duration', 'in')):
-            raise ValueError('Linked Premiere audio and video must stay aligned')
-        video_track = int(video['track']) - 1
-        audio_track = -int(audio['track']) - 1
-        if not 0 <= video_track < len(sequence.video_tracks) or not 0 <= audio_track < len(sequence.audio_tracks):
-            raise ValueError('Native linked placement track is unavailable')
-    linked_groups_placed = set()
     # Put linked camera sound on a free audio track alongside the explicit mix.
     audio_regions = [[] for _ in sequence.audio_tracks]
     for region in data.get('clips', []):
@@ -791,17 +946,12 @@ def save_project(data):
         index = -ui_track - 1 if is_audio else ui_track - 1
         if index < 0 or index >= len(tracks):
             raise ValueError('Unsupported track number')
-        group_key = item.get('linkGroup')
-        if group_key in new_link_groups and group_key not in linked_groups_placed:
-            pair = new_link_groups[group_key]
-            video = next(member for member in pair if member['type'] == 'video')
-            audio = next(member for member in pair if member['type'] == 'audio')
-            linked_video, linked_audio = place_linked(
+        pair = linked_pairs.get(item.get('linkGroup'))
+        if pair and item.get('id') not in linked_placements:
+            video, audio = pair
+            linked_placements[video['id']], linked_placements[audio['id']] = place_linked(
                 video, py_premiere.Time.from_seconds(float(video['start'])),
-                int(video['track']) - 1, -int(audio['track']) - 1,audio)
-            linked_placements[video['id']] = linked_video
-            linked_placements[audio['id']] = linked_audio
-            linked_groups_placed.add(group_key)
+                int(video['track']) - 1, -int(audio['track']) - 1, audio)
         if item.get('id') in linked_placements:
             clip = linked_placements[item['id']]
         elif original and 'premiereIndex' in item:
@@ -885,6 +1035,8 @@ def save_project(data):
         if source_changed or length_changed or 'premiereIndex' not in item:
             clip.out_point = py_premiere.Time.from_seconds(start + duration * speed)
             clip.end = py_premiere.Time.from_seconds(float(item.get('start', 0)) + duration)
+        if item.get('pictureDip') or item.get('fadeClock'):
+            item = _native_fade_keys(item, items, requested_fps, is_audio or companion is not None)
         if companion is not None:
             if abs(speed-companion.speed)>.000001:
                 _set_clip_speed(companion,speed)
@@ -904,6 +1056,13 @@ def save_project(data):
             premiere_effects.apply_extended(companion, audio_item)
             item = {**item, 'fadeIn': 0, 'fadeOut': 0, 'pan': 0,
                     'keyframes': {key: points for key, points in (item.get('keyframes') or {}).items() if key != 'volume'}}
+        placed_clips[item.get('id')] = clip
+        # A disabled Splice clip is a disabled Premiere track item; so is the camera sound placed
+        # with it, since a disabled clip contributes no sound either.
+        disabled = item.get('enabled') is False
+        for native in (clip, companion):
+            if native is not None and native.is_disabled != disabled:
+                native.is_disabled = disabled
         premiere_effects.apply(clip, item.get('color') or {}, float(item.get('volume', 100)))
         premiere_effects.apply_extended(clip, item)
         if item.get('transition') in TRANSITIONS and not is_audio:
@@ -913,6 +1072,15 @@ def save_project(data):
             if match not in AUDIO_CROSSFADE_NAMES:
                 match = AUDIO_CROSSFADE
             pending_transitions.append((clip, item, match, match))
+    # Link every Splice link group that is not an untouched native link, including groups
+    # whose picture and sound are out of sync.
+    link_groups = {}
+    for item in data.get('clips', []):
+        if item.get('linkGroup') and item.get('id') in placed_clips:
+            link_groups.setdefault(item['linkGroup'], []).append(placed_clips[item['id']])
+    for group, members in link_groups.items():
+        if group not in intact_links and group not in linked_pairs and len(members) >= 2:
+            sequence._link(members)
     if original:
         retained = {(('video' if c.get('type') == 'title' else c.get('type')), c.get('premiereTrack'), c.get('premiereIndex')) for c in data.get('clips', []) if 'premiereIndex' in c}
         for key, clip in original_clips.items():

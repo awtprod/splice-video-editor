@@ -7,11 +7,16 @@
   const field = (title, key, value, min, max, step = .04, group = '') =>
     `<label class="splice-number"><span>${title}</span><input aria-label="${title}" type="number" data-field="${key}" data-group="${group}" min="${min}" max="${max}" step="${step}" value="${value}"></label>`;
   const section = (title, body) => `<section class="splice-section"><h3>${title}</h3>${body}</section>`;
+  // 1D LUTs are applied at full length in preview and export (lut1d); only a missing file needs a note.
+  const lutNote = lut => lut && !lut.data?.length ? '<p class="splice-lut-note" role="note">This LUT\'s table is missing. Import the .cube file again.</p>' : '';
   const option = (key, title, selected) => `<option value="${escape(key)}" ${key === selected ? 'selected' : ''}>${escape(title)}</option>`;
-  let lastScopePaint = 0;
   let automationProperty = 'opacity';
   let showSafeArea = false;
-  const automation = {opacity:['Opacity',0,100,1],x:['Horizontal',-100,100,1],y:['Vertical',-100,100,1],scale:['Scale',10,400,1],rotation:['Rotation',-180,180,1],volume:['Audio gain',0,200,1]};
+  const automation = {opacity:['Opacity',0,100,1],x:['Horizontal',-100,100,1],y:['Vertical',-100,100,1],scale:['Scale',10,400,1],rotation:['Rotation',-180,180,1],volume:['Audio gain',0,200,1],
+    // Grade keyframes (color-grade.js ANIMATED): the grade at each keyframe is mixed over time.
+    exposure:['Exposure (EV)',-4,4,.1],temperature:['Temperature',-100,100,1],tint:['Tint',-100,100,1],
+    brightness:['Brightness',0,200,1],contrast:['Contrast',0,200,1],saturation:['Saturation',0,200,1]};
+  const gradeKeys = ['exposure','temperature','tint','brightness','contrast','saturation'];
   function atKeyframe(points,time,base) {
     if(!points.length)return base;
     if(time<=points[0].time)return points[0].value;
@@ -22,13 +27,17 @@
     }
     return points.at(-1).value;
   }
-  function render(state, element, editor) {
+  const renderedInspectors = new WeakMap();
+  function render(state, element, editor, reuse = false) {
     const clip = state.selected;
     if (!clip) {
+      renderedInspectors.delete(element);
       element.innerHTML = '<div class="inspector-empty">Select a clip to edit its settings.</div>';
       return;
     }
     const source = state.project.media.find(item => item.id === clip.mediaId);
+    // RAW controls follow the media the clip plays: a multicam clip's active angle, a subclip's original.
+    const rawSource = (editor.resolveClipMedia ? editor.resolveClipMedia(clip, state.project).item : source) || null;
     const title = clip.title || source?.name || 'Title';
     const color = clip.color || {};
     const transform = clip.transform || {};
@@ -38,15 +47,43 @@
     const maximumDuration = !source?.still && source?.duration ? Math.max(1/fps, (source.duration - (clip.in || 0))/number(clip.speed,1)) : 7200;
     let html = `<div class="splice-clip-heading"><small>${escape(clip.type)} · ${clip.track > 0 ? 'V' + clip.track : 'A' + Math.abs(clip.track)}</small><strong>${escape(title)}</strong></div>`;
     if(locked) html += '<p class="splice-compat">This track is locked. Unlock it in the timeline to edit this clip.</p>';
+    if (window.SpliceNested?.isNativeNested?.(source)) {
+      html += section('Nested sequence',
+        '<div class="inspector-editorial-actions">' +
+        '<button type="button" data-action="enter-nest">Open nested sequence</button>' +
+        '<button type="button" data-action="unnest-clip">Unnest in place</button>' +
+        '</div>');
+    }
+    if (window.SpliceMulticam?.isMulticamItem?.(source)) {
+      const angles = source.multicam.angles;
+      const curAngle = (clip.type === 'audio' ? clip.multicamAudioAngle : undefined) ?? clip.multicamAngle ?? 0;
+      const opts = angles.map((a, i) => clip.type === 'video' && !editor.isPictureAngle(a, state.project) ? '' : option(String(i), `${i + 1}: ${a.name || 'Angle ' + (i + 1)}`, String(curAngle))).join('');
+      html += section('Multicam',
+        `<label class="splice-number"><span>Active angle</span><select aria-label="Multicam angle" data-action="mc-angle">${opts}</select></label>` +
+        '<div class="inspector-editorial-actions">' +
+        `<button type="button" data-action="mc-view">${window.SpliceMulticam.isViewEnabled() ? 'Close multicam view' : 'Multicam monitor'}</button>` +
+        '<button type="button" data-action="mc-flatten">Flatten multicam</button>' +
+        '</div>');
+    }
+    if (source?.parentMediaId) {
+      const sIn = Number(source.subclipIn) || 0;
+      const sOut = Number(source.subclipOut) || (sIn + (Number(source.duration) || 0));
+      html += section('Subclip',
+        `<p class="splice-handle">Bounds: ${escape(editor.formatTimecode(sIn, fps))} – ${escape(editor.formatTimecode(sOut, fps))}</p>` +
+        '<div class="inspector-editorial-actions"><button type="button" data-action="remove-subclip-limits">Remove subclip limits</button></div>');
+    }
+    const labelColors = window.SpliceBins?.COLOR_LABELS || [];
     html += section('Timing',
       field('Timeline start', 'start', number(clip.start, 0).toFixed(2), 0, 7200, 1/fps) +
       (clip.type==='title' ? field('Video track','track',clip.track,1,64,1) : '') +
       (clip.type === 'title' || source?.still ? '' : field('Source in', 'in', number(clip.in, 0).toFixed(2), 0, source?.duration || 7200, 1/fps)) +
-      field('Duration', 'duration', number(clip.duration, 1).toFixed(2), 1/fps, maximumDuration, 1/fps));
+      field('Duration', 'duration', number(clip.duration, 1).toFixed(2), 1/fps, maximumDuration, 1/fps) +
+      (labelColors.length ? `<label class="splice-number"><span>Color label</span><select aria-label="Clip color label" data-field="colorLabel">${labelColors.map(c => option(c.key, c.name, clip.colorLabel || '')).join('')}</select></label>` : ''));
     if (clip.type!=='title' && !source?.still && !clip.nativeTimeRemap) html += section('Speed',
       field('Speed (%)','speedPercent',Math.round(number(clip.speed,1)*10000)/100,10,800,.01) +
       `<label class="splice-safe-toggle"><input aria-label="Reverse clip" type="checkbox" data-field="reverse" ${clip.reverse?'checked':''}> Reverse clip</label>`);
     if (clip.type === 'video') {
+      if (window.SpliceRawUI && rawSource?.raw === true) html += window.SpliceRawUI.markup(clip, rawSource, source?.parentMediaId ? source : null);
       const previous = state.project.clips.find(item => item.type==='video' && item.track===clip.track && item.id!==clip.id &&
         Math.round((item.start+item.duration)*fps)===Math.round(clip.start*fps));
       const previousMedia = previous && state.project.media.find(item=>item.id===previous.mediaId);
@@ -67,10 +104,14 @@
         label('Exposure', 'exposure', number(color.exposure, 0), -4, 4, .1, ' EV', 'color') +
         label('Temperature', 'temperature', number(color.temperature, 0), -100, 100, 1, '', 'color') +
         label('Tint', 'tint', number(color.tint, 0), -100, 100, 1, '', 'color') +
-        `<div class="splice-lut-row"><button type="button" data-action="import-lut">Import .cube LUT</button><span>${escape(color.lut?.title || 'No LUT')}</span>${color.lut ? '<button type="button" data-action="remove-lut">Remove</button>' : ''}</div>` +
+        // The LUT name has a row of its own, so it stays readable in a narrow inspector.
+        `<div class="splice-lut"><p class="splice-lut-name" title="${escape(color.lut?.title || 'No LUT')}"><small>LUT</small> ${escape(color.lut?.title || 'None')}</p>` +
+        `<div class="splice-lut-row"><button type="button" data-action="import-lut">${color.lut ? 'Replace .cube LUT' : 'Import .cube LUT'}</button>${color.lut ? '<button type="button" data-action="remove-lut">Remove</button>' : ''}</div></div>` +
+        lutNote(color.lut) +
         (color.lut ? label('LUT intensity', 'lutIntensity', number(color.lutIntensity, 100), 0, 100, 1, '%', 'color') : '') +
         '<input type="file" class="splice-lut-input" accept=".cube" hidden>' +
-        '<canvas class="splice-scope" width="240" height="210" aria-label="RGB parade, luma waveform, and vectorscope from graded frame"></canvas>');
+        (window.SpliceColorUI ? window.SpliceColorUI.markup(clip, source) : '') +
+        window.SpliceScopes.markup());
       html += section('Incoming transition',
         `<label class="splice-number"><span>Style</span><select aria-label="Transition style" data-field="transition">${clip.transition==='native'?option('native','Imported: '+(clip.transitionMatchName||'Premiere effect'),'native'):''}${option('none','Cut',clip.transition || 'none')}${option('dissolve','Cross dissolve',clip.transition || 'none')}${option('fade','Fade through black',clip.transition || 'none')}${option('wipe','Wipe left to right',clip.transition || 'none')}</select></label>` +
         field('Length', 'transitionDuration', number(clip.transitionDuration, .5).toFixed(2), 1/fps, 7200, 1/fps) +
@@ -102,25 +143,34 @@
         (clip.keyframes?.volume?.length ? '<p class="splice-handle">Gain keyframes control the level. Edit them below.</p>' : '') +
         label('Pan', 'pan', number(clip.pan, 0), -100, 100, 1, '', '') +
         field('Fade in', 'fadeIn', number(clip.fadeIn, 0).toFixed(2), 0, clip.duration, .04) +
-        field('Fade out', 'fadeOut', number(clip.fadeOut, 0).toFixed(2), 0, clip.duration, .04));
+        field('Fade out', 'fadeOut', number(clip.fadeOut, 0).toFixed(2), 0, clip.duration, .04) +
+        audioRouting(clip, state.project) +
+        `<div class="audio-fx-mount" data-owner="clip:${escape(clip.id)}" aria-label="Clip audio effects"></div>`);
     }
     if (clip.type === 'audio') {
       html += section('Incoming transition',
-        `<label class="splice-number"><span>Style</span><select aria-label="Audio transition style" data-field="transition">${clip.transition==='native'?option('native','Imported: '+(clip.transitionMatchName||'Premiere effect'),'native'):''}${option('none','Cut',clip.transition || 'none')}${option('dissolve','Crossfade',clip.transition || 'none')}</select></label>` +
+        `<label class="splice-number"><span>Style</span><select aria-label="Audio transition style" data-field="transition">${clip.transition==='native'?option('native','Imported: '+(clip.transitionMatchName||'Premiere effect'),'native'):''}${option('none','Cut',clip.transition || 'none')}${option('dissolve','Crossfade',clip.transition || 'none')}${option('fade','Dip (out, then in)',clip.transition || 'none')}</select></label>` +
         field('Length','transitionDuration',number(clip.transitionDuration,.5).toFixed(2),1/fps,7200,1/fps));
     }
     if (['video','audio','title'].includes(clip.type)) {
       const available=clip.type==='audio' ? ['volume'] : clip.type==='title' ? ['opacity'] :
-        ['opacity','x','y','scale','rotation',...(clip.embeddedAudio===false?[]:['volume'])];
+        ['opacity','x','y','scale','rotation',...(clip.embeddedAudio===false?[]:['volume']),...gradeKeys];
       if(!available.includes(automationProperty))automationProperty=available[0];
       const spec=automation[automationProperty], local=Math.max(0,Math.min(clip.duration,number(state.time,clip.start)-clip.start));
       const points=(clip.keyframes?.[automationProperty] || []).slice().sort((a,b)=>a.time-b.time);
-      const base=automationProperty==='opacity' ? number(clip.opacity,100) : automationProperty==='volume' ? number(clip.volume,100) : number(transform[automationProperty],automationProperty==='scale'?100:0);
+      const base=automationProperty==='opacity' ? number(clip.opacity,100) : automationProperty==='volume' ? number(clip.volume,100) :
+        gradeKeys.includes(automationProperty) ? number(color[automationProperty],['brightness','contrast','saturation'].includes(automationProperty)?100:0) :
+        number(transform[automationProperty],automationProperty==='scale'?100:0);
       const current=atKeyframe(points,local,base);
+      const keyButtons=points.map(point=>{
+        const outside=point.time < -1e-6 || point.time > clip.duration+1e-6;
+        const when=point.time.toFixed(2);
+        return `<button type="button" data-key-time="${point.time}" ${outside?'disabled':''} title="${outside?'Keyframe outside this trim':'Go to keyframe at '+when+' seconds'}">${when}s · ${point.value}</button>`;
+      }).join('');
       html += section('Keyframes',
         `<label class="splice-number"><span>Property</span><select aria-label="Keyframe property" data-key-property>${available.map(key=>option(key,automation[key][0],automationProperty)).join('')}</select></label>` +
         `<div class="splice-key-edit"><label><span class="splice-key-time">Value at ${local.toFixed(2)} s</span><input aria-label="Keyframe value" type="number" class="splice-key-value" min="${spec[1]}" max="${spec[2]}" step="${spec[3]}" value="${current}"></label><button type="button" data-key-add>Add / update</button></div>` +
-        (points.length ? `<div class="splice-key-list">${points.map(point=>`<button type="button" data-key-time="${point.time}" title="Go to keyframe at ${point.time.toFixed(2)} seconds">${point.time.toFixed(2)}s · ${point.value}</button>`).join('')}</div><button type="button" class="splice-key-delete" data-key-delete>Delete keyframe at playhead</button>` : '<p class="splice-handle">No keyframes. Add one at the playhead to animate this property.</p>'));
+        (points.length ? `<div class="splice-key-list">${keyButtons}</div><button type="button" class="splice-key-delete" data-key-delete>Delete keyframe at playhead</button>` : '<p class="splice-handle">No keyframes. Add one at the playhead to animate this property.</p>'));
     }
     if (clip.type === 'audio' || clip.type === 'video' && clip.embeddedAudio !== false) {
       const track = clip.track;
@@ -142,11 +192,25 @@
       `<p class="splice-compat">${escape(nativeLimits.join(', '))} will not save to Premiere. Save a Splice working copy to keep this edit.</p>`);
     if(clip.transition==='native') html += section('Render compatibility',
       `<p class="splice-compat">This imported Premiere transition (${escape(clip.transitionMatchName||'unknown effect')}) stays in the native project. MP4 export cannot render it yet. Choose a supported transition to export video.</p>`);
+    // Edits elsewhere on the timeline often leave this inspector identical.
+    // Preserve its canvases and listeners when their captured inputs still match.
+    const prior = renderedInspectors.get(element);
+    if (reuse && prior?.root === element.firstElementChild && prior.clip === clip &&
+        prior.source === source && prior.locked === locked && prior.html === html && prior.fps === fps) return;
+    // The scope canvas and Audio FX mount survive re-renders when their inputs still match.
+    const previousScope = element.querySelector('.splice-scope');
+    const previousFx = element.querySelector('.audio-fx-mount');
     element.innerHTML = html;
-    for(const key of ['scale','x','y','rotation','opacity','volume'])
+    renderedInspectors.set(element, {root: element.firstElementChild, clip, source, locked, html, fps});
+    const freshScope = element.querySelector('.splice-scope');
+    if (previousScope && freshScope) {
+      previousScope.style.height = freshScope.style.height;
+      freshScope.replaceWith(previousScope);
+    }
+    for(const key of ['scale','x','y','rotation','opacity','volume',...gradeKeys])
       if(clip.keyframes?.[key]?.length) element.querySelector(`[data-field="${key}"]:not([data-group="trackMix"])`)?.setAttribute('disabled','');
     if(clip.transition==='native') element.querySelector('[data-field="transitionDuration"]')?.setAttribute('disabled','');
-    if(locked) for(const input of element.querySelectorAll('[data-field]:not([data-group="trackMix"]),[data-key-add],[data-key-delete],[data-key-property],.splice-key-value,[data-action="import-lut"],[data-action="remove-lut"]')) input.disabled=true;
+    if(locked) for(const input of element.querySelectorAll('[data-field]:not([data-group="trackMix"]),[data-key-add],[data-key-delete],[data-key-property],.splice-key-value,[data-action="import-lut"],[data-action="remove-lut"],[data-action="unnest-clip"],[data-action="mc-angle"],[data-action="mc-flatten"],[data-action="remove-subclip-limits"],[data-grade-tools] input,[data-grade-tools] select,[data-grade-tools] button:not([data-grade-action="copy"]):not([data-grade-action="cube"]):not([data-curve-tab])')) input.disabled=true;
     document.querySelector('#monitor-frame')?.classList.toggle('show-safe-area', showSafeArea);
     element.querySelector('[data-safe-area]')?.addEventListener('change',event=>{
       showSafeArea=event.target.checked;
@@ -174,12 +238,14 @@
         try {
           if (group === 'trackMix') {
             editor.updateTrackMix(active.track, {[key]: value});
+          } else if (key === 'colorLabel' && window.SpliceBins) {
+            window.SpliceBins.setClipColorLabel(active.id, value);
           } else if (key==='speedPercent') {
             editor.setClipSpeed(active.id,value/100);
             render(editor.get(),element,editor);
           } else {
             editor.updateClip(active.id, group ? {[group]: {...(active[group] || {}), [key]: value}} : {[key]: value});
-            if(['align','track','pan','fadeIn','fadeOut','transition','transitionDuration'].includes(key)) render(editor.get(),element,editor);
+            if(['align','track','pan','fadeIn','fadeOut','transition','transitionDuration','channelMap','audioTransition'].includes(key)) render(editor.get(),element,editor);
           }
         } catch(error) {
           window.alert(error.message || 'This clip cannot be changed.');
@@ -187,6 +253,54 @@
         }
       });
     }
+    element.querySelector('[data-action="enter-nest"]')?.addEventListener('click', () => {
+      if (source) window.SpliceNested?.enter?.(source.id).catch(err => window.SpliceNotify?.(err.message));
+    });
+    element.querySelector('[data-action="unnest-clip"]')?.addEventListener('click', () => {
+      try {
+        const out = window.SpliceNested?.unnestClip?.(clip.id);
+        if (out) window.SpliceNotify?.(`Unnested ${out.length} clip${out.length === 1 ? '' : 's'} in place`);
+      } catch (err) { window.SpliceNotify?.(err.message); }
+    });
+    element.querySelector('[data-action="mc-angle"]')?.addEventListener('change', event => {
+      const idx = Number(event.target.value);
+      try {
+        editor.editProject(next => {
+          const target = next.clips.find(c => c.id === clip.id);
+          if (!target) return;
+          const mc = next.media.find(m => m.id === target.mediaId)?.multicam;
+          if (!mc?.angles[idx]) return;
+          const picture = editor.isPictureAngle(mc.angles[idx], next);
+          if (target.type === 'audio' && (!picture || Number.isInteger(target.multicamAudioAngle))) {
+            target.multicamAudioAngle = idx;
+            return;
+          }
+          if (!picture) return;
+          target.multicamAngle = idx;
+          if (target.linkGroup && mc.audioMode === 'follow') {
+            for (const other of next.clips) {
+              if (other.id !== target.id && other.linkGroup === target.linkGroup && other.mediaId === target.mediaId) other.multicamAngle = idx;
+            }
+          }
+        });
+      } catch (err) { window.SpliceNotify?.(err.message); }
+    });
+    element.querySelector('[data-action="mc-view"]')?.addEventListener('click', () => {
+      window.SpliceMulticam?.toggleMulticamView?.();
+      render(editor.get(), element, editor);
+    });
+    element.querySelector('[data-action="mc-flatten"]')?.addEventListener('click', () => {
+      try {
+        const out = window.SpliceMulticam?.flattenClips?.(clip.id);
+        if (out) window.SpliceNotify?.(`Flattened multicam into ${out.length} clip${out.length === 1 ? '' : 's'}`);
+      } catch (err) { window.SpliceNotify?.(err.message); }
+    });
+    element.querySelector('[data-action="remove-subclip-limits"]')?.addEventListener('click', () => {
+      try {
+        window.SpliceBins?.removeClipSubclipLimits?.(clip.id);
+        window.SpliceNotify?.('Removed subclip limits on clip');
+      } catch (err) { window.SpliceNotify?.(err.message); }
+    });
     const picker = element.querySelector('.splice-lut-input');
     element.querySelector('[data-action="import-lut"]')?.addEventListener('click', () => picker.click());
     element.querySelector('[data-action="remove-lut"]')?.addEventListener('click', () => {
@@ -197,7 +311,7 @@
       const file=picker.files?.[0];
       if (!file) return;
       try {
-        if (file.size > 4_000_000) throw new Error('The LUT file is too large.');
+        if (file.size > window.SpliceLUT.limits.chars) throw new Error('The LUT file is too large.');
         const lut=window.SpliceLUT.parseCube(await file.text(),file.name);
         editor.updateClip(clip.id,{color:{...color,lut,lutIntensity:100}});
         render(editor.get(),element,editor);
@@ -215,7 +329,10 @@
       const time=Math.round(Math.max(0,Math.min(active.duration,editor.get().time-active.start))*fps)/fps;
       const points=(active.keyframes?.[automationProperty]||[]).filter(point=>Math.abs(point.time-time)>=.5/fps);
       points.push({time,value});points.sort((a,b)=>a.time-b.time);
-      editor.updateClip(active.id,{keyframes:{...(active.keyframes||{}),[automationProperty]:points}});
+      const keyframes={...(active.keyframes||{}),[automationProperty]:points};
+      try { window.SpliceGrade.keyTimes({keyframes}); }
+      catch (error) { return window.alert(error.message); }
+      editor.updateClip(active.id,{keyframes});
       render(editor.get(),element,editor);
     });
     element.querySelector('[data-key-delete]')?.addEventListener('click',()=>{
@@ -230,10 +347,20 @@
       editor.seek(clip.start+Number(button.dataset.keyTime));
       render(editor.get(),element,editor);
     });
-    paintScope(element.querySelector('.splice-scope'));
+    if (clip.type === 'video') {
+      if (rawSource?.raw === true) window.SpliceRawUI?.bind(element, clip, editor, () => render(editor.get(), element, editor));
+      window.SpliceColorUI?.bind(element, clip, editor, () => render(editor.get(), element, editor));
+    }
+    if (clip.type === 'audio' || clip.type === 'video' && clip.embeddedAudio !== false) mountAudioFx(element, clip, editor, locked, previousFx);
+    window.SpliceScopes.bind(element);
+    // Never forced here: the scopes' own throttle and unchanged-frame check decide (the preview
+    // loop paints them too). A new canvas gets one paint on the next animation frame.
+    if (!previousScope) schedulePaint();
     paintMeters(state);
   }
   function paintMeters(state=window.Editor?.get()) {
+    const fxMount=document.querySelector('.audio-fx-mount');
+    if (fxMount && window.SpliceAudioFX) window.SpliceAudioFX.paintReduction(fxMount, fxMount.dataset.owner);
     for (const meter of document.querySelectorAll('.splice-meter')) {
       const peak=Number(state?.audioMeters?.[meter.dataset.track] || 0);
       meter.firstElementChild.style.width=`${Math.min(100,Math.max(0,peak*100))}%`;
@@ -243,43 +370,52 @@
     if(input && clip && document.activeElement!==input){
       const local=Math.max(0,Math.min(clip.duration,number(state.time,clip.start)-clip.start));
       const points=(clip.keyframes?.[automationProperty]||[]).slice().sort((a,b)=>a.time-b.time);
-      const base=automationProperty==='opacity'?number(clip.opacity,100):automationProperty==='volume'?number(clip.volume,100):number(clip.transform?.[automationProperty],automationProperty==='scale'?100:0);
+      const base=automationProperty==='opacity'?number(clip.opacity,100):automationProperty==='volume'?number(clip.volume,100):
+        gradeKeys.includes(automationProperty)?number(clip.color?.[automationProperty],['brightness','contrast','saturation'].includes(automationProperty)?100:0):
+        number(clip.transform?.[automationProperty],automationProperty==='scale'?100:0);
       input.value=String(atKeyframe(points,local,base));
       const label=document.querySelector('.splice-key-time');
       if(label)label.textContent=`Value at ${local.toFixed(2)} s`;
     }
   }
-  function paintScope(canvas=document.querySelector('.splice-scope')) {
-    if (!canvas) return;
-    const now=performance.now();
-    if (now-lastScopePaint < 100) return;
-    lastScopePaint=now;
-    const video=document.querySelector('#preview-canvas');
-    if (!video || !video.width || !video.height) return;
-    const small = document.createElement('canvas');
-    small.width = 96; small.height = 54;
-    const context = small.getContext('2d', {willReadFrequently:true});
-    try { context.drawImage(video, 0, 0, 96, 54); } catch { return; }
-    const bytes = context.getImageData(0,0,96,54).data;
-    const ctx = canvas.getContext('2d');
-    const w=canvas.width,h=canvas.height;
-    ctx.fillStyle='#101610'; ctx.fillRect(0,0,w,h);
-    ctx.strokeStyle='#344135'; ctx.lineWidth=1;
-    for(const y of [0,70,140,210]) {ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke();}
-    for(let p=0;p<bytes.length;p+=4){
-      const pixel=p/4,x=pixel%96;
-      for(let channel=0;channel<3;channel++){
-        ctx.fillStyle=['rgba(255,92,92,.12)','rgba(107,241,125,.12)','rgba(105,157,255,.12)'][channel];
-        ctx.fillRect(channel*80+bytes[p+channel]/255*79,70-bytes[p+channel]/255*68,1,1);
-      }
-      const lum=(.2126*bytes[p]+.7152*bytes[p+1]+.0722*bytes[p+2])/255;
-      ctx.fillStyle='rgba(244,244,220,.18)'; ctx.fillRect(x*2.5,140-lum*68,1,1);
-      const u=(-.14713*bytes[p]-.28886*bytes[p+1]+.436*bytes[p+2])/255;
-      const v=(.615*bytes[p]-.51499*bytes[p+1]-.10001*bytes[p+2])/255;
-      ctx.fillStyle='rgba(190,242,110,.23)';ctx.fillRect(120+u*112,175-v*50,1,1);
+  let paintQueued = false;
+  function schedulePaint() {
+    if (paintQueued) return;
+    paintQueued = true;
+    requestAnimationFrame(() => { paintQueued = false; paintScope(); });
+  }
+  // Scopes read the graded program frame; SpliceScopes paces itself.
+  // The large docked scope, when it is open, is the one painted.
+  function paintScope(canvas=document.querySelector('.scope-dock .splice-scope')||document.querySelector('.splice-scope'),force=false) {
+    window.SpliceScopes.paint(canvas,force);
+  }
+  // Channel mapping and the sound's transition (follow the picture, or override).
+  function audioRouting(clip, project) {
+    const maps={stereo:'As recorded',left:'Left to both channels',right:'Right to both channels',mono:'Sum to mono',swap:'Swap left and right'};
+    const linkedPicture=clip.type==='audio' && clip.linkGroup ? project.clips.find(other=>other.type==='video' && other.linkGroup===clip.linkGroup &&
+      Math.abs(other.start-clip.start)<.5/(project.fps||25)) : null;
+    const follows=clip.type==='video' ? clip.transition : (['dissolve','wipe','fade'].includes(clip.transition) ? null : linkedPicture?.transition);
+    const names={dissolve:'crossfade',wipe:'crossfade',fade:'dip',none:'cut'};
+    const auto=follows!=null ? `Follow picture (${names[follows]||'cut'})` : 'Follow clip transition';
+    const transitions={auto,cut:'Cut',crossfade:'Crossfade',dip:'Dip (out, then in)'};
+    return `<label class="splice-number"><span>Channels</span><select aria-label="Source channel mapping" data-field="channelMap">${Object.entries(maps).map(([key,name])=>option(key,name,clip.channelMap||'stereo')).join('')}</select></label>` +
+      `<label class="splice-number"><span>Sound transition in</span><select aria-label="Sound transition at the clip's start" data-field="audioTransition">${Object.entries(transitions).map(([key,name])=>option(key,name,clip.audioTransition||'auto')).join('')}</select></label>`;
+  }
+  function mountAudioFx(element, clip, editor, locked, previous) {
+    const mount=element.querySelector('.audio-fx-mount');
+    if (!mount || !window.SpliceAudioFX) return;
+    // An edit on another clip does not change these controls or the response curve.
+    if (previous && previous.dataset.owner === mount.dataset.owner &&
+        previous.effects === clip.audioFx && previous.trackLocked === locked) {
+      mount.replaceWith(previous);
+      return;
     }
-    ctx.fillStyle='#b9c9b5';ctx.font='10px monospace';
-    ctx.fillText('RGB PARADE',5,10);ctx.fillText('LUMA WAVEFORM',5,80);ctx.fillText('VECTORSCOPE',5,150);
+    mount.effects = clip.audioFx;
+    mount.trackLocked = locked;
+    window.SpliceAudioFX.render(mount, clip.audioFx, {owner:'clip-'+clip.id, disabled:locked, onChange:fx=>{
+      editor.updateClip(clip.id,{audioFx:fx});
+      render(editor.get(),element,editor);
+    }});
   }
   window.SpliceInspector = {render,paintScope,paintMeters};
 })();

@@ -12,7 +12,10 @@ window.SpliceMedia = (() => {
     /^(?:\.\/|\/)?assets\/(?:ridge|forest|valley|lake)\.(?:mp4|jpg)$|^(?:\.\/|\/)?assets\/score\.wav$/.test(
       src,
     );
-  const localMedia = (src) => /^\/media\/[a-f0-9]{32}\/[^/]+$/.test(src);
+  // Managed copies and proxies, or originals linked in place (desktop and
+  // python3 server.py on this machine): the server resolves those through
+  // its registry of paths the user picked.
+  const localMedia = (src) => /^\/media\/(?:linked\/)?[a-f0-9]{32}\/[^/]+$/.test(src);
   const key = (item) =>
     /^m\d+$/.test(item.id) && item.path ? "path:" + item.path : item.id;
   const open = () => {
@@ -89,6 +92,19 @@ window.SpliceMedia = (() => {
     if (!response.ok || !localMedia(result.src)) throw Error(result.error || 'Import failed.');
     return result.src;
   }
+  // A picked original stays where it is. Picker entries look like Files to
+  // the editor (name, webkitRelativePath) and carry the absolute path.
+  let noticeShown = false;
+  async function link(file) {
+    if (file.spliceLinked) return file.spliceLinked;
+    const response = await fetch('/api/media/link', {method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({paths:[file.splicePath]}),signal:AbortSignal.timeout(120000)});
+    const result = await response.json();
+    const entry = result.files?.[0];
+    if (result.notice && !noticeShown) { noticeShown = true; window.alert(result.notice); }
+    if (!response.ok || !entry || entry.error || !localMedia(entry.src)) throw Error(entry?.error || result.error || 'Could not link '+file.name+'.');
+    return entry;
+  }
   async function exists(src) {
     if (!localMedia(src) && !bundled(src)) return false;
     return (await fetch(src,{method:'HEAD',cache:'no-store',signal:AbortSignal.timeout(15000)})).ok;
@@ -99,17 +115,59 @@ window.SpliceMedia = (() => {
     if(!response.ok) throw Error(data.error||'Could not inspect the original source');
     return data;
   }
-  async function makeProxy(src, seekOptimized=false, audioStream=null, gradingData=false) {
+  async function makeProxy(src, seekOptimized=false, audioStream=null, gradingData=false, rawSettings=null) {
     const response=await fetch('/api/media/proxy',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({src,seekOptimized,audioStream,gradingData}),signal:AbortSignal.timeout(3650000)});
+      body:JSON.stringify({src,seekOptimized,audioStream,gradingData,rawSettings}),signal:AbortSignal.timeout(3650000)});
     const data=await response.json();
     if(!response.ok || !localMedia(data.src)) throw Error(data.error||'Could not create edit proxy');
     return data.src;
   }
+  async function makeRawProxy(src, rawSettings=null, seekOptimized=false, audioStream=null) {
+    const response=await fetch('/api/raw/preview',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({src,rawSettings,seekOptimized,audioStream}),signal:AbortSignal.timeout(3650000)});
+    const data=await response.json();
+    if(!response.ok || !localMedia(data.src)) throw Error(data.error||'Could not decode Camera RAW preview');
+    return data.src;
+  }
   const previewJobs = new Map();
   const previewKey = (item,stream,grading) => JSON.stringify([item.originalSrc||item.src,!!item.seekOptimized,stream,grading]);
+  const rawPreviewKey = (item,rawSettings,stream) => JSON.stringify(['raw',item.originalSrc||item.src,!!item.seekOptimized,stream??null,rawSettings||null]);
   function hdrPreviewStatus(item, stream=item?.audioStream??null) {
     return item?.src ? previewJobs.get(previewKey(item,stream,true)) : undefined;
+  }
+  function rawPreviewStatus(item, rawSettings, stream=item?.audioStream??null) {
+    return item?.src ? previewJobs.get(rawPreviewKey(item,rawSettings,stream)) : undefined;
+  }
+  // One RAW re-decode per source at a time: dragging Exposure queues decodes instead of
+  // tripping the server's encoder limit, and a setting superseded while queued is skipped.
+  const rawChains = new Map(), rawLatest = new Map();
+  function prepareRawPreview(item, rawSettings, stream=item?.audioStream??null, retry=false) {
+    if (!item?.src || item.offline || !item.raw) return;
+    const key=rawPreviewKey(item,rawSettings,stream), source=item.originalSrc||item.src;
+    let job=previewJobs.get(key);
+    if (job && !(retry && job.error)) return job;
+    job={pending:true};
+    previewJobs.set(key,job);
+    rawLatest.set(source,key);
+    if (previewJobs.size>500) {
+      const expired=[...previewJobs].find(([,entry])=>!entry.pending);
+      if (expired) previewJobs.delete(expired[0]);
+    }
+    const run=(rawChains.get(source)||Promise.resolve()).then(()=>{
+      if (rawLatest.get(source)!==key) { previewJobs.delete(key); return; }
+      return makeRawProxy(source,rawSettings,item.seekOptimized===true,stream).then(src=>{job.src=src;});
+    }).catch(error=>{
+      job.error=error.message;
+      // The server's two encoders were busy with other sources: let the next draw ask again.
+      if (/busy/i.test(job.error)) setTimeout(()=>{ if (previewJobs.get(key)===job) previewJobs.delete(key); },1500);
+    }).finally(()=>{
+      job.pending=false;
+      if (rawChains.get(source)===run) rawChains.delete(source);
+      window.Editor?.refreshMedia?.();
+    });
+    rawChains.set(source,run);
+    job.done=run;
+    return job;
   }
   function preparePreview(item, stream, grading=false, retry=false) {
     if (!item.src || item.offline) return;
@@ -133,24 +191,39 @@ window.SpliceMedia = (() => {
     return job;
   }
   async function importFile(file) {
-    const originalSrc=await upload(file);
+    const linked=typeof file.splicePath==='string'?await link(file):null;
+    const originalSrc=linked?linked.src:await upload(file);
     const info=await probe(originalSrc);
     const src=info.proxyRecommended?await makeProxy(originalSrc):originalSrc;
-    return {...info,src,originalSrc,name:file.name,path:file.name,offline:false,seekOptimized:false,audioStream:null};
+    return {...info,src,originalSrc,name:file.name,path:linked?linked.sourcePath:file.name,linked:!!linked,
+            sourceFingerprint:linked?.fingerprint,offline:false,seekOptimized:false,audioStream:null};
   }
+  const isNestedItem = (item) =>
+    Boolean(item?.nestedProject) || Number.isInteger(item?.nestedSequence) ||
+    (typeof item?.nestedSequence === 'string' && item.nestedSequence.length > 0);
   const nestedRequests=new WeakMap();
+  function invalidateNested(item) {
+    if (!item) return;
+    nestedRequests.delete(item);
+    item.src = '';
+    delete item.proxyState;
+    delete item.proxyError;
+  }
   function prepareNested(item,retry=false) {
-    if(!item?.nestedProject || item.src) return;
+    if(!item?.nestedProject) return;
+    if(retry) invalidateNested(item);
+    if(item.src) return;
     if(nestedRequests.has(item) && !retry)return nestedRequests.get(item);
     const task=(async()=>{
       try {
         item.proxyState='preparing';
         const project=await forPremiere(item.nestedProject);
+        const minimumDuration = typeof item.nestedSequence === 'string' ? item.duration : 0;
         const response=await fetch('/api/media/nested-preview',{method:'POST',headers:{'Content-Type':'application/json'},
-                                 body:JSON.stringify({project}),signal:AbortSignal.timeout(3600000)});
+                                 body:JSON.stringify({project,minimumDuration}),signal:AbortSignal.timeout(3600000)});
         const body=await response.json();
         if(!response.ok||!localMedia(body.src))throw Error(body.error||'Nested preview failed');
-        item.src=body.src;item.proxyState='ready';item.offline=false;
+        item.src=body.src;item.colorSpace='bt709';item.proxyState='ready';item.offline=false;
       }catch(e){item.proxyState='unavailable';item.proxyError=e.message;}
       window.Editor?.refreshMedia?.();
     })();
@@ -168,8 +241,8 @@ window.SpliceMedia = (() => {
     Object.assign(item,metadata,{src,originalSrc:original});
   }
   function needsSourceProbe(item) {
-    return !Number.isInteger(item.audioStreams) || (item.audioStreams>1 && !Array.isArray(item.audioStreamChannels)) ||
-      (item.hdr && item.hdrPreviewVersion!==3) || (item.still && item.stillPreviewVersion!==1);
+    return !Number.isInteger(item.audioStreams) || !Array.isArray(item.audioStreamDetails) || (item.audioStreams>1 && !Array.isArray(item.audioStreamChannels)) ||
+      (item.hdr && item.hdrPreviewVersion!==3) || (item.still && item.stillPreviewVersion!==1) || (item.raw && !item.rawFormat);
   }
   async function restore(project) {
     const db = await open();
@@ -178,10 +251,13 @@ window.SpliceMedia = (() => {
         item.offline=false;
         continue;
       }
-      if (Number.isInteger(item.nestedSequence)) {
+      if (isNestedItem(item)) {
         if(item.nestedProject) await restore(item.nestedProject);
         if(item.src && (!localMedia(item.src)||!await exists(item.src)))item.src='';
         item.offline=false;
+        continue;
+      }
+      if (item.multicam || item.parentMediaId) {
         continue;
       }
       if ((bundled(item.src) || localMedia(item.src)) && await exists(item.src)) {
@@ -227,6 +303,32 @@ window.SpliceMedia = (() => {
         item.offline = true;
       }
     }
+    const byId = new Map(project.media.map(m => [m.id, m]));
+    for (const item of project.media) {
+      if (item.parentMediaId) {
+        let cur = item, seen = new Set([item.id]);
+        while (cur?.parentMediaId && !seen.has(cur.parentMediaId)) {
+          seen.add(cur.parentMediaId);
+          cur = byId.get(cur.parentMediaId);
+        }
+        if (cur && cur !== item) {
+          item.src = cur.src || '';
+          if (cur.originalSrc) item.originalSrc = cur.originalSrc;
+          item.offline = !!cur.offline;
+        } else {
+          item.src = '';
+          item.offline = true;
+        }
+      }
+    }
+    for (const item of project.media) {
+      if (item.multicam) {
+        const angles = Array.isArray(item.multicam.angles) ? item.multicam.angles : [];
+        const first = angles.map(a => byId.get(a.mediaId)).find(Boolean);
+        item.src = first?.src || '';
+        item.offline = angles.length > 0 && angles.every(a => byId.get(a.mediaId)?.offline);
+      }
+    }
     return project;
   }
   async function forPremiere(project) {
@@ -234,7 +336,8 @@ window.SpliceMedia = (() => {
     const db = await open();
     for (const item of copy.media) {
       delete item.thumb;
-      if(Number.isInteger(item.nestedSequence)) {if(item.nestedProject) item.nestedProject=await forPremiere(item.nestedProject);continue;}
+      if(isNestedItem(item)) {if(item.nestedProject) item.nestedProject=await forPremiere(item.nestedProject);continue;}
+      if(item.multicam || item.parentMediaId) continue;
       if(localMedia(item.originalSrc) || bundled(item.originalSrc)) {item.src=item.originalSrc;continue;}
       if (!item.src || bundled(item.src) || localMedia(item.src)) continue;
       const record = await read(
@@ -264,7 +367,18 @@ window.SpliceMedia = (() => {
       }
       item.src = record.serverSrc;
     }
+    const byId = new Map(copy.media.map(m => [m.id, m]));
+    for (const item of copy.media) {
+      if (item.parentMediaId) {
+        let cur = item, seen = new Set([item.id]);
+        while (cur?.parentMediaId && !seen.has(cur.parentMediaId)) {
+          seen.add(cur.parentMediaId);
+          cur = byId.get(cur.parentMediaId);
+        }
+        if (cur && cur !== item && cur.src) item.src = cur.src;
+      }
+    }
     return copy;
   }
-  return { importFile, remember, rememberMany, makeProxy, prepareNested, preparePreview, hdrPreviewStatus, restore, matches, matchFolder, forPremiere };
+  return { importFile, remember, rememberMany, makeProxy, makeRawProxy, prepareNested, invalidateNested, preparePreview, prepareRawPreview, hdrPreviewStatus, rawPreviewStatus, restore, matches, matchFolder, forPremiere };
 })();

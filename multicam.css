@@ -1,0 +1,535 @@
+/* Slice L: Multicam, Native Nested Sequences, Subclips & Bin Organization */
+
+/* 8 standard NLE color labels */
+:root {
+  --label-blue: #4a90d9;
+  --label-green: #4caf72;
+  --label-yellow: #d9b648;
+  --label-orange: #e0823d;
+  --label-red: #d9534f;
+  --label-purple: #9b6bc7;
+  --label-teal: #3fb5b5;
+  --label-magenta: #cf5da0;
+}
+
+/* Nested sequence breadcrumb bar */
+.nested-breadcrumb {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  background: color-mix(in srgb, var(--accent, #55c57a) 11%, #151916);
+  border-bottom: 1px solid color-mix(in srgb, var(--accent, #55c57a) 35%, transparent);
+  font-size: 11.5px;
+  min-height: 28px;
+  overflow-x: auto;
+  flex-shrink: 0;
+}
+.nested-breadcrumb[hidden] { display: none; }
+.nested-back-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.06);
+  color: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.nested-back-btn:hover { background: rgba(255, 255, 255, 0.14); }
+.nested-crumb-list {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: nowrap;
+  white-space: nowrap;
+}
+.nested-crumb {
+  background: none;
+  border: none;
+  color: rgba(255, 255, 255, 0.72);
+  font-size: 11.5px;
+  padding: 2px 5px;
+  border-radius: 3px;
+  cursor: pointer;
+}
+.nested-crumb:hover { background: rgba(255, 255, 255, 0.09); color: #fff; }
+.nested-crumb.current {
+  color: #fff;
+  font-weight: 600;
+  cursor: default;
+}
+.nested-crumb-sep { opacity: 0.45; user-select: none; }
+.nested-depth-pill {
+  margin-left: auto;
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 99px;
+  background: rgba(255, 255, 255, 0.09);
+  color: rgba(255, 255, 255, 0.8);
+  white-space: nowrap;
+}
+
+/* Multicam Monitor toggle & multi-angle grid */
+.multicam-toggle.active {
+  background: color-mix(in srgb, #e5a93c 24%, transparent);
+  border-color: #e5a93c;
+  color: #ffd98a;
+}
+.multicam-grid {
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  display: grid;
+  gap: 4px;
+  padding: 4px;
+  background: #0c0e0d;
+  box-sizing: border-box;
+}
+.multicam-grid[hidden] { display: none; }
+.multicam-grid.grid-2x2 {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-rows: repeat(2, minmax(0, 1fr));
+}
+.multicam-grid.grid-3x3 {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-rows: repeat(3, minmax(0, 1fr));
+}
+.multicam-tile {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #141716;
+  border: 2px solid rgba(255, 255, 255, 0.14);
+  border-radius: 4px;
+  overflow: hidden;
+  padding: 0;
+  cursor: pointer;
+  color: #fff;
+  min-width: 0;
+  min-height: 0;
+}
+.multicam-tile:hover { border-color: rgba(255, 255, 255, 0.42); }
+.multicam-tile.active {
+  border-color: #f0c43c;
+  box-shadow: inset 0 0 0 1px rgba(240, 196, 60, 0.65);
+}
+.multicam-tile.active.recording {
+  border-color: #e84848;
+  box-shadow: inset 0 0 0 1px rgba(232, 72, 72, 0.75);
+}
+.multicam-tile video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  pointer-events: none;
+  background: #000;
+}
+.multicam-tile.out-of-range video { opacity: 0.15; }
+.multicam-badge {
+  position: absolute;
+  left: 6px;
+  top: 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  background: rgba(10, 12, 11, 0.8);
+  font-size: 11px;
+  font-weight: 600;
+  max-width: calc(100% - 14px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  pointer-events: none;
+}
+.multicam-tile.active .multicam-badge {
+  background: rgba(240, 196, 60, 0.92);
+  color: #111;
+}
+.multicam-tile.active.recording .multicam-badge {
+  background: rgba(224, 56, 56, 0.94);
+  color: #fff;
+}
+.multicam-empty-msg {
+  grid-column: 1 / -1;
+  grid-row: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  color: rgba(255, 255, 255, 0.72);
+  font-size: 12px;
+  text-align: center;
+  padding: 16px;
+}
+
+/* Bin tree & pool toolbar inside #library-body */
+.bin-browser {
+  margin-bottom: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.025);
+  padding: 6px;
+}
+.bin-browser-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.bin-toggle-btn {
+  background: none;
+  border: none;
+  color: rgba(255, 255, 255, 0.85);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 3px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.bin-toggle-btn:hover { background: rgba(255, 255, 255, 0.08); }
+.bin-action-bar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  flex-wrap: wrap;
+}
+.bin-mini-btn {
+  font-size: 10.5px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.05);
+  color: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.bin-mini-btn:hover:not(:disabled) { background: rgba(255, 255, 255, 0.13); }
+.bin-mini-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.bin-crumb-bar {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.68);
+}
+.bin-crumb-btn {
+  background: none;
+  border: none;
+  color: inherit;
+  font-size: 11px;
+  padding: 1px 4px;
+  border-radius: 3px;
+  cursor: pointer;
+}
+.bin-crumb-btn:hover { background: rgba(255, 255, 255, 0.08); color: #fff; }
+.bin-crumb-btn.active { color: #fff; font-weight: 600; }
+.bin-tree-list {
+  margin-top: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 140px;
+  overflow-y: auto;
+}
+.bin-tree-list[hidden] { display: none; }
+.bin-node {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  border-radius: 4px;
+  padding: 2px 4px;
+  font-size: 11.5px;
+}
+.bin-node.active { background: rgba(255, 255, 255, 0.11); }
+.bin-node.drop-over {
+  outline: 1.5px dashed var(--accent, #55c57a);
+  background: color-mix(in srgb, var(--accent, #55c57a) 16%, transparent);
+}
+.bin-node-select {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  background: none;
+  border: none;
+  color: inherit;
+  font-size: 11.5px;
+  padding: 2px 4px;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.bin-node-count {
+  font-size: 10px;
+  opacity: 0.6;
+  padding: 0 3px;
+}
+.bin-node-op {
+  background: none;
+  border: none;
+  color: rgba(255, 255, 255, 0.58);
+  font-size: 10.5px;
+  padding: 1px 4px;
+  border-radius: 3px;
+  cursor: pointer;
+}
+.bin-node-op:hover { background: rgba(255, 255, 255, 0.12); color: #fff; }
+
+/* Media Pool selection, badges, and 8 NLE color labels */
+.media-card.pool-selected,
+.media-row.pool-selected {
+  outline: 2px solid var(--accent, #55c57a);
+  outline-offset: -2px;
+  background: color-mix(in srgb, var(--accent, #55c57a) 12%, rgba(255, 255, 255, 0.04));
+}
+.media-badge-pill {
+  position: absolute;
+  right: 5px;
+  top: 5px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: rgba(15, 18, 16, 0.85);
+  color: #e2e8e4;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  pointer-events: none;
+}
+.media-badge-pill.nested { background: rgba(58, 140, 98, 0.92); color: #fff; }
+.media-badge-pill.multicam { background: rgba(204, 134, 42, 0.94); color: #111; }
+.media-badge-pill.subclip { background: rgba(74, 144, 217, 0.92); color: #fff; }
+
+/* Color label stripes on Media Pool cards, list rows, and Timeline clips */
+.media-card[data-label-color],
+.media-row[data-label-color] {
+  border-left: 4px solid var(--clip-label, transparent);
+}
+.timeline-clip[data-label-color] {
+  box-shadow: inset 4px 0 0 0 var(--clip-label, transparent);
+}
+[data-label-color="blue"] { --clip-label: var(--label-blue); }
+[data-label-color="green"] { --clip-label: var(--label-green); }
+[data-label-color="yellow"] { --clip-label: var(--label-yellow); }
+[data-label-color="orange"] { --clip-label: var(--label-orange); }
+[data-label-color="red"] { --clip-label: var(--label-red); }
+[data-label-color="purple"] { --clip-label: var(--label-purple); }
+[data-label-color="teal"] { --clip-label: var(--label-teal); }
+[data-label-color="magenta"] { --clip-label: var(--label-magenta); }
+
+.timeline-clip.is-nested {
+  border-color: color-mix(in srgb, #4caf72 65%, rgba(255, 255, 255, 0.25));
+}
+.timeline-clip.is-multicam {
+  border-color: color-mix(in srgb, #e5a93c 70%, rgba(255, 255, 255, 0.25));
+}
+.clip-kind-tag {
+  display: inline-block;
+  font-size: 9px;
+  font-weight: 700;
+  padding: 0 4px;
+  margin-right: 4px;
+  border-radius: 2px;
+  background: rgba(0, 0, 0, 0.45);
+  color: #f4f7f5;
+  vertical-align: middle;
+}
+.clip-kind-tag.mc { background: rgba(229, 169, 60, 0.88); color: #111; }
+.clip-kind-tag.nest { background: rgba(76, 175, 114, 0.88); color: #0c1710; }
+.clip-kind-tag.sub { background: rgba(74, 144, 217, 0.88); color: #fff; }
+
+/* Source Monitor subclip & editorial metadata inside scrollable .source-controls */
+.source-subclip-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.source-subclip-btn {
+  padding: 4px 10px;
+  border-radius: 5px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(74, 144, 217, 0.18);
+  color: #dbeeff;
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.source-subclip-btn:hover { background: rgba(74, 144, 217, 0.32); }
+.source-subclip-badge {
+  font-size: 10.5px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgba(74, 144, 217, 0.22);
+  color: #c7e2ff;
+}
+.source-meta-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 5px 8px;
+  margin-top: 4px;
+}
+.source-meta-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 10.5px;
+  color: rgba(255, 255, 255, 0.72);
+}
+.source-meta-grid label.full { grid-column: 1 / -1; }
+.source-meta-grid input,
+.source-meta-grid select {
+  font-size: 11.5px;
+  padding: 3px 6px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(0, 0, 0, 0.28);
+  color: #fff;
+  min-width: 0;
+}
+
+/* Multicam & editorial dialogs */
+.mc-angle-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11.5px;
+  margin: 8px 0;
+}
+.mc-angle-table th,
+.mc-angle-table td {
+  text-align: left;
+  padding: 5px 6px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+.mc-angle-table th {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  opacity: 0.7;
+}
+.mc-offset-warn { color: #f08a7e; font-size: 11.5px; }
+.mc-field-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+.label-swatch-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 4px;
+}
+.label-swatch-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 7px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  background: rgba(255, 255, 255, 0.04);
+  color: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.label-swatch-btn.active {
+  border-color: #fff;
+  background: rgba(255, 255, 255, 0.14);
+}
+.label-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--clip-label, rgba(255, 255, 255, 0.25));
+  display: inline-block;
+}
+
+/* Match Scope Dock toggle styling and keep viewer header fitting down to 360px container width */
+.multicam-toggle {
+  padding: 3px 8px;
+  border: 1px solid #465346;
+  border-radius: 4px;
+  font-size: 11px;
+  color: #b6c9af;
+  background: transparent;
+  white-space: nowrap;
+}
+/* The program monitor header holds the title, the monitor colour controls (quality, view, guides,
+   Bypass, Split), Multicam, Scopes and fullscreen. Keep them on one row at every supported window
+   size, tightening step by step as the panel narrows, so the picture keeps the height a second
+   header row would take. Wrapping stays as the fallback for the narrowest docked layouts. */
+@container viewer (max-width: 900px) {
+  .viewer > .panel-top { gap: 4px 8px; padding-left: 10px; padding-right: 10px; }
+  .viewer-actions { gap: 4px 6px; }
+  .monitor-color-controls { gap: 4px 5px; }
+  .monitor-select { max-width: 92px; }
+  .monitor-color-controls button, .scope-dock-toggle, .multicam-toggle { padding: 3px 6px; }
+}
+@container viewer (max-width: 720px) {
+  .viewer > .panel-top { min-height: 32px; padding: 2px 6px; gap: 2px 4px; }
+  .viewer-actions, .monitor-color-controls { gap: 2px 4px; }
+  .monitor-subtitle { display: none; }
+  .monitor-select { max-width: 74px; padding: 1px 2px; font-size: 10px; }
+  .monitor-color-controls button, .scope-dock-toggle, .multicam-toggle { padding: 1px 5px; font-size: 10px; }
+}
+@container viewer (max-width: 600px) {
+  /* "Fit" repeats the monitor scale; the quality menu says how the picture is processed. */
+  #monitor-resolution { display: none; }
+  .viewer > .panel-top, .viewer-actions, .monitor-color-controls { column-gap: 3px; }
+  /* Sized so the defaults (Auto, Normal, No guides) read in full. */
+  .monitor-select[data-monitor-quality] { max-width: 50px; }
+  .monitor-select[data-monitor-view] { max-width: 62px; }
+  .monitor-select[data-monitor-guides] { max-width: 72px; }
+  .monitor-color-controls button, .scope-dock-toggle, .multicam-toggle { padding: 1px 4px; }
+}
+
+/* Keep bin browser strictly inside narrow Media Pool panels */
+.bin-browser {
+  max-width: 100%;
+  box-sizing: border-box;
+  overflow: hidden;
+}
+
+/* Wide Media Pool list table accommodates the 5 additional editorial metadata columns */
+@container (min-width: 560px) {
+  .media-table-head,
+  .media-row {
+    grid-template-columns: minmax(120px, 1.8fr) 74px 54px 86px 56px 60px minmax(76px, 1fr) 54px 54px 48px minmax(88px, 1.2fr) 62px;
+    min-width: 880px;
+  }
+}
+
+/* Compact Inspector editorial action row */
+.inspector-editorial-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+.inspector-editorial-actions button {
+  padding: 4px 8px;
+  border-radius: 4px;
+  border: 1px solid #465346;
+  background: #222922;
+  color: #dfe9dc;
+  font-size: 11px;
+  cursor: pointer;
+}
+.inspector-editorial-actions button:hover {
+  background: #303a30;
+}

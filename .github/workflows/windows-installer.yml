@@ -9,40 +9,72 @@ permissions:
 
 jobs:
   installer:
-    runs-on: windows-2025
-    timeout-minutes: 25
+    runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
-          python-version: '3.13'
+          python-version: '3.14'
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: '22'
+      - name: Windows platform unit tests
+        shell: pwsh
+        run: |
+          python -m unittest -v tests.test_windows_installer
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Build installer
         shell: pwsh
         run: |
+          # build.py also runs the bundled Python against the bundled FFmpeg
+          # (stdlib imports and runtime_check.py --strict) before compiling.
           $nsis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
           if (!(Test-Path $nsis)) {
             choco install nsis --version=3.11 --yes --no-progress
             if ($LASTEXITCODE) { exit $LASTEXITCODE }
           }
-          python desktop/windows/build.py artifacts/installer --nsis "$nsis"
-      - name: Install and verify Splice
+          python desktop/windows/build.py artifacts/installer --nsis "$nsis" --cache "$env:RUNNER_TEMP\splice-downloads"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Get-Item artifacts/installer/Splice-Setup-x64.exe | Select-Object Name, Length
+      - name: Install
         shell: pwsh
         run: |
           $setup = Resolve-Path artifacts/installer/Splice-Setup-x64.exe
           $result = Start-Process $setup -ArgumentList '/S' -Wait -PassThru
           if ($result.ExitCode) { exit $result.ExitCode }
+          $app = Join-Path $env:LOCALAPPDATA 'Programs\Splice\Application'
+          foreach ($file in 'Splice.exe', 'manifest.json', 'Third-party.txt', 'resources\python\python.exe',
+                   'resources\ffmpeg\ffmpeg.exe', 'resources\ffmpeg\ffprobe.exe', 'resources\ffmpeg\LICENSE.txt',
+                   'resources\splice\server.py', 'resources\splice\runtime_check.py') {
+            if (!(Test-Path (Join-Path $app $file))) { throw "The installer did not install $file" }
+          }
+      - name: Check the installed runtimes
+        shell: pwsh
+        run: |
+          # Bundled Python and FFmpeg only: modules, filters, codecs, test encodes, startup gate.
+          $app = Join-Path $env:LOCALAPPDATA 'Programs\Splice\Application'
+          $python = Join-Path $app 'resources\python\python.exe'
+          $env:Path = Join-Path $app 'resources\ffmpeg'
+          & $python -B tests\windows_bundle_check.py (Join-Path $app 'resources') artifacts\installer-proof\bundle-check.json
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Run the installed app
+        shell: pwsh
+        run: |
           npm ci
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           node tests/windows-installer.cjs
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Uninstall
+        shell: pwsh
+        run: |
           $root = Join-Path $env:LOCALAPPDATA 'Programs\Splice'
           $result = Start-Process (Join-Path $root 'Uninstall.exe') -ArgumentList '/S' -Wait -PassThru
           if ($result.ExitCode) { exit $result.ExitCode }
+          # The uninstaller copies itself to TEMP and returns before it finishes.
+          for ($i = 0; $i -lt 60 -and (Test-Path (Join-Path $root 'Application\Splice.exe')); $i++) { Start-Sleep -Seconds 1 }
           if (Test-Path (Join-Path $root 'Application\Splice.exe')) { throw 'Uninstall left Splice.exe behind.' }
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
@@ -54,5 +86,7 @@ jobs:
         if: always()
         with:
           name: Windows-installer-verification
-          path: artifacts/installer-proof
+          path: |
+            artifacts/installer-proof
+            artifacts/installer/manifest.json
           if-no-files-found: ignore

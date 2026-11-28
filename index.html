@@ -11,6 +11,12 @@
     <link rel="stylesheet" href="studio.css" />
     <link rel="stylesheet" href="inspector.css" />
     <link rel="stylesheet" href="track_controls.css" />
+    <link rel="stylesheet" href="resolve-dialogs.css" />
+    <link rel="stylesheet" href="media-link.css" />
+    <link rel="stylesheet" href="interchange-dialogs.css" />
+    <link rel="stylesheet" href="multicam.css" />
+    <link rel="stylesheet" href="audio-finishing.css" />
+    <link rel="stylesheet" href="raw.css" />
   </head>
   <body>
     <div class="app-shell">
@@ -56,15 +62,38 @@
       <div class="utility-bar">
         <div class="utility-left">
           <details class="file-menu"><summary>File</summary><div>
-            <button id="new-project">New project…</button><button id="save-as">Save Premiere as…</button>
+            <button id="new-project">New project…</button><button id="open-resolve">Open Resolve project (.drp)…</button><button id="open-resolve-library">Open from Resolve library…</button><button id="save-resolve-library">Save to Resolve library…</button><button id="resolve-compatibility">Resolve compatibility details…</button><button id="save-as">Save Premiere as…</button>
             <button id="save-working">Save working project…</button>
+            <button id="link-media">Link media in place…</button><button id="media-cache">Media cache…</button>
+            <button id="raw-decoders">RAW Decoders…</button>
+            <button id="render-queue">Render queue…</button>
+            <button id="export-timeline">Export timeline…</button><button id="import-timeline">Import timeline…</button>
             <button id="versions">Recent projects &amp; recovery</button>
             <button id="compatibility">Project compatibility…</button>
-            <button id="shortcuts">Keyboard and mouse</button></div></details><button id="import-media" class="menu-button">
+            <button id="sequence-settings">Sequence settings…</button>
+            <button id="shortcuts">Keyboard and mouse</button>
+          </div></details><details class="edit-menu"><summary>Edit</summary><div>
+            <button data-command="markClip">Mark clip <kbd>X</kbd></button>
+            <button data-command="clearMarks">Clear In and Out <kbd>Ctrl+Shift+X</kbd></button>
+            <button data-command="lift">Lift In/Out range <kbd>;</kbd></button>
+            <button data-command="extract">Extract In/Out range <kbd>'</kbd></button>
+            <button data-command="addEditAll">Add edit to all tracks <kbd>Ctrl+Shift+K</kbd></button>
+            <button data-command="rippleStart">Ripple trim start to playhead <kbd>Q</kbd></button>
+            <button data-command="rippleEnd">Ripple trim end to playhead <kbd>W</kbd></button>
+            <button data-command="link">Link / unlink <kbd>Ctrl+L</kbd></button>
+            <button data-command="syncSound">Sync picture to sound…</button>
+            <button data-command="enable">Enable / disable clip <kbd>Shift+E</kbd></button>
+            <button data-command="nest">Nest…</button>
+            <button data-command="unnest">Unnest / Decompose in place</button>
+            <button data-command="createMulticam">Create multicam clip…</button>
+            <button data-command="toggleMulticamView">Multicam monitor</button>
+            <button data-command="flattenMulticam">Flatten multicam</button>
+            <button id="new-adjustment-clip" title="An adjustment clip grades every track beneath it for its duration">New adjustment clip</button>
+          </div></details><button id="import-media" class="menu-button">
             Import media <span>+</span></button
           ><span class="utility-sep"></span
           ><span class="sequence-label">SEQUENCE 01</span
-          ><span class="sequence-name">Alpine Passage — Main Edit</span><select id="sequence-select" aria-label="Sequence" hidden></select>
+          ><span class="sequence-name">Alpine Passage — Main Edit</span><select id="sequence-select" aria-label="Sequence" hidden></select><button id="compat-badge" class="compat-badge" type="button" hidden></button>
         </div>
         <div class="utility-right">
           <span class="format-pill" id="size-label">1920 × 1080</span
@@ -93,7 +122,7 @@
             ><button data-library="effects">Effects</button
             ><button data-library="titles">Titles</button><button data-library="captions">Captions</button>
           </div>
-          <div class="pool-tools"><select id="bin-filter" aria-label="Media bin"><option value="">All bins</option></select><input id="media-search" type="search" placeholder="Search media" aria-label="Search media" /><select id="media-filter" aria-label="Filter media"><option value="all">All media</option><option value="video">Video</option><option value="audio">Audio</option><option value="offline">Offline</option></select></div><div class="library-body" id="library-body"></div>
+          <div class="pool-tools"><select id="bin-filter" aria-label="Media bin"><option value="">All bins</option></select><input id="media-search" type="search" placeholder="Search media" aria-label="Search media" /><select id="media-filter" aria-label="Filter media"><option value="all">All media</option><option value="video">Video</option><option value="audio">Audio</option><option value="offline">Offline</option></select><button id="media-view" type="button" aria-pressed="false" title="Show media as a sortable list">List</button></div><div class="library-body" id="library-body"></div>
           <div class="library-footer">
             <span class="status-dot"></span
             ><span id="asset-footer">Project ready</span>
@@ -108,6 +137,22 @@
             <div class="viewer-actions">
               <span id="hdr-preview-status" role="status" hidden></span>
               <span id="monitor-resolution">Fit</span
+              ><button
+                class="quiet multicam-toggle"
+                id="multicam-toggle"
+                type="button"
+                aria-pressed="false"
+                title="Toggle live multi-angle Multicam Monitor (keys 1–9 switch angles)"
+              >
+                Multicam</button
+              ><button
+                class="quiet scope-dock-toggle"
+                id="scope-dock-toggle"
+                type="button"
+                aria-pressed="false"
+                title="Show a large video scope beside the program monitor"
+              >
+                Scopes</button
               ><button
                 class="icon-button"
                 id="fullscreen-monitor"
@@ -125,6 +170,7 @@
                 height="720"
                 aria-label="Video preview"
               ></canvas>
+              <div id="multicam-grid" class="multicam-grid" hidden></div>
               <div id="monitor-caption" hidden></div>
               <div id="preview-title" class="preview-title"></div>
               <div id="preview-empty" class="preview-empty">
@@ -136,7 +182,7 @@
           </div>
           <div class="viewer-bottom">
             <div class="viewer-info">
-              <span class="viewer-timecode" id="viewer-time">00:00:00:00</span
+              <span class="viewer-timecode" id="viewer-time" role="button" tabindex="0" title="Click to type a timecode">00:00:00:00</span
               ><span class="viewer-duration" id="viewer-duration"
                 >/ 00:00:00:00</span
               >
@@ -186,11 +232,18 @@
             ><button id="delete-selected" title="Delete selected clip">
               ⌫ <span>Delete</span></button
             ><span class="tool-sep"></span
-            ><button id="add-marker" title="Add marker (M)">Marker</button><button id="snap-toggle" class="active" title="Snap to edit points (N)">Snap</button><button id="ripple-toggle" title="Ripple trim (R)">Ripple</button><button id="zoom-out" title="Zoom out">−</button
-            ><span id="zoom-label">55%</span
-            ><button id="zoom-in" title="Zoom in">+</button>
+            ><button id="add-marker" title="Add marker (M)">Marker</button
+            ><button id="snap-toggle" class="active" title="Snap to edit points (N)">Snap</button
+            ><button id="ripple-toggle" title="Ripple trim (R)">Ripple</button
+            ><button id="linked-toggle" class="active" aria-pressed="true" title="Linked selection: linked picture and sound select, move and trim together (Ctrl/Cmd+Shift+L)">Linked</button
+            ><span class="tool-sep"></span
+            ><button id="zoom-out" title="Zoom out (−)">−</button
+            ><span id="zoom-label">—</span
+            ><button id="zoom-in" title="Zoom in (=)">+</button
+            ><button id="zoom-fit" title="Zoom to fit the whole timeline (\)">Fit</button>
           </div>
         </div>
+        <div id="nested-breadcrumb" class="nested-breadcrumb" hidden></div>
         <div class="timeline-body" id="timeline-body">
           <div class="track-heads" id="track-heads">
             <div class="ruler-head">TIMECODE</div>
@@ -208,21 +261,22 @@
             <span class="status-dot"></span
             ><span id="timeline-status">Ready to edit</span>
           </div>
-          <span>Drag assets to the timeline · Space to play · S to split</span>
+          <span id="mark-status" class="mark-status" hidden></span>
+          <span>Drag assets to the timeline · Space to play · S to split · I/O mark</span>
         </div>
       </section>
     </div>
     <input
       type="file"
       id="media-input"
-      accept="video/*,audio/*,image/jpeg,image/png,.mxf,.mov,.mkv,.aiff,.bmp"
+      accept="video/*,audio/*,image/jpeg,image/png,.mxf,.mov,.mkv,.aiff,.bmp,.mts,.m2ts,.ts,.mpg,.dv,.tif,.tiff,.exr,.dpx,.webp,.dng,.braw,.r3d,.ari,.arx,.crm,.nev,.cr2,.cr3,.arw,.nef,.raf,.orf,.rw2"
       multiple
       hidden
     />
     <input
       type="file"
       id="relink-input"
-      accept="video/*,audio/*,image/jpeg,image/png,.mxf,.mov,.mkv,.aiff,.bmp"
+      accept="video/*,audio/*,image/jpeg,image/png,.mxf,.mov,.mkv,.aiff,.bmp,.mts,.m2ts,.ts,.mpg,.dv,.tif,.tiff,.exr,.dpx,.webp,.dng,.braw,.r3d,.ari,.arx,.crm,.nev,.cr2,.cr3,.arw,.nef,.raf,.orf,.rw2"
       multiple
       hidden
     />
@@ -234,15 +288,37 @@
     />
     <input type="file" id="specific-relink-input" hidden />
     <input type="file" id="folder-relink-input" webkitdirectory multiple hidden />
+    <input type="file" id="resolve-input" accept=".drp" hidden />
+    <script src="splice-auth.js"></script>
     <script src="media-store.js"></script>
     <script src="lut.js"></script>
+    <script src="color-grade.js"></script>
+    <script src="gl-preview.js"></script>
+    <script src="color-monitor.js"></script>
+    <script src="color-wheels.js"></script>
+    <script src="raw-inspector.js"></script>
+    <script src="raw-settings.js"></script>
+    <script src="audio-dsp.js"></script>
+    <script src="audio-mixer.js"></script>
     <script src="engine.js"></script>
+    <script src="nested.js"></script>
+    <script src="multicam.js"></script>
+    <script src="bins.js"></script>
+    <script src="scopes.js"></script>
     <script src="inspector.js"></script>
     <script src="source_monitor.js"></script>
     <script src="studio-dialogs.js"></script>
+    <script src="export-presets.js"></script>
     <script src="recovery.js"></script>
     <script src="captions.js"></script>
     <script src="track_controls.js"></script>
+    <script src="audio-fx.js"></script>
+    <script src="audio-meter.js"></script>
+    <script src="audio-automation.js"></script>
+    <script src="audio-sync.js"></script>
     <script src="workspace.js"></script>
+    <script src="media-link.js"></script>
+    <script src="interchange-dialogs.js"></script>
+    <script src="resolve-dialogs.js"></script>
   </body>
 </html>

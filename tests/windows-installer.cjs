@@ -5,9 +5,14 @@ const { tmpdir } = require('node:os')
 const path = require('node:path')
 const { _electron: electron } = require('playwright-core')
 
-const installed = path.join(process.env.LOCALAPPDATA, 'Programs', 'Splice', 'Application')
-const ffprobe = path.join(installed, 'resources', 'ffmpeg', 'ffprobe.exe')
-const proof = path.resolve('artifacts/installer-proof')
+// Checks the installed Windows app. SPLICE_INSTALLED_APP points it at another
+// staged copy (a Linux Electron build of the same shell, for local runs).
+const windows = process.platform === 'win32'
+const installed = process.env.SPLICE_INSTALLED_APP ||
+  path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Splice', 'Application')
+const executable = path.join(installed, windows ? 'Splice.exe' : 'Splice')
+const ffprobe = path.join(installed, 'resources', 'ffmpeg', windows ? 'ffprobe.exe' : 'ffprobe')
+const proof = path.resolve(process.env.SPLICE_INSTALLER_PROOF || 'artifacts/installer-proof')
 const workspace = mkdtempSync(path.join(tmpdir(), 'splice-installer-'))
 const native = path.join(proof, 'Windows Installer.prproj')
 const rendered = path.join(proof, 'Windows Installer.mp4')
@@ -15,11 +20,11 @@ const rendered = path.join(proof, 'Windows Installer.mp4')
 async function windowForEditor() {
   // Launch with only system directories on PATH to exercise the bundled runtimes.
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => key.toLowerCase() !== 'path'))
+  const systemPath = windows ? { Path: path.join(process.env.SystemRoot, 'System32') } : { PATH: '/usr/bin:/bin' }
   const app = await electron.launch({
-    executablePath: path.join(installed, 'Splice.exe'),
-    args: [`--user-data-dir=${path.join(workspace, 'profile')}`],
-    env: { ...env, Path: path.join(process.env.SystemRoot, 'System32'),
-      SPLICE_DATA_DIR: path.join(workspace, 'media'), SPLICE_TEST_TRACE: '1' },
+    executablePath: executable,
+    args: [`--user-data-dir=${path.join(workspace, 'profile')}`, ...(windows ? [] : ['--no-sandbox'])],
+    env: { ...env, ...systemPath, SPLICE_DATA_DIR: path.join(workspace, 'media'), SPLICE_TEST_TRACE: '1' },
     timeout: 30000
   })
   app.on('console', message => { if (message.type() === 'error') console.error(message.text()) })

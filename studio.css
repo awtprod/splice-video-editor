@@ -812,17 +812,14 @@ select:focus-visible {
   height: 31px;
   border-bottom: 1px solid var(--line);
   position: relative;
-  background: repeating-linear-gradient(
-    90deg,
-    transparent 0,
-    transparent 59px,
-    #3b453a 60px,
-    #3b453a 61px
-  );
 }
 .ruler-tick {
   position: absolute;
-  top: 6px;
+  top: 0;
+  bottom: 0;
+  padding: 6px 0 0 5px;
+  border-left: 1px solid #3b453a;
+  white-space: nowrap;
   color: #839080;
   font:
     9px "IBM Plex Mono",
@@ -949,10 +946,13 @@ select:focus-visible {
   gap: 7px;
   align-items: center;
 }
+/* Toasts go in the utility bar's empty middle (.in-bar, placed by workspace.js); without room
+   there they sit under the header, over panel headings, never over timeline tracks. */
 .toast {
   position: fixed;
-  bottom: 33px;
+  top: 118px;
   right: 20px;
+  max-width: min(440px, 60vw);
   background: #2e3c29;
   color: #e9f5e3;
   border: 1px solid #728b62;
@@ -1124,3 +1124,582 @@ button svg {
   .transport{gap:4px}
   .viewer-scale{display:none}
 }
+/* Editing core: links, sync, In/Out, edit selection, density lanes, media list. */
+.timeline-clip.linked .clip-name {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.link-mark {
+  width: 11px;
+  height: 11px;
+  margin-right: 4px;
+  vertical-align: -1px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+}
+.timeline-clip.out-of-sync {
+  border-color: #ff8a6b;
+}
+.sync-badge {
+  position: absolute;
+  z-index: 3;
+  right: 11px;
+  bottom: 4px;
+  min-width: 20px;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: #c8432b;
+  color: #fff;
+  font: 700 10px "IBM Plex Mono", monospace;
+  text-align: center;
+  cursor: pointer;
+}
+.sync-menu {
+  position: fixed;
+  z-index: 60;
+  display: grid;
+  min-width: 170px;
+  padding: 4px;
+  background: #202620;
+  border: 1px solid #495443;
+  border-radius: 5px;
+  box-shadow: 0 8px 24px #0008;
+}
+.sync-menu button {
+  padding: 8px 10px;
+  text-align: left;
+  color: #edf5e8;
+  background: transparent;
+  border-radius: 3px;
+}
+.sync-menu button:hover,
+.sync-menu button:focus-visible {
+  background: #384238;
+}
+.clip-wave.camera-wave {
+  top: auto;
+  bottom: 0;
+  height: 34%;
+  opacity: 0.75;
+}
+.timeline-clip.edit-start .trim-left,
+.timeline-clip.edit-end .trim-right {
+  opacity: 1;
+  background: #ffcf64;
+}
+.lane-density {
+  position: absolute;
+  top: 12px;
+  height: 40px;
+  opacity: 0.85;
+  cursor: pointer;
+}
+.mark-range {
+  position: absolute;
+  z-index: 4;
+  top: 0;
+  pointer-events: none;
+  background: #9fd2ff1a;
+  border-left: 2px solid #8cc8ff;
+  border-right: 2px solid #8cc8ff;
+}
+.mark-range.open-in {
+  border-left: 0;
+}
+.mark-range.open-out {
+  border-right: 0;
+}
+.mark-status {
+  color: #a8d4ff;
+  font: 11px "IBM Plex Mono", monospace;
+}
+.viewer-timecode[role="button"] {
+  cursor: text;
+}
+.timecode-entry {
+  width: 13ch;
+  padding: 1px 4px;
+  color: inherit;
+  background: #101410;
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  font: inherit;
+}
+.edit-menu kbd {
+  float: right;
+  margin-left: 14px;
+  color: #93a28f;
+  font: 10px "IBM Plex Mono", monospace;
+}
+.edit-menu[open] > div {
+  min-width: 290px;
+}
+#linked-toggle.active {
+  color: #d1f6a3;
+}
+#zoom-label {
+  min-width: 64px;
+  text-align: center;
+}
+.media-extra {
+  color: #93a28f;
+  font-size: 10px;
+}
+#media-view {
+  flex: none;
+  padding: 0 8px;
+  color: #d6e2d2;
+  background: #202720;
+  border: 1px solid #475545;
+  border-radius: 4px;
+}
+.media-table {
+  display: grid;
+  margin: 0 0 10px;
+  overflow-x: auto;
+  font-size: 11px;
+}
+.media-table-head,
+.media-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 2fr) 84px 58px 92px 60px 64px minmax(80px, 1fr);
+  min-width: 600px;
+  text-align: left;
+}
+.media-table-head button {
+  padding: 6px 5px;
+  color: #aebbaa;
+  font-weight: 700;
+  text-align: left;
+  background: #202620;
+  border-bottom: 1px solid #3a4238;
+}
+.media-row {
+  padding: 0;
+  color: #e7efe4;
+  background: transparent;
+  border-bottom: 1px solid #2c332b;
+}
+.media-row:hover {
+  background: #2a322a;
+}
+.media-row span {
+  padding: 6px 5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.edit-menu {
+  position: relative;
+}
+.edit-menu > summary {
+  cursor: pointer;
+  list-style: none;
+  padding: 5px 10px;
+}
+.edit-menu[open] > div {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 20;
+  padding: 5px;
+  background: #202620;
+  border: 1px solid #495443;
+  box-shadow: 0 6px 18px #0006;
+}
+.edit-menu button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 8px 10px;
+}
+.edit-menu button:hover {
+  background: #384238;
+}
+/* Keep the ruler and its header cell visible while scrolling down through many tracks. */
+.time-ruler {
+  position: sticky;
+  top: 0;
+  z-index: 4;
+  background-color: #1a1f1a;
+}
+.ruler-head {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: inherit;
+}
+/* Pool tools share one row: the search field and filters shrink before anything overflows. */
+.pool-tools input {
+  flex: 1 1 70px;
+  width: auto;
+}
+.pool-tools select {
+  flex: 0 1 92px;
+  min-width: 0;
+}
+@media (max-width: 1320px) {
+  .pool-tools {
+    display: grid;
+    grid-template-columns: 1fr 1fr auto;
+    gap: 4px;
+    padding: 6px 8px;
+  }
+  .pool-tools input {
+    grid-column: 1 / -1;
+    grid-row: 1;
+    width: 100%;
+  }
+  .pool-tools select,
+  #bin-filter {
+    width: 100%;
+    max-width: none;
+  }
+  .pool-tools[hidden] {
+    display: none;
+  }
+}
+/* Round 1 layout fixes. */
+/* The sync badge sits at the top right and the clip name stops short of it. */
+.sync-badge {
+  top: 6px;
+  bottom: auto;
+  right: 10px;
+}
+.timeline-clip.out-of-sync .clip-name {
+  padding-right: 42px;
+}
+/* Pool tools: the search field has its own full-width row; bins, type and List share the next. */
+.pool-tools,
+.pool-tools:not([hidden]) {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  gap: 5px;
+  padding: 7px 10px;
+}
+.pool-tools input {
+  grid-column: 1 / -1;
+  grid-row: 1;
+  width: 100%;
+  min-width: 0;
+}
+.pool-tools select,
+#bin-filter {
+  width: 100%;
+  min-width: 0;
+  max-width: none;
+}
+.pool-tools[hidden] {
+  display: none;
+}
+/* The media list is a full table when the pool is wide enough; in a narrow pool each row
+   puts name and duration on one line and the other columns under them. */
+.library-body {
+  container-type: inline-size;
+}
+@container (max-width: 559px) {
+  .media-table-head,
+  .media-row {
+    display: flex;
+    flex-wrap: wrap;
+    min-width: 0;
+  }
+  .media-table-head {
+    gap: 2px;
+  }
+  .media-table-head button {
+    flex: 1 0 auto;
+    padding: 4px 6px;
+  }
+  .media-row span {
+    flex: 0 1 auto;
+    padding: 0 0 6px 6px;
+    color: #a9b8a5;
+    font-size: 10px;
+  }
+  .media-row span:empty {
+    display: none;
+  }
+  .media-row span:nth-child(1) {
+    flex: 1 0 calc(100% - 96px);
+    padding: 6px 5px 3px 6px;
+    color: #e7efe4;
+    font-size: 11px;
+    font-weight: 700;
+  }
+  .media-row span:nth-child(2) {
+    flex: 0 0 96px;
+    padding: 6px 6px 3px 0;
+    color: #e7efe4;
+    text-align: right;
+  }
+  .media-row span:nth-child(3):not(:empty)::after {
+    content: " fps";
+  }
+  .media-row span:nth-child(n + 3):not(:empty) ~ span:not(:empty)::before {
+    content: "· ";
+  }
+}
+/* Keyboard reference: the list scrolls, the heading and Close stay in view. */
+.studio-dialog.shortcut-reference[open] {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.shortcut-reference .shortcut-list {
+  min-height: 0;
+  overflow: auto;
+  margin: 0 0 14px;
+  padding-right: 6px;
+}
+.shortcut-reference > button {
+  align-self: flex-end;
+  flex: none;
+}
+/* Below 1320 px the four pool tabs tighten so Captions stays in view. */
+@media (max-width: 1320px) {
+  .library-tabs {
+    justify-content: space-between;
+    gap: 3px;
+    padding: 0 8px;
+  }
+  .library-tabs button {
+    font-size: 11px;
+  }
+}
+/* Track rows take their heights from the timeline (laneHeights in workspace.js); clips fill them. */
+.timeline .timeline-clip{top:4px;height:calc(100% - 8px)}
+.track-head.is-compact .track-controls button{height:22px}
+.track-lane.drop-target{box-shadow:inset 0 0 0 2px #c6f178}
+/* Pool cards: every line stays inside its card. Long paths end in an ellipsis (full path in the tooltip). */
+.media-card{overflow:hidden}
+.media-card .media-meta{overflow-wrap:anywhere}
+.media-card .media-path{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;overflow-wrap:normal}
+/* Large scope dock: replaces the media pool column beside the program monitor while grading. */
+/* The program monitor keeps at least 360 px; the dock gives way first (from 506 px down to
+   360 px in small windows). With the source monitor open too the dock narrows further, and below
+   1100 px wide the three cannot share the window: the dock closes and says so (workspace.js). */
+.workspace.scope-docked{grid-template-columns:minmax(min(506px,calc(100vw - 640px)),38%) minmax(360px,1fr) minmax(230px,20%)}
+.workspace.scope-docked>.library{display:none}
+.workspace.scope-docked.source-open{grid-template-columns:minmax(360px,30%) minmax(300px,1fr) minmax(360px,1fr)}
+@media (min-width:1400px){
+  .workspace.scope-docked.source-open{grid-template-columns:minmax(360px,28%) minmax(300px,1fr) minmax(360px,1fr) minmax(230px,16%)}
+}
+.scope-dock{display:flex;flex-direction:column;min-width:0;min-height:0}
+.scope-dock-body{flex:1;min-height:0;display:flex;flex-direction:column;padding:10px 12px}
+.scope-dock .splice-scopes{flex:1;min-height:0;display:flex;flex-direction:column;gap:8px}
+.scope-dock .splice-scope{flex:1;min-height:0;height:auto!important}
+.scope-dock .splice-scope-size,.scope-dock .splice-scope-enlarge{display:none}
+.workspace.scope-docked .inspector .splice-scope,.workspace.scope-docked .inspector .splice-scope-size,
+.workspace.scope-docked .inspector .splice-scope-tabs,.workspace.scope-docked .inspector .splice-scope-luma,
+.workspace.scope-docked .inspector .splice-scope-enlarge{display:none}
+.workspace.scope-docked .inspector .splice-scopes::after{content:"The scope is docked beside the program monitor.";font-size:11px;color:#9baa9b}
+.scope-dock-toggle{padding:3px 8px;border:1px solid #465346;border-radius:4px;font-size:11px;color:#b6c9af;background:transparent}
+.scope-dock-toggle.active{color:#e9f6d8;background:#2f3d2b;border-color:#c4ee78}
+/* Short windows (down to the 1024 × 640 minimum): slimmer header and utility bar, and a timeline
+   that leaves the monitors room while keeping V1 and A1 in view. */
+@media (max-height:700px){
+  .app-shell{min-height:640px}
+  .app-header{height:48px;gap:16px;padding:0 16px}
+  .brand-mark{transform:scale(.8)}
+  .export-button{padding:7px 13px}
+  .utility-bar{height:34px;padding:0 16px}
+  .timeline,body:has(.workspace.source-open) .timeline{min-height:0;height:236px}
+  .timeline-header{height:38px}
+  .timeline-footer{height:26px}
+  .toast{top:90px}
+  .monitor-area{padding:8px}
+  .viewer-bottom{height:46px}
+  .panel-top{height:38px}
+}
+/* The smallest supported window is 1024 × 640. Below it the page keeps that layout and scrolls,
+   rather than squeezing panels past the point where they work. */
+body{min-width:1024px}
+/* A narrow program monitor (large scope or source panel beside it) keeps its transport on one row. */
+.viewer{container:viewer/inline-size}
+.viewer-info{white-space:nowrap}
+@container viewer (max-width:500px){
+  .viewer-scale{display:none}
+  .viewer-bottom{gap:8px;padding-left:12px;padding-right:12px}
+}
+/* Disabled clips (Shift+E): still selectable, trimmable and movable, but they contribute no
+   picture or sound. Dimmed and hatched, with an OFF tag so the state does not rely on colour. */
+.timeline-clip.disabled {
+  border-style: dashed;
+  border-color: #8a8f88;
+  background-image: repeating-linear-gradient(135deg, #0000 0 6px, #0006 6px 9px);
+}
+.timeline-clip.disabled .clip-overlay {
+  z-index: 1;
+  background: repeating-linear-gradient(135deg, #0000 0 6px, #000a 6px 9px);
+}
+.timeline-clip.disabled .clip-name { z-index: 2; }
+.timeline-clip.disabled .clip-image,
+.timeline-clip.disabled .clip-wave {
+  opacity: .3;
+  filter: grayscale(1);
+}
+.timeline-clip.disabled .clip-name {
+  color: #c9ccc6;
+  font-style: italic;
+}
+.clip-off {
+  display: inline-block;
+  margin-right: 5px;
+  padding: 0 4px;
+  border: 1px solid currentColor;
+  border-radius: 2px;
+  font-size: 9px;
+  font-style: normal;
+  font-weight: 700;
+  letter-spacing: .06em;
+  line-height: 13px;
+  color: #f2f2ee;
+  background: #2b2d2a;
+}
+/* The narrowest program monitor (360 px, beside the scope dock and source monitor): the timecode
+   and duration stack and the transport tightens so all five buttons stay inside the panel. */
+@container viewer (max-width:440px){
+  .viewer-info{flex-direction:column;gap:0}
+  .viewer-bottom{gap:6px;padding-left:10px;padding-right:10px}
+  .transport{gap:6px}
+}
+/* Status toasts in the utility bar's empty middle (see placeToast in workspace.js): two lines at
+   most, the full text in the tooltip; a click dismisses one. */
+.toast{cursor:pointer}
+.toast.in-bar{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden;padding:2px 12px;
+  box-shadow:none;font-size:11.5px;line-height:14px;max-width:none}
+.compat-badge{margin-left:10px;padding:2px 8px;border:1px solid #b8913f;border-radius:10px;font-size:11px;color:#f3d48b;background:#3a311c;white-space:nowrap;cursor:pointer}
+.compat-badge[hidden]{display:none}
+/* Export video: the Audio group, the finished export's report, and a footer that stays in view. */
+.studio-dialog[data-dialog=export]{width:min(560px,90vw);scroll-padding-bottom:84px}
+.studio-dialog[data-dialog=export] form>footer{position:sticky;bottom:-22px;margin:20px -22px -22px;padding:12px 22px 22px;background:#1c211d;border-top:1px solid #2e372e}
+.export-audio{border:1px solid #3a4538;border-radius:6px;margin:16px 0 4px;padding:2px 12px 10px}
+.export-audio legend{padding:0 6px;font-weight:600;color:#c9d6c4}
+.export-audio label{margin:10px 0}
+.studio-dialog .export-audio input[type=checkbox]{justify-self:start;width:16px;height:16px;margin:0;accent-color:#bde773}
+.studio-dialog .export-audio label.export-check{grid-template-columns:auto 1fr;align-items:start}
+.export-audio label.export-check input{order:-1;margin-top:2px}
+.studio-dialog input:disabled{opacity:.5}
+.export-help{margin:-6px 0 10px;font-size:12px;line-height:1.35;color:#a5b3a1}
+.export-help[hidden],.export-report[hidden]{display:none}
+.export-audio label.export-check+.export-help{padding-left:26px}
+.export-report{margin:6px 0 10px;font-size:13px;line-height:1.4}
+.export-measured{margin:0 0 4px;color:#dfe9da;font-variant-numeric:tabular-nums}
+.export-warnings{margin:0;padding:0 0 0 18px;color:#ffcf64}
+.export-warnings li+li{margin-top:3px}
+
+/* ---- Colour finishing: monitor controls and grading tools (color-monitor.js, color-wheels.js) ---- */
+.viewer>.panel-top{height:auto;min-height:47px;flex-wrap:wrap;gap:6px 10px;padding:6px 14px}
+.viewer .panel-title{flex:0 0 auto;white-space:nowrap}
+.viewer-actions{flex:1 1 auto;flex-wrap:wrap;justify-content:flex-end;gap:6px 8px;min-width:0}
+.monitor-color-controls{display:flex;align-items:center;gap:4px 6px;flex-wrap:wrap;justify-content:flex-end;min-width:0}
+.monitor-select{background:#202820;color:#b6c9af;border:1px solid #465346;border-radius:4px;padding:2px 4px;font:11px 'DM Sans',sans-serif;max-width:118px;min-width:0}
+.monitor-select:focus,.monitor-color-controls button:focus-visible{outline:2px solid #c4ee78}
+.monitor-color-controls button{padding:3px 8px;border:1px solid #465346;border-radius:4px;font-size:11px;color:#b6c9af;background:transparent;cursor:pointer;white-space:nowrap}
+.monitor-color-controls button[aria-pressed=true]{color:#e9f6d8;background:#2f3d2b;border-color:#c4ee78}
+@media (max-height:700px){
+  .viewer>.panel-top{height:auto;min-height:32px;padding:2px 6px;gap:2px 4px}
+  .viewer-actions,.monitor-color-controls{gap:2px 4px}
+  .monitor-area{padding:3px 6px}
+  .viewer-bottom{height:38px}
+}
+@container viewer (max-width:640px){
+  .viewer>.panel-top{min-height:32px;padding:2px 6px;gap:2px 4px}
+  .viewer-actions,.monitor-color-controls{gap:2px 4px}
+  .monitor-area{padding:4px 8px}
+  .viewer-bottom{height:40px}
+  .monitor-subtitle{display:none}
+  .monitor-select{max-width:74px;padding:1px 2px;font-size:10px}
+  .monitor-color-controls button,.scope-dock-toggle{padding:1px 5px;font-size:10px}
+}
+.monitor-frame{position:relative}
+.monitor-frame.grade-bypassed::after{content:'GRADE BYPASSED';position:absolute;top:8px;left:8px;padding:2px 6px;border-radius:3px;background:rgba(16,19,16,.8);color:#e0a44a;font:10px 'IBM Plex Mono',monospace;letter-spacing:.08em;pointer-events:none}
+.monitor-split-handle{position:absolute;top:0;bottom:0;width:14px;margin-left:-7px;cursor:ew-resize;touch-action:none;z-index:3}
+.monitor-split-handle::before{content:'';position:absolute;left:6px;top:0;bottom:0;width:2px;background:#c4ee78;box-shadow:0 0 0 1px rgba(0,0,0,.6)}
+.monitor-split-handle:focus-visible::before{background:#e9f6d8}
+.monitor-split-handle span{position:absolute;top:8px;padding:1px 5px;border-radius:3px;background:rgba(16,19,16,.8);color:#d8e4d0;font:10px 'IBM Plex Mono',monospace;white-space:nowrap;pointer-events:none}
+.monitor-split-handle span:first-child{right:12px}
+.monitor-split-handle span:last-child{left:12px}
+.monitor-guides{position:absolute;inset:0;display:grid;place-items:center;pointer-events:none;z-index:2}
+.monitor-guide-box{box-sizing:border-box;border:1px dashed rgba(224,164,74,.9);box-shadow:0 0 0 9999px rgba(0,0,0,.35);position:relative}
+.monitor-guide-box span{position:absolute;left:4px;top:3px;color:#e0a44a;font:10px 'IBM Plex Mono',monospace}
+.grade-tools{display:grid;gap:12px;min-width:0}
+.grade-actions{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.grade-actions button,.grade-curve-point button{border:1px solid #56684f;background:#253025;color:#e4f2d9;border-radius:4px;padding:5px 7px;font:11px 'DM Sans',sans-serif;cursor:pointer;white-space:nowrap}
+.grade-actions button:disabled{opacity:.45;cursor:default}
+.grade-actions button:focus-visible,.grade-curve-point button:focus-visible{outline:2px solid #c4ee78}
+.grade-wheels{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.grade-wheel{display:grid;gap:5px;min-width:0}
+.grade-wheel-head{display:flex;justify-content:space-between;align-items:center;font-size:12px;color:#aebaae}
+.grade-mini{border:1px solid #465346;background:#202820;color:#b6c9af;border-radius:4px;padding:0 5px;font-size:11px;line-height:18px;cursor:pointer}
+.grade-wheel-pad{width:100%;max-width:150px;aspect-ratio:1;justify-self:center;border-radius:50%;background:#0c110d;cursor:crosshair;touch-action:none}
+.grade-wheel-pad:focus-visible,.grade-curve:focus-visible{outline:2px solid #c4ee78;outline-offset:2px}
+.grade-wheel-master{width:100%;accent-color:#c4ee78}
+.grade-wheel-numbers{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:3px 5px}
+.grade-wheel-numbers label{display:grid;grid-template-columns:10px minmax(0,1fr);align-items:center;gap:3px;font:10px 'IBM Plex Mono',monospace;color:#9baa9b}
+.grade-wheel-numbers input,.grade-curve-point input{width:100%;box-sizing:border-box;min-width:0;background:#252d25;color:#e7eee7;border:1px solid #465346;border-radius:3px;padding:3px 2px;font:11px 'IBM Plex Mono',monospace;text-align:center}
+.grade-wheel-numbers input,.grade-curve-point input{-moz-appearance:textfield;appearance:textfield}
+.grade-wheel-numbers input::-webkit-inner-spin-button,.grade-wheel-numbers input::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}
+.grade-wheel-numbers input:focus,.grade-curve-point input:focus{outline:2px solid #c4ee78}
+.grade-curves{display:grid;gap:6px}
+.grade-curve-tabs{display:flex;flex-wrap:wrap;gap:4px}
+.grade-curve-tabs button{flex:1 1 auto;border:1px solid #465346;background:#202820;color:#b6c9af;border-radius:4px;padding:4px 5px;font:11px 'DM Sans',sans-serif;cursor:pointer;white-space:nowrap}
+.grade-curve-tabs button[aria-selected=true]{background:#2f3d2b;border-color:#c4ee78;color:#e9f6d8}
+.grade-curve{display:block;width:100%;aspect-ratio:560/300;box-sizing:border-box;border:1px solid #3c483b;border-radius:4px;cursor:crosshair;touch-action:none}
+.grade-curve-point{display:grid;grid-template-columns:1fr 1fr auto;gap:6px;align-items:end}
+.grade-curve-point label{display:grid;gap:2px;font-size:11px;color:#aebaae}
+.grade-source{display:grid;gap:6px;padding-top:6px;border-top:1px solid #343b34}
+.grade-source-title{margin:0;font-size:12px;color:#e4f2d9;overflow-wrap:anywhere}
+.grade-source-title small{color:#9baa9b;font:10px 'IBM Plex Mono',monospace;text-transform:uppercase;letter-spacing:.08em;margin-right:4px}
+.workspace.color-page{grid-template-columns:minmax(200px,18%) minmax(360px,1fr) minmax(280px,27%)}
+.workspace.color-page.scope-docked{grid-template-columns:minmax(min(420px,calc(100vw - 660px)),32%) minmax(360px,1fr) minmax(280px,27%)}
+.workspace.color-page.scope-docked.source-open{grid-template-columns:minmax(360px,30%) minmax(300px,1fr) minmax(360px,1fr)}
+@media (min-width:1400px){
+  .workspace.color-page.scope-docked.source-open{grid-template-columns:minmax(360px,28%) minmax(300px,1fr) minmax(360px,1fr) minmax(230px,16%)}
+}
+
+/* Delivery (export-presets.js): presets, format groups, notices and the render queue panel. */
+.studio-dialog[data-dialog=export] .export-preset-row{display:grid;grid-template-columns:1fr auto auto;gap:8px;align-items:center}
+.studio-dialog[data-dialog=export] .export-preset-row label{margin:6px 0;grid-template-columns:auto 1fr}
+.studio-dialog .export-small{padding:6px 9px;font-size:12px}
+.export-purpose{margin:0 0 8px}
+.export-purpose[hidden],.export-hdr[hidden],.export-notices[hidden],.export-group[hidden],.studio-dialog fieldset label[hidden]{display:none}
+.export-format,.export-hdr{border:1px solid #3a4538;border-radius:6px;margin:10px 0 4px;padding:2px 12px 8px}
+.export-format legend,.export-hdr legend{padding:0 6px;font-weight:600;color:#c9d6c4}
+.export-format label,.export-hdr label,.export-group label{margin:8px 0}
+.export-group{border:1px solid #3a4538;border-radius:6px;margin:8px 0;padding:6px 12px}
+.export-group summary{cursor:pointer;font-weight:600;color:#c9d6c4;padding:3px 0}
+.export-group[open] summary{margin-bottom:4px}
+.studio-dialog label.export-check{grid-template-columns:auto 1fr;align-items:start}
+.studio-dialog label.export-check input{order:-1;justify-self:start;width:16px;height:16px;margin:2px 0 0;accent-color:#bde773}
+.export-notices{margin:8px 0;padding:8px 12px 8px 28px;border-radius:6px;background:#262d24;font-size:13px;line-height:1.4}
+.export-notices .export-problem{color:#ff9b85}
+.export-notices .export-conversion{color:#ffd77a}
+.export-queue-row{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;margin-top:10px}
+.studio-dialog option:disabled{color:#7e877b}
+.delivery-dialog{width:min(640px,92vw)}
+.delivery-dialog[data-dialog=queue]{width:min(760px,94vw)}
+.queue-toolbar{display:flex;gap:16px;align-items:center;flex-wrap:wrap}
+.queue-toolbar label{margin:0}
+.queue-list{list-style:none;margin:12px 0;padding:0;display:grid;gap:8px}
+.queue-job{border:1px solid #3a4538;border-radius:6px;padding:10px 12px;background:#202620}
+.queue-job.state-rendering{border-color:#7fa64a}
+.queue-job.state-failed,.queue-job.state-interrupted{border-color:#a9583f}
+.queue-head{display:flex;justify-content:space-between;gap:12px}
+.queue-state{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:#a5b3a1}
+.queue-detail,.queue-eta,.queue-output,.queue-note{font-size:12px;color:#b9c6b4;margin:4px 0 0;overflow-wrap:anywhere}
+.queue-note{color:#d9c98f}
+.queue-error{color:#ff9b85;font-size:13px;margin:6px 0 0}
+.queue-job progress{width:100%;margin-top:6px}
+.queue-actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+.studio-dialog .queue-actions button{padding:5px 9px;font-size:12px}
+.batch-list{display:grid;gap:2px;max-height:50vh;overflow:auto}
+.preset-list{list-style:none;padding:0;display:grid;gap:6px}
+.preset-list li{display:flex;gap:6px;align-items:center}
+.preset-list li span{flex:1}
+.studio-dialog[data-dialog=export] fieldset{min-inline-size:0}
+.studio-dialog[data-dialog=export] .export-format label{grid-template-columns:minmax(0,1fr) minmax(0,1.4fr)}
+.studio-dialog[data-dialog=export] label>select,.studio-dialog[data-dialog=export] label>input:not([type=checkbox]){width:100%;min-width:0;box-sizing:border-box}

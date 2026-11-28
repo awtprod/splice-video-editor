@@ -6,20 +6,27 @@ import subprocess
 import sys
 
 
+# Windows: start console programs (FFmpeg, taskkill) without a console window.
+# The desktop launcher also gives the server a hidden console that every other
+# child inherits. 0 elsewhere, the only creationflags value POSIX accepts.
 HIDE_CONSOLE = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 def data_directory(*, browser=False):
+    """The per-user data folder, with symlinks resolved so the media checks
+    that compare resolved paths agree with it (a symlinked home included)."""
     override = os.environ.get("SPLICE_DATA_DIR")
     if override:
         return Path(override).expanduser().resolve()
     home = Path.home()
     if sys.platform == "darwin":
-        return home / "Library" / "Application Support" / "Splice"
-    if sys.platform == "win32":
-        return Path(os.environ.get("LOCALAPPDATA") or home / "AppData" / "Local") / "Splice"
-    base = os.environ.get("XDG_DATA_HOME") if browser else None
-    return Path(base or home / ".local" / "share") / "splice"
+        path = home / "Library" / "Application Support" / "Splice"
+    elif sys.platform == "win32":
+        path = Path(os.environ.get("LOCALAPPDATA") or home / "AppData" / "Local") / "Splice"
+    else:
+        base = os.environ.get("XDG_DATA_HOME") if browser else None
+        path = Path(base or home / ".local" / "share") / "splice"
+    return path.resolve()
 
 
 def browser_executable():

@@ -32,21 +32,31 @@ def objects(data):
 
 
 class AdobeCorpus(unittest.TestCase):
-    def test_native_link_graph_stays_aligned_on_edits(self):
+    def test_native_link_graph_keeps_drift_and_unlinks(self):
         source = (CORPUS / '71_av_subclip.prproj').read_bytes()
         project = open_project(source, 1)
         linked = [clip for clip in project['clips'] if clip.get('linkGroup')]
         self.assertEqual(len(linked), 2)
         self.assertEqual(linked[0]['linkGroup'], linked[1]['linkGroup'])
+        # Linked clips may drift out of sync (a J- or L-cut) and stay linked, as in Premiere.
         linked[0]['start'] += 1
-        with self.assertRaisesRegex(ValueError, 'stay aligned'):
-            save_project(project)
+        drifted = open_project(save_project(project), 1)
+        self.assertEqual(sorted(clip['start'] for clip in drifted['clips']), [0, 1])
+        self.assertEqual(len({clip.get('linkGroup') for clip in drifted['clips']}), 1)
+        self.assertIsNotNone(drifted['clips'][0].get('linkGroup'))
         linked[1]['start'] += 1
         moved = open_project(save_project(project), 1)
         self.assertEqual([clip['start'] for clip in moved['clips']], [1, 1])
+        # Unlinking in Splice removes the native link.
+        for clip in linked:
+            clip.pop('linkGroup')
+        unlinked = open_project(save_project(project), 1)
+        self.assertFalse(any(clip.get('linkGroup') for clip in unlinked['clips']))
+        # Deleting one side (linked selection off) keeps the other clip, unlinked.
         project['clips'] = [clip for clip in project['clips'] if clip['id'] != linked[1]['id']]
-        with self.assertRaisesRegex(ValueError, 'deleted together'):
-            save_project(project)
+        single = open_project(save_project(project), 1)
+        self.assertEqual(len(single['clips']), 1)
+        self.assertIsNone(single['clips'][0].get('linkGroup'))
         project['clips'] = []
         removed = open_project(save_project(project), 1)
         self.assertFalse(removed['clips'])

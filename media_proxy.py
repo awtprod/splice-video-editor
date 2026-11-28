@@ -1,17 +1,21 @@
 """Probe camera originals and produce reusable local edit proxies."""
 from fractions import Fraction
+from functools import lru_cache
 import hashlib
 import json
 import math
 from pathlib import Path
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 import threading
 
-from premiere import MEDIA_ROOT, STILL_IMAGES, _media_path, _playback_url
-from splice_platform import HIDE_CONSOLE
+from premiere import MEDIA_ROOT, STILL_IMAGES, _playback_url
+from media_exec import run_bounded
+from media_links import mark, resolve_media as _media_path
+import raw_decode
 
 _encoders = threading.BoundedSemaphore(2)
 _locks = tuple(threading.Lock() for _ in range(32))
@@ -24,12 +28,19 @@ STILL_PREVIEW_VERSION = 1
 # BT.2408 reference white is 203 cd/m². Leave enough room in the SDR
 # highlight shoulder to distinguish bright patches on an 8-bit display.
 HDR_LINEAR_REC709 = 'zscale=t=linear:npl={peak:.9f},format=gbrpf32le,zscale=p=bt709'
-HDR_TONE_MAP = 'tonemap=mobius:param=0.78:desat=0:peak=4.926108,zscale=t=bt709:m=bt709:r=limited,format=yuv444p10le'
-HDR_TO_REC709 = HDR_LINEAR_REC709.format(peak=203) + ',' + HDR_TONE_MAP
-# Pack wide-gamut PQ channel values into a browser-decodable proxy. Its
-# Rec.709 tags prevent the browser from tone-mapping these data samples.
-HDR_GRADE_DATA = ('zscale=t=linear:npl=203,format=gbrpf32le,zscale=p=bt2020,'
-                  'zscale=t=smpte2084:m=bt709:r=limited:npl=203,format=yuv420p')
+HDR_TONE_MAP = 'tonemap=mobius:param=0.78:desat=0:peak=4.926108,zscale=t=bt709:m=bt709:r=limited'
+HDR_TO_REC709 = HDR_LINEAR_REC709.format(peak=203) + ',' + HDR_TONE_MAP + ',format=yuv444p10le'
+# Compand signed linear Rec.709 before reducing to proxy precision. Quantizing
+# PQ BT.2020 first magnifies errors when saturated channels cancel in the
+# gamut matrix. Reserve most codes for displayable values, with log tails
+# for out-of-gamut negatives and specular highlights (linear white = 1).
+# Codes 32..206 carry SDR, the endpoints cover roughly -42..86 times white.
+_HDR_PACK = ("st(0,{c}(X,Y));if(lt(ld(0),0),32-3.45*log(1-256*ld(0)),"
+             "if(lte(ld(0),1),32+174*pow(ld(0),1/2.4),206+11*log(ld(0))))/255")
+HDR_GRADE_DATA = (HDR_LINEAR_REC709.format(peak=203) + ',format=gbrpf32le,geq=' +
+                  ':'.join(f"{c}='{_HDR_PACK.format(c=c)}'" for c in 'rgb') +
+                  ':interpolation=nearest,setparams=color_primaries=bt709:color_trc=bt709:range=pc,'
+                  'format=gbrp')
 AUDITION_SECONDS = 4
 _audition_decoders = threading.BoundedSemaphore(4)
 
@@ -48,35 +59,65 @@ def tempo_filters(speed):
     return filters
 
 
-def audition_audio(src, index, rate=1, reverse=False):
+AUDITION_RATE = 48000
+# Two channels of 16-bit PCM for the window plus the tempo overlap, a WAV
+# header and generous slack. Nothing larger is ever held in memory.
+AUDITION_LIMIT = 1024 * 1024
+PROBE_LIMIT = 8 * 1024 * 1024
+SCAN_LIMIT = 256 * 1024
+
+
+def _silence(seconds):
+    frames = round(seconds * AUDITION_RATE)
+    data = frames * 4
+    header = (b'RIFF' + (36 + data).to_bytes(4, 'little') + b'WAVEfmt ' + (16).to_bytes(4, 'little') +
+              (1).to_bytes(2, 'little') + (2).to_bytes(2, 'little') + AUDITION_RATE.to_bytes(4, 'little') +
+              (AUDITION_RATE * 4).to_bytes(4, 'little') + (4).to_bytes(2, 'little') + (16).to_bytes(2, 'little') +
+              b'data' + data.to_bytes(4, 'little'))
+    return header + bytes(data)
+
+
+def audition_audio(src, index, rate=1, reverse=False, stream=0):
     """Read a bounded span and apply the same tempo processing as delivery."""
     if not math.isfinite(rate) or not .0625 <= rate <= 16:
         raise ValueError('Invalid audio preview speed')
     span = AUDITION_SECONDS * rate
-    if not 0 <= index < 86400 / span:
+    if type(index) is not int or not 0 <= index < 86400 / span:
         raise ValueError('Invalid audio preview position')
+    path = _media_path(src)
+    info = describe(src)
+    if info.get('rawAudioPath'):
+        path = Path(info['rawAudioPath'])
+    streams = info['audioStreams']
+    if type(stream) is not int or not 0 <= stream < max(1, streams):
+        raise ValueError('The selected source audio stream is unavailable')
+    if not streams:
+        raise ValueError('The source has no audio')
     start = index * span
+    overlap = .02 if rate != 1 else 0
+    if start >= info['duration']:
+        # Past the end of the source: answer with the silence the tail
+        # padding would have produced instead of decoding nothing forever.
+        return _silence(AUDITION_SECONDS + overlap)
     # Give the tempo filter extra source after the requested window so its
     # analysis latency cannot leave a silent tail on an ordinary boundary.
-    overlap = .02 if rate != 1 else 0
     extra = .25 * max(1, rate) if overlap else 0
     seek = max(0, start-extra) if reverse else start
     length = start+span-seek + (0 if reverse else extra)
-    filters = ['aresample=48000:first_pts=0', f'apad=whole_dur={length:.9f}', f'atrim=duration={length:.9f}']
+    filters = [f'aresample={AUDITION_RATE}:first_pts=0', f'apad=whole_dur={length:.9f}', f'atrim=duration={length:.9f}']
     if reverse:
         filters.append('areverse')
     filters.extend(tempo_filters(rate))
-    filters.append('apad')
-    path = _media_path(src)
+    filters.append(f'apad=whole_dur={AUDITION_SECONDS+overlap:.9f}')
     if not _audition_decoders.acquire(timeout=2):
         raise ValueError('Audio preview is busy')
     try:
-        result = subprocess.run([
+        result = run_bounded([
             'ffmpeg', '-nostdin', '-v', 'error', '-protocol_whitelist', 'file', '-threads', '1',
-            '-ss', f'{seek:.9f}', '-i', str(path), '-map', '0:a:0',
-            '-af', ','.join(filters), '-ac', '2', '-c:a', 'pcm_s16le',
+            '-ss', f'{seek:.9f}', '-i', str(path), '-map', f'0:a:{stream}',
+            '-af', ','.join(filters), '-ac', '2', '-ar', str(AUDITION_RATE), '-c:a', 'pcm_s16le',
             '-t', str(AUDITION_SECONDS+overlap), '-f', 'wav', 'pipe:1',
-        ], capture_output=True, timeout=8, creationflags=HIDE_CONSOLE)
+        ], timeout=8, max_output=AUDITION_LIMIT)
         if result.returncode:
             raise ValueError('Could not decode audio for preview')
         return result.stdout
@@ -99,41 +140,247 @@ def stereo_mix_filters(sources, output, channels, duration):
     return filters
 
 
-def describe(src):
-    path = _media_path(src)
-    probe = subprocess.run(['ffprobe', '-v', 'error', '-protocol_whitelist', 'file',
-                            '-show_entries', 'format=duration:stream=codec_type,codec_name,width,height,avg_frame_rate,duration,channels,color_transfer:stream_disposition=attached_pic',
-                            '-of', 'json', str(path)], capture_output=True, timeout=25, creationflags=HIDE_CONSOLE)
-    if probe.returncode:
-        raise ValueError('Could not read media streams in ' + path.name)
-    data = json.loads(probe.stdout)
-    streams = data.get('streams', [])
-    video = next((s for s in streams if s['codec_type']=='video' and not s.get('disposition',{}).get('attached_pic')), {})
-    audio_streams = [s for s in streams if s['codec_type']=='audio']
-    if len(audio_streams)>MAX_AUDIO_STREAMS:
+STANDARD_RATES = tuple(Fraction(r) for r in ('24000/1001', '24', '25', '30000/1001', '30', '48', '50',
+                                                '60000/1001', '60', '100', '120000/1001', '120'))
+LONG_GOP = frozenset({'h264', 'hevc', 'av1', 'vp8', 'vp9', 'mpeg2video', 'mpeg4'})
+STILL_FORMATS = frozenset({'image2', 'png_pipe', 'tiff_pipe', 'jpeg_pipe', 'bmp_pipe', 'exr_pipe', 'dpx_pipe',
+                           'webp_pipe', 'image2pipe'})
+_TIMECODE = re.compile(r'(\d{2}):(\d{2}):(\d{2})([:;.,])(\d{2,3})')
+
+
+def _fraction(value):
+    try:
+        rate = Fraction(str(value or '0'))
+    except (ValueError, ZeroDivisionError):
+        return None
+    return rate if 0 < rate <= 1000 else None
+
+
+def _rational(value):
+    return f'{value.numerator}/{value.denominator}'
+
+
+def _snap(rate):
+    """A probed average such as 2997/100 is the 30000/1001 a camera wrote."""
+    for standard in STANDARD_RATES:
+        if abs(rate - standard) / standard < Fraction(1, 2000):
+            return standard
+    return rate.limit_denominator(1001)
+
+
+def _tag(tags, *names):
+    lowered = {str(k).lower(): v for k, v in (tags or {}).items()}
+    for name in names:
+        value = lowered.get(name)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+class ProbeTimeout(ValueError):
+    """FFprobe did not answer in time: a slow or disconnected drive, not a
+    file FFmpeg cannot decode."""
+
+
+def _ffprobe(path, *arguments, limit=PROBE_LIMIT, timeout=25):
+    try:
+        result = run_bounded(['ffprobe', '-v', 'error', '-protocol_whitelist', 'file', *arguments, '-of', 'json', str(path)],
+                             timeout=timeout, max_output=limit)
+    except subprocess.TimeoutExpired:
+        raise ProbeTimeout(f'Reading {Path(path).name} timed out after {timeout:g} s. Its drive may be slow or '
+                           'disconnected; try again once it responds.') from None
+    if result.returncode:
+        raise ValueError('Could not read media streams in ' + Path(path).name)
+    data = json.loads(result.stdout)
+    if not isinstance(data, dict):
+        raise ValueError('Could not read media streams in ' + Path(path).name)
+    return data
+
+
+VFR_PACKETS = 300
+VFR_MIN_STEPS = 8
+
+
+def _variable_rate(path, stream_index, nominal, average):
+    """Whether the first packets' timestamps step irregularly. Always
+    scanned: Matroska/WebM report matching nominal and average rates even
+    when the rate changes. Too few packets to judge falls back to whether
+    the nominal and average rates disagree."""
+    mismatch = nominal is not None and average is not None and abs(nominal - average) / nominal >= Fraction(1, 1000)
+    data = _ffprobe(path, '-select_streams', str(stream_index), '-read_intervals', f'%+#{VFR_PACKETS}',
+                    '-show_entries', 'packet=pts_time', limit=SCAN_LIMIT, timeout=15)
+    times = []
+    for packet in data.get('packets', []):
+        try:
+            times.append(float(packet['pts_time']))
+        except (KeyError, TypeError, ValueError):
+            continue
+    times.sort()
+    steps = sorted(b - a for a, b in zip(times, times[1:]) if b > a)
+    if len(steps) < VFR_MIN_STEPS:
+        return mismatch
+    median = steps[len(steps) // 2]
+    irregular = sum(abs(step - median) > median * .1 for step in steps)
+    return irregular / len(steps) > .05
+
+
+def _rotation(stream):
+    for side in stream.get('side_data_list') or []:
+        if isinstance(side, dict) and 'rotation' in side:
+            try:
+                return round(-float(side['rotation'])) % 360
+            except (TypeError, ValueError):
+                break
+    try:
+        return round(float(_tag(stream.get('tags'), 'rotate') or 0)) % 360
+    except ValueError:
+        return 0
+
+
+def _time_reference(fmt):
+    value = _tag(fmt.get('tags'), 'time_reference')
+    if not value or not value.isascii() or not value.isdecimal() or len(value) > 19:
+        return None
+    reference = int(value)
+    return reference if reference < 2**63 else None
+
+
+def _sample_rate(audio):
+    try:
+        rate = int(audio.get('sample_rate') or 0)
+    except (TypeError, ValueError):
+        return None
+    return rate if 0 < rate <= 768000 else None
+
+
+def _color(value):
+    return value if isinstance(value, str) and value not in ('unknown', 'unspecified', 'reserved') else None
+
+
+@lru_cache(maxsize=512)
+def _describe_file(path, size, modified):
+    path = Path(path)
+    data = _ffprobe(path, '-show_streams', '-show_format')
+    streams = [s for s in data.get('streams', []) if isinstance(s, dict)]
+    fmt = data.get('format') if isinstance(data.get('format'), dict) else {}
+    video = next((s for s in streams if s.get('codec_type') == 'video' and not (s.get('disposition') or {}).get('attached_pic')), {})
+    audio_streams = [s for s in streams if s.get('codec_type') == 'audio']
+    if len(audio_streams) > MAX_AUDIO_STREAMS:
         raise ValueError(f'Media has more than {MAX_AUDIO_STREAMS} audio streams')
     audio = audio_streams[0] if audio_streams else {}
     if not video and not audio:
         raise ValueError('The source contains no editable audio or video stream')
-    still = path.suffix.lower() in STILL_IMAGES
-    duration = 5 if still else float(data.get('format',{}).get('duration') or video.get('duration') or audio.get('duration') or 0)
+    if _text_art(fmt, streams):
+        raise ValueError(f'The installed FFmpeg cannot decode {path.name}: it is a text file, not media')
+    still = bool(video) and (path.suffix.lower() in STILL_IMAGES or fmt.get('format_name') in STILL_FORMATS)
+    try:
+        duration = 5 if still else float(fmt.get('duration') or video.get('duration') or audio.get('duration') or 0)
+    except ValueError:
+        duration = 0
     if not math.isfinite(duration) or not 0 < duration <= 86400:
         raise ValueError('No supported media duration in ' + path.name)
-    try:
-        fps = float(Fraction(video.get('avg_frame_rate') or '0'))
-    except (ValueError, ZeroDivisionError):
-        fps = 0
+    nominal, average = _fraction(video.get('r_frame_rate')), _fraction(video.get('avg_frame_rate'))
+    fps = float(average) if average else 0
+    vfr = bool(video) and not still and _variable_rate(path, video.get('index', 0), nominal, average)
+    rate = None
+    if video and not still and (average or nominal):
+        if vfr or not nominal:
+            rate = _snap(average or nominal)
+        elif average and abs(nominal - average) / average >= Fraction(1, 1000):
+            rate = _snap(average)  # Field-rate nominal values on interlaced sources.
+        else:
+            rate = _snap(nominal)
+    timecode_stream = next((s for s in streams if s.get('codec_tag_string') == 'tmcd' or
+                            (s.get('codec_type') == 'data' and _tag(s.get('tags'), 'timecode'))), {})
+    timecode = None
+    for tags in (timecode_stream.get('tags'), video.get('tags'), fmt.get('tags'), *(s.get('tags') for s in streams)):
+        match = _TIMECODE.fullmatch(_tag(tags, 'timecode') or '')
+        if match:
+            timecode = match
+            break
+    drop = bool(timecode) and timecode.group(4) in ';,'
+    reel = None
+    for tags in (timecode_stream.get('tags'), video.get('tags'), fmt.get('tags')):
+        reel = _tag(tags, 'reel_name', 'reel', 'tape_name', 'tape')
+        if reel:
+            break
     vcodec, acodec = video.get('codec_name'), audio.get('codec_name')
+    width, height = video.get('width'), video.get('height')
     native_video = not video or vcodec in ('h264','vp8','vp9','av1')
     native_audio = not audio or acodec in ('aac','mp3','opus','vorbis','flac','pcm_s16le','pcm_s24le','pcm_f32le')
     native_container = path.suffix.lower() in ('.mp4','.m4v','.m4a','.webm','.wav','.mp3','.ogg','.flac','.aac')
     hdr = video.get('color_transfer') in HDR_TRANSFERS
-    return dict(type='video' if video else 'audio', duration=duration, width=video.get('width'), height=video.get('height'), hdr=hdr,
+    uhd_long_gop = vcodec in LONG_GOP and isinstance(width, int) and isinstance(height, int) and max(width, height) >= 3840
+    return dict(type='video' if video else 'audio', duration=duration, width=width, height=height, hdr=hdr,
                 hdrPreviewVersion=HDR_PREVIEW_VERSION if hdr else None,
-                fps=fps, videoCodec=vcodec, audioCodec=acodec, audioChannels=2 if len(audio_streams)>1 else audio.get('channels',0),
-                audioStreams=len(audio_streams), audioStreamChannels=[stream.get('channels',1) for stream in audio_streams], still=still,
+                fps=fps, rate=_rational(rate) if rate else None, vfr=vfr,
+                timecode=(':'.join(timecode.group(1, 2, 3)) + (';' if drop else ':') + timecode.group(5)) if timecode else None,
+                dropFrame=drop, reel=reel,
+                # Dual-system sync: a BWF recorder file's start (samples since midnight) and its rate.
+                timeReference=_time_reference(fmt), audioSampleRate=_sample_rate(audio),
+                videoCodec=vcodec, audioCodec=acodec, audioChannels=2 if len(audio_streams)>1 else audio.get('channels',0),
+                audioStreams=len(audio_streams),
+                audioStreamDetails=[dict(index=i, streamIndex=s.get('index'), channels=s.get('channels', 1),
+                                   layout=s.get('channel_layout'), codec=s.get('codec_name'))
+                              for i, s in enumerate(audio_streams)],
+                audioStreamChannels=[stream.get('channels',1) for stream in audio_streams], still=still,
                 stillPreviewVersion=STILL_PREVIEW_VERSION if still else None,
-                proxyRecommended=hdr or len(audio_streams)>1 or not (native_video and native_audio and native_container))
+                pixelFormat=video.get('pix_fmt'), colorPrimaries=_color(video.get('color_primaries')),
+                colorTransfer=_color(video.get('color_transfer')), colorSpace=_color(video.get('color_space')),
+                colorRange=_color(video.get('color_range')), rotation=_rotation(video) if video else 0,
+                proxyRecommended=hdr or vfr or uhd_long_gop or len(audio_streams)>1 or
+                not (native_video and native_audio and native_container))
+
+
+def describe_path(path):
+    path = Path(path)
+    raw_format = raw_decode.detect_raw_format(path)
+    if raw_format and raw_format != 'prores_raw':
+        return {**raw_decode.probe_raw(path), 'sourcePath': str(path)}
+    stat = path.stat()
+    described = _describe_file(str(path), stat.st_size, stat.st_mtime_ns)
+    if raw_format == 'prores_raw':
+        described = raw_decode.enrich_prores_raw(path, described)
+    return {**described, 'sourcePath': str(path)}
+
+
+def describe(src):
+    return describe_path(_media_path(src))
+
+
+# FFmpeg renders any text file as a picture through its tty demuxer (and
+# reads BBS art formats): never media a user meant to edit.
+TEXT_FORMATS = frozenset({'tty', 'bin', 'xbin', 'adf', 'idf'})
+# Playlist and script demuxers read other files (or URLs) named inside a text file: a renamed
+# playlist must never be registered or served as media.
+TEXT_FORMATS |= frozenset({'concat', 'ffconcat', 'hls', 'applehttp', 'dash', 'imf', 'webm_dash_manifest', 'mpl2'})
+TEXT_CODECS = frozenset({'ansi', 'bintext', 'xbin', 'idf'})
+
+
+def _text_art(fmt, streams):
+    names = set(str(fmt.get('format_name') or '').split(','))
+    return bool(names & TEXT_FORMATS) or any(s.get('codec_name') in TEXT_CODECS for s in streams if isinstance(s, dict))
+
+
+def decodable(path, name):
+    """Whether Splice can edit this file. The probe decides, not the filename extension, except
+    for text files FFmpeg would draw as a picture. Camera RAW is read by raw_decode, which
+    imports it even without a decoder for its picture (sound, timecode and reel still edit).
+    A probe that times out is reported as a timeout."""
+    if raw_decode.is_raw_candidate(path, name):
+        raw_decode.probe_raw(path)
+        return
+    try:
+        data = _ffprobe(path, '-show_entries', 'stream=codec_type,codec_name:format=format_name',
+                        timeout=25, limit=SCAN_LIMIT)
+    except ProbeTimeout:
+        raise
+    except (ValueError, OSError, subprocess.SubprocessError):
+        data = {}
+    streams = [s for s in data.get('streams', []) if isinstance(s, dict)]
+    fmt = data.get('format') if isinstance(data.get('format'), dict) else {}
+    if _text_art(fmt, streams) or not any(s.get('codec_type') in ('video', 'audio') for s in streams):
+        raise ValueError(f'The installed FFmpeg cannot decode {Path(name).name}')
 
 
 def _select_stream(channels, selection):
@@ -150,7 +397,7 @@ def _source_audio_map(channels, selection, duration):
     return ['-map',f'0:a:{chosen[0]}' if chosen else '0:a:0?']
 
 
-def proxy(src, seek_optimized=False, audio_stream=None, grading_data=False):
+def proxy(src, seek_optimized=False, audio_stream=None, grading_data=False, raw_settings=None):
     original = _media_path(src)
     info = describe(src)
     if grading_data and not info['hdr']:
@@ -158,12 +405,20 @@ def proxy(src, seek_optimized=False, audio_stream=None, grading_data=False):
     if seek_optimized and (info['type']!='video' or info['still']):
         raise ValueError('A seek proxy requires moving video')
     stat = original.stat()
+    is_raw = bool(info.get('raw'))
     profile = 'proxy-seek-v1' if seek_optimized else 'proxy-v3'
-    alpha = info['still'] and original.suffix.lower() in ('.png','.bmp')
+    raw_effective = None
+    if is_raw:
+        raw_effective = raw_decode.normalize_raw_settings(raw_settings, fmt=info.get('rawFormat'),
+                                                          defaults=info.get('rawDefaults'))
+        salt = raw_decode.decoder_cache_salt(info['rawFormat'])
+        fp = raw_decode.sequence_fingerprint(original)
+        profile += f":raw-v1:{raw_decode.raw_settings_key(raw_effective)}:{salt}:{fp}"
+    alpha = not is_raw and info['still'] and original.suffix.lower() in ('.png','.bmp')
     if alpha:
         profile += f':still-alpha-v{STILL_PREVIEW_VERSION}'
     if info['hdr']:
-        profile += ':hdr-grading-v1' if grading_data else f':hdr-rec709-v{HDR_PREVIEW_VERSION}'
+        profile += ':hdr-grading-v2' if grading_data else f':hdr-rec709-v{HDR_PREVIEW_VERSION}'
     audio_map = _source_audio_map(info['audioStreamChannels'],audio_stream,info['duration'])
     if info['audioStreams']>1:
         profile += f':audio-v2:{audio_stream}'
@@ -180,10 +435,16 @@ def proxy(src, seek_optimized=False, audio_stream=None, grading_data=False):
             if target.is_file():
                 return _playback_url(target)
             directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            mark(directory, 'derived')
             if shutil.disk_usage(directory).free < 512 * 1024**2 + info['duration'] * (525000 if video else 24000):
                 raise ValueError('Insufficient free space for an edit proxy')
             with tempfile.TemporaryDirectory(dir=directory,prefix='.proxy-') as staging:
                 out = Path(staging) / target.name
+                if is_raw:
+                    raw_decode.decode_to_proxy(original, out, raw_effective, info=info,
+                                               seek_optimized=seek_optimized, audio_stream=audio_stream)
+                    os.link(out, target)
+                    return _playback_url(target)
                 cmd = ['ffmpeg','-nostdin','-v','error','-y','-threads','2','-filter_threads','1','-filter_complex_threads','2','-protocol_whitelist','file']
                 if info['still']:
                     cmd += ['-f','image2','-loop','1','-framerate','25']
@@ -191,18 +452,24 @@ def proxy(src, seek_optimized=False, audio_stream=None, grading_data=False):
                 if video:
                     width,height = (960,540) if seek_optimized else (1280,720)
                     fit = f"scale=w='min({width},iw)':h='min({height},ih)':force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1"
-                    picture = (HDR_GRADE_DATA if grading_data else HDR_TO_REC709)+','+fit if info['hdr'] else fit
+                    picture = fit
                     if grading_data:
-                        picture += ',setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv'
+                        picture += ','+HDR_GRADE_DATA
+                    elif info['hdr']:
+                        picture = HDR_TO_REC709+','+fit
                     cmd += ['-map','0:V:0','-vf',picture]
                     if alpha:
                         cmd += ['-c:v','libvpx-vp9','-threads','2','-deadline','realtime','-cpu-used','5',
                                 '-b:v','0','-crf','18','-auto-alt-ref','0','-pix_fmt','yuva420p']
+                    elif grading_data:
+                        cmd += ['-c:v','libx264rgb','-threads','2','-preset','veryfast','-crf','10','-maxrate','4M','-bufsize','8M',
+                                '-g','1' if seek_optimized else '24','-pix_fmt','rgb24',
+                                '-colorspace','rgb','-color_range','pc','-color_primaries','bt709','-color_trc','bt709']
                     else:
                         cmd += ['-c:v','libx264','-threads','2','-preset','veryfast',
                                 '-crf','22' if seek_optimized else '19','-maxrate','4M','-bufsize','8M',
                                 '-g','1' if seek_optimized else '24','-pix_fmt','yuv420p']
-                    if info['hdr']:
+                    if info['hdr'] and not grading_data:
                         cmd += ['-bsf:v',AVC_REC709,'-color_primaries','bt709','-color_trc','bt709','-colorspace','bt709']
                 else:
                     cmd += ['-vn']
@@ -212,8 +479,7 @@ def proxy(src, seek_optimized=False, audio_stream=None, grading_data=False):
                 else:
                     cmd += audio_map + ['-c:a','aac','-b:a','160k','-ac',str(min(2,max(1,info['audioChannels']))),'-movflags','+faststart']
                 cmd.append(str(out))
-                completed = subprocess.run(cmd,capture_output=True,timeout=min(3600,max(60,info['duration']*3)),
-                                           creationflags=HIDE_CONSOLE)
+                completed = run_bounded(cmd,timeout=min(3600,max(60,info['duration']*3)),max_output=SCAN_LIMIT)
                 if completed.returncode:
                     raise ValueError('Proxy creation failed for '+original.name+': '+completed.stderr.decode(errors='replace')[-400:])
                 os.link(out,target)
@@ -234,6 +500,7 @@ def premiere_audio(src, audio_stream=None):
         with _locks[int(key[:2],16)%len(_locks)]:
             if target.is_file():return target
             target.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
+            mark(target.parent, 'derived')
             duration = info['duration']
             if shutil.disk_usage(target.parent).free < 512*1024**2 + duration*288000:
                 raise ValueError('Insufficient free space for Premiere audio media')
@@ -248,8 +515,7 @@ def premiere_audio(src, audio_stream=None):
                 cmd=['ffmpeg','-nostdin','-v','error','-y','-threads','2','-filter_complex_threads','2',
                      '-protocol_whitelist','file','-i',str(original),'-filter_complex',';'.join(filters),
                      '-map','[audio]','-c:a','pcm_s24le','-t',str(duration),str(output)]
-                result=subprocess.run(cmd,capture_output=True,timeout=min(3600,max(60,duration*3)),
-                                      creationflags=HIDE_CONSOLE)
+                result=run_bounded(cmd,timeout=min(3600,max(60,duration*3)),max_output=SCAN_LIMIT)
                 if result.returncode:
                     raise ValueError('Could not write Premiere audio: '+result.stderr.decode(errors='replace')[-400:])
                 os.link(output,target)
@@ -258,24 +524,41 @@ def premiere_audio(src, audio_stream=None):
         _encoders.release()
 
 
-def nested_preview(project):
+def nested_preview(project, minimum_duration=0):
     """Cache a review-size render by timeline content and original file timestamps."""
-    from render_movie import render_to_file
+    from render_movie import MAX_TIMELINE_SECONDS, _number, render_to_file
 
     if not isinstance(project, dict) or not isinstance(project.get('clips'),list) or not isinstance(project.get('media'),list):
         raise ValueError('Invalid nested sequence')
-    if not project['clips']:
+    minimum_duration = _number(minimum_duration, 'nested media duration', 0, MAX_TIMELINE_SECONDS)
+    if not project['clips'] and not minimum_duration:
         raise ValueError('The nested sequence has no playable clips')
-    fingerprint = hashlib.sha256(b'nested-preview-v2')
-    def add_sources(sequence,depth=0):
+    fingerprint = hashlib.sha256(f'nested-preview-v3:{minimum_duration}'.encode())
+    def add_sources(sequence,depth=0,seen=frozenset()):
         if depth>4:
             raise ValueError('Nested sequence exceeds four levels')
-        used = {c.get('mediaId') for c in sequence['clips']}
-        for item in sequence['media']:
-            if item.get('id') not in used:
+        by_id = {m.get('id'): m for m in sequence['media'] if isinstance(m, dict) and isinstance(m.get('id'), str)}
+        queue = [c.get('mediaId') for c in sequence['clips'] if isinstance(c, dict) and c.get('mediaId')]
+        visited = set()
+        while queue:
+            mid = queue.pop()
+            if mid in visited: continue
+            visited.add(mid)
+            item = by_id.get(mid)
+            if not item: continue
+            if item.get('multicam') and isinstance(item['multicam'], dict):
+                for angle in item['multicam'].get('angles') or []:
+                    if isinstance(angle, dict) and angle.get('mediaId'):
+                        queue.append(angle['mediaId'])
+                continue
+            if item.get('parentMediaId'):
+                queue.append(item['parentMediaId'])
                 continue
             if item.get('nestedProject'):
-                add_sources(item['nestedProject'],depth+1)
+                seq_id = item.get('nestedSequence')
+                if seq_id is not None and seq_id in seen:
+                    raise ValueError('Circular nested sequence reference')
+                add_sources(item['nestedProject'],depth+1,seen | ({seq_id} if seq_id is not None else set()))
             elif item.get('src'):
                 path = _media_path(item['src']); stat = path.stat()
                 fingerprint.update(f'{path}:{stat.st_size}:{stat.st_mtime_ns}'.encode())
@@ -299,9 +582,10 @@ def nested_preview(project):
             ratio=min(1,1280/width,720/height)
             prepared={**project,'width':max(16,2*round(width*ratio/2)),'height':max(16,2*round(height*ratio/2))}
             directory.mkdir(mode=0o700,parents=True,exist_ok=True)
+            mark(directory, 'derived')
             with tempfile.TemporaryDirectory(dir=directory,prefix='.nested-') as staging:
                 output = Path(staging) / target.name
-                render_to_file(prepared,output,options={'codec':'h264','crf':19})
+                render_to_file(prepared,output,options={'codec':'h264','crf':19},_minimum_duration=minimum_duration)
                 os.link(output,target)
             return _playback_url(target)
     finally:

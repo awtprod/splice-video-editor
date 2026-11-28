@@ -1,0 +1,525 @@
+"""Turn a Splice project into a frame-exact cut list that every writer shares.
+
+Splice stores float seconds. Record positions are snapped to the sequence's frame grid, source
+positions to the source's own frame grid (the sequence grid for audio-only and still media), so
+every writer emits the same frames. Anything a cut list cannot hold (grades, LUTs, pan, nested
+sequences, Premiere-native effects) is recorded in :class:`Report` against the clip, so writers
+add only what their own format loses.
+"""
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+from fractions import Fraction
+
+from .media import (MAX_PROBES, PROBE_SECONDS, ProbeBudget, Source, clean, invalid_on_target, map_path, path_rules,
+                    resolve_source)
+from .timecode import frames_timecode, seconds_frames, sequence_rate, timecode_frames
+
+MAX_CLIPS = 20_000
+MAX_KEYFRAMES = 2_000
+TRANSITIONS = ('dissolve', 'wipe', 'fade')
+KEYFRAME_KEYS = ('opacity', 'x', 'y', 'scale', 'rotation', 'volume')
+
+
+class InterchangeError(ValueError):
+    pass
+
+
+@dataclass
+class Transition:
+    kind: str           # 'dissolve', 'wipe' or 'fade' (dip to black)
+    frames: int
+    before: int         # frames of the transition before the cut
+    power: bool = False  # constant-power audio crossfade
+
+
+@dataclass
+class Event:
+    id: str
+    kind: str                    # 'video', 'audio' or 'title'
+    track: int                   # >0 picture/title tracks, <0 audio tracks
+    record_in: int               # sequence frames from the export's first frame
+    frames: int
+    source: Source | None
+    source_in: Fraction = Fraction(0)    # seconds from the media file's first sample
+    speed: Fraction = Fraction(1)
+    reverse: bool = False
+    name: str = ''
+    enabled: bool = True
+    embedded_audio: bool = False   # a picture clip that also plays its own sound
+    transition: Transition | None = None
+    volume: float = 100.0
+    fade_in: int = 0
+    fade_out: int = 0
+    keyframes: dict = field(default_factory=dict)  # key -> [(frame from clip start, value)]
+    transform: dict = field(default_factory=dict)  # x, y, scale, rotation (Splice units)
+    opacity: float = 100.0
+    link_group: str | None = None
+    text: str = ''
+    title_style: dict = field(default_factory=dict)
+
+    @property
+    def record_out(self) -> int:
+        return self.record_in + self.frames
+
+    @property
+    def source_span(self) -> Fraction:
+        """Seconds of source the clip consumes."""
+        return Fraction(self.frames) / self.rate * self.speed
+
+    rate: Fraction = Fraction(25)
+
+
+@dataclass
+class Marker:
+    frame: int
+    name: str
+    id: str = ''
+    duration: int = 0
+    color: str = ''
+
+
+@dataclass
+class Report:
+    """Per-format list of what could not be represented, each entry naming the clip."""
+    general: list = field(default_factory=list)
+    by_format: dict = field(default_factory=dict)
+
+    def add(self, fmt: str, message: str):
+        entries = self.by_format.setdefault(fmt, [])
+        if message not in entries:
+            entries.append(message)
+
+    def note(self, message: str):
+        if message not in self.general:
+            self.general.append(message)
+
+
+@dataclass
+class Cut:
+    name: str
+    rate: Fraction
+    width: int
+    height: int
+    tc_start: int             # sequence start timecode, frames at rate
+    drop: bool
+    frames: int               # length of the exported range
+    events: list
+    sources: dict
+    markers: list
+    report: Report
+    range_start: int = 0      # first exported frame of the Splice timeline
+    track_mix: dict = field(default_factory=dict)
+    path_rules: list = field(default_factory=list)   # [(from, to)] applied to media paths
+
+    def timecode(self, frame: int) -> str:
+        return frames_timecode(self.tc_start + frame, self.rate, self.drop)
+
+    def label(self, event: Event) -> str:
+        """How a report names a clip: name, track and record timecode."""
+        track = ('A' if event.track < 0 else 'V') + str(abs(event.track))
+        return f'{event.name or "Clip"} ({track} at {self.timecode(event.record_in)})'
+
+
+def _number(value, default, low=-math.inf, high=math.inf):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return min(high, max(low, number)) if math.isfinite(number) else default
+
+
+def _speed(value) -> Fraction:
+    speed = _number(value, 1, .1, 16)
+    return Fraction(repr(speed)).limit_denominator(10000)
+
+
+def build_cut(project: dict, options: dict | None = None) -> Cut:
+    options = options or {}
+    if not isinstance(project, dict) or not isinstance(project.get('clips'), list) or not isinstance(project.get('media'), list):
+        raise InterchangeError('Invalid project')
+    if len(project['clips']) > MAX_CLIPS or len(project['media']) > MAX_CLIPS:
+        raise InterchangeError(f'Timeline interchange supports up to {MAX_CLIPS} clips and sources')
+    try:
+        rate = sequence_rate(project.get('fps', 25))
+    except ValueError as error:
+        raise InterchangeError(str(error)) from None
+    width, height = int(_number(project.get('width'), 1920, 16, 16384)), int(_number(project.get('height'), 1080, 16, 16384))
+    # The sequence start timecode and drop-frame come from the options when given (the export
+    # dialog fills them in from the sequence), else from the project as engine.js keeps them:
+    # ``startTimecode`` a whole frame count, ``dropFrame`` false for non-drop (absent = drop at
+    # 29.97/59.94). Text starts written by earlier builds are read as labels.
+    drop_rate = rate in (Fraction(30000, 1001), Fraction(60000, 1001))
+    wanted = options.get('dropFrame')
+    drop = drop_rate and (bool(wanted) if wanted is not None else project.get('dropFrame') is not False)
+    start = options.get('startTimecode') or project.get('startTimecode')
+    try:
+        if isinstance(start, int) and not isinstance(start, bool):
+            if start < 0:
+                raise ValueError('it is before 00:00:00:00')
+            tc_start = start
+        else:
+            tc_start = timecode_frames(str(start or '01:00:00:00'), rate, drop)
+    except ValueError as error:
+        raise InterchangeError(f'Sequence start timecode: {error}') from None
+    report = Report()
+    budget = ProbeBudget(min(MAX_PROBES, max(0, int(_number(options.get('maxProbes'), MAX_PROBES)))),
+                         min(PROBE_SECONDS, _number(options.get('probeSeconds'), PROBE_SECONDS, 0)))
+    try:
+        rules = path_rules(options.get('pathMap'))
+    except ValueError as error:
+        raise InterchangeError(str(error)) from None
+    media_by_id = {str(item['id']): item for item in project['media'] if isinstance(item, dict) and item.get('id') is not None}
+    subclips = {}
+    for mid, item in media_by_id.items():
+        if not item.get('parentMediaId'):
+            continue
+        cur, offset, seen, valid = mid, 0.0, set(), True
+        while True:
+            if cur in seen:
+                valid = False
+                break
+            seen.add(cur)
+            entry = media_by_id.get(cur)
+            if not entry or not entry.get('parentMediaId'):
+                break
+            offset += _number(entry.get('subclipIn'), 0, 0)
+            parent_id = str(entry['parentMediaId'])
+            if parent_id not in media_by_id:
+                valid = False
+                break
+            cur = parent_id
+        if valid:
+            subclips[mid] = (cur, offset, clean(item.get('name') or '') or None)
+    sources = {}
+    for item in project['media']:
+        if isinstance(item, dict) and item.get('id') is not None:
+            mid = str(item['id'])
+            if mid in subclips:
+                continue
+            source = sources[mid] = resolve_source(item, rate, budget)
+            if source.path and rules:
+                source.original_path = source.path
+                source.path, source.path_rule = map_path(source.path, rules)
+                problem = invalid_on_target(source.original_path, rules[source.path_rule] if source.path_rule is not None else None)
+                if problem:
+                    report.note(f'Path mapping: source {source.name} maps to {source.path}, but {problem}; the receiving '
+                                'machine cannot find it there. Rename the file (or map it to a POSIX path) and export again.')
+    if budget.skipped:
+        shown = ', '.join(budget.skipped[:20]) + (f' and {len(budget.skipped) - 20} more' if len(budget.skipped) > 20 else '')
+        report.note(f'Probing stopped after {budget.seconds:g} s or {MAX_PROBES} files; not probed: {shown}. '
+                    'Their start timecode, rate and audio layout come only from what Splice already knew.')
+    total = max((_span(c, rate)[1] for c in project['clips'] if isinstance(c, dict)), default=0)
+    first, last = 0, total
+    span = options.get('range')
+    if isinstance(span, dict):
+        first = max(0, seconds_frames(_number(span.get('start'), 0, 0), rate))
+        last = min(total, seconds_frames(_number(span.get('end'), total / rate, 0), rate))
+        if last <= first:
+            raise InterchangeError('The export range is empty')
+    cut = Cut(name=clean(project.get('name') or 'Untitled', 200) or 'Untitled', rate=rate, width=width, height=height,
+              tc_start=tc_start, drop=drop, frames=last - first, events=[], sources=sources,
+              markers=[], report=report, range_start=first, track_mix=dict(project.get('trackMix') or {}),
+              path_rules=rules)
+    try:
+        frames_timecode(tc_start + cut.frames, rate, drop)
+    except ValueError:
+        raise InterchangeError('The sequence runs past 24 hours of timecode; choose an earlier start timecode') from None
+    raw = [c for c in project['clips'] if isinstance(c, dict)]
+    for clip in raw:
+        event = _event(cut, clip, subclips)
+        if event is not None:
+            cut.events.append(event)
+            item = media_by_id.get(str(clip.get('mediaId')), {})
+            fields = [label for key, label in (('scene', 'scene'), ('shot', 'shot'), ('take', 'take'),
+                      ('logNote', 'log note'), ('colorLabel', 'label'), ('bin', 'bin'), ('camera', 'camera'))
+                      if item.get(key)]
+            if fields:
+                report.note(f"{event.name}: editorial metadata omitted: {', '.join(fields)}.")
+    _timecode_policy(cut, options.get('unknownTimecode'))
+    _separate_overlaps(cut)
+    cut.events.sort(key=lambda e: (e.kind == 'audio', abs(e.track), e.record_in))
+    for marker in project.get('markers') or []:
+        if not isinstance(marker, dict):
+            continue
+        frame = seconds_frames(_number(marker.get('time'), 0, 0), rate)
+        if first <= frame < max(last, first + 1):
+            cut.markers.append(Marker(frame - first, clean(marker.get('name') or 'Marker', 500), clean(marker.get('id'), 64),
+                                      seconds_frames(_number(marker.get('duration'), 0, 0), rate), str(marker.get('color') or '')))
+        else:
+            report.note(f'Marker "{marker.get("name")}" lies outside the export range and was not exported.')
+    for caption in project.get('captions') or []:
+        if isinstance(caption, dict):
+            report.note(f'Caption "{str(caption.get("text", ""))[:40]}" at {cut.timecode(max(0, seconds_frames(_number(caption.get("start"), 0, 0), rate) - first))}: '
+                        'captions are not part of timeline interchange; export them as subtitles.')
+    for key, mix in cut.track_mix.items():
+        if isinstance(mix, dict) and (mix.get('gain', 100) != 100 or mix.get('pan', 0) or mix.get('mute') or mix.get('solo') or mix.get('outputStages')):
+            report.note(f'Audio track A{abs(int(key))} mixer settings (gain, pan, mute or solo) are not carried; '
+                        'interchange formats have no track mixer.')
+        if isinstance(mix, dict):
+            lost = [*_effects_named(mix.get('fx')),
+                    *(['volume automation'] if (mix.get('keyframes') or {}).get('volume') else []),
+                    *(['pan automation'] if (mix.get('keyframes') or {}).get('pan') else []),
+                    *([f'stem "{mix["stem"]}"'] if mix.get('stem') else []),
+                    *([f'5.1 placement ({mix["route"]})'] if mix.get('route') not in (None, 'front') else []),
+                    *(['mono track'] if mix.get('channels') == 'mono' else [])]
+            if lost:
+                report.note(f'Audio track A{abs(int(key))}: {", ".join(lost)} not carried; interchange formats have no '
+                            'track effects, automation or stems. Export stems or iso WAVs for the mixer.')
+    master = _effects_named(project.get('masterFx'))
+    if master:
+        report.note(f'Master bus {" and ".join(master)} not carried; deliver a printed mix or stems.')
+    return cut
+
+
+def _effects_named(fx) -> list:
+    """Names of the enabled audio effects in a clip, track or master setting."""
+    names = {'eq': 'EQ', 'comp': 'compressor', 'gate': 'gate', 'denoise': 'de-noise'}
+    if not isinstance(fx, dict):
+        return []
+    return [name for key, name in names.items() if isinstance(fx.get(key), dict) and fx[key].get('enabled', True) is not False
+            and (key != 'eq' or fx[key].get('bands'))]
+
+
+def _event(cut: Cut, clip: dict, subclips: dict | None = None) -> Event | None:
+    rate, report = cut.rate, cut.report
+    kind = clip.get('type') if clip.get('type') in ('video', 'audio', 'title') else None
+    raw_media_id = str(clip.get('mediaId')) if clip.get('mediaId') is not None else None
+    sub_entry = (subclips or {}).get(raw_media_id) if raw_media_id is not None else None
+    sub_offset = 0.0
+    sub_name = None
+    if sub_entry is not None:
+        parent_id, sub_offset, sub_name = sub_entry
+        source = cut.sources.get(parent_id)
+    else:
+        source = cut.sources.get(raw_media_id) if raw_media_id is not None else None
+    name = clean(clip.get('title')) if kind == 'title' else (sub_name or (source.name if source else clean(clip.get('name') or 'Clip')))
+    start, end = _span(clip, rate)
+    frames = end - start
+    track = int(_number(clip.get('track'), 1, -64, 64)) or 1
+    label = f'{name or "Clip"} ({"A" if track < 0 else "V"}{abs(track)} at {frames_timecode(cut.tc_start + max(0, start - cut.range_start), rate, cut.drop) if start >= cut.range_start else "before the range"})'
+    if kind is None or frames <= 0:
+        report.note(f'{label}: not exported because it has no supported type or length.')
+        return None
+    if start + frames <= cut.range_start or start >= cut.range_start + cut.frames:
+        return None
+    if kind != 'title' and source is None:
+        report.note(f'{label}: not exported because its source is missing from the project.')
+        return None
+    if source is not None and source.multicam:
+        report.note(f'{label}: not exported because it is an un-flattened multicam clip; flatten multicam before timeline interchange export.')
+        return None
+    if source is not None and source.adjustment:
+        report.note(f'{label}: adjustment clip: its grade of the tracks beneath is not carried; export that grade as a .cube LUT from the Color section to rebuild it.')
+        return None
+    if source is not None and (source.nested or source.generator):
+        what = 'a nested sequence' if source.nested else 'a Premiere-native generator'
+        report.note(f'{label}: not exported because it is {what}; decompose in place or export that sequence.')
+        return None
+    event = Event(id=str(clip.get('id')), kind=kind, track=track, record_in=start, frames=frames, source=source,
+                  name=name, rate=rate)
+    event.enabled = clip.get('enabled') is not False and clip.get('disabled') is not True
+    event.speed = _speed(clip.get('speed', 1))
+    asked = _number(clip.get('speed', 1), 1)
+    if abs(asked - float(event.speed)) > 1e-6:
+        report.note(f'{label}: speed {asked:g}x is outside the 0.1x-16x timeline interchange carries; written as {float(event.speed):g}x.')
+    event.reverse = bool(clip.get('reverse'))
+    event.link_group = clip.get('linkGroup') if isinstance(clip.get('linkGroup'), str) else None
+    if source is not None:
+        grid = source.rate if source.rate and not source.still else rate
+        exact = Fraction(repr(_number(clip.get('in'), 0, 0) + sub_offset)) * grid
+        frame = math.floor(exact + Fraction(1, 2))
+        event.source_in = Fraction(0) if source.still else Fraction(frame) / grid
+        if not source.still and abs(exact - frame) > Fraction(1, 1000):
+            report.note(f'{label}: its source in point ({float(exact / grid):.4f} s) falls between source frames; '
+                        f'exported at frame {frame} ({float(frame / grid):.4f} s).')
+        event.embedded_audio = kind == 'video' and clip.get('embeddedAudio') is not False and source.has_audio and not source.still
+    event.volume = _number(clip.get('volume'), 100, 0, 200)
+    event.fade_in = seconds_frames(_number(clip.get('fadeIn'), 0, 0), rate)
+    event.fade_out = seconds_frames(_number(clip.get('fadeOut'), 0, 0), rate)
+    transform = clip.get('transform') if isinstance(clip.get('transform'), dict) else {}
+    event.transform = {key: _number(transform.get(key), default, low, high) for key, default, low, high in (
+        ('x', 0, -100, 100), ('y', 0, -100, 100), ('scale', 100, 10, 400), ('rotation', 0, -180, 180))}
+    event.opacity = _number(clip.get('opacity'), 100, 0, 100)
+    if kind == 'title':
+        event.text = clean(clip.get('title'), 2000)
+        event.title_style = clip.get('titleStyle') if isinstance(clip.get('titleStyle'), dict) else {}
+    if clip.get('transitionClock'):
+        report.note(f'{label}: cropped transition timing is not carried by timeline interchange.')
+    if clip.get('pictureDip') or clip.get('fadeClock'):
+        report.note(f'{label}: retimed fades are not carried by timeline interchange.')
+    keys = clip.get('keyframes') if isinstance(clip.get('keyframes'), dict) else {}
+    for key, points in keys.items():
+        if key not in KEYFRAME_KEYS or not isinstance(points, list):
+            report.note(f'{label}: keyframes for "{key}" are not carried by timeline interchange.')
+            continue
+        points_kept = sorted((seconds_frames(_number(p.get('time'), 0, 0), rate), _number(p.get('value'), 0))
+                       for p in points[:MAX_KEYFRAMES] if isinstance(p, dict))
+        if points_kept:
+            event.keyframes[key] = points_kept
+    style = clip.get('transition')
+    if style in TRANSITIONS and kind != 'title':
+        requested = min(max(_number(clip.get('transitionDuration'), .5, 0) or .5, 1 / float(rate)), 7200)
+        before = min(_number(clip.get('transitionBefore'), 0, 0), requested)
+        length = min(seconds_frames(requested, rate), frames + seconds_frames(before, rate))
+        event.transition = Transition(style, max(1, length), seconds_frames(before, rate),
+                                      clip.get('transitionMatchName') == 'Constant Power')
+        if style == 'fade' and kind == 'audio':
+            event.transition.kind = 'dissolve'
+    elif style in TRANSITIONS:
+        report.note(f'{label}: title transitions are not carried; the title cuts in and out.')
+    elif style == 'native':
+        report.note(f'{label}: its Premiere-native transition ({clip.get("transitionMatchName") or "unknown"}) is not carried; the cut is exported.')
+    elif style not in (None, '', 'none') and kind != 'title':
+        report.note(f'{label}: transition "{style}" is not carried; the cut is exported.')
+    color = clip.get('color') if isinstance(clip.get('color'), dict) else {}
+    graded = any(color.get(k, 100) != 100 for k in ('brightness', 'contrast', 'saturation')) or \
+        any(color.get(k) for k in ('exposure', 'temperature', 'tint', 'lift', 'gamma', 'gain', 'curves'))
+    if graded or color.get('lut'):
+        report.note(f'{label}: its Splice grade{" and LUT" if color.get("lut") else ""} is not carried; grade from the source media.')
+    grade = color.get('grade') if isinstance(color.get('grade'), dict) else {}
+    tools = [name for name, present in (('colour wheels', any(grade.get(key) for key in ('lift', 'gamma', 'gain', 'offset'))),
+                                        ('curves', bool(grade.get('curves'))), ('hue vs saturation curve', bool(grade.get('hueSat'))),
+                                        ('contrast pivot', 'pivot' in grade)) if present]
+    if tools:
+        report.note(f'{label}: its {", ".join(tools)} are not carried; Export .cube in the Color section takes the whole grade as a LUT.')
+    keyed = [key for key in ('exposure', 'temperature', 'tint', 'brightness', 'contrast', 'saturation') if (clip.get('keyframes') or {}).get(key)]
+    if keyed:
+        report.note(f'{label}: its grade keyframes ({", ".join(keyed)}) are not carried.')
+    if grade.get('bypass'):
+        report.note(f'{label}: its grade is bypassed in Splice; receiving apps get the ungraded clip and none of its grade.')
+    if source is not None and source.input_lut:
+        report.note(f'{label}: the input LUT of its source ({source.input_lut}) is not carried.')
+    if source is not None and source.color_matrix:
+        report.note(f'{label}: the untagged color matrix override of its source ({source.color_matrix}) is not carried.')
+    raw_settings = clip.get('rawSettings')
+    if isinstance(raw_settings, dict) and raw_settings.get('decodeUsing') == 'clip':
+        capabilities = source.raw_capabilities if source is not None else None
+        try:
+            from raw_decode import unapplied_settings
+        except ImportError:  # pragma: no cover - interchange without the RAW engine
+            unapplied_settings = lambda settings, caps: []  # noqa: E731
+        ignored = set(unapplied_settings(raw_settings, capabilities))
+        applied, skipped = [], []
+        for key, text in (
+                ('iso', f"ISO {raw_settings['iso']}" if raw_settings.get('iso') is not None else None),
+                ('exposure', f"exposure {float(raw_settings['exposure']):+g} EV"
+                 if raw_settings.get('exposure') not in (None, 0, 0.0) else None),
+                ('kelvin', f"{int(round(float(raw_settings['kelvin'])))}K" if raw_settings.get('kelvin') is not None else None),
+                ('tint', f"tint {float(raw_settings['tint']):+g}" if raw_settings.get('tint') not in (None, 0, 0.0) else None),
+                ('colorSpace', str(raw_settings['colorSpace']) if raw_settings.get('colorSpace') else None),
+                ('gamma', str(raw_settings['gamma']) if raw_settings.get('gamma') else None),
+                ('highlightRecovery', 'highlight recovery' if raw_settings.get('highlightRecovery') else None)):
+            if text:
+                (skipped if key in ignored else applied).append(text)
+        summary = f" ({', '.join(applied)})" if applied else ''
+        report.note(f'{label}: its Splice Camera RAW decode overrides{summary} are not carried; receiving apps decode the original RAW using camera metadata.')
+        if skipped:
+            tool = (capabilities or {}).get('tool') or 'its decoder'
+            report.note(f"{label}: {tool} cannot take {', '.join(skipped)}, so Splice's own export did not apply "
+                        f"{'it' if len(skipped) == 1 else 'them'} either.")
+    if clip.get('pan') not in (None, 0):
+        report.note(f'{label}: clip pan is not carried by timeline interchange.')
+    effects = _effects_named(clip.get('audioFx'))
+    if effects:
+        report.note(f'{label}: its audio {", ".join(effects)} {"is" if len(effects) == 1 else "are"} not carried; '
+                    'receiving apps play the clip unprocessed.')
+    if clip.get('channelMap') not in (None, 'stereo'):
+        report.note(f'{label}: its channel mapping ({clip["channelMap"]}) is not carried.')
+    if clip.get('audioTransition') not in (None, 'auto'):
+        report.note(f'{label}: its sound transition override ({clip["audioTransition"]}) is not carried.')
+    if any(isinstance(point, dict) and point.get('ease') for point in (clip.get('keyframes') or {}).get('volume') or []):
+        report.note(f'{label}: eased volume keyframes are exported as linear ramps.')
+    if clip.get('nativeVolumeOutsideTrim'):
+        report.note(f'{label}: its Premiere volume keyframes outside the trimmed part of the clip are not carried.')
+    if clip.get('nativeTimeRemap'):
+        report.note(f'{label}: its Premiere time-remapping curve is exported as a constant {float(event.speed):g}x speed.')
+    if clip.get('audioStream') is not None or (source is not None and len(source.audio_streams) > 1 and kind != 'title'):
+        report.note(f'{label}: the source has {len(source.audio_streams) if source else "several"} audio streams; '
+                    'receiving apps choose their own channel mapping.')
+    if not event.enabled:
+        report.note(f'{label}: disabled in Splice.')
+    _trim_to_range(cut, event)
+    return event
+
+
+def _trim_to_range(cut: Cut, event: Event):
+    first, last = cut.range_start, cut.range_start + cut.frames
+    head = max(0, first - event.record_in)
+    tail = max(0, event.record_out - last)
+    if event.transition is not None:
+        window = event.record_in - event.transition.before
+        if window < first or head:
+            cut.report.note(f'{event.name}: its transition starts before the export range (or the timeline) and was replaced by a cut.')
+            event.transition = None
+    if head or tail:
+        step = Fraction(1) / cut.rate * event.speed
+        if event.reverse:
+            event.source_in += tail * step
+        else:
+            event.source_in += head * step
+        if event.source is not None and not event.source.still:
+            grid = event.source.rate or cut.rate  # a retimed clip can be cut between source frames
+            event.source_in = Fraction(math.floor(event.source_in * grid + Fraction(1, 2))) / grid
+        event.frames -= head + tail
+        event.fade_in = max(0, event.fade_in - head)
+        event.fade_out = max(0, event.fade_out - tail)
+        event.keyframes = {k: _window(points, head, head + event.frames) for k, points in event.keyframes.items()}
+    event.record_in = max(event.record_in, first) - first
+
+
+def _window(points, start, end):
+    def value(at):
+        if at <= points[0][0]:
+            return points[0][1]
+        for (t0, v0), (t1, v1) in zip(points, points[1:]):
+            if at <= t1:
+                return v0 + (v1 - v0) * (at - t0) / (t1 - t0) if t1 != t0 else v1
+        return points[-1][1]
+    inner = [(t - start, v) for t, v in points if start < t < end]
+    return [(0, value(start)), *inner, (end - start, value(end))]
+
+
+def _span(clip: dict, rate: Fraction):
+    """First and end frame of a clip; both edges are rounded, so butted clips stay butted."""
+    start = _number(clip.get('start'), 0, 0)
+    return seconds_frames(start, rate), seconds_frames(start + _number(clip.get('duration'), 0, 0), rate)
+
+
+def _timecode_policy(cut: Cut, policy):
+    """Resolve links an FCPXML clip to its file only when the asset starts at the file's own
+    timecode, so an unreadable start timecode is the user's decision, never a silent zero:
+    ``policy`` ``'zero'`` writes 00:00:00:00 and lists each affected clip; anything else refuses."""
+    used = {id(e.source): e.source for e in cut.events if e.source is not None and not e.source.still}
+    unknown = sorted(s.name for s in used.values() if s.timecode_state == 'unknown')
+    if unknown and policy != 'zero':
+        shown = ', '.join(unknown[:8]) + (f' and {len(unknown) - 8} more' if len(unknown) > 8 else '')
+        raise InterchangeError(f'Start timecode could not be read for {shown}. Relink the original files, or choose '
+                               'to write 00:00:00:00 for unreadable sources (receiving apps may then show them offline).')
+    for source in used.values():
+        for note in source.notes:
+            cut.report.note(f'Source {source.name}: {note}.')
+        if source.timecode_state == 'none':
+            cut.report.note(f'Source {source.name} has no embedded start timecode; written as 00:00:00:00, '
+                            'which is what Resolve and Premiere assume for such files.')
+    for event in cut.events:
+        if event.source is not None and event.source.timecode_state == 'unknown' and not event.source.still:
+            cut.report.note(f'{cut.label(event)}: source start timecode unknown, written as 00:00:00:00 by choice; '
+                            'the receiving app may import this clip offline.')
+
+
+def _separate_overlaps(cut: Cut):
+    """Interchange formats cannot hold two clips at once on one track. Splice never stores that,
+    but a hand-edited project can; such a clip moves to a new track and is reported."""
+    busy = {}
+    for event in sorted(cut.events, key=lambda e: (e.record_in, e.id)):
+        side = -1 if event.kind == 'audio' else 1
+        track = event.track
+        while any(event.record_in < end and start < event.record_out for start, end in busy.get((side, track), ())):
+            track += side
+        if track != event.track:
+            cut.report.note(f'{cut.label(event)} overlapped another clip on its track and was moved to '
+                            f'{"A" if side < 0 else "V"}{abs(track)}.')
+            event.track = track
+        busy.setdefault((side, track), []).append((event.record_in, event.record_out))

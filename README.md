@@ -6,7 +6,7 @@ Splice is a local video editor for Linux, Windows, and macOS. It opens with **Al
 
 Use [Python 3.10 or newer](https://www.python.org/downloads/), Chromium, Google Chrome, or Microsoft Edge, and [FFmpeg](https://ffmpeg.org/download.html) with ffprobe, H.264, AAC, and the drawtext filter. HDR-to-SDR conversion uses FFmpeg's zscale and tonemap filters. Keep the whole extracted application together.
 
-- **Windows installer (x64):** Run `Splice-Setup-x64.exe`, then open Splice from Start. The installer includes Chromium, Python, FFmpeg, and ffprobe. It is unsigned and installs for the current user.
+- **Windows installer (x64):** Run `Splice-Setup-x64.exe`, then open Splice from Start. The installer includes Chromium (Electron), Python, and a GPL build of FFmpeg and ffprobe; `Third-party.txt` in the install folder lists versions and licenses. It is unsigned and installs for the current user.
 - **Windows portable ZIP:** Extract `Splice-Windows.zip` and double-click `Splice.cmd`. Install Python with the launcher or add Python to PATH. Add the directory containing `ffmpeg.exe` and `ffprobe.exe` to PATH.
 - **macOS:** Extract `Splice-macOS.zip` and open `Splice.app`. The app detects Homebrew Python and FFmpeg in `/opt/homebrew/bin` or `/usr/local/bin`. This portable build is unsigned.
 - **Linux:** Run the command below from the extracted Splice directory.
@@ -46,4 +46,4 @@ DM Sans and IBM Plex Mono are distributed under the SIL Open Font License. Licen
 From a source checkout, run the Python suite with `python3 -m unittest discover -s tests`. To run the full browser and render suite on Linux, install Node 20 or later and run `npm ci && npm test`. Set `SPLICE_CHROME` if Chromium is installed outside the standard paths. The suite imports media, edits a sequence, saves and reopens a native project, checks exported streams, and verifies recovery after browser and server crashes.
 
 Run `python3 package_desktop.py artifacts` from a source checkout to build the Windows and macOS archives.
-Build the x64 Windows installer with Python 3.11 or later and NSIS 3 using `python desktop/windows/build.py artifacts/installer`. The GitHub Windows installer job builds it, runs the installed app, and uploads the verified executable.
+Build the x64 Windows installer on Windows with Python 3.11 or later and NSIS 3 using `python desktop/windows/build.py artifacts/installer`; add `--stage-only` to stage the files on any OS. The GitHub Windows installer job builds it, runs the installed app, and uploads the verified executable.
