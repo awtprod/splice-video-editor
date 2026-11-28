@@ -4,7 +4,9 @@
  * each shape, a masked adjustment clip, chroma keys with spill, all ten blend modes, bezier
  * keyframes on opacity, scale, crop, masks and the grade, bypassed and disabled effects, and a
  * speed ramp whose source frames are read back by colour. Sources are flat colour patches
- * (and a source whose every frame has its own colour). At each sample point a 6x6 average is
+ * (and a source whose every frame has its own colour), tagged Rec. 709; graded clips with
+ * effects, a blend mode and a key are also read from untagged and Rec. 601-tagged sources
+ * (FFmpeg had converted those to the grade's matrix before the grade read them). At each sample point a 6x6 average is
  * read from the monitor (WebGL2 and Canvas 2D) and from the decoded ProRes 422 HQ, ProRes 4444
  * and H.264 exports. Points on hard mask or key edges (where a renderer may land a pixel either
  * side) are skipped: the JS maths says where they are. A Markdown table is written to
@@ -22,14 +24,17 @@ const POINTS = [];
 for (let j = 0; j < 4; j++) for (let i = 0; i < 8; i++) POINTS.push([Math.floor((i+.5)*W/8), Math.floor((j+.5)*H/4)]);
 const TOLERANCE = {prores:2, h264:4};
 
-function source(file, paint, frames = 100) {
+// Rec. 709-tagged; 'bt601' tagged Rec. 601; 'untagged' Rec. 601 values without tags.
+function source(file, paint, frames = 100, matrix = 'bt709') {
+  const tags = {bt709:',setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv',
+    bt601:',setparams=colorspace=smpte170m:color_primaries=smpte170m:color_trc=smpte170m:range=tv', untagged:''}[matrix];
   const rgb = Buffer.alloc(W*H*3*frames);
   for (let f = 0; f < frames; f++) for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) rgb.set(paint(x, y, f), ((f*H+y)*W+x)*3);
   const raw = file+'.rgb';
   fs.writeFileSync(raw, rgb);
   ffmpeg(['-y', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-s', `${W}x${H}`, '-r', String(FPS), '-i', raw,
     '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo', '-t', String(frames/FPS),
-    '-vf', 'scale=out_color_matrix=bt709:out_range=tv,format=yuv420p,setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv',
+    '-vf', `scale=out_color_matrix=${matrix === 'bt709' ? 'bt709' : 'bt601'}:out_range=tv,format=yuv420p${tags}`,
     '-c:v', 'libx264', '-qp', '0', '-pix_fmt', 'yuv420p', '-g', '1', '-c:a', 'aac', '-shortest', file]);
   fs.rmSync(raw);
 }
@@ -46,8 +51,13 @@ async function main() {
   if (proof) fs.mkdirSync(proof, {recursive:true});
   try {
     const files = {bg:patch([0,1,2,3,4,5,6,7]), rev:patch([7,6,5,4,3,2,1,0]), green:greenScreen, frames:(x, y, f) => frameColor(f)};
+    for (const matrix of ['untagged', 'bt601']) Object.assign(files, {[`bg-${matrix}`]:[files.bg, matrix], [`rev-${matrix}`]:[files.rev, matrix],
+      [`green-${matrix}`]:[greenScreen, matrix]});
     const paths = {};
-    for (const [name, paint] of Object.entries(files)) { paths[name] = path.join(splice.temp, name+'.mp4'); source(paths[name], paint); }
+    for (const [name, paint] of Object.entries(files)) {
+      paths[name] = path.join(splice.temp, name+'.mp4');
+      if (Array.isArray(paint)) source(paths[name], paint[0], 100, paint[1]); else source(paths[name], paint);
+    }
     const {page, errors} = await openPage(splice, {width:1440, height:900});
     page.setDefaultTimeout(60000);
     await page.evaluate(({W, H, FPS}) => SpliceSession.newProject({name:'Effects parity', width:W, height:H, fps:FPS}), {W, H, FPS});
@@ -99,6 +109,16 @@ async function main() {
     cases.push({name:'speed ramp (ease, hold, bezier, freeze)', length:2, alone:true, times:[.12, .52, .92, 1.32, 1.72, 1.96],
       clips:[{track:1, source:'frames', in:.4, effects:{speedAudio:'varispeed'}, keyframes:{speed:[{time:0, value:100, interp:'easeInOut'}, {time:.4, value:30, interp:'hold'},
         {time:.8, value:30, interp:'bezier', outHandle:[.2, .8]}, {time:1.2, value:250, inHandle:[.5, 0]}, {time:1.5, value:0, interp:'hold'}, {time:1.7, value:100}]}}]});
+    for (const matrix of ['untagged', 'bt601']) {
+      const under = {track:1, source:`bg-${matrix}`};
+      cases.push({name:`${matrix} source: graded and cropped`, times:[.48], clips:[under, {track:2, source:`rev-${matrix}`,
+        color:{saturation:140, exposure:.3}, effects:{crop:{left:20, right:10, top:15, bottom:25}}}]});
+      cases.push({name:`${matrix} source: graded and masked at 70%`, times:[.48], clips:[under, {track:2, source:`rev-${matrix}`, opacity:70,
+        color:{grade:{gain:[1.2, 1, .8, 1]}}, effects:{masks:[{shape:'ellipse', x:50, y:50, width:60, height:70, feather:6}]}}]});
+      cases.push({name:`${matrix} source: blend screen`, times:[.48], clips:[under, {track:2, source:`rev-${matrix}`, effects:{blend:'screen'}}]});
+      cases.push({name:`${matrix} source: chroma key graded`, times:[.48], clips:[under, {track:2, source:`green-${matrix}`,
+        color:{saturation:130}, effects:{key:{color:'#20c040', similarity:12, smoothness:10, spill:60}}}]});
+    }
     if (process.env.SPLICE_PARITY_ONLY) { const keep = process.env.SPLICE_PARITY_ONLY.split('|'); cases.splice(0, cases.length, ...cases.filter(item => keep.includes(item.name))); }
 
     // ---- Build the timeline.

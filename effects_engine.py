@@ -1089,22 +1089,25 @@ def blend_composite(filters, base, layer, output, position, first, frames, windo
     timing = f'setpts=PTS-STARTPTS,tpad=start={max(0,first)}:stop={max(0,window_frames-first-frames)}:color=black@0'
     if first < 0:
         timing = f'trim=start_frame={-first},' + timing
-    to_rgb = f'setparams=colorspace={SETPARAMS_MATRIX[matrix]}:range=tv,zscale,format={WORKING_FORMAT}'
-    layer_rgb = to_rgb
+    def to_rgb(pixel_format):
+        # Convert, not relabel: an ungraded untagged clip, or a composite FFmpeg left untagged, holds
+        # Rec. 601 values. The format's colourspace makes FFmpeg convert them to the working matrix.
+        return (f'format={pixel_format}:color_spaces={SETPARAMS_MATRIX[matrix]}:color_ranges=tv,'
+                f'zscale,format={WORKING_FORMAT}')
     alpha = base_format.startswith('yuva')
     o = output
     filters.append(f'[{layer}]format=yuva444p16le,{position},setsar=1,{timing},split[{o}_fg][{o}_a]')
     filters.append(f'[{base}]split[{o}_bg][{o}_b]')
     if alpha:
-        filters.append(f'[{o}_fg]{layer_rgb},split[{o}_s][{o}_own]')
+        filters.append(f'[{o}_fg]{to_rgb("yuva444p16le")},split[{o}_s][{o}_own]')
         filters.append(f'[{o}_b]split[{o}_b1][{o}_b2]')
-        filters.append(f'[{o}_b1]{to_rgb}[{o}_d]')
+        filters.append(f'[{o}_b1]{to_rgb(base_format)}[{o}_d]')
         filters.append(f"[{o}_s][{o}_d]blend=all_expr='{blend_expr(mode)}'[{o}_m0]")
         filters.append(f'[{o}_b2]extractplanes=a,format={WORKING_FORMAT}[{o}_bm]')
         filters.append(f'[{o}_own][{o}_m0][{o}_bm]maskedmerge[{o}_m]')
     else:
-        filters.append(f'[{o}_fg]{layer_rgb}[{o}_s]')
-        filters.append(f'[{o}_b]{to_rgb}[{o}_d]')
+        filters.append(f'[{o}_fg]{to_rgb("yuva444p16le")}[{o}_s]')
+        filters.append(f'[{o}_b]{to_rgb(base_format)}[{o}_d]')
         filters.append(f"[{o}_s][{o}_d]blend=all_expr='{blend_expr(mode)}'[{o}_m]")
     # zscale quantizes to the composite's own depth: swscale's 16- to 10-bit step inside overlay
     # moves non-code-aligned chroma by about two 10-bit steps.

@@ -4,6 +4,7 @@ import heapq
 import json
 import math
 import os
+import re
 import shutil
 import struct
 import threading
@@ -405,7 +406,7 @@ def _run_ffmpeg(command, cancelled=None, heartbeat=None):
 def _probe(path):
     from media_proxy import MAX_AUDIO_STREAMS
     result = splice_platform.run(['ffprobe', '-v', 'error', '-protocol_whitelist', 'file', '-show_entries',
-                                 'stream=codec_type,channels,sample_rate,width,height,color_primaries,color_transfer,color_space,color_range,time_base,start_time'
+                                 'stream=codec_type,channels,sample_rate,width,height,pix_fmt,color_primaries,color_transfer,color_space,color_range,time_base,start_time'
                                  ':format=duration,start_time,format_name', '-of', 'json', str(path)],
                                  capture_output=True, text=True, timeout=30, check=True)
     data = json.loads(result.stdout)
@@ -445,6 +446,7 @@ def _probe(path):
             'profile': tuple(video.get(key) for key in ('color_primaries', 'color_transfer', 'color_space')),
             'range': 'pc' if video.get('color_range') in ('pc', 'jpeg') else 'tv',
             'start': start, 'time_base': time_base, 'rates': rates, 'video_start': video_start,
+            'alpha': bool(re.match(ALPHA_PIXEL_FORMATS, str(video.get('pix_fmt') or ''))),
             'format': str(data.get('format', {}).get('format_name') or '')}
 
 
@@ -556,6 +558,8 @@ def _brightness_contrast(brightness, contrast, pivot=.5):
 
 PRIMARY_COLOR_KEYS = ('brightness', 'contrast', 'saturation', 'exposure', 'temperature', 'tint')
 ALLOWED_SOURCE_RANGES = ('tv', 'pc')
+# Pixel formats with an alpha plane (FFmpeg names).
+ALPHA_PIXEL_FORMATS = r'(yuva|gbrap|ya\d|rgba|bgra|argb|abgr)'
 
 
 def _hdr_static_color(clip):
@@ -633,12 +637,74 @@ def _hdr_still_filter(profile, depth):
             'zscale=t='+transfer+limited)
 
 
+_ZSCALE_COLORSPACE = {'709': 'bt709', '170m': 'smpte170m', '470bg': 'bt470bg', '2020_ncl': 'bt2020nc', '2020_cl': 'bt2020c'}
+_ZSCALE_RANGE = {'limited': 'tv', 'full': 'pc', 'tv': 'tv', 'pc': 'pc'}
+_TAGGED_COLORSPACES = frozenset({'bt709', 'smpte170m', 'bt470bg', 'bt2020nc', 'bt2020c', 'fcc', 'smpte240m'})
+# Filters that run on R'G'B' only: a chain ending in one leaves R'G'B', and the Y'CbCr after it is
+# whatever FFmpeg negotiates.
+_RGB_FILTERS = frozenset({'lut1d', 'lut3d', 'lutrgb', 'colorchannelmixer', 'exposure', 'haldclut'})
+
+
+def _chain_filters(chain):
+    """The filters of a filtergraph string in order, as (name, {option: value}), without pad labels.
+    Commas and semicolons inside quotes or after a backslash do not split."""
+    parts, current, quoted, escaped = [], '', False, False
+    for character in chain:
+        if escaped:
+            current, escaped = current+character, False
+        elif character == '\\':
+            current, escaped = current+character, True
+        elif character == "'":
+            current, quoted = current+character, not quoted
+        elif character in ',;' and not quoted:
+            parts, current = parts+[current], ''
+        else:
+            current += character
+    filters = []
+    for part in parts+[current]:
+        part = re.sub(r'\s*(\[[^\]]*\]\s*)+$', '', re.sub(r'^\s*(\[[^\]]*\]\s*)+', '', part))
+        if not part:
+            continue
+        name, _, arguments = part.partition('=')
+        options = {}
+        for index, item in enumerate(arguments.split(':') if arguments else ()):
+            key, equals, value = item.partition('=')
+            options[key if equals else str(index)] = value if equals else key
+        filters.append((name.strip(), options))
+    return filters
+
+
+def _chain_output_tags(chain):
+    """(colorspace, range), as setparams names, of the Y'CbCr frames a picture chain leaves with
+    when its last colour step fixes them (zscale with a matrix, or setparams). None when the chain
+    ends on R'G'B' (the Y'CbCr after it follows FFmpeg's negotiation) or never sets them."""
+    colorspace = color_range = None
+    for name, options in reversed(_chain_filters(chain)):
+        if name == 'setparams':
+            colorspace = colorspace or options.get('colorspace')
+            color_range = color_range or options.get('range')
+        elif name == 'zscale':
+            matrix = options.get('m') or options.get('matrix')
+            value = options.get('r') or options.get('range') or options.get('out_range')
+            colorspace = colorspace or (_ZSCALE_COLORSPACE.get(matrix, matrix) if matrix else None)
+            color_range = color_range or (_ZSCALE_RANGE.get(value) if value else None)
+        elif name in _RGB_FILTERS or (name == 'format' and re.match(r'(gbr|rgb|bgr|argb|abgr|rgba|bgra)',
+                                                                     options.get('0', options.get('pix_fmts', '')))):
+            return None
+        if colorspace and colorspace not in _TAGGED_COLORSPACES:
+            return None
+        if colorspace and color_range:
+            return colorspace, color_range
+    return None
+
+
 def _fit_picture(width, height, color, lut, alpha_format, depth, profile=None, rec709=False,
                  *, still_frames=0, hdr_profile=None, conform_pq=False, high_depth=None,
-                 graded=None, animate_still=False, effects='', effects_label='fx'):
+                 graded=None, animate_still=False, effects='', effects_label='fx', source_alpha=False):
     """``graded``: the table-based grade (color_grade) for this clip, which replaces the CSS-style
     filters and the LUT. ``effects``: effects_engine.fit_effects, applied before the grade; a
-    grade drops alpha, so the matte is split off and merged back after it, at 16 bits."""
+    grade drops alpha, so the matte is split off and merged back after it, at 16 bits. So is the
+    matte of a ``source_alpha`` video (ProRes 4444, PNG/QuickTime Animation) without effects."""
     wide_yuv = f'format=yuv444p{max(10,depth)}le'
     if high_depth is None:
         high_depth = depth > 8
@@ -662,13 +728,21 @@ def _fit_picture(width, height, color, lut, alpha_format, depth, profile=None, r
                                       for value,default in zip(profile,REC709))
             grade += (f',zscale=pin={primaries}:tin={transfer}:min={matrix}:p=bt2020:t=linear,format=gbrpf32le,'
                       'zscale=t=smpte2084:m=bt2020nc:r=limited:npl=203,'+wide_yuv)
+    if grade and not effects and source_alpha and not still_frames:
+        effects = ',null'
     if effects:
         label = '_'+effects_label.replace('-', '_')
         # The graded colour takes the alpha plane of the effects' own frame: blend's normal mode at
         # opacity 1 keeps the colour and its tags, at 0 the alpha. alphamerge took only 8-bit formats
         # (a 16-bit delivery kept 138 levels), and mergeplanes moved a gray matte to limited range.
-        grade = (f'{effects},split[{label}_c][{label}_a];'
-                 f'[{label}_c]null{grade},format=yuva444p16le[{label}_g];[{label}_g][{label}_a]blend=c3_opacity=0') if grade else effects
+        # blend needs one colourspace and range on both inputs. Tagged like the graded colour, the
+        # alpha branch asks nothing of the source; untagged, FFmpeg would convert the source to the
+        # grade's output matrix before the grade reads it with the source's own.
+        tags = _chain_output_tags(grade)
+        matte = (f'[{label}_a]setparams=colorspace={tags[0]}:range={tags[1]}[{label}_m];' if tags else '')
+        grade = (f'{effects},split[{label}_c][{label}_a];{matte}'
+                 f'[{label}_c]null{grade},format=yuva444p16le[{label}_g];'
+                 f'[{label}_g][{label}_{"m" if tags else "a"}]blend=c3_opacity=0') if grade else effects
     repeat = f',loop=loop={still_frames-1}:size=1:start=0,setpts=N' if still_frames>1 else ''
     if animate_still:
         # The grade and its alpha branch need a frame at each sequence timestamp.
@@ -746,11 +820,15 @@ def _picture_grade(clip, item, directory, name, profile, *, fps, zero, frames, r
             raise ValueError('Invalid source color range')
         matrix = SETPARAMS_MATRIX[source_matrix(source_profile, item.get('colorMatrix'))]
         return f',setparams=colorspace={matrix}:range={source_range},zscale,format={WORKING_FORMAT}{chain}{out}'
-    # A still keeps its alpha: graded colour and the original alpha are merged after the grade.
+    # A still keeps its alpha: graded colour and the original alpha are merged after the grade, at
+    # 16 bits (alphamerge took only 8-bit formats). blend's inputs share one format and colourspace:
+    # the alpha branch is converted to the graded colour's.
     label = '_still_'+name.replace('-', '_')
-    return (f',format=gbrap16le,split[{label}_c][{label}_a];[{label}_a]alphaextract[{label}_alpha];'
+    matrix = SETPARAMS_MATRIX[output_matrix(profile)]
+    return (f',format=gbrap16le,split[{label}_c][{label}_a];'
+            f'[{label}_a]format=yuva444p16le:color_spaces={matrix}:color_ranges=tv[{label}_alpha];'
             f'[{label}_c]zscale=rin=full:r=full,format={WORKING_FORMAT}{chain}{out},format=yuva444p16le[{label}_g];'
-            f'[{label}_g][{label}_alpha]alphamerge')
+            f'[{label}_g][{label}_alpha]blend=c3_opacity=0')
 
 
 def _adjustment_layer(filters, active, number, clip, item, directory, profile, fps, alpha_format, full_alpha, overlay,
@@ -1312,6 +1390,7 @@ def _media_info(item, probes, heartbeat=None):
                 _sourceProfile=probe['profile'], _startTime=probe['start'], _videoTimeBase=probe['time_base'],
                 _videoStart=probe.get('video_start') if set(probe['format'].split(',')) & STREAM_FORMATS else None,
                 _sourceRange=probed_range if probed_range in ALLOWED_SOURCE_RANGES else 'tv',
+                _sourceAlpha=bool(probe.get('alpha')),
                 _seekMargin=SEEK_MARGIN_STREAM_SECONDS if set(probe['format'].split(',')) & STREAM_FORMATS else SEEK_MARGIN_SECONDS)
     return item
 
@@ -1644,7 +1723,7 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
                                high_depth=high_depth, graded=graded,
                                animate_still=still_frames>1 and ((not clip_bypass and len(_grade_key_times(clip))>1) or
                                                                  (bool(fx_chain) and fx_animated)),
-                               effects=fx_chain, effects_label=f'fx{number}')
+                               effects=fx_chain, effects_label=f'fx{number}', source_alpha=bool(item.get('_sourceAlpha')))
             # Reverse after scaling so the buffered window holds sequence-size frames.
             flip = ',reverse' if reverse and not still_frames and index is not None else ''
             chain = f'{prefix},{fit}{flip}{transform}'
@@ -1746,7 +1825,8 @@ def _render_window_inner(project, output_path, directory, *, options=None, cance
                 prior_fit = _fit_picture(width,height,prior_fit_color,prior_lut,alpha_format,depth,
                                          prior_item.get('_sourceProfile'),rec709,still_frames=still_tail,
                                          hdr_profile=hdr_profile,conform_pq=conform_pq,high_depth=high_depth,
-                                         graded=prior_graded, animate_still=still_tail>1 and not prior_bypass and len(_grade_key_times(prior_tail))>1)
+                                         graded=prior_graded, animate_still=still_tail>1 and not prior_bypass and len(_grade_key_times(prior_tail))>1,
+                                         effects_label=f'prior{number}', source_alpha=bool(prior_item.get('_sourceAlpha')))
                 prior_flip = ',reverse' if prior_reverse and not still_tail and prior_index is not None else ''
                 prior_alpha = _mask_alpha(f'{prior_opacity:.6f}',alpha_format,full_alpha) if prior_opacity!=1 else ''
                 filters.append(f'{prior_prefix},{prior_fit}{prior_flip}{prior_transform}{prior_alpha},setpts=PTS+{cut_frame}[tail{number}]')
@@ -4187,7 +4267,6 @@ def _to_full_rgb(profile):
 
 
 def _read_light_levels(target):
-    import re
     peak_file, average_file = Path(str(target) + '.peak'), Path(str(target) + '.average')
     peaks = [int(value) for value in re.findall(r'YMAX=(\d+)', peak_file.read_text(encoding='ascii'))]
     averages = [float(value) for value in re.findall(r'YAVG=([0-9.]+)', average_file.read_text(encoding='ascii'))]
@@ -4316,8 +4395,13 @@ def _delivery_tail(spec, width, height, fps, profile, burn, directory):
         steps.extend(_burn_in_filters(burn, out_w, out_h, fps, directory, profile))
     if spec['mode'] == 'stream' or spec['kind'] == 'images':
         if spec['kind'] == 'images':
+            # _to_full_rgb reads the composite with the program's matrix. Conform it to that matrix
+            # first: an untagged (Rec. 601) composite, or a layer FFmpeg converted to the untagged
+            # canvas, would otherwise be read as Rec. 709.
+            matrix = profile[2] if profile[2] in ('bt2020nc', 'bt2020c', 'smpte170m', 'bt470bg') else 'bt709'
+            conform = f'format={"yuva444p16le" if spec["alpha"] else "yuv444p16le"}:color_spaces={matrix}:color_ranges=tv,'
             # zimg writes planar 16-bit RGB; FFmpeg repacks it into the file's pixel format.
-            steps.append(_to_full_rgb(profile) + (',format=gbrap16le' if spec['alpha'] else ',format=gbrp16le'))
+            steps.append(conform + _to_full_rgb(profile) + (',format=gbrap16le' if spec['alpha'] else ',format=gbrp16le'))
         elif profile[2] == 'bt709':
             # Streamed frames reach the encoder already labelled Rec. 709 (_encoder_command): conform
             # an untagged (Rec. 601) composite here, before the delivery's bit depth. Tagged frames
