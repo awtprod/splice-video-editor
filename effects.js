@@ -341,11 +341,25 @@
     if (effects.stabilize) names.push('stabilization');
     return effects.bypass && names.length ? names.map(name => name+' (bypassed)') : names;
   }
+  // The export's refusals (render_movie, effects_engine), word for word.
+  const MESSAGES = {
+    multicamRamp:'Speed ramps on multicam clips are not supported. Flatten the multicam clip first.',
+    stabilizeSource:'Stabilize the clips inside a nested or multicam clip, or a video clip',
+  };
+  const effectKeyMessage = key => /^mask\.\d+\./.test(key) ? `Invalid keyframes: ${key.slice(0, 40)} (a clip has at most ${MAX_MASKS} masks)` : `Invalid keyframes: ${key.slice(0, 40)}`;
+  // Effects a clip's media cannot take (a ramp on a multicam clip; stabilization of a nested,
+  // multicam or generated clip): the same refusals as the export, whether bypassed or not.
+  function validateEffectsSource(clip, item) {
+    if (!item || clip.type !== 'video') return;
+    if (clip.keyframes?.speed?.length && item.multicam) fail(MESSAGES.multicamRamp);
+    if (clip.effects?.stabilize && (item.nestedProject || item.multicam || item.nativeGenerator != null)) fail(MESSAGES.stabilizeSource);
+  }
   // Keyframes of effect properties (speed, crop.*, mask.N.*): bounds and interpolation fields.
   function validateKeyframes(keyframes) {
     for (const [key, points] of Object.entries(keyframes || {})) {
       for (const point of points || []) validatePointShape(point, key);
       const bounds = KEY_BOUNDS[key];
+      if (!bounds && /^(mask|crop)\./.test(key)) fail(effectKeyMessage(key));
       if (!bounds) continue;
       if (points.length > 100) fail(`A clip has more than 100 ${key} keyframes, the export limit`);
       for (const point of points) { finite(point.time, key+' keyframe time', 0, 48*3600); finite(point.value, key+' keyframe value', ...bounds); }
@@ -652,7 +666,7 @@ float fxBlend(int mode, float b, float s) {
   window.SpliceEffects = {INTERPOLATIONS, BLEND_MODES, BLEND_NAMES, BLEND_INDEX, MASK_SHAPES, MAX_MASKS, MAX_POLYGON_POINTS, SPEED_AUDIO,
     MASK_PROPS, CROP_PROPS, KEY_PROPS, STABILIZE_PROPS, KEY_BOUNDS, PRESETS, PRESET_HANDLES, GLSL, BLEND_GLSL,
     validatePointShape, eased, segmentKind, bezierComponent, bezierSolve, segmentFraction, curveValue, splitSegment, windowPoints,
-    orderedPoints, normalizeRamps, describe, gradeSegmentKind, rampPoints, rampSource, rampSpeed, rampDuration, sourceDelta, presetRamp, validateEffects, validateKeyframes, isEffectKey,
+    orderedPoints, normalizeRamps, describe, gradeSegmentKind, rampPoints, rampSource, rampSpeed, rampDuration, sourceDelta, presetRamp, validateEffects, validateKeyframes, validateEffectsSource, MESSAGES, isEffectKey,
     maskParams, maskCoverage, masksAlpha, cropParams, cropAlpha, keyChroma, keyParams, keyAlpha, despill, blendChannel,
     live, layerFx, bindUniforms, canvasPass, blendPixels, segmentIntegral, offsetAt};
 })();

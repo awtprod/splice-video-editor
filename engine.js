@@ -1762,6 +1762,7 @@
         try { window.SpliceEffects.validateKeyframes(clip.keyframes); window.SpliceEffects.validateEffects(clip.effects); }
         catch (error) { throw new Error('This project file has invalid effects: '+error.message+'.'); }
         if (clip.keyframes?.speed?.length && clip.reverse) throw new Error('Speed ramps play forward. Turn off Reverse to ramp this clip.');
+        window.SpliceEffects.validateEffectsSource(clip, mediaById.get(clip.mediaId));
       }
       if (clip.color?.grade !== undefined) window.SpliceGrade.validateGrade(clip.color.grade);
       if (clip.color?.lut) {

@@ -156,7 +156,7 @@
     body += `<div class="fx-row"><button type="button" data-fx-analyze ${capability === false || status?.state === 'running' ? 'disabled' : ''}>${s?.analysis ? 'Analyze again' : 'Analyze'}</button>` +
       (s ? `<label><input type="checkbox" data-fx-toggle="stabilize" ${s.enabled !== false ? 'checked' : ''}> On</label><button type="button" data-fx-stabilize-reset>Reset</button>` : '') + '</div>';
     if (status?.state === 'running') body += `<p class="splice-handle" role="status">Analyzing motion… ${Math.round((status.progress || 0)*100)}%</p>`;
-    else if (status?.state === 'failed') body += `<p class="splice-compat" role="alert">${esc(status.error)}</p>`;
+    else if (status?.state === 'failed' || status?.state === 'cancelled') body += `<p class="splice-compat" role="alert">${esc(status.error)}</p>`;
     else if (s?.analysis && status?.state === 'done') body += `<p class="splice-handle" role="status">Analyzed ${status.frames} frames${Number.isFinite(status.shake?.before) ? ` · measured shake ${status.shake.before.toFixed(1)} px/frame` : ''}.</p>`;
     if (s) body += Object.entries(E.STABILIZE_PROPS).filter(([name]) => name !== 'autoZoom').map(([name, [low, high, base]]) =>
       slider({smoothing:'Smoothing (frames)', maxShift:'Max shift (px, -1 any)', zoom:'Zoom'}[name], 'stabilize.'+name, s[name] ?? base, low, high, 1, name === 'zoom' ? '%' : '', false, null)).join('') +
@@ -222,6 +222,20 @@
       return true;
     } catch (error) { notify(error.message); return false; }
   }
+  // The ramp's sound mode, like the ramp itself (rampChange), applies to the whole link group:
+  // the linked sound clip is the one that plays.
+  function speedAudioChange(editor, clip, mode) {
+    const members = [clip, ...editor.get().project.clips.filter(other => other.id !== clip.id && clip.linkGroup && other.linkGroup === clip.linkGroup)];
+    try {
+      editor.editProject(next => {
+        for (const member of members) {
+          const target = next.clips.find(other => other.id === member.id);
+          target.effects = {...(target.effects || {}), speedAudio:mode};
+        }
+      });
+      return true;
+    } catch (error) { notify(error.message); return false; }
+  }
   function bind(element, clip, editor, rerender) {
     const box = element.querySelector('[data-fx-tools]');
     if (!box) return;
@@ -270,7 +284,7 @@
       update(editor, current(), {effects}); rerender();
     });
     // ---- speed ramp
-    box.querySelector('[data-fx-speed-audio]')?.addEventListener('change', event => update(editor, current(), {effects:{...effectsOf(current()), speedAudio:event.target.value}}));
+    box.querySelector('[data-fx-speed-audio]')?.addEventListener('change', event => speedAudioChange(editor, current(), event.target.value));
     for (const button of box.querySelectorAll('[data-fx-preset]')) button.addEventListener('click', () => {
       const live = current(), span = E.sourceDelta(live, 0, live.duration);
       try { if (rampChange(editor, live, E.presetRamp(button.dataset.fxPreset, span).keys, editor.get())) rerender(); }
@@ -387,7 +401,12 @@
     box.querySelector('[data-fx-blend]')?.addEventListener('change', event => update(editor, current(), {effects:{...effectsOf(current()), blend:event.target.value}}));
     // ---- stabilization
     box.querySelector('[data-fx-analyze]')?.addEventListener('click', () => analyze(editor, current(), rerender));
-    box.querySelector('[data-fx-stabilize-reset]')?.addEventListener('click', () => { const effects = effectsOf(current()); delete effects.stabilize; update(editor, current(), {effects}); rerender(); });
+    box.querySelector('[data-fx-stabilize-reset]')?.addEventListener('click', () => {
+      const effects = effectsOf(current()), id = effects.stabilize?.analysis;
+      delete effects.stabilize;
+      if (update(editor, current(), {effects})) release(editor, id);
+      rerender();
+    });
     box.querySelector('[data-fx-stabilize-zoom]')?.addEventListener('change', event => writePath(editor, current(), 'stabilize.autoZoom', Number(event.target.value), fps, time()));
     box.querySelector('[data-fx-stabilize-flag]')?.addEventListener('change', event => {
       const effects = effectsOf(current()); effects.stabilize = {...(effects.stabilize || {}), tripod:event.target.checked};
@@ -417,13 +436,24 @@
       jobs.set(status.analysis, status);
       const effects = structuredClone(clip.effects || {});
       effects.stabilize = {smoothing:15, maxShift:-1, zoom:0, autoZoom:1, tripod:false, ...(effects.stabilize || {}), analysis:status.analysis, source:[sourceIn, sourceOut], enabled:true};
+      const previous = clip.effects?.stabilize?.analysis;
       editor.updateClip(clip.id, {effects});
+      if (previous !== status.analysis) release(editor, previous);
       rerender();
       poll(status.analysis, editor, rerender);
     } catch (error) { notify(error.message); }
   }
+  // An analysis no clip uses any more (Reset, a deleted clip, a new analysis) is cancelled on the
+  // server, so its two vidstab passes stop.
+  const inUse = (state, id) => (state?.project?.clips || []).some(clip => clip.effects?.stabilize?.analysis === id);
+  function release(editor, id) {
+    if (!id || inUse(editor.get(), id) || jobs.get(id)?.state !== 'running') return;
+    jobs.set(id, {state:'cancelled', analysis:id, error:'Analysis cancelled: analyze the clip again'});
+    api('/api/effects/stabilize/cancel', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id})}).catch(() => {});
+  }
   function poll(id, editor, rerender) {
     const step = async () => {
+      if (!inUse(editor.get(), id)) { release(editor, id); rerender(); return; }
       let status;
       try { status = await api('/api/effects/stabilize?id='+encodeURIComponent(id)); }
       catch (error) { jobs.set(id, {state:'failed', error:error.message}); rerender(); return; }
@@ -450,9 +480,17 @@
     if (!preview) {
       if (!pending.has(s.analysis+key)) {
         pending.add(s.analysis+key);
-        api('/api/effects/stabilize/preview', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id:s.analysis, settings:{smoothing:s.smoothing, maxShift:s.maxShift, zoom:s.zoom, autoZoom:s.autoZoom, tripod:!!s.tripod}})})
-          .then(result => { (status.previews ||= {})[key] = result; pending.delete(s.analysis+key); window.Editor?.refreshMedia(); })
+        // The server renders the preview as a job: ask until it is done (never blocking a request).
+        const request = () => api('/api/effects/stabilize/preview', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id:s.analysis, settings:{smoothing:s.smoothing, maxShift:s.maxShift, zoom:s.zoom, autoZoom:s.autoZoom, tripod:!!s.tripod}})})
+          .then(result => {
+            if (result.state === 'running') { setTimeout(request, 400); return; }
+            pending.delete(s.analysis+key);
+            if (result.state === 'failed') { notify(result.error || 'The stabilized preview failed.'); return; }
+            (status.previews ||= {})[key] = {src:result.src, offset:result.offset};
+            window.Editor?.refreshMedia();
+          })
           .catch(error => { pending.delete(s.analysis+key); notify(error.message); });
+        request();
       }
       return null;
     }
@@ -612,5 +650,5 @@
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init, {once:true});
   else init();
 
-  window.SpliceEffectsUI = {markup, bind, overlay, stabilizedPreview, jobs, capabilities, rampChange, analyze};
+  window.SpliceEffectsUI = {markup, bind, overlay, stabilizedPreview, jobs, capabilities, rampChange, speedAudioChange, analyze};
 })();
