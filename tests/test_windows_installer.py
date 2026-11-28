@@ -287,11 +287,7 @@ class FFmpegFeatureListsMatchTheCode(unittest.TestCase):
     }
     # Listed for work not on this branch yet; the test fails once the code uses them, so the
     # entry is dropped then.
-    ANTICIPATED = {
-        'vidstabdetect': 'the effects engine (PR #18) stabilizer; optional, it checks vidstab_available()',
-        'vidstabtransform': 'the effects engine (PR #18) stabilizer; optional, it checks vidstab_available()',
-        'matroska': "the effects engine's (PR #18) FFV1 .mkv intermediates",
-    }
+    ANTICIPATED = {}
 
     @classmethod
     def setUpClass(cls):

@@ -116,7 +116,7 @@ Park alternates the way you would in any NLE:
 
 - Select a clip to change its speed or direction in the Inspector. Speed runs from 10% to 1600%. Changing speed changes the clip's timeline duration so that it keeps its source range, to the nearest timeline frame.
 - **Reset (↺)** resets every clip adjustment, speed included, or nothing if the speed cannot return to 100%.
-- Variable speed (speed ramps) is part of the effects work in [Effects](effects.md), which is not merged yet.
+- Variable speed (speed ramps) is in [Effects](effects.md).
 
 ## Timecode
 

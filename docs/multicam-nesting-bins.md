@@ -42,4 +42,4 @@ All of these are saved in a Splice working project (**File → Save working proj
 
 - Up to 9 angles per multicam clip.
 - Nesting depth is limited to four levels.
-- With the effects work (PR #18, not merged), a speed ramp on a multicam clip and stabilization of a nested or multicam clip are refused; see [Effects](effects.md).
+- A speed ramp on a multicam clip and stabilization of a nested or multicam clip are refused; see [Effects](effects.md).

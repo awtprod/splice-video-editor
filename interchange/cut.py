@@ -435,6 +435,19 @@ def _event(cut: Cut, clip: dict, subclips: dict | None = None) -> Event | None:
         report.note(f'{label}: its Premiere volume keyframes outside the trimmed part of the clip are not carried.')
     if clip.get('nativeTimeRemap'):
         report.note(f'{label}: its Premiere time-remapping curve is exported as a constant {float(event.speed):g}x speed.')
+    # Splice effects (effects_engine): what timeline interchange cannot carry is named per clip.
+    if keys.get('speed'):
+        report.note(f'{label}: its speed ramp is exported as a constant {float(event.speed):g}x speed (its average); '
+                    'the clip keeps its source In and Out, but the timing inside it is not carried.')
+    eased_keys = sorted(key for key, points in keys.items() if key in KEYFRAME_KEYS and isinstance(points, list) and
+                        any(isinstance(point, dict) and point.get('interp') not in (None, 'linear') for point in points))
+    if eased_keys:
+        report.note(f'{label}: its eased, held or bezier keyframes ({", ".join(eased_keys)}) are exported as linear ramps between the keys.')
+    from effects_engine import describe
+    named = [name for name in describe(clip.get('effects') if isinstance(clip.get('effects'), dict) else None) if name != 'speed ramp']
+    if named:
+        report.note(f'{label}: its {", ".join(named)} {"is" if len(named) == 1 else "are"} not carried by timeline interchange; '
+                    'receiving apps show the clip without '+('it.' if len(named) == 1 else 'them.'))
     if clip.get('audioStream') is not None or (source is not None and len(source.audio_streams) > 1 and kind != 'title'):
         report.note(f'{label}: the source has {len(source.audio_streams) if source else "several"} audio streams; '
                     'receiving apps choose their own channel mapping.')

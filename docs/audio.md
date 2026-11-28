@@ -64,4 +64,4 @@ These tests do not establish compliance with a broadcast delivery specification,
 - Stems are pre-master-dynamics, so they may not null against a limited mix (reported).
 - Default AAC can overshoot the ceiling after encoding (measured, reported and warned about).
 - Waveform sync refuses repetitive signals with ambiguous offsets.
-- Sound from an MPEG-TS file whose audio stream starts later than its picture can play early, by the gap between the two streams, when a clip's In point is under about 1.25 s. Found during the effects review (PR #18) and not fixed yet.
+- Sound from an MPEG-TS file whose audio stream starts later than its picture can play early, by the gap between the two streams, when a clip's In point is under about 1.25 s. Not fixed yet.

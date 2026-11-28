@@ -45,6 +45,7 @@ import media_links
 from media_proxy import audition_audio, decodable, describe, nested_preview, proxy
 from media_peaks import waveform
 from resolve import http as resolve_http
+import effects_engine
 
 MAX_NATIVE_PROJECT = 50 * 1024 * 1024
 # JSON also carries the base64 original graph plus the current editing model.
@@ -128,6 +129,43 @@ def media_audition(handler, query):
     audio = audition_audio(query.get('src', [''])[0], _query_int(query, 'index', -1), rate,
                            query.get('reverse', ['0'])[0] == '1', _query_int(query, 'stream', 0))
     handler._reply(200, audio, 'audio/wav')
+
+
+STABILIZER = effects_engine.Stabilizer()
+
+
+@get('/api/effects/capabilities')
+def effects_capabilities(handler, query):
+    available = effects_engine.vidstab_available()
+    handler._json(200, {'vidstab': available, 'message': '' if available else effects_engine.VIDSTAB_MISSING})
+
+
+@post('/api/effects/stabilize', limit=MAX_SMALL_BODY)
+def effects_stabilize(handler, body):
+    """Start (or look up) the motion analysis of a source range; it runs in the background."""
+    payload = _json_body(body)
+    handler._json(200, STABILIZER.start(payload.get('src', ''), payload.get('in'), payload.get('out')))
+
+
+@get('/api/effects/stabilize')
+def effects_stabilize_status(handler, query):
+    try:
+        handler._json(200, STABILIZER.status(query.get('id', [''])[0]))
+    except KeyError as error:
+        handler._json(404, {'error': str(error.args[0])})
+
+
+@post('/api/effects/stabilize/cancel', limit=MAX_SMALL_BODY)
+def effects_stabilize_cancel(handler, body):
+    """Stop an analysis no clip uses any more (the editor asks on Reset and when clips are deleted)."""
+    payload = _json_body(body)
+    handler._json(200, STABILIZER.cancel(payload.get('id')))
+
+
+@post('/api/effects/stabilize/preview', limit=MAX_SMALL_BODY)
+def effects_stabilize_preview(handler, body):
+    payload = _json_body(body)
+    handler._json(200, STABILIZER.preview(payload.get('id'), payload.get('settings') or {}))
 
 
 @get('/api/files')

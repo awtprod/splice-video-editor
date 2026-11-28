@@ -17,10 +17,10 @@ import splice_platform
 # sources and fails when a name is used but not listed here, or listed but unused.
 REQUIRED_FILTERS = (
     # picture
-    'alphaextract', 'alphamerge', 'blend', 'color', 'colorchannelmixer', 'crop', 'drawbox', 'drawtext', 'exposure',
+    'alphaextract', 'alphamerge', 'blend', 'color', 'colorchannelmixer', 'copy', 'crop', 'drawbox', 'drawtext', 'exposure',
     'extractplanes', 'fade', 'format', 'fps', 'geq', 'loop', 'lut1d', 'lut3d', 'lutrgb', 'lutyuv', 'maskedmerge',
     'mergeplanes', 'metadata', 'null', 'overlay', 'pad', 'reverse', 'rotate', 'scale', 'setparams', 'setpts',
-    'setsar', 'settb', 'signalstats', 'split', 'tonemap', 'tpad', 'trim', 'zscale',
+    'setsar', 'settb', 'showinfo', 'signalstats', 'split', 'tonemap', 'tpad', 'trim', 'zscale',
     # sound
     'acompressor', 'adelay', 'aeval', 'aformat', 'agate', 'ametadata', 'amix', 'amultiply', 'anull', 'anullsrc',
     'apad', 'aresample', 'areverse', 'asetpts', 'astats', 'atempo', 'atrim', 'biquad', 'ebur128', 'highpass',
@@ -33,9 +33,8 @@ REQUIRED_ENCODERS = (
 REQUIRED_DECODERS = ('h264', 'hevc', 'prores', 'dnxhd', 'png', 'tiff', 'exr', 'aac', 'pcm_s24le')
 # Bitstream filters that rewrite the colour description of H.264 proxies and ProRes masters.
 REQUIRED_BITSTREAM_FILTERS = ('h264_metadata', 'prores_metadata')
-# 'webm' is the alpha edit proxy, 'ipod' the audio-only .m4a proxy and 'matroska' the
-# effects engine's FFV1 intermediates (.mkv).
-REQUIRED_MUXERS = ('mp4', 'mov', 'mxf', 'wav', 'webm', 'ipod', 'matroska', 'image2', 'null', 'rawvideo', 'f32le',
+# 'webm' is the alpha edit proxy and 'ipod' the audio-only .m4a proxy.
+REQUIRED_MUXERS = ('mp4', 'mov', 'mxf', 'wav', 'webm', 'ipod', 'image2', 'null', 'rawvideo', 'f32le',
                    's16le')
 # 'lavfi' generates swatches and test sources; 'concat' joins rendered segments.
 REQUIRED_DEMUXERS = ('concat', 'lavfi', 'image2', 'rawvideo', 'f32le')

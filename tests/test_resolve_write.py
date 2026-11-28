@@ -1313,7 +1313,7 @@ class EditorFieldCoverageTests(unittest.TestCase):
         for listed in re.findall(r"\['opacity','x','y','scale','rotation'[^\]]*\]|\['volume'\]|\['opacity'\]", inspector):
             need(writer.KEYFRAME_FIELDS, re.findall(r"'(\w+)'", listed), 'keyframes')
         sources = [(ROOT / name).read_text() for name in ('engine.js', 'inspector.js', 'track_controls.js',
-                                                          'workspace.js', 'captions.js')]
+                                                          'workspace.js', 'captions.js', 'effects-ui.js')]
         found = editor_fields(sources)
         self.assertGreaterEqual(len(found['clip']), 10)  # the scan sees the editor's own clip literals
         need(writer.CLIP_FIELDS, found['clip'], 'clip')
@@ -1412,6 +1412,13 @@ class EveryFeatureTests(SaveCase):
              'in': 0, 'mediaId': v[0]['mediaId']},
             {'id': 'a3', 'type': 'audio', 'track': -project['trackCounts']['audio'], 'start': 0, 'duration': 4 * fr,
              'in': 0, 'mediaId': a[0]['mediaId']}]
+        # Clip effects: every kind, one of them bypassed, and a speed ramp.
+        v[2]['effects'] = {'crop': {'left': 10, 'right': 0, 'top': 0, 'bottom': 0}, 'blend': 'screen',
+                           'masks': [{'shape': 'ellipse', 'x': 50, 'y': 50, 'width': 40, 'height': 40}],
+                           'key': {'color': '#00ff00', 'enabled': False},
+                           'stabilize': {'analysis': '0' * 32, 'smoothing': 10}}
+        v[2]['keyframes'] = {'speed': [{'time': 0, 'value': 100, 'interp': 'easeInOut'}, {'time': 0.1, 'value': 50}],
+                             'crop.left': [{'time': 0, 'value': 0}, {'time': 0.1, 'value': 20}]}
         # Settings a later editor may add, unknown to the writer.
         v[2]['futureClipFeature'] = 3
         project['futureTimelineFeature'] = {'on': True}
@@ -1438,7 +1445,13 @@ class EveryFeatureTests(SaveCase):
         has('Clip fades')
         has('Clip pan')
         has('Speed changes and reversed clips')
-        has('Speed ramps')
+        has('Speed ramps', writer.NOT_WRITTEN, 'Splice speed keyframes')
+        has('Crop', writer.NOT_WRITTEN, 'crop')
+        has('Masks', writer.NOT_WRITTEN, 'masks')
+        has('Chroma keys', writer.NOT_WRITTEN, 'chroma key')
+        has('Blend modes', writer.NOT_WRITTEN, 'screen blend mode')
+        has('Stabilization', writer.NOT_WRITTEN, 'stabilization')
+        has('Keyframes', writer.NOT_WRITTEN, 'speed', 'crop.left')
         has('Picture transitions and fades')
         has('Clip markers')
         has('Clip names changed in Splice')

@@ -53,7 +53,7 @@ What each format carries:
 Before exporting:
 
 - **Unnest / Decompose in place** nested sequences and **Flatten multicam** clips. The report lists what is left out otherwise, including subclip limits and editorial metadata (camera, scene, take, log note, label, bin). See [Multicam, nesting, subclips and bins](multicam-nesting-bins.md).
-- Effects from PR #18 are not carried; a speed ramp is written as its average speed. See [Effects](effects.md).
+- Effects (speed ramps, masks, keys, blend modes, stabilization) are not carried; a speed ramp is written as its average speed. See [Effects](effects.md).
 - Camera RAW clips keep the original RAW path, reel and timecode; Splice's RAW settings are listed, not carried. See [Camera RAW](camera-raw.md).
 
 Details that matter in practice:

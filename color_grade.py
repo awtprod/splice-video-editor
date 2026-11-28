@@ -457,7 +457,9 @@ def grade_filter(clip, directory, name, *, input_lut=None, clock='T', offset=0.0
     current = f'{label}_k0'
     for i in range(1, len(times)):
         a, b = times[i-1], times[i]
-        weight = f'({local}-({a:.9f}))/({b-a:.9f})'
+        # Eased grade keyframes ease the mix (effects_engine.grade_weight_expr, effects.js gradeSegmentKind).
+        from effects_engine import grade_weight_expr
+        weight = f'({grade_weight_expr(clip, a, f"(({local}-({a:.9f}))/({b-a:.9f}))")})'
         expression = f'if(lt({local},{a:.9f}),A,if(gte({local},{b:.9f}),B,A+(B-A)*{weight}))'
         target = f'{label}_m{i}'
         parts.append(f";[{current}][{label}_k{i}]blend=all_expr='{expression}'[{target}]")
