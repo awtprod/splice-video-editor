@@ -140,8 +140,9 @@ jobs:
             if (!(Test-Path $exe) -or $splice.HasExited) { throw 'Splice was damaged or stopped by the refused upgrade.' }
             Write-Host 'Upgrade and uninstall were refused while Splice ran.'
           } finally {
-            # Close it as a user would (WM_CLOSE), so the server stops through its pipe.
-            taskkill /PID $splice.Id /T | Out-Host
+            # Close its window as a user would (WM_CLOSE), so the server stops through its pipe.
+            $splice.Refresh()
+            if (!$splice.HasExited) { $splice.CloseMainWindow() | Out-Null }
             if (!$splice.WaitForExit(30000)) {
               Write-Host '::warning::Splice did not close within 30 seconds; stopping it.'
               taskkill /PID $splice.Id /T /F | Out-Host
@@ -153,7 +154,7 @@ jobs:
           }
           $left = Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($app) }
           if ($left) { $left | Select-Object Name, ProcessId | Out-Host; throw 'Splice processes were left running.' }
-          exit 0  # taskkill's exit code is not the result of this step
+          exit 0  # a fallback taskkill's exit code is not the result of this step
       - name: Uninstall
         shell: pwsh
         run: |
