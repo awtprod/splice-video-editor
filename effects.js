@@ -195,6 +195,15 @@
     if (points) return rampSource(points, b)-rampSource(points, a);
     return (b-a)*(Number(clip.speed) || 1);
   }
+  // After every edit: a ramped clip's nominal speed is its average (edits use it for the Out point).
+  function normalizeRamps(project) {
+    for (const clip of project.clips || []) {
+      if (!clip.keyframes?.speed?.length || !(clip.duration > 0)) continue;
+      const ramp = rampPoints(clip);
+      const average = Math.min(16, Math.max(.1, Math.round(rampSource(ramp, clip.duration)/clip.duration*1e6)/1e6));
+      if (clip.speed !== average) clip.speed = average;
+    }
+  }
   // Speed ramp presets: keys over the clip's current length that keep its source span when
   // the duration is solved (applyRamp).
   const PRESETS = {
@@ -576,7 +585,7 @@ float fxBlend(int mode, float b, float s) {
   window.SpliceEffects = {INTERPOLATIONS, BLEND_MODES, BLEND_NAMES, BLEND_INDEX, MASK_SHAPES, MAX_MASKS, MAX_POLYGON_POINTS, SPEED_AUDIO,
     MASK_PROPS, CROP_PROPS, KEY_PROPS, STABILIZE_PROPS, KEY_BOUNDS, PRESETS, PRESET_HANDLES, GLSL, BLEND_GLSL,
     validatePointShape, eased, segmentKind, bezierComponent, bezierSolve, segmentFraction, curveValue, splitSegment, windowPoints,
-    rampPoints, rampSource, rampSpeed, rampDuration, sourceDelta, presetRamp, validateEffects, validateKeyframes, isEffectKey,
+    orderedPoints, normalizeRamps, rampPoints, rampSource, rampSpeed, rampDuration, sourceDelta, presetRamp, validateEffects, validateKeyframes, isEffectKey,
     maskParams, maskCoverage, masksAlpha, cropParams, cropAlpha, keyChroma, keyParams, keyAlpha, despill, blendChannel,
     live, layerFx, bindUniforms, canvasPass, blendPixels, segmentIntegral, offsetAt};
 })();

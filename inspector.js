@@ -77,8 +77,10 @@
       (clip.type === 'title' || source?.still ? '' : field('Source in', 'in', number(clip.in, 0).toFixed(2), 0, source?.duration || 7200, 1/fps)) +
       field('Duration', 'duration', number(clip.duration, 1).toFixed(2), 1/fps, maximumDuration, 1/fps) +
       (labelColors.length ? `<label class="splice-number"><span>Color label</span><select aria-label="Clip color label" data-field="colorLabel">${labelColors.map(c => option(c.key, c.name, clip.colorLabel || '')).join('')}</select></label>` : ''));
+    const ramped = !!clip.keyframes?.speed?.length;
     if (clip.type!=='title' && !source?.still && !clip.nativeTimeRemap) html += section('Speed',
-      field('Speed (%)','speedPercent',Math.round(number(clip.speed,1)*10000)/100,10,800,.01) +
+      (ramped ? '<p class="splice-handle">A speed ramp sets this clip\'s speed: edit it under Effects.</p>' :
+        field('Speed (%)','speedPercent',Math.round(number(clip.speed,1)*10000)/100,10,800,.01)) +
       `<label class="splice-safe-toggle"><input aria-label="Reverse clip" type="checkbox" data-field="reverse" ${clip.reverse?'checked':''}> Reverse clip</label>`);
     if (clip.type === 'video') {
       const previous = state.project.clips.find(item => item.type==='video' && item.track===clip.track && item.id!==clip.id &&
@@ -116,6 +118,8 @@
         (clip.transition!=='none' && clip.transition!=='native' && number(clip.transitionDuration,.5)>clip.duration+number(clip.transitionBefore,0)+1e-6 ?
           `<p class="splice-handle">The available shot limits playback to ${(clip.duration+number(clip.transitionBefore,0)).toFixed(2)} s.</p>` : ''));
     }
+    // Speed ramps, easing, crop, masks, key, blend and stabilization (effects-ui.js).
+    if (clip.type !== 'title' && window.SpliceEffectsUI) html += section('Effects', window.SpliceEffectsUI.markup(clip, source, state));
     if (clip.type === 'title') {
       const fonts=['DM Sans','IBM Plex Mono','DejaVu Sans'];
       if(text.fontFamily && !fonts.includes(text.fontFamily))fonts.unshift(text.fontFamily);
@@ -345,6 +349,7 @@
       render(editor.get(),element,editor);
     });
     if (clip.type === 'video') window.SpliceColorUI?.bind(element, clip, editor, () => render(editor.get(), element, editor));
+    window.SpliceEffectsUI?.bind(element, clip, editor, () => render(editor.get(), element, editor));
     if (clip.type === 'audio' || clip.type === 'video' && clip.embeddedAudio !== false) mountAudioFx(element, clip, editor, locked, previousFx);
     window.SpliceScopes.bind(element);
     // Never forced here: the scopes' own throttle and unchanged-frame check decide (the preview

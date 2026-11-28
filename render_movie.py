@@ -2678,6 +2678,8 @@ def render_to_file(project, output_path, *, options=None, progress=None, cancell
     # Keys with a leading underscore are internal to the renderer.
     options = {key: value for key, value in (options or {}).items() if isinstance(key, str) and not key.startswith('_')}
     if _nested_depth>4: raise ValueError('Nested sequences exceed four levels')
+    # Stabilized clips read their analysis' stabilized picture (effects_engine).
+    project = effects_engine.apply_stabilization(project, cancelled, heartbeat)
     expanded = _expand_editorial_clips(project)
     if expanded is not project:
         # Missing angle footage contributes black and silence through the original edit's Out.

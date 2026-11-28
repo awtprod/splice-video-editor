@@ -690,6 +690,8 @@
     if (resolved.item?.still) return 0;
     const t = rawSourceTime(clip, atTime);
     if (resolved.angle) return Math.max(0, t - resolved.minTime + resolved.inShift);
+    const stabilized=stabilizedPreview(clip);
+    if (stabilized) return Math.max(0, t - stabilized.offset);
     return Math.max(0, t + resolved.inShift);
   };
   const trackSettings = track => project.trackMix?.[String(track)] || {};
@@ -826,9 +828,13 @@
       ['exposure','temperature','tint'].some(key=>Number(color[key])||0);
   }
   const clipAudioStream=(clip,item)=>'audioStream' in clip?clip.audioStream:item?.audioStream??null;
+  // A stabilized clip plays its preview, made from the same analysis as the export (effects-ui.js).
+  const stabilizedPreview = clip => clip?.type==='video' ? window.SpliceEffectsUI?.stabilizedPreview(clip) : null;
   function programSource(clip) {
     const item=clip && resolveClipMedia(clip).item;
     if (!item?.src) return;
+    const stabilized=stabilizedPreview(clip);
+    if (stabilized) return stabilized.src;
     const stream=clipAudioStream(clip,item);
     if (item.hdr && hasHdrGrade(clip)) {
       const graded=window.SpliceMedia?.preparePreview(item,stream,true)?.src;

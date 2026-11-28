@@ -1,0 +1,55 @@
+/* Effects section of the inspector (effects-ui.js), mask handles on the monitor, ramp ticks on the timeline. */
+.fx-tools{display:grid;gap:8px;min-width:0}
+.fx-row{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:12px;color:#b9c8b9}
+.fx-row label{display:flex;align-items:center;gap:5px;cursor:pointer}
+.fx-row input[type=checkbox],.fx-tools .splice-safe-toggle input{accent-color:#c4ee78}
+.fx-top{justify-content:space-between}
+.fx-tools button{border:1px solid #465346;background:#202820;color:#d3e2cf;border-radius:4px;padding:5px 8px;font:11px 'DM Sans',sans-serif;cursor:pointer;min-width:0}
+.fx-tools button:hover:not(:disabled){border-color:#c4ee78}
+.fx-tools button:disabled{opacity:.45;cursor:default}
+.fx-tools button[aria-pressed=true]{background:#2f3d2b;border-color:#c4ee78;color:#e9f6d8}
+.fx-group{border:1px solid #343b34;border-radius:5px;background:#171b17;min-width:0}
+.fx-group>summary{cursor:pointer;padding:7px 9px;font-size:12px;font-weight:700;color:#e2ebe0;list-style-position:inside}
+.fx-group[open]>summary{border-bottom:1px solid #2b322b}
+.fx-group>:not(summary){margin:8px 9px}
+.fx-badge{font:10px 'IBM Plex Mono',monospace;color:#11160f;background:#c4ee78;border-radius:3px;padding:1px 4px;margin-left:4px;font-weight:600}
+.fx-presets{display:grid;grid-template-columns:repeat(auto-fill,minmax(96px,1fr));gap:5px}
+.fx-control>span{align-items:center;gap:4px}
+.fx-control output{margin-left:auto}
+.fx-key,.fx-key-clear{padding:1px 4px!important;font-size:10px!important;line-height:1.2;color:#8e9b8c!important}
+.fx-key.on{color:#c4ee78!important;border-color:#c4ee78!important}
+.fx-speed-curve{display:block;width:100%;height:auto;background:#0c110d;border:1px solid #3c483b;border-radius:4px}
+.fx-speed-curve polyline{fill:none;stroke:#c4ee78;stroke-width:1.6}
+.fx-speed-curve circle{fill:#11160f;stroke:#c4ee78;stroke-width:1.4}
+.fx-speed-curve .fx-unity{stroke:#4b5a49;stroke-dasharray:3 3}
+.fx-speed-curve .fx-playhead{stroke:#f5d76e;stroke-width:1}
+.fx-knots{display:grid;gap:4px}
+.fx-knot{display:grid;grid-template-columns:52px minmax(48px,64px) minmax(0,1fr) 26px;gap:4px;align-items:center}
+.fx-knot input,.fx-knot select,.fx-handle-numbers input{background:#252d25;color:#e7eee7;border:1px solid #465346;border-radius:4px;padding:4px 5px;font:11px 'DM Sans',sans-serif;min-width:0;width:100%;box-sizing:border-box}
+.fx-segments{display:flex;flex-wrap:wrap;gap:4px}
+.fx-curve-editor{display:grid;grid-template-columns:132px minmax(0,1fr);gap:8px;align-items:start}
+.fx-curve-editor svg{width:132px;height:132px;background:#0c110d;border:1px solid #3c483b;border-radius:4px;touch-action:none}
+.fx-curve-editor polyline{fill:none;stroke:#c4ee78;stroke-width:1.8}
+.fx-curve-editor .fx-frame{fill:none;stroke:#2f382e}
+.fx-curve-editor .fx-arm{stroke:#7f8f7c;stroke-width:1}
+.fx-curve-editor .fx-handle{fill:#202820;stroke:#7f8f7c;stroke-width:1.5}
+.fx-curve-editor .fx-handle.live{fill:#c4ee78;stroke:#11160f;cursor:grab}
+.fx-curve-editor .splice-handle{grid-column:2;margin:0}
+.fx-handle-numbers{display:grid;grid-template-columns:1fr 1fr;gap:4px}
+.fx-handle-numbers label{display:grid;gap:2px;font-size:10px;color:#9fb09c}
+.fx-mask{border-top:1px solid #2b322b;padding-top:6px;display:grid;gap:8px}
+.fx-mask-head{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:11px;color:#b9c8b9}
+.fx-mask-head label{display:flex;align-items:center;gap:3px}
+.fx-mask-pick{flex:1 1 auto;text-align:left}
+.fx-swatch{display:flex;align-items:center;gap:6px}
+.fx-swatch input{width:38px;height:24px;padding:1px;background:#252d25;border:1px solid #465346;border-radius:4px}
+/* Monitor overlay: DOM only, never part of a rendered picture. */
+.fx-overlay{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;overflow:visible;z-index:3}
+.fx-overlay .fx-outline{fill:none;stroke:#f5d76e;stroke-width:1.5;stroke-dasharray:5 3}
+.fx-overlay .fx-stem{stroke:#f5d76e;stroke-width:1}
+.fx-overlay .fx-mh{fill:#11160f;stroke:#f5d76e;stroke-width:1.6;pointer-events:all;cursor:move;touch-action:none}
+.fx-overlay .fx-mh.rotate{cursor:grab}
+.fx-overlay .fx-mh.centre{fill:#f5d76e}
+.monitor-frame.fx-picking canvas{cursor:crosshair}
+.fx-knot-strip{position:absolute;left:0;right:0;bottom:1px;height:5px;pointer-events:none}
+.fx-knot-strip i{position:absolute;bottom:0;width:6px;height:6px;margin-left:-3px;background:#f5d76e;transform:rotate(45deg);border:1px solid #11160f}

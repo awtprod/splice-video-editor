@@ -1105,3 +1105,316 @@ def prerender_ramp(event, u0, u1, target, directory, cancelled, heartbeat, layou
     return dict(path=Path(target), streams={0: channels}, rates={0: rate}, source=0.0, length=u1-u0, speed=1.0,
                 reverse=False, start=event['start']+u0, processing='anull', envelope=[], pan=None, post='',
                 stateful=False, prerendered=True, track=event.get('track'))
+
+
+# ---------------------------------------------------------------- stabilization (vidstab, two passes)
+# Analyses live in the media store, named by a hash of the source file and its trimmed range: a
+# project names only the 32-hex analysis id, never a path, so nothing a project holds reaches a
+# filtergraph but numbers this module formats itself.
+STABILIZE_VERSION = 'vidstab-1'
+DETECT_OPTIONS = 'shakiness=6:accuracy=15:stepsize=6:mincontrast=0.2'
+_vidstab = None
+
+
+def vidstab_available():
+    global _vidstab
+    if _vidstab is None:
+        import subprocess
+        try:
+            names = subprocess.run(['ffmpeg', '-hide_banner', '-filters'], capture_output=True, text=True, timeout=20).stdout
+        except (OSError, subprocess.SubprocessError):
+            names = ''
+        _vidstab = ' vidstabdetect ' in names and ' vidstabtransform ' in names
+    return _vidstab
+
+
+VIDSTAB_MISSING = ('This FFmpeg was built without libvidstab, so Splice cannot stabilize. '
+                   'Install an FFmpeg built with --enable-libvidstab (most distribution and static builds include it).')
+
+
+def stabilize_store():
+    from premiere import MEDIA_ROOT
+    return MEDIA_ROOT / '.effects' / 'stabilize'
+
+
+def _analysis_dir(analysis):
+    if not isinstance(analysis, str) or not ANALYSIS_ID.match(analysis):
+        raise ValueError('Invalid stabilization analysis')
+    return stabilize_store() / analysis
+
+
+def _probe_frames(path, low, high):
+    """Presentation times (seconds, container clock) of the video frames around low..high."""
+    import subprocess
+    result = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-read_intervals', f'{max(0.0, low-3):.6f}%{high+1:.6f}',
+                             '-show_entries', 'frame=pts_time,best_effort_timestamp_time:stream=start_time', '-of', 'json', str(path)],
+                            capture_output=True, text=True, timeout=600, check=True)
+    import json
+    data = json.loads(result.stdout)
+    times = sorted({float(frame.get('pts_time', frame.get('best_effort_timestamp_time'))) for frame in data.get('frames', [])
+                    if frame.get('pts_time', frame.get('best_effort_timestamp_time')) not in (None, 'N/A')})
+    start = data.get('streams', [{}])[0].get('start_time')
+    return times, float(start) if start not in (None, 'N/A') else 0.0
+
+
+def _settings_key(settings):
+    return f"{int(round(settings['smoothing']))}-{int(round(settings['maxShift']))}-{settings['zoom']:.1f}-{int(settings['autoZoom'])}-{1 if settings.get('tripod') else 0}"
+
+
+def _transform_settings(settings):
+    out = {}
+    for name, (low, high, default) in STABILIZE_PROPS.items():
+        out[name] = _finite((settings or {}).get(name, default), 'stabilization '+name, low, high)
+    tripod = (settings or {}).get('tripod', False)
+    if not isinstance(tripod, bool):
+        raise ValueError('Invalid stabilization tripod')
+    out['tripod'] = tripod
+    return out
+
+
+class Stabilizer:
+    """Background vidstab analyses (server.py): one job per source range, kept on disk."""
+    def __init__(self):
+        import threading
+        self.lock = threading.Lock()
+        self.jobs = {}
+
+    def start(self, src, source_in, source_out):
+        import hashlib, json, threading
+        from premiere import _media_path
+        if not vidstab_available():
+            raise ValueError(VIDSTAB_MISSING)
+        source_in = _finite(source_in, 'stabilization in point', 0, 48*3600)
+        source_out = _finite(source_out, 'stabilization out point', 0, 48*3600)
+        if source_out <= source_in or source_out-source_in > 3*3600:
+            raise ValueError('Stabilize a range of up to three hours')
+        path = _media_path(src)
+        stat = path.stat()
+        analysis = hashlib.sha256(f'{STABILIZE_VERSION}|{path}|{stat.st_size}|{stat.st_mtime_ns}|{source_in:.6f}|{source_out:.6f}'.encode()).hexdigest()[:32]
+        directory = _analysis_dir(analysis)
+        with self.lock:
+            job = self.jobs.get(analysis)
+            if job and job['state'] in ('running', 'done'):
+                return self.status(analysis)
+            if (directory/'analysis.json').exists():
+                return self.status(analysis)
+            job = self.jobs[analysis] = {'state': 'running', 'progress': 0.0, 'analysis': analysis}
+        directory.mkdir(parents=True, exist_ok=True)
+        threading.Thread(target=self._detect, args=(analysis, path, source_in, source_out, directory), daemon=True).start()
+        return self.status(analysis)
+
+    def _detect(self, analysis, path, source_in, source_out, directory):
+        import json, subprocess
+        try:
+            times, start = _probe_frames(path, source_in+0, source_out+0)
+            # Source times are measured from the container start, as the editor's are.
+            low, high = source_in+start, source_out+start
+            inside = [t for t in times if low-1e-6 <= t < high-1e-6]
+            if len(inside) < 2:
+                raise ValueError('The stabilized range holds fewer than two frames')
+            first, last = inside[0], inside[-1]
+            before = [t for t in times if t < first]
+            after = [t for t in times if t > last]
+            # Trim between frames, so the analysis and every transform read exactly these frames.
+            trim_start = (before[-1]+first)/2 if before else first-1e-3
+            trim_end = (last+after[0])/2 if after else last+1e-3
+            meta = {'version': STABILIZE_VERSION, 'path': str(path), 'start': start, 'first': first, 'frames': len(inside),
+                    'trim': [trim_start, trim_end], 'source': [source_in, source_out], 'offset': first-start}
+            trf = directory/'analysis.trf'
+            seek = max(0.0, trim_start-2)
+            command = ['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y', '-progress', 'pipe:1',
+                       '-ss', f'{seek:.6f}', '-copyts', '-protocol_whitelist', 'file', '-i', str(path), '-map', '0:v:0',
+                       '-vf', f"trim=start={trim_start:.9f}:end={trim_end:.9f},vidstabdetect=result={_vidstab_path(trf)}:{DETECT_OPTIONS}",
+                       '-f', 'null', '-']
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            span = max(1e-6, trim_end-trim_start)
+            for line in process.stdout:
+                if line.startswith('out_time_us='):
+                    try:
+                        done = int(line.split('=', 1)[1])/1e6
+                    except ValueError:
+                        continue
+                    with self.lock:
+                        self.jobs[analysis]['progress'] = min(0.99, max(0.0, (done-(trim_start-seek))/span))
+            errors = process.stderr.read()
+            if process.wait() != 0 or not trf.exists():
+                raise RuntimeError('Motion analysis failed: '+errors.strip()[-400:])
+            meta['shake'] = {'before': shake_metric(path, trim_start, trim_end, seek)}
+            (directory/'analysis.json').write_text(json.dumps(meta))
+            with self.lock:
+                self.jobs[analysis] = {'state': 'done', 'analysis': analysis}
+        except Exception as error:   # reported to the editor, which shows it on the clip
+            with self.lock:
+                self.jobs[analysis] = {'state': 'failed', 'analysis': analysis, 'error': str(error)}
+
+    def status(self, analysis):
+        import json
+        directory = _analysis_dir(analysis)
+        with self.lock:
+            job = dict(self.jobs.get(analysis) or {})
+        if job.get('state') in ('running', 'failed'):
+            return job
+        meta_file = directory/'analysis.json'
+        if not meta_file.exists():
+            if job:
+                return job
+            raise KeyError('Unknown stabilization analysis: analyze the clip again')
+        meta = json.loads(meta_file.read_text())
+        return {'state': 'done', 'analysis': analysis, 'frames': meta['frames'], 'source': meta['source'],
+                'shake': meta.get('shake'), 'offset': meta['offset']}
+
+    def preview(self, analysis, settings):
+        """A monitor proxy of the stabilized range (the same analysis and transform as the export)."""
+        from premiere import MEDIA_ROOT
+        settings = _transform_settings(settings)
+        meta = analysis_meta(analysis)
+        target = _analysis_dir(analysis)/f'preview-{_settings_key(settings)}.mp4'
+        if not target.exists():
+            render_stabilized(analysis, settings, target, preview=True)
+        return {'src': '/media/'+str(target.relative_to(MEDIA_ROOT)), 'offset': meta['offset']}
+
+
+def _vidstab_path(path):
+    from render_movie import _filter_path
+    return _filter_path(path)
+
+
+def analysis_meta(analysis):
+    import json
+    meta_file = _analysis_dir(analysis)/'analysis.json'
+    if not meta_file.exists():
+        raise ValueError('This clip\'s stabilization analysis is missing: analyze the clip again')
+    meta = json.loads(meta_file.read_text())
+    if meta.get('version') != STABILIZE_VERSION:
+        raise ValueError('This clip\'s stabilization analysis is outdated: analyze the clip again')
+    return meta
+
+
+def render_stabilized(analysis, settings, target, *, preview=False, cancelled=None, heartbeat=None):
+    """Apply the analysis to exactly the analyzed frames. The export reads a lossless FFV1 file
+    whose time 0 is the first analyzed frame; the monitor reads an H.264 proxy (with the sound)."""
+    import os, subprocess
+    from pathlib import Path
+    from render_movie import _run_ffmpeg
+    if not vidstab_available():
+        raise ValueError(VIDSTAB_MISSING)
+    meta = analysis_meta(analysis)
+    directory = _analysis_dir(analysis)
+    trf = directory/'analysis.trf'
+    trim_start, trim_end = meta['trim']
+    seek = max(0.0, trim_start-2)
+    picture = (f"trim=start={trim_start:.9f}:end={trim_end:.9f},{stabilize_transform_args(settings, trf)},setpts=PTS-STARTPTS")
+    partial = Path(str(target)+'.part'+Path(target).suffix)
+    if preview:
+        picture += ",scale='min(1280,iw)':-2:flags=bicubic,format=yuv420p"
+        sound = ['-map', '0:a:0?', '-af', f'atrim=start={trim_start:.9f}:end={trim_end:.9f},asetpts=PTS-STARTPTS', '-c:a', 'aac', '-b:a', '160k']
+        codec = ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '16', '-g', '12', '-movflags', '+faststart']
+    else:
+        sound = ['-an']
+        codec = ['-c:v', 'ffv1', '-level', '3', '-g', '1', '-slicecrc', '0']
+    command = ['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y', '-ss', f'{seek:.6f}', '-copyts',
+               '-protocol_whitelist', 'file', '-i', meta['path'], '-map', '0:v:0', '-vf', picture, *codec, *sound,
+               '-map_metadata', '-1', '-avoid_negative_ts', 'make_zero', str(partial)]
+    _run_ffmpeg(command, cancelled, heartbeat)
+    os.replace(partial, target)
+    return target
+
+
+def stabilized_media(analysis, settings, cancelled=None, heartbeat=None):
+    """The export's stabilized picture for an analysis (rendered once per setting, then kept)."""
+    settings = _transform_settings(settings)
+    target = _analysis_dir(analysis)/f'export-{_settings_key(settings)}.mkv'
+    if not target.exists():
+        render_stabilized(analysis, settings, target, cancelled=cancelled, heartbeat=heartbeat)
+    return target, analysis_meta(analysis)
+
+
+def shake_metric(path, start, end, seek=0.0, width=160):
+    """Mean frame-to-frame global motion (pixels at ``width``): a block search on grey frames."""
+    import array, subprocess
+    height = None
+    raw = subprocess.run(['ffmpeg', '-nostdin', '-v', 'error', '-ss', f'{seek:.6f}', '-copyts', '-i', str(path), '-map', '0:v:0',
+                          '-vf', f'trim=start={start:.9f}:end={end:.9f},scale={width}:-2,format=gray', '-f', 'rawvideo', '-'],
+                         capture_output=True, timeout=1800, check=True).stdout
+    probe = subprocess.run(['ffmpeg', '-nostdin', '-v', 'error', '-ss', f'{seek:.6f}', '-copyts', '-i', str(path), '-map', '0:v:0', '-frames:v', '1',
+                            '-vf', f'trim=start={start:.9f},scale={width}:-2,format=gray', '-f', 'rawvideo', '-'],
+                           capture_output=True, timeout=600, check=True).stdout
+    height = len(probe)//width
+    if not height:
+        return 0.0
+    frames = [raw[i:i+width*height] for i in range(0, len(raw)-width*height+1, width*height)]
+    return mean_motion(frames, width, height)
+
+
+def mean_motion(frames, width, height, radius=8, step=3):
+    """Average |dx|+|dy| of the best integer shift between consecutive frames (sum of absolute
+    differences over a centre window, every ``step`` pixels)."""
+    if len(frames) < 2:
+        return 0.0
+    margin = radius+2
+    xs = range(margin, width-margin, step)
+    ys = range(margin, height-margin, step)
+    total = 0.0
+    for a, b in zip(frames, frames[1:]):
+        best, best_cost = (0, 0), None
+        for dy in range(-radius, radius+1):
+            for dx in range(-radius, radius+1):
+                cost = 0
+                for y in ys:
+                    row_a, row_b = y*width, (y+dy)*width+dx
+                    for x in xs:
+                        cost += abs(a[row_a+x]-b[row_b+x])
+                if best_cost is None or cost < best_cost:
+                    best, best_cost = (dx, dy), cost
+        total += abs(best[0])+abs(best[1])
+    return total/(len(frames)-1)
+
+
+def apply_stabilization(project, cancelled=None, heartbeat=None):
+    """Point every stabilized video clip's picture at its stabilized intermediate (a new media
+    item whose time 0 is the first analyzed frame); its sound stays on the original media as a
+    separate clip. Returns the project (a copy when anything changed)."""
+    import copy
+    clips = project.get('clips')
+    if not isinstance(clips, list) or not any(isinstance(clip, dict) and clip.get('type') == 'video' and clip.get('effects') for clip in clips):
+        return project
+    prepared = None
+    for index, clip in enumerate(clips):
+        if not isinstance(clip, dict) or clip.get('type') != 'video' or clip.get('enabled') is False or clip.get('disabled'):
+            continue
+        live = effects_for(clip)
+        stabilize = live and live.get('stabilize')
+        if not stabilize:
+            continue
+        if prepared is None:
+            prepared = copy.deepcopy(project)
+            media_by_id = {item.get('id'): item for item in prepared.get('media') or [] if isinstance(item, dict)}
+        target = prepared['clips'][index]
+        item = media_by_id.get(target.get('mediaId'))
+        if item is None or item.get('nestedProject') or item.get('multicam') or item.get('nativeGenerator') is not None:
+            raise ValueError('Stabilize the clips inside a nested or multicam clip, or a video clip')
+        path, meta = stabilized_media(stabilize['analysis'], stabilize, cancelled, heartbeat)
+        source_in = float(target.get('in', 0) or 0)
+        span = source_delta(target, 0, float(target['duration']))
+        low, high = meta['source']
+        if source_in < low-0.02 or source_in+span > high+0.05:
+            raise ValueError('A stabilized clip was trimmed past its analyzed range: analyze it again')
+        from premiere import MEDIA_ROOT
+        media_id = f"stabilized-{stabilize['analysis']}-{_settings_key(stabilize)}"
+        if media_id not in media_by_id:
+            stabilized = {key: value for key, value in item.items() if key not in ('audioStreams', 'audioStream', 'audioChannels')}
+            stabilized.update(id=media_id, name=(item.get('name') or 'Clip')+' (stabilized)', src='/media/'+str(path.relative_to(MEDIA_ROOT)),
+                              duration=meta['trim'][1]-meta['trim'][0], audioChannels=0)
+            prepared['media'].append(stabilized)
+            media_by_id[media_id] = stabilized
+        if target.get('embeddedAudio') is not False:
+            sound = {**copy.deepcopy(target), 'id': f"{target.get('id', 'clip')}#sound", 'type': 'audio'}
+            sound.pop('effects', None)
+            sound['effects'] = {'speedAudio': (target.get('effects') or {}).get('speedAudio', 'pitch')}
+            sound['_optionalAudio'] = True
+            prepared['clips'].append(sound)
+            target['embeddedAudio'] = False
+        target['mediaId'] = media_id
+        target['in'] = source_in-meta['offset']
+        target['effects'] = {key: value for key, value in (target.get('effects') or {}).items() if key != 'stabilize'}
+    return prepared or project
