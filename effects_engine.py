@@ -30,6 +30,8 @@ import array
 import math
 import re
 
+import splice_platform
+
 # ---------------------------------------------------------------- keyframe curves
 INTERPOLATIONS = ('linear', 'hold', 'easeIn', 'easeOut', 'easeInOut', 'bezier')
 PRESET_HANDLES = {'easeIn': (0.42, 0.0, 1.0, 1.0), 'easeOut': (0.0, 0.0, 0.58, 1.0), 'easeInOut': (0.42, 0.0, 0.58, 1.0)}
@@ -1314,7 +1316,7 @@ def vidstab_available():
     if _vidstab is None:
         import subprocess
         try:
-            names = subprocess.run(['ffmpeg', '-hide_banner', '-filters'], capture_output=True, text=True, timeout=20).stdout
+            names = splice_platform.run(['ffmpeg', '-hide_banner', '-filters'], capture_output=True, text=True, timeout=20).stdout
         except (OSError, subprocess.SubprocessError):
             names = ''
         _vidstab = ' vidstabdetect ' in names and ' vidstabtransform ' in names
@@ -1341,8 +1343,8 @@ def _probe_frames(path, low, high):
     and the container start time. Source times count from the container start, as the export
     counts them (render_movie._probe, _input_time_shift) and as FFmpeg's input -ss does: on an
     MPEG-TS file whose sound starts first, the picture starts a little after source time 0."""
-    import json, subprocess
-    probe = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'format=start_time', '-of', 'json', str(path)],
+    import json
+    probe = splice_platform.run(['ffprobe', '-v', 'error', '-show_entries', 'format=start_time', '-of', 'json', str(path)],
                            capture_output=True, text=True, timeout=60, check=True)
     start = json.loads(probe.stdout).get('format', {}).get('start_time')
     try:
@@ -1352,7 +1354,7 @@ def _probe_frames(path, low, high):
     if not math.isfinite(start):
         start = 0.0
     # -read_intervals takes file timestamps, not source times.
-    result = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+    result = splice_platform.run(['ffprobe', '-v', 'error', '-select_streams', 'v:0',
                              '-read_intervals', f'{max(0.0, start+low-3):.6f}%{start+high+1:.6f}',
                              '-show_entries', 'frame=pts_time,best_effort_timestamp_time', '-of', 'json', str(path)],
                             capture_output=True, text=True, timeout=600, check=True)
@@ -1454,7 +1456,7 @@ class Stabilizer:
         with self.lock:
             if job['_cancel'].is_set():
                 raise InterruptedError('cancelled')
-            process = job['_process'] = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            process = job['_process'] = splice_platform.popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                                          stderr=subprocess.PIPE, text=True)
         errors = []
         import threading
@@ -1688,12 +1690,12 @@ def stabilized_media(analysis, settings, cancelled=None, heartbeat=None, scratch
 
 def shake_metric(path, start, end, seek=0.0, width=160):
     """Mean frame-to-frame global motion (pixels at ``width``): a block search on grey frames."""
-    import array, subprocess
+    import array
     height = None
-    raw = subprocess.run(['ffmpeg', '-nostdin', '-v', 'error', '-ss', f'{seek:.6f}', '-copyts', '-i', str(path), '-map', '0:v:0',
+    raw = splice_platform.run(['ffmpeg', '-nostdin', '-v', 'error', '-ss', f'{seek:.6f}', '-copyts', '-i', str(path), '-map', '0:v:0',
                           '-vf', f'trim=start={start:.9f}:end={end:.9f},scale={width}:-2,format=gray', '-f', 'rawvideo', '-'],
                          capture_output=True, timeout=1800, check=True).stdout
-    probe = subprocess.run(['ffmpeg', '-nostdin', '-v', 'error', '-ss', f'{seek:.6f}', '-copyts', '-i', str(path), '-map', '0:v:0', '-frames:v', '1',
+    probe = splice_platform.run(['ffmpeg', '-nostdin', '-v', 'error', '-ss', f'{seek:.6f}', '-copyts', '-i', str(path), '-map', '0:v:0', '-frames:v', '1',
                             '-vf', f'trim=start={start:.9f},scale={width}:-2,format=gray', '-f', 'rawvideo', '-'],
                            capture_output=True, timeout=600, check=True).stdout
     height = len(probe)//width

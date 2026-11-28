@@ -1,0 +1,73 @@
+Splice for Windows (x64) - bundled third-party software
+=======================================================
+
+The installer contains three unmodified upstream distributions. Splice runs
+Python and FFmpeg as separate programs; it does not link to them. The
+versions and SHA-256 checksums below are the ones desktop/windows/build.py
+pins and verifies.
+
+
+FFmpeg 9.1 (resources\ffmpeg)
+-----------------------------
+Build:    gyan.dev "full_build-shared" 9.1, 64-bit (ffmpeg.exe, ffprobe.exe
+          and the FFmpeg DLLs; ffplay is not included)
+Archive:  https://github.com/GyanD/codexffmpeg/releases/download/9.1/ffmpeg-9.1-full_build-shared.zip
+SHA-256:  d010a19b78d5eae62dca8d4c7f195acd56dae8ed6fb85f72821edd9437da2898
+License:  GNU General Public License, version 3 (LICENSE.txt in that folder).
+
+This FFmpeg is built with --enable-gpl --enable-version3 and links GPL
+libraries (among them x264, x265, librubberband and vid.stab), so the
+FFmpeg files are distributed under the GPL v3 as a whole. It is not built
+with --enable-nonfree. BUILD-CONFIGURATION.txt lists the configuration and
+every library with its version; ffmpeg.exe -buildconf prints the same.
+
+Corresponding source:
+  FFmpeg:    https://github.com/FFmpeg/FFmpeg/commit/74e4393595
+  Libraries: the revisions listed in BUILD-CONFIGURATION.txt, as built by
+             https://www.gyan.dev/ffmpeg/builds/
+This installer does not include those sources. As the distributor of these
+GPL binaries, the Splice project will provide the complete corresponding
+source for the FFmpeg files in this installer on request, for at least three
+years after this version was last distributed; ask through the project's
+issue tracker.
+
+`python desktop/windows/build.py OUT --source-archive` collects that source
+as far as it is published: the FFmpeg 9.1 release tarball (signed by FFmpeg;
+the n9.1 tag is commit 74e4393595) and OUT/source/SOURCES.txt, which lists
+every library in this build with the version gyan.dev reports.
+Known gap: gyan.dev publishes no source archives for those libraries and no
+build scripts, only their versions, so the library sources are not collected
+and would have to be fetched from each project at the listed revision.
+
+Libraries Splice depends on in this build, with the versions gyan.dev reports:
+  x264 0.165.3223 (GPL-2.0+)          x265 4.3 (GPL-2.0+)
+  SVT-AV1 4.3.0 (BSD-3-Clause-Clear)  zimg 3.0.6 (WTFPL)
+  vid.stab 1.1.0 (GPL-2.0+)           Rubber Band 4.0.0 (GPL-2.0+)
+  FreeType 2.15.0 (FTL/GPL-2.0)       HarfBuzz 15.1.0 (MIT)
+  FriBidi 1.0.18 (LGPL-2.1+)          libass 0.17.5 (ISC)
+  dav1d 1.5.4 (BSD-2-Clause)          Opus 1.6.1 (BSD-3-Clause)
+
+
+Python 3.14.10 (resources\python)
+--------------------------------
+Build:    python.org Windows embeddable package, x64
+Archive:  https://www.python.org/ftp/python/3.14.10/python-3.14.10-embed-amd64.zip
+SHA-256:  90905e64a840557d8c1bc4f5b74db3d7ee85e3ffb217611cac1c7813acea4159
+License:  Python Software Foundation License Version 2 (LICENSE.txt in that
+          folder, with the notices Python ships for the libraries it
+          bundles).
+
+
+Electron 45.5.0 (Splice.exe and the files beside it)
+---------------------------------------------------
+Build:    electron-v45.5.0-win32-x64
+Archive:  https://github.com/electron/electron/releases/download/v45.5.0/electron-v45.5.0-win32-x64.zip
+SHA-256:  20155c8b8aa5b1f575f3757bdf21490e0bac2f19a65a26ce9ba99bcf9f2c69bd
+License:  MIT (LICENSE). Chromium and its dependencies: LICENSES.chromium.html.
+Electron.exe is renamed Splice.exe; the default app is removed.
+
+
+Fonts bundled with the editor (resources\splice\assets\fonts)
+-------------------------------------------------------------
+DM Sans and IBM Plex Mono, SIL Open Font License 1.1 (license files beside
+the fonts). py-premiere: see resources\splice\vendor\py-premiere-LICENSE.

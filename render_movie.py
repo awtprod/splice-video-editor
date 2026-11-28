@@ -16,6 +16,7 @@ from pathlib import Path
 
 from premiere import MEDIA_ROOT, STILL_IMAGES, _media_path
 from media_proxy import AVC_REC709, HDR_LINEAR_REC709, HDR_TONE_MAP, HDR_TRANSFERS, REC709, tempo_filters
+import splice_platform
 from splice_platform import data_directory, font_roots, installed_font
 import audio_dsp
 import audio_loudness
@@ -296,8 +297,8 @@ def _graph_file_option(directory):
         try:
             for option in ('-/filter_complex', '-filter_complex_script'):
                 try:
-                    result = subprocess.run(['ffmpeg', '-nostdin', '-v', 'error', option, str(script), '-map', '[a]', '-f', 'null', '-'],
-                                            capture_output=True, timeout=30)
+                    result = splice_platform.run(['ffmpeg', '-nostdin', '-v', 'error', option, str(script), '-map', '[a]', '-f', 'null', '-'],
+                                                 capture_output=True, timeout=30)
                 except subprocess.TimeoutExpired:
                     continue
                 if result.returncode == 0:
@@ -322,7 +323,7 @@ def _stop_tree(process, force=True):
     if os.name == 'nt':
         taskkill = Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32' / 'taskkill.exe'
         try:
-            subprocess.run([str(taskkill), '/PID', str(process.pid), '/T', '/F'], capture_output=True, timeout=4)
+            splice_platform.run([str(taskkill), '/PID', str(process.pid), '/T', '/F'], capture_output=True, timeout=4)
         except (OSError, subprocess.SubprocessError):
             pass
     if process.poll() is None:
@@ -335,7 +336,7 @@ def _run_ffmpeg(command, cancelled=None, heartbeat=None):
         raise ValueError('Internal error: not an FFmpeg command')
     stall = _stall_seconds()
     command = [command[0], '-progress', 'pipe:1', '-stats_period', '1', *command[1:]]
-    process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    process = splice_platform.popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     state = {'progress': time.monotonic(), 'last': None}
     lock = threading.Lock()
     errors = collections.deque(maxlen=200)
@@ -403,10 +404,10 @@ def _run_ffmpeg(command, cancelled=None, heartbeat=None):
 
 def _probe(path):
     from media_proxy import MAX_AUDIO_STREAMS
-    result = subprocess.run(['ffprobe', '-v', 'error', '-protocol_whitelist', 'file', '-show_entries',
-                            'stream=codec_type,channels,sample_rate,width,height,color_primaries,color_transfer,color_space,color_range,time_base,start_time'
-                            ':format=duration,start_time,format_name', '-of', 'json', str(path)],
-                            capture_output=True, text=True, timeout=30, check=True)
+    result = splice_platform.run(['ffprobe', '-v', 'error', '-protocol_whitelist', 'file', '-show_entries',
+                                 'stream=codec_type,channels,sample_rate,width,height,color_primaries,color_transfer,color_space,color_range,time_base,start_time'
+                                 ':format=duration,start_time,format_name', '-of', 'json', str(path)],
+                                 capture_output=True, text=True, timeout=30, check=True)
     data = json.loads(result.stdout)
     streams = data.get('streams', [])
     if not isinstance(streams, list) or any(not isinstance(stream, dict) for stream in streams):
@@ -474,7 +475,7 @@ def _font_path(family):
     resolved_family, resolved = 'DM Sans', Path(__file__).resolve().parent/'assets'/'fonts'/'dm-sans.ttf'
     fontconfig = which('fc-match')
     if fontconfig:
-        match=subprocess.run([fontconfig,'-f','%{family}|%{file}',family],capture_output=True,text=True,timeout=5,check=True).stdout
+        match=splice_platform.run([fontconfig,'-f','%{family}|%{file}',family],capture_output=True,text=True,timeout=5,check=True).stdout
         name,separator,path=match.partition('|')
         if separator:
             path=Path(path).resolve()
@@ -1147,8 +1148,9 @@ def _hdr_graphic_color(color, primaries, transfer):
     if not hlg:
         swatch += f',zscale=t={transfer}:m=gbr:r=full:npl=203,format=gbrp'
     pixel_format = 'gbrpf32le' if hlg else 'rgb24'
-    result = subprocess.check_output(['ffmpeg','-nostdin','-v','error','-f','lavfi','-i',swatch,
-                                      '-frames:v','1','-pix_fmt',pixel_format,'-f','rawvideo','pipe:1'],timeout=5)
+    result = splice_platform.check_output(['ffmpeg','-nostdin','-v','error','-f','lavfi','-i',swatch,
+                                      '-frames:v','1','-pix_fmt',pixel_format,'-f','rawvideo','pipe:1'],
+                                          timeout=5)
     if len(result) != (48 if hlg else 12):
         raise ValueError('Could not convert the HDR title color')
     if hlg:
@@ -3754,7 +3756,7 @@ class _Window:
         self.read_error = None
         self.errors = collections.deque(maxlen=100)
         self.cond = threading.Condition()
-        self.process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.process = splice_platform.popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.threads = [threading.Thread(target=self._read, daemon=True), threading.Thread(target=self._errors, daemon=True)]
         for thread in self.threads:
             thread.start()
@@ -3917,8 +3919,8 @@ def _pump_windows(project, picture, first, stop, total_frames, fps, width, heigh
     cap = max(PIPE_CHUNK, min(READ_AHEAD_BYTES, int(_memory_available() * .25)) // workers)
     activity = [time.monotonic()]
     errors = collections.deque(maxlen=200)
-    encoder = subprocess.Popen(['ffmpeg', '-progress', 'pipe:1', '-stats_period', '1', *command[1:]],
-                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    encoder = splice_platform.popen(['ffmpeg', '-progress', 'pipe:1', '-stats_period', '1', *command[1:]],
+                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     state = dict(error=None, done=False, window=None, stop=False)
     windows = collections.deque()
     plans = _picture_windows(project, picture, first, stop, total_frames, fps, width, height, spec, options, burn)
@@ -4091,7 +4093,7 @@ def light_level_filter_args(profile, target):
 @lru_cache(maxsize=1)
 def _has_zscale():
     try:
-        result = subprocess.run(['ffmpeg', '-hide_banner', '-filters'], capture_output=True, text=True, timeout=30)
+        result = splice_platform.run(['ffmpeg', '-hide_banner', '-filters'], capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.SubprocessError):
         return False
     return any(line.split()[1:2] == ['zscale'] for line in result.stdout.splitlines() if line.strip())
@@ -4132,9 +4134,9 @@ def _source_light_levels(project, measured):
     if len(sources) == 1:
         path = next(iter(sources))
         try:
-            result = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-read_intervals', '%+#1',
+            result = splice_platform.run(['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-read_intervals', '%+#1',
                                      '-show_frames', '-of', 'json', str(path)],
-                                    capture_output=True, text=True, timeout=30, check=True)
+                                         capture_output=True, text=True, timeout=30, check=True)
             for frame in json.loads(result.stdout).get('frames', []):
                 for side in frame.get('side_data_list', []):
                     if side.get('side_data_type') == 'Content light level metadata':
@@ -4204,7 +4206,7 @@ def _media_timecode(item, fps):
     if not path:
         return None
     try:
-        result = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'format_tags=timecode:stream_tags=timecode:stream=r_frame_rate,codec_type',
+        result = splice_platform.run(['ffprobe', '-v', 'error', '-show_entries', 'format_tags=timecode:stream_tags=timecode:stream=r_frame_rate,codec_type',
                                  '-of', 'json', str(path)], capture_output=True, text=True, timeout=30, check=True)
         data = json.loads(result.stdout)
         labels = [data.get('format', {}).get('tags', {}).get('timecode')] + [s.get('tags', {}).get('timecode') for s in data.get('streams', [])]

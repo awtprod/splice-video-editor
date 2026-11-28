@@ -20,6 +20,8 @@ from fractions import Fraction
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from urllib.parse import quote, unquote, urlsplit
 
+import splice_platform
+
 from .timecode import is_drop_frame, parse_rate, snap_rate, timecode_frames
 
 PROBE_TIMEOUT = 20
@@ -228,9 +230,9 @@ def probe_file(path: Path, timeout: float = PROBE_TIMEOUT) -> Probe:
             reel=info.get('reel') or None,
         )
     try:
-        result = subprocess.run(['ffprobe', '-v', 'error', '-protocol_whitelist', 'file',
-                                 '-show_streams', '-show_format', '-of', 'json', 'file:' + str(path)],
-                                capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        result = splice_platform.run(['ffprobe', '-v', 'error', '-protocol_whitelist', 'file',
+                                      '-show_streams', '-show_format', '-of', 'json', 'file:' + str(path)],
+                                     capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
     except (subprocess.TimeoutExpired, OSError) as error:
         raise ValueError(f'Could not probe {path.name}: {error}') from None
     if result.returncode:
