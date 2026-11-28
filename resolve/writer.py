@@ -63,7 +63,7 @@ CLIP_FIELDS = {
     'audioFx': 'reported', 'audioTransition': 'reported', 'channelMap': 'reported',
     'markers': 'reported', 'embeddedAudio': 'reported', 'audioStream': 'reported',
     'nestedSequence': 'reported', 'multicamAngle': 'reported', 'multicamAudioAngle': 'reported',
-    'colorLabel': 'reported',
+    'colorLabel': 'reported', 'effects': 'reported',
     'nativeTimeRemap': 'reported', 'nativeUnsupported': 'written', 'resolveItemId': 'meta',
     'resolveFrames': 'meta', 'resolveFlags': 'meta', 'resolveTransitionId': 'meta', 'premiereTrack': 'meta',
     'premiereIndex': 'meta', 'premiereId': 'meta', 'nativeId': 'meta', 'locked': 'meta', 'selected': 'meta'}
@@ -71,7 +71,7 @@ CLIP_FIELDS = {
 COLOR_FIELDS = {'brightness': 100, 'contrast': 100, 'saturation': 100, 'exposure': 0, 'temperature': 0, 'tint': 0,
                 'lut': None, 'lutName': None, 'lutIntensity': 100, 'grade': None}
 TRANSFORM_FIELDS = {'x': 0, 'y': 0, 'scale': 100, 'rotation': 0}
-KEYFRAME_FIELDS = ('opacity', 'x', 'y', 'scale', 'rotation', 'volume',
+KEYFRAME_FIELDS = ('opacity', 'x', 'y', 'scale', 'rotation', 'volume', 'speed',
                    'exposure', 'temperature', 'tint', 'brightness', 'contrast', 'saturation')
 TRACK_STATE_FIELDS = {'locked': 'written', 'hidden': 'written', 'syncLocked': 'reported'}
 TRACK_MIX_FIELDS = {'mute': 'written', 'gain': 'reported', 'pan': 'reported', 'solo': 'reported', 'outputStages': 'reported',
@@ -92,7 +92,7 @@ MEDIA_FIELDS = {
 _DEFAULTS = {'speed': 1, 'reverse': False, 'opacity': 100, 'fadeIn': 0, 'fadeOut': 0, 'pan': 0, 'title': '',
              'markers': [], 'keyframes': {}, 'color': {}, 'audioStream': 0, 'nativeTimeRemap': None,
              'titleStyle': None, 'text': None, 'embeddedAudio': None, 'colorLabel': '',
-             'nestedSequence': None, 'multicamAngle': None, 'multicamAudioAngle': None}
+             'nestedSequence': None, 'multicamAngle': None, 'multicamAudioAngle': None, 'effects': None}
 
 
 def _same(a, b):
@@ -105,6 +105,16 @@ def _same(a, b):
     if isinstance(a, list) and isinstance(b, list):
         return len(a) == len(b) and all(_same(x, y) for x, y in zip(a, b))
     return a == b
+
+
+EFFECT_LINES = {
+    'crop': 'Crop (Resolve sizing crops are not written)',
+    'masks': 'Masks (Resolve power windows are not written)',
+    'chroma key': 'Chroma keys (the Resolve keyer is not written)',
+    'blend': 'Blend modes (Resolve composite modes are not written)',
+    'stabilization': 'Stabilization (Resolve stabilizes from its own analysis: stabilize the clip there)',
+    'speed ramp': 'Speed ramps (time remapping)',
+}
 
 
 class WriteError(ResolveError):
@@ -891,6 +901,19 @@ class Writer:
             report.add(NOT_WRITTEN, 'Speed changes of retimed Resolve clips (the clip keeps Resolve\'s speed)', where)
         if changed('nativeTimeRemap'):
             report.add(NOT_WRITTEN, 'Speed ramps (time remapping)', where)
+        speed_keys = (clip.get('keyframes') or {}).get('speed') if isinstance(clip.get('keyframes'), dict) else None
+        if speed_keys and not _same(speed_keys, (was('keyframes') or {}).get('speed')):
+            report.add(NOT_WRITTEN, 'Speed ramps (time remapping)', f'{where} (Splice speed keyframes)')
+        # Clip effects (effects_engine): Resolve's crop, power windows, keyer, composite modes and
+        # stabilizer are not written. Bypassed or switched-off effects are still the editor's: reported too.
+        if changed('effects'):
+            from effects_engine import describe
+            effects = clip.get('effects') if isinstance(clip.get('effects'), dict) else {}
+            for name in describe(effects):
+                label = name.replace(' (bypassed)', '')
+                line = EFFECT_LINES.get(label.split(' blend mode')[0] if label.endswith('blend mode') else label,
+                                        EFFECT_LINES['blend'] if label.endswith('blend mode') else 'Splice clip effects')
+                report.add(NOT_WRITTEN, line, f'{where} ({name})')
         keyframes = clip.get('keyframes') if isinstance(clip.get('keyframes'), dict) else {}
         animated = sorted(k for k, v in keyframes.items() if v and not _same(v, (was('keyframes') or {}).get(k)))
         if animated:

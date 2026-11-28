@@ -107,53 +107,98 @@
     const cx = value => clamp(value, 0, 1), cy = value => clamp(value, ...HANDLE_Y);
     return [[cx(left[0]), cy(left[1]), cx(left[2]), cy(left[3])], [cx(right[0]), cy(right[1]), cx(right[2]), cy(right[3])], ym];
   }
+  // Absolute control points of a segment, de Casteljau in 2D, and the keys that draw them: a piece
+  // whose handles cannot be written in the segment's unit square (a curve that overshoots its
+  // ends) is split again at its value extremum, so a cut never bends a curve.
+  function controlPoints(a, b, kind) {
+    const [, x1, y1, x2, y2] = kind[0] === 'smooth' ? ['bezier', 1/3, 0, 2/3, 1] : kind;
+    const dt = b.time-a.time, dv = b.value-a.value;
+    return [[a.time, a.value], [a.time+x1*dt, a.value+y1*dv], [a.time+x2*dt, a.value+y2*dv], [b.time, b.value]];
+  }
+  function casteljau(P, s) {
+    const lerp = (p, q) => [p[0]+(q[0]-p[0])*s, p[1]+(q[1]-p[1])*s];
+    const a = lerp(P[0], P[1]), b = lerp(P[1], P[2]), c = lerp(P[2], P[3]), d = lerp(a, b), e = lerp(b, c), m = lerp(d, e);
+    return [[P[0], a, d, m], [m, e, c, P[3]]];
+  }
+  function curveParam(P, time) {
+    const dt = P[3][0]-P[0][0];
+    if (dt <= 0) return 0;
+    const x1 = (P[1][0]-P[0][0])/dt, x2 = (P[2][0]-P[0][0])/dt;
+    return bezierSolve(x1, x2, (time-P[0][0])/dt);
+  }
+  function handlesOf(P) {
+    const dt = P[3][0]-P[0][0], dv = P[3][1]-P[0][1], spread = Math.max(...P.map(p => Math.abs(p[1]-P[0][1])));
+    const x1 = clamp((P[1][0]-P[0][0])/dt, 0, 1), x2 = clamp((P[2][0]-P[0][0])/dt, 0, 1);
+    if (Math.abs(dv) <= 1e-12) return spread <= 1e-9 ? [x1, 1/3, x2, 2/3] : null;
+    const y1 = (P[1][1]-P[0][1])/dv, y2 = (P[2][1]-P[0][1])/dv;
+    return y1 >= HANDLE_Y[0] && y1 <= HANDLE_Y[1] && y2 >= HANDLE_Y[0] && y2 <= HANDLE_Y[1] ? [x1, y1, x2, y2] : null;
+  }
+  function valueExtremum(P) {
+    // y(s) = y0 + ((A s + B) s + C) s: the first root of its derivative inside (0, 1), else the middle.
+    const p1 = P[1][1]-P[0][1], p2 = P[2][1]-P[0][1], p3 = P[3][1]-P[0][1];
+    const A = p3-3*p2+3*p1, B = 3*p2-6*p1, C = 3*p1;
+    let roots = [];
+    if (Math.abs(A) < 1e-12) { if (Math.abs(B) > 1e-12) roots = [-C/(2*B)]; }
+    else { const disc = 4*B*B-12*A*C; if (disc >= 0) roots = [(-2*B-Math.sqrt(disc))/(6*A), (-2*B+Math.sqrt(disc))/(6*A)]; }
+    return roots.filter(r => r > 1e-6 && r < 1-1e-6).sort((x, y) => x-y)[0] ?? .5;
+  }
+  function pieces(P, depth = 0) {
+    const handles = handlesOf(P);
+    if (handles || depth >= 4) return [{P, handles:handles || [1/3, 1/3, 2/3, 2/3]}];
+    const [left, right] = casteljau(P, valueExtremum(P));
+    return [...pieces(left, depth+1), ...pieces(right, depth+1)];
+  }
   // The keys that shape from..to, re-based to start at 0. A segment cut by the window keeps its
-  // exact shape: eased segments become bezier segments with the halves' handles (de Casteljau).
+  // exact shape: eased segments become bezier segments with the halves' handles.
   function windowPoints(points, from, to) {
     const ordered = orderedPoints(points);
     if (!ordered.length) return [];
     const plain = point => { const out = {...point}; for (const key of ['interp', 'ease', 'inHandle', 'outHandle']) if (out[key] == null) delete out[key]; return out; };
-    const asBezier = kind => kind[0] === 'smooth' ? ['bezier', 1/3, 0, 2/3, 1] : kind;
-    const locate = time => {
-      if (time <= ordered[0].time || time >= ordered[ordered.length-1].time) return null;
-      const i = ordered.findIndex(p => p.time >= time);
-      if (ordered[i].time === time) return null;
-      return {i, a:ordered[i-1], b:ordered[i], u:(time-ordered[i-1].time)/(ordered[i].time-ordered[i-1].time)};
+    const out = [];
+    const push = point => {
+      const last = out[out.length-1];
+      if (last && Math.abs(last.time-point.time) < 1e-9) { Object.assign(last, {...point, inHandle:last.inHandle ?? point.inHandle}); return; }
+      out.push(point);
     };
-    const head = locate(from), tail = locate(to);
-    const out = [{time:0, value:curveValue(ordered, from, 0)}];
-    const inside = ordered.filter(p => p.time > from+1e-9 && p.time < to-1e-9).map(p => plain({...p, time:p.time-from}));
-    const end = {time:to-from, value:curveValue(ordered, to, 0)};
-    // The key that leads the first kept segment is the new head; it takes the cut segment's interpolation.
-    const lead = out[0];
-    if (head) {
-      const kind = segmentKind(head.a, head.b);
-      if (kind[0] === 'hold') lead.interp = 'hold';
-      else if (kind[0] !== 'linear') {
-        const [, right] = splitSegment(asBezier(kind), head.u);
-        lead.interp = 'bezier'; lead.outHandle = [right[0], right[1]];
-        const next = inside[0] || end;
-        if (!(tail && tail.i === head.i)) next.inHandle = [right[2], right[3]];
-        lead._right = right;
+    const curved = kind => kind[0] === 'bezier' || kind[0] === 'smooth';
+    // Before the first key and after the last the curve is flat.
+    if (from < ordered[0].time) push({time:0, value:ordered[0].value});
+    for (let i = 0; i < ordered.length; i++) {
+      const a = ordered[i], b = ordered[i+1];
+      if (!b) { if (a.time >= from-1e-9 && a.time <= to+1e-9) push(plain({...a, time:a.time-from})); break; }
+      if (b.time <= from || a.time >= to) continue;
+      const kind = segmentKind(a, b), lo = Math.max(from, a.time), hi = Math.min(to, b.time);
+      if (!curved(kind)) {
+        const start = {time:lo-from, value:curveValue(ordered, lo, 0)};
+        if (lo === a.time) Object.assign(start, plain({...a, time:a.time-from}));
+        else if (kind[0] === 'hold') start.interp = 'hold';
+        push(start);
+        continue;
       }
-    } else {
-      const at = ordered.find(p => Math.abs(p.time-from) < 1e-9);
-      if (at) for (const key of ['interp', 'ease', 'outHandle']) if (at[key] != null) lead[key] = at[key];
-    }
-    if (tail) {
-      const kind = segmentKind(tail.a, tail.b);
-      const before = inside[inside.length-1] || lead;
-      if (kind[0] !== 'linear' && kind[0] !== 'hold') {
-        let left;
-        if (head && head.i === tail.i) {
-          const right = lead._right || splitSegment(asBezier(kind), head.u)[1];
-          [left] = splitSegment(['bezier', ...right], (tail.u-head.u)/(1-head.u));
-        } else [left] = splitSegment(asBezier(kind), tail.u);
-        before.interp = 'bezier'; delete before.ease; before.outHandle = [left[0], left[1]]; end.inHandle = [left[2], left[3]];
+      let P = controlPoints(a, b, kind);
+      if (hi < b.time) P = casteljau(P, curveParam(P, hi))[0];
+      if (lo > a.time) P = casteljau(P, curveParam(P, lo))[1];
+      for (const piece of pieces(P)) {
+        const [x1, y1, x2, y2] = piece.handles;
+        const head = {time:piece.P[0][0]-from, value:piece.P[0][1], interp:'bezier', outHandle:[x1, y1]};
+        if (piece.P[0][0] === a.time && a.inHandle) head.inHandle = a.inHandle;
+        push(head);
+        out.push({time:piece.P[3][0]-from, value:piece.P[3][1], inHandle:[x2, y2], _end:true});
       }
+      // The piece end is the next key (or the window end): drop the placeholder unless it is the end.
+      if (out[out.length-1]._end && hi < to) { const end = out.pop(); delete end._end; out.push(end); }
     }
-    delete lead._right;
-    return [lead, ...inside, end].map(plain);
+    // The window end, held flat after the last key.
+    const last = out[out.length-1];
+    if (!last || last.time < to-from-1e-9) push({time:to-from, value:curveValue(ordered, to, 0)});
+    for (const point of out) delete point._end;
+    // Close the window exactly at 0 and to-from.
+    if (out[0].time > 1e-9) out.unshift({time:0, value:curveValue(ordered, from, 0)});
+    for (const point of out) {
+      if (Math.abs(point.time) < 1e-9) point.time = 0;
+      if (Math.abs(point.time-(to-from)) < 1e-9) point.time = to-from;
+    }
+    return out.map(plain);
   }
 
   // ---------------------------------------------------------------- speed ramps
@@ -273,6 +318,28 @@
           !stabilize.source.every(v => Number.isFinite(v) && v >= 0) || stabilize.source[1] <= stabilize.source[0])) fail('Invalid stabilization source range');
     }
     if (effects.speedAudio != null && !SPEED_AUDIO.includes(effects.speedAudio)) fail('Invalid ramp audio mode');
+  }
+  // Grade keyframes mix two gradings between key times: the mix eases as the key at the segment's
+  // start says (the first grade property, in color-grade.js order, with a key there).
+  const GRADE_KEYS = ['exposure', 'temperature', 'tint', 'brightness', 'contrast', 'saturation'];
+  function gradeSegmentKind(clip, start) {
+    for (const key of GRADE_KEYS) {
+      const points = orderedPoints(clip.keyframes?.[key]), index = points.findIndex(point => point.time === start);
+      if (index >= 0 && index < points.length-1) return segmentKind(points[index], points[index+1]);
+    }
+    return null;
+  }
+  // Names of a clip's configured effects (bypassed or switched off ones too): effects_engine.describe.
+  function describe(effects, keyframes = null) {
+    const names = [];
+    if (keyframes?.speed?.length) names.push('speed ramp');
+    if (!effects) return names;
+    if (effects.crop) names.push('crop');
+    if (effects.masks?.length) names.push('masks');
+    if (effects.key) names.push('chroma key');
+    if ((effects.blend || 'normal') !== 'normal') names.push(effects.blend+' blend mode');
+    if (effects.stabilize) names.push('stabilization');
+    return effects.bypass && names.length ? names.map(name => name+' (bypassed)') : names;
   }
   // Keyframes of effect properties (speed, crop.*, mask.N.*): bounds and interpolation fields.
   function validateKeyframes(keyframes) {
@@ -585,7 +652,7 @@ float fxBlend(int mode, float b, float s) {
   window.SpliceEffects = {INTERPOLATIONS, BLEND_MODES, BLEND_NAMES, BLEND_INDEX, MASK_SHAPES, MAX_MASKS, MAX_POLYGON_POINTS, SPEED_AUDIO,
     MASK_PROPS, CROP_PROPS, KEY_PROPS, STABILIZE_PROPS, KEY_BOUNDS, PRESETS, PRESET_HANDLES, GLSL, BLEND_GLSL,
     validatePointShape, eased, segmentKind, bezierComponent, bezierSolve, segmentFraction, curveValue, splitSegment, windowPoints,
-    orderedPoints, normalizeRamps, rampPoints, rampSource, rampSpeed, rampDuration, sourceDelta, presetRamp, validateEffects, validateKeyframes, isEffectKey,
+    orderedPoints, normalizeRamps, describe, gradeSegmentKind, rampPoints, rampSource, rampSpeed, rampDuration, sourceDelta, presetRamp, validateEffects, validateKeyframes, isEffectKey,
     maskParams, maskCoverage, masksAlpha, cropParams, cropAlpha, keyChroma, keyParams, keyAlpha, despill, blendChannel,
     live, layerFx, bindUniforms, canvasPass, blendPixels, segmentIntegral, offsetAt};
 })();

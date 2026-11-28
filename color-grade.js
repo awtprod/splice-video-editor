@@ -294,7 +294,11 @@
     const times = keyTimes(clip);
     if (!times.length) return null;
     if (local <= times[0]) return {a:times[0], b:times[0], weight:0};
-    for (let i = 1; i < times.length; i++) if (local < times[i]) return {a:times[i-1], b:times[i], weight:(local-times[i-1])/(times[i]-times[i-1])};
+    for (let i = 1; i < times.length; i++) if (local < times[i]) {
+      // The mix follows the easing of the key that starts the segment (effects.js gradeSegmentKind).
+      const u = (local-times[i-1])/(times[i]-times[i-1]), kind = window.SpliceEffects?.gradeSegmentKind(clip, times[i-1]);
+      return {a:times[i-1], b:times[i], weight:kind ? window.SpliceEffects.segmentFraction(kind, u) : u};
+    }
     return {a:times.at(-1), b:times.at(-1), weight:0};
   }
   // ---- A clip's grade as a .cube file (for a colorist's tool) ----

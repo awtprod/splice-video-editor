@@ -138,6 +138,30 @@ def segment_fraction(kind, u):
     return u
 
 
+GRADE_KEYS = ('exposure', 'temperature', 'tint', 'brightness', 'contrast', 'saturation')
+
+
+def grade_segment_kind(clip, start):
+    """The easing of the grade mix from key time ``start``: effects.js gradeSegmentKind."""
+    for key in GRADE_KEYS:
+        points = ordered_points((clip.get('keyframes') or {}).get(key))
+        for index, point in enumerate(points[:-1]):
+            if point['time'] == start:
+                return segment_kind(point, points[index+1])
+    return None
+
+
+def grade_weight_expr(clip, start, fraction):
+    """FFmpeg expression of the eased grade mix weight at segment fraction ``fraction`` (0..1)."""
+    kind = grade_segment_kind(clip, start)
+    if kind is None or kind[0] == 'linear':
+        return fraction
+    if kind[0] == 'hold':
+        return '0'
+    knots = [(index/200, segment_fraction(kind, index/200)) for index in range(201)]
+    return _tree(knots, fraction)
+
+
 def ordered_points(points):
     return sorted((point for point in points or [] if isinstance(point, dict)), key=lambda point: point['time'])
 
@@ -183,59 +207,123 @@ def split_segment(kind, u):
             (clamp_x(right[0]), clamp_y(right[1]), clamp_x(right[2]), clamp_y(right[3])), ym)
 
 
+def _control_points(a, b, kind):
+    _, x1, y1, x2, y2 = ('bezier', 1/3, 0.0, 2/3, 1.0) if kind[0] == 'smooth' else kind
+    dt, dv = b['time']-a['time'], b['value']-a['value']
+    return [(a['time'], a['value']), (a['time']+x1*dt, a['value']+y1*dv), (a['time']+x2*dt, a['value']+y2*dv), (b['time'], b['value'])]
+
+
+def _casteljau(points, s):
+    def lerp(p, q):
+        return (p[0]+(q[0]-p[0])*s, p[1]+(q[1]-p[1])*s)
+    a, b, c = lerp(points[0], points[1]), lerp(points[1], points[2]), lerp(points[2], points[3])
+    d, e = lerp(a, b), lerp(b, c)
+    m = lerp(d, e)
+    return [points[0], a, d, m], [m, e, c, points[3]]
+
+
+def _curve_param(points, at):
+    dt = points[3][0]-points[0][0]
+    if dt <= 0:
+        return 0.0
+    return bezier_solve((points[1][0]-points[0][0])/dt, (points[2][0]-points[0][0])/dt, (at-points[0][0])/dt)
+
+
+def _handles_of(points):
+    dt, dv = points[3][0]-points[0][0], points[3][1]-points[0][1]
+    spread = max(abs(p[1]-points[0][1]) for p in points)
+    x1 = min(1.0, max(0.0, (points[1][0]-points[0][0])/dt))
+    x2 = min(1.0, max(0.0, (points[2][0]-points[0][0])/dt))
+    if abs(dv) <= 1e-12:
+        return (x1, 1/3, x2, 2/3) if spread <= 1e-9 else None
+    y1, y2 = (points[1][1]-points[0][1])/dv, (points[2][1]-points[0][1])/dv
+    if HANDLE_Y[0] <= y1 <= HANDLE_Y[1] and HANDLE_Y[0] <= y2 <= HANDLE_Y[1]:
+        return (x1, y1, x2, y2)
+    return None
+
+
+def _value_extremum(points):
+    p1, p2, p3 = (points[i][1]-points[0][1] for i in (1, 2, 3))
+    a, b, c = p3-3*p2+3*p1, 3*p2-6*p1, 3*p1
+    roots = []
+    if abs(a) < 1e-12:
+        if abs(b) > 1e-12:
+            roots = [-c/(2*b)]
+    else:
+        disc = 4*b*b-12*a*c
+        if disc >= 0:
+            roots = [(-2*b-math.sqrt(disc))/(6*a), (-2*b+math.sqrt(disc))/(6*a)]
+    inside = sorted(r for r in roots if 1e-6 < r < 1-1e-6)
+    return inside[0] if inside else 0.5
+
+
+def _pieces(points, depth=0):
+    handles = _handles_of(points)
+    if handles or depth >= 4:
+        return [(points, handles or (1/3, 1/3, 2/3, 2/3))]
+    left, right = _casteljau(points, _value_extremum(points))
+    return _pieces(left, depth+1)+_pieces(right, depth+1)
+
+
 def window_points(points, start, end):
-    """The keys that shape start..end, re-based to 0; segments cut by the window keep their exact
-    shape (eased segments become bezier segments with the halves' handles). effects.js windowPoints."""
+    """The keys that shape start..end, re-based to 0; a segment cut by the window keeps its exact
+    shape (pieces whose handles cannot be written are split at their value extremum).
+    effects.js windowPoints, step for step."""
     ordered = ordered_points(points)
     if not ordered:
         return []
     def plain(point):
         return {key: value for key, value in point.items() if not (key in ('interp', 'ease', 'inHandle', 'outHandle') and value is None)}
-    def as_bezier(kind):
-        return ('bezier', 1/3, 0.0, 2/3, 1.0) if kind[0] == 'smooth' else kind
-    def locate(at):
-        if at <= ordered[0]['time'] or at >= ordered[-1]['time']:
-            return None
-        i = next(index for index, point in enumerate(ordered) if point['time'] >= at)
-        if ordered[i]['time'] == at:
-            return None
-        a, b = ordered[i-1], ordered[i]
-        return {'i': i, 'a': a, 'b': b, 'u': (at-a['time'])/(b['time']-a['time'])}
-    head, tail = locate(start), locate(end)
-    lead = {'time': 0.0, 'value': curve_value(ordered, start, 0)}
-    inside = [plain({**point, 'time': point['time']-start}) for point in ordered if start+1e-9 < point['time'] < end-1e-9]
-    last = {'time': end-start, 'value': curve_value(ordered, end, 0)}
-    right = None
-    if head:
-        kind = segment_kind(head['a'], head['b'])
-        if kind[0] == 'hold':
-            lead['interp'] = 'hold'
-        elif kind[0] != 'linear':
-            _, right, _ = split_segment(as_bezier(kind), head['u'])
-            lead['interp'] = 'bezier'
-            lead['outHandle'] = [right[0], right[1]]
-            if not (tail and tail['i'] == head['i']):
-                (inside[0] if inside else last)['inHandle'] = [right[2], right[3]]
-    else:
-        at = next((point for point in ordered if abs(point['time']-start) < 1e-9), None)
-        if at:
-            for key in ('interp', 'ease', 'outHandle'):
-                if at.get(key) is not None:
-                    lead[key] = at[key]
-    if tail:
-        kind = segment_kind(tail['a'], tail['b'])
-        before = inside[-1] if inside else lead
-        if kind[0] not in ('linear', 'hold'):
-            if head and head['i'] == tail['i']:
-                base = right or split_segment(as_bezier(kind), head['u'])[1]
-                left, _, _ = split_segment(('bezier', *base), (tail['u']-head['u'])/(1-head['u']))
-            else:
-                left, _, _ = split_segment(as_bezier(kind), tail['u'])
-            before['interp'] = 'bezier'
-            before.pop('ease', None)
-            before['outHandle'] = [left[0], left[1]]
-            last['inHandle'] = [left[2], left[3]]
-    return [plain(point) for point in [lead, *inside, last]]
+    out = []
+    def push(point):
+        if out and abs(out[-1]['time']-point['time']) < 1e-9:
+            keep = out[-1].get('inHandle', point.get('inHandle'))
+            out[-1].update(point)
+            if keep is not None:
+                out[-1]['inHandle'] = keep
+            return
+        out.append(point)
+    if start < ordered[0]['time']:
+        push({'time': 0.0, 'value': ordered[0]['value']})
+    for i, a in enumerate(ordered):
+        b = ordered[i+1] if i+1 < len(ordered) else None
+        if b is None:
+            if start-1e-9 <= a['time'] <= end+1e-9:
+                push(plain({**a, 'time': a['time']-start}))
+            break
+        if b['time'] <= start or a['time'] >= end:
+            continue
+        kind = segment_kind(a, b)
+        lo, hi = max(start, a['time']), min(end, b['time'])
+        if kind[0] not in ('bezier', 'smooth'):
+            head = {'time': lo-start, 'value': curve_value(ordered, lo, 0)}
+            if lo == a['time']:
+                head.update(plain({**a, 'time': a['time']-start}))
+            elif kind[0] == 'hold':
+                head['interp'] = 'hold'
+            push(head)
+            continue
+        control = _control_points(a, b, kind)
+        if hi < b['time']:
+            control = _casteljau(control, _curve_param(control, hi))[0]
+        if lo > a['time']:
+            control = _casteljau(control, _curve_param(control, lo))[1]
+        for piece, (x1, y1, x2, y2) in _pieces(control):
+            head = {'time': piece[0][0]-start, 'value': piece[0][1], 'interp': 'bezier', 'outHandle': [x1, y1]}
+            if piece[0][0] == a['time'] and a.get('inHandle'):
+                head['inHandle'] = a['inHandle']
+            push(head)
+            out.append({'time': piece[3][0]-start, 'value': piece[3][1], 'inHandle': [x2, y2]})
+    if not out or out[-1]['time'] < end-start-1e-9:
+        push({'time': end-start, 'value': curve_value(ordered, end, 0)})
+    if out[0]['time'] > 1e-9:
+        out.insert(0, {'time': 0.0, 'value': curve_value(ordered, start, 0)})
+    for point in out:
+        if abs(point['time']) < 1e-9:
+            point['time'] = 0.0
+        if abs(point['time']-(end-start)) < 1e-9:
+            point['time'] = end-start
+    return [plain(point) for point in out]
 
 
 # ---------------------------------------------------------------- speed ramps
@@ -898,7 +986,7 @@ def picture_alpha(clip, effects, u, v, aspect, clock, fps):
 def effects_for(clip):
     """The validated, live effects of a clip (None when nothing renders)."""
     checked = validate_effects(clip.get('effects'))
-    if not checked:
+    if not checked or checked.get('bypass'):
         return None
     live = active(checked, clip.get('keyframes'))
     numbers = [number for number, mask in enumerate(checked.get('masks') or []) if mask.get('enabled', True)]
@@ -1111,7 +1199,7 @@ def prerender_ramp(event, u0, u1, target, directory, cancelled, heartbeat, layou
 # Analyses live in the media store, named by a hash of the source file and its trimmed range: a
 # project names only the 32-hex analysis id, never a path, so nothing a project holds reaches a
 # filtergraph but numbers this module formats itself.
-STABILIZE_VERSION = 'vidstab-1'
+STABILIZE_VERSION = 'vidstab-2'
 DETECT_OPTIONS = 'shakiness=6:accuracy=15:stepsize=6:mincontrast=0.2'
 _vidstab = None
 
@@ -1239,6 +1327,11 @@ class Stabilizer:
             errors = process.stderr.read()
             if process.wait() != 0 or not trf.exists():
                 raise RuntimeError('Motion analysis failed: '+errors.strip()[-400:])
+            # Tripod mode measures every frame against the first: a second pass of its own.
+            tripod = directory/'tripod.trf'
+            subprocess.run([*command[:command.index('-vf')+1],
+                            f"trim=start={trim_start:.9f}:end={trim_end:.9f},vidstabdetect=result={_vidstab_path(tripod)}:{DETECT_OPTIONS}:tripod=1",
+                            '-f', 'null', '-'], capture_output=True, text=True, check=True, timeout=7200)
             meta['shake'] = {'before': shake_metric(path, trim_start, trim_end, seek)}
             (directory/'analysis.json').write_text(json.dumps(meta))
             with self.lock:
@@ -1300,7 +1393,7 @@ def render_stabilized(analysis, settings, target, *, preview=False, cancelled=No
         raise ValueError(VIDSTAB_MISSING)
     meta = analysis_meta(analysis)
     directory = _analysis_dir(analysis)
-    trf = directory/'analysis.trf'
+    trf = directory/('tripod.trf' if settings.get('tripod') else 'analysis.trf')
     trim_start, trim_end = meta['trim']
     seek = max(0.0, trim_start-2)
     picture = (f"trim=start={trim_start:.9f}:end={trim_end:.9f},{stabilize_transform_args(settings, trf)},setpts=PTS-STARTPTS")

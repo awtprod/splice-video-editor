@@ -486,6 +486,8 @@ window.SpliceNested = (() => {
     if (clip.pictureDip) names.push('picture dip');
     for (const [key, points] of Object.entries(clip.keyframes || {}))
       if (key !== 'volume' && points.length) names.push('animated ' + key);
+    // Clip effects, bypassed or switched off ones included (effects.js describe).
+    names.push(...(window.SpliceEffects?.describe(clip.effects) || []));
     return names;
   }
 
@@ -531,6 +533,11 @@ window.SpliceNested = (() => {
     }
     if (finishing.size)
       throw new Error('Cannot unnest losslessly: outer ' + [...finishing].join(', ') + ' must remain on the nested mix.');
+    // A speed ramp or stabilization acts on the nest's timing or motion as a whole: no per-child copy keeps it.
+    const whole = outerClips.flatMap(c => (window.SpliceEffects?.describe(c.effects, c.keyframes) || [])
+      .filter(name => /^(speed ramp|stabilization)/.test(name)));
+    if (whole.length)
+      throw new Error('Cannot unnest losslessly: outer ' + [...new Set(whole)].join(', ') + ' must remain on the nested composite.');
 
     const outerIds = new Set(outerClips.map(c => c.id));
     const child = item.nestedProject;
@@ -679,7 +686,7 @@ window.SpliceNested = (() => {
       } else {
         out.track = childLane(cc.track);
         if (pictureAdjustments(outer).length) {
-          for (const field of ['transform','color','opacity'])
+          for (const field of ['transform','color','opacity','effects'])
             if (outer[field] != null) out[field] = structuredClone(outer[field]);
           const keys = Object.fromEntries(Object.entries(outer.keyframes || {}).filter(([key]) => key !== 'volume'));
           const from = newStart - outer.start;
