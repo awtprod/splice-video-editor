@@ -212,7 +212,9 @@ async function main() {
         ...(childEffects ? {effects:childEffects} : {})}]; });
       SpliceNested.nestSelection(['c1'], {name:'Nest'});
       const outer = Editor.get().project.clips.find(c => c.type === 'video');
-      Editor.updateClip(outer.id, {...(outerEffects ? {effects:outerEffects} : {}), ...(outerKeys ? {keyframes:outerKeys} : {})});
+      const edited = JSON.stringify(Editor.get().project);
+      try { Editor.updateClip(outer.id, {...(outerEffects ? {effects:outerEffects} : {}), ...(outerKeys ? {keyframes:outerKeys} : {})}); }
+      catch (error) { return {ok:false, refusedEdit:true, message:error.message, unchanged:JSON.stringify(Editor.get().project) === edited}; }
       const before = JSON.stringify(Editor.get().project);
       try {
         const out = SpliceNested.unnestClip(outer.id).filter(c => c.type === 'video');
@@ -227,11 +229,13 @@ async function main() {
     assert.ok(result.ok && result.effects[0].bypass === true && result.effects[0].key.enabled === false, 'bypassed and disabled effects are carried, never dropped');
     result = await unnest(null, {speed:[{time:0, value:100}, {time:1, value:50}]});
     assert.ok(!result.ok && /Cannot unnest losslessly: outer speed ramp/.test(result.message) && result.unchanged, JSON.stringify(result));
+    // Stabilization never reaches a nested clip: the edit is refused with the export's words.
     result = await unnest({stabilize:{analysis:'0'.repeat(32), enabled:false}});
-    assert.ok(!result.ok && /stabilization/.test(result.message) && result.unchanged, JSON.stringify(result));
+    assert.ok(!result.ok && result.refusedEdit && result.message.includes(await page.evaluate(() => SpliceEffects.MESSAGES.stabilizeSource)) &&
+      result.unchanged, JSON.stringify(result));
     result = await unnest(masks, null, {blend:'screen'});
     assert.ok(!result.ok && /Cannot unnest losslessly/.test(result.message) && result.unchanged, 'a child with its own effects keeps the nest: '+JSON.stringify(result));
-    console.log('Unnest: outer effects copied intact (bypassed too) over a plain child; ramps, stabilization or effected children refuse and leave the project unchanged.');
+    console.log('Unnest: outer effects copied intact (bypassed too) over a plain child; ramps or effected children refuse and leave the project unchanged; stabilizing a nest is refused at the edit.');
 
     // ---- 8. Screenshots at three sizes: the panels must not overlap or clip.
     await page.locator('#project-input').setInputFiles(file);

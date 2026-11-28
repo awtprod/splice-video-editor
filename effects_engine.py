@@ -1065,10 +1065,19 @@ def blend_composite(filters, base, layer, output, position, first, frames, windo
         filters.append(f"[{o}_s][{o}_d]blend=all_expr='{blend_expr(mode)}'[{o}_m]")
     # zscale quantizes to the composite's own depth: swscale's 16- to 10-bit step inside overlay
     # moves non-code-aligned chroma by about two 10-bit steps.
-    depth = '16' if 'p16' in base_format else '10'
-    filters.append(f'[{o}_m]zscale=m={ZSCALE_MATRIX[matrix]}:r=limited,format=yuv444p{depth}le[{o}_c]')
-    filters.append(f'[{o}_a]alphaextract,format=gray{depth}le[{o}_alpha]')
-    filters.append(f'[{o}_c]format=yuva444p{depth}le[{o}_ca];[{o}_ca][{o}_alpha]alphamerge[{o}_layer]')
+    if 'p16' in base_format:
+        # At 16 bits the alpha joins the blended colour in float RGB, and zscale quantizes both:
+        # alphamerge takes only 8-bit formats, so it rounded a 16-bit blend to 8 bits (a ProRes 4444
+        # alpha delivery composites at 16 bits). zscale writes alpha on the limited-range scale too
+        # (1.0 -> 60160); the lookup puts it back on the full scale, exact at 0 and 1.
+        filters.append(f'[{o}_a]alphaextract,format=grayf32le[{o}_alpha]')
+        filters.append(f'[{o}_m][{o}_alpha]mergeplanes=0x00010210:format=gbrapf32le,'
+                       f'zscale=m={ZSCALE_MATRIX[matrix]}:r=limited,format=yuva444p16le,'
+                       f"lutyuv=a='clip(round((val-4096)*65535/56064),0,65535)'[{o}_layer]")
+    else:
+        filters.append(f'[{o}_m]zscale=m={ZSCALE_MATRIX[matrix]}:r=limited,format=yuv444p10le[{o}_c]')
+        filters.append(f'[{o}_a]alphaextract,format=gray10le[{o}_alpha]')
+        filters.append(f'[{o}_c]format=yuva444p10le[{o}_ca];[{o}_ca][{o}_alpha]alphamerge[{o}_layer]')
     # The layer is already on the frame and timed: composite it in place.
     _composite_layer(filters, f'{o}_bg', f'{o}_layer', o, 'x=0:y=0' if overlay else 'null', overlay, 0, window_frames,
                      window_frames, base_format)
@@ -1394,12 +1403,17 @@ class Stabilizer:
                 return self.status(analysis)
             job = self.jobs[analysis] = {'state': 'running', 'progress': 0.0, 'analysis': analysis,
                                          '_cancel': threading.Event(), '_process': None}
-        directory.mkdir(parents=True, exist_ok=True)
-        threading.Thread(target=self._detect, args=(analysis, path, source_in, source_out, directory, job), daemon=True).start()
+            directory.mkdir(parents=True, exist_ok=True)
+            job['_thread'] = threading.Thread(target=self._detect, args=(analysis, path, source_in, source_out, directory, job),
+                                              daemon=True)
+            job['_thread'].start()
         return self.status(analysis)
 
     def cancel(self, analysis):
-        """Stop a running analysis and remove what it wrote. A finished analysis is kept."""
+        """Stop a running analysis and remove what it wrote. It reports cancelled only once its
+        FFmpeg has exited and its files are gone (the analysis thread removes them as it ends).
+        A finished analysis is kept."""
+        import subprocess
         if not isinstance(analysis, str) or not ANALYSIS_ID.match(analysis):
             raise ValueError('Invalid stabilization analysis id')
         with self.lock:
@@ -1407,11 +1421,21 @@ class Stabilizer:
             if not job or job['state'] != 'running':
                 return {'state': (job or {}).get('state', 'unknown'), 'analysis': analysis}
             job['_cancel'].set()
-            process = job.get('_process')
-            self.jobs[analysis] = {'state': 'cancelled', 'analysis': analysis, 'error': 'Analysis cancelled: analyze the clip again'}
+            process, thread = job.get('_process'), job.get('_thread')
         if process is not None and process.poll() is None:
             process.terminate()
-        return {'state': 'cancelled', 'analysis': analysis}
+            try:
+                process.wait(10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        if thread is not None:
+            thread.join(120)
+        with self.lock:
+            if self.jobs.get(analysis) is job:
+                self.jobs[analysis] = {'state': 'cancelled', 'analysis': analysis, 'error': 'Analysis cancelled: analyze the clip again'}
+            state = self.jobs[analysis]['state']
+        return {'state': state, 'analysis': analysis}
 
     def _run(self, job, command, progress=None):
         """One vidstab pass, stoppable by cancel(): ``progress(seconds)`` receives FFmpeg's clock."""
@@ -1496,7 +1520,8 @@ class Stabilizer:
                     self.jobs[analysis] = {'state': 'done', 'analysis': analysis}
         except Exception as error:   # reported to the editor, which shows it on the clip
             with self.lock:
-                if self.jobs.get(analysis) is job:
+                # A cancelled job is settled by cancel(), after this thread has cleaned up.
+                if self.jobs.get(analysis) is job and not job['_cancel'].is_set():
                     self.jobs[analysis] = {'state': 'failed', 'analysis': analysis, 'error': str(error)}
         finally:
             for name in (trf, tripod) if trf else ():

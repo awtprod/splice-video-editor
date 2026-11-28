@@ -132,14 +132,36 @@ class AlphaDelivery(Fixture):
                "r='205+(40-205)*clip((X-40)/80,0,1)':g='150+(190-150)*clip((X-40)/80,0,1)':b='120+(70-120)*clip((X-40)/80,0,1)'",
                '-t', '1', '-vf', 'scale=out_color_matrix=bt709:out_range=tv,format=yuv444p', '-c:v', 'libx264', '-qp', '0', '-g', '1',
                *TAGS, cls.media/'edge.mp4')
+        for name, graph in (('gbg', "geq=r='40+X':g='60+Y':b='200-X/2'"), ('gtop', "geq=r='220-X/2':g='90+Y':b='60+X/3'")):
+            ffmpeg('-f', 'lavfi', '-i', f'color=c=black:s={W}x{H}:r={FPS},format=gbrp,{graph}', '-t', '1',
+                   '-vf', 'scale=out_color_matrix=bt709:out_range=tv,format=yuv444p', '-c:v', 'libx264', '-qp', '0', '-g', '1', *TAGS,
+                   cls.media/f'{name}.mp4')
         cls.items = [{'id': 'top', 'name': 'top.mp4', 'src': '/media/top.mp4', 'type': 'video', 'duration': 2},
-                     {'id': 'edge', 'name': 'edge.mp4', 'src': '/media/edge.mp4', 'type': 'video', 'duration': 1}]
+                     {'id': 'edge', 'name': 'edge.mp4', 'src': '/media/edge.mp4', 'type': 'video', 'duration': 1},
+                     *({'id': name, 'name': name+'.mp4', 'src': f'/media/{name}.mp4', 'type': 'video', 'duration': 1} for name in ('gbg', 'gtop'))]
 
-    def render(self, clip, name):
+    def render(self, clip, name, clips=None, alpha=True):
         out = self.out(name)
-        render_to_file({'name': 'a', 'width': W, 'height': H, 'fps': FPS, 'media': self.items, 'clips': [clip]}, out,
-                       options={'codec': 'prores', 'profile': '4444', 'alpha': True})
+        render_to_file({'name': 'a', 'width': W, 'height': H, 'fps': FPS, 'media': self.items, 'clips': clips or [clip]}, out,
+                       options={'codec': 'prores', 'profile': '4444', **({'alpha': True} if alpha else {})})
         return out
+
+    def test_blend_modes_keep_their_precision_with_alpha(self):
+        # A 4444 alpha delivery composites at 16 bits: a blended layer there must match the same
+        # composite delivered without alpha (FFmpeg's alphamerge had rounded it to 8 bits).
+        def clip(media, track, **extra):
+            return {'id': media, 'type': 'video', 'mediaId': media, 'track': track, 'start': 0, 'duration': .4, 'in': 0,
+                    'embeddedAudio': False, 'transition': 'none', **extra}
+        for mode in ('multiply', 'screen', 'lighten'):
+            clips = [clip('gbg', 1), clip('gtop', 2, effects={'blend': mode})]
+            plain, = frames_rgb(self.render(None, f'blend-{mode}.mov', clips, alpha=False))[0][:1]
+            alpha, size = frames_rgb(self.render(None, f'blend-{mode}-alpha.mov', clips), alpha=True)
+            alpha = alpha[0]
+            for c in range(3):
+                d = [alpha[i*4+c]-plain[i*3+c] for i in range(W*H)]
+                self.assertLess(abs(sum(d)/len(d)), .3, f'{mode}: channel {c} mean difference {sum(d)/len(d):.2f}')
+                self.assertLessEqual(max(map(abs, d)), 4, f'{mode}: channel {c}')
+            self.assertEqual(min(alpha[3::4]), 255, f'{mode}: the opaque composite stays opaque')
 
     def test_opacity_alone_keeps_the_source_colour(self):
         for opacity, alpha in ((62, 158), (30, 76)):
@@ -308,15 +330,14 @@ class StabilizeJobs(Fixture):
         status = stabilizer.start('/media/long.mp4', 0, 39)
         analysis = status['analysis']
         deadline = time.monotonic()+60
-        while stabilizer.jobs[analysis].get('_process') is None and time.monotonic() < deadline:
+        while (stabilizer.jobs[analysis].get('_process') is None or not self.leftovers(analysis)) and time.monotonic() < deadline:
             time.sleep(.05)
         process = stabilizer.jobs[analysis]['_process']
+        self.assertTrue(self.leftovers(analysis), 'the pass is writing its motion file')
+        # cancel() settles only once FFmpeg has exited and the job's files are gone.
         self.assertEqual(stabilizer.cancel(analysis)['state'], 'cancelled')
-        process.wait(10)
-        self.assertIsNotNone(process.poll(), 'the vidstab pass stops')
-        deadline = time.monotonic()+10
-        while self.leftovers(analysis) and time.monotonic() < deadline:
-            time.sleep(.05)
+        self.assertIsNotNone(process.poll(), 'the vidstab pass has exited')
+        self.assertFalse(stabilizer.jobs.get(analysis, {}).get('_thread'), 'the job is settled')
         self.assertEqual(self.leftovers(analysis), [])
         self.assertFalse((E.stabilize_store()/analysis/'analysis.json').exists())
         self.assertEqual(stabilizer.status(analysis)['state'], 'cancelled')
